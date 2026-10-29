@@ -283,6 +283,16 @@ fn realtime_volumetric_shadow_setting_changes_render() -> TestResult {
     Ok(())
 }
 
+/// Blender stores each froxel's direct source in `UFLOAT_11_11_10` before volume integration.
+fn eevee_ufloat_channel(value: f64, mantissa_bits: i32) -> f64 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0.0;
+    }
+    let exponent = value.log2().floor().clamp(-14.0, 15.0);
+    let step = (exponent - f64::from(mantissa_bits)).exp2();
+    (value / step).floor() * step
+}
+
 #[test]
 fn realtime_sun_volume_shadow_matches_homogeneous_slab_integral() -> TestResult {
     const DENSITY: f64 = 0.5;
@@ -338,11 +348,14 @@ fn realtime_sun_volume_shadow_matches_homogeneous_slab_integral() -> TestResult 
     let mut camera_transmittance = 1.0;
     let mut direct = 0.0;
     let mut self_shadowed = 0.0;
+    let light_source = DENSITY * 3.0 / (4.0 * std::f64::consts::PI);
+    let direct_source = eevee_ufloat_channel(light_source, 6);
     for index in 0..SHADOW_STEPS {
         let distance = (f64::from(index) + 0.5) * step;
         let source_weight = camera_transmittance * source_distance;
-        direct += source_weight;
-        self_shadowed += source_weight * (-DENSITY * distance).exp();
+        direct += source_weight * direct_source;
+        self_shadowed +=
+            source_weight * eevee_ufloat_channel(light_source * (-DENSITY * distance).exp(), 6);
         camera_transmittance *= camera_step_transmittance;
     }
     let expected_ratio = self_shadowed / direct;

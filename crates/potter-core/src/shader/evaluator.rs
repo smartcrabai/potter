@@ -495,14 +495,6 @@ pub struct HitFootprint {
     /// The geometric normal of the hit's triangle.
     pub geometric_normal: DVec3,
 }
-/// Per-pixel screen-space differentials for EEVEE-style shader evaluation.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct HitDifferentials {
-    pub(crate) world_dx: DVec3,
-    pub(crate) world_dy: DVec3,
-    pub(crate) uv_dx: [f64; 2],
-    pub(crate) uv_dy: [f64; 2],
-}
 
 impl<'a> HitContext<'a> {
     #[must_use]
@@ -546,6 +538,10 @@ impl<'a> HitContext<'a> {
             geometry_attribute_barycentric: [1.0, 0.0, 0.0],
             footprint: None,
             realtime_differentials: None,
+            bump_center_position: DVec3::ZERO,
+            bump_center_realtime_position_f32: None,
+            opacity_only: false,
+            bump_height_shifted: false,
         }
     }
 
@@ -583,15 +579,6 @@ impl<'a> HitContext<'a> {
     #[must_use]
     pub const fn with_path_traced(mut self, path_traced: bool) -> Self {
         self.path_traced = path_traced;
-        self
-    }
-    /// Attach screen-space differentials for realtime shader evaluation.
-    #[must_use]
-    pub(crate) const fn with_realtime_differentials(
-        mut self,
-        differentials: HitDifferentials,
-    ) -> Self {
-        self.realtime_differentials = Some(differentials);
         self
     }
 
@@ -1918,6 +1905,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             links: parent_links,
             group_input_binding: parent_binding,
             group_depth: parent_depth,
+            texture_mapping_unsupported: self.texture_mapping_unsupported,
         };
         parent.input(parent_node_id, &input_socket.id, kind)
     }
@@ -1960,6 +1948,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         let material = self.material;
         let hit_ctx = self.hit_ctx;
         let alpha_linked_images = self.alpha_linked_images;
+        let texture_mapping_unsupported = self.texture_mapping_unsupported;
         let binding = GroupInputBinding {
             group: self.group,
             node_id: id,
@@ -1978,6 +1967,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             links: self.links.and_then(|index| index.children.get(id)),
             group_input_binding: Some(&binding),
             group_depth,
+            texture_mapping_unsupported,
         };
         let result = nested.input(output_node, &output_socket.name, output_kind);
         self.workspace.active_groups.truncate(active_start);
@@ -2806,9 +2796,6 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                         blackbody_emission = DVec3::ZERO;
                     }
                 }
-                if !self.hit_ctx.path_traced && self.hit_ctx.volume_data.is_none() {
-                    blackbody_emission = DVec3::ZERO;
-                }
                 let tint = if blackbody_emission.max_element() > 0.0
                     || self.hit_ctx.volume_temperature_capture.is_some()
                 {
@@ -3222,24 +3209,13 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         } else {
             [ImageExtension::Repeat, ImageExtension::Extend]
         };
-        let color = if !self.hit_ctx.path_traced && image.udim {
-            crate::image::sampling::sample_with_extension_alpha_first_tile_axes(
-                image,
-                uv,
-                interpolation,
-                extensions,
-                false,
-            )
-        } else {
-            crate::image::sampling::sample_with_extension_alpha_axes(
-                image,
-                uv,
-                false,
-                interpolation,
-                extensions,
-                false,
-            )
-        };
+        let color = crate::shader::texture::sample_environment_texture(
+            image,
+            uv,
+            interpolation,
+            extensions,
+            self.hit_ctx.path_traced,
+        );
         if color.iter().any(|component| !component.is_finite()) {
             return Err(eval_error(format!(
                 "Environment Texture node `{id}` sampled non-finite pixels"
@@ -3611,7 +3587,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         if dimensions == 1 {
             coordinate[0] = self.scalar_input(id, &["W"], 0.0)? as f32 * scale;
         } else {
-            let default_vector = self.hit_ctx.position;
+            // Shader nodes default to CD_ORCO/Generated, separate from GN's `NODE_DEFAULT_INPUT_POSITION_FIELD`.
+            let default_vector = self.hit_ctx.generated;
             let vector = self.texture_vector_input(id, default_vector)?;
             coordinate[0] = vector.x as f32 * scale;
             coordinate[1] = vector.y as f32 * scale;
@@ -4110,7 +4087,10 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             return Err(invalid(format!("unknown Blackbody output `{socket}`")));
         }
         let temperature = self.scalar_input(id, &["Temperature"], 6500.0)? as f32;
-        let [red, green, blue] = if self.hit_ctx.path_traced {
+        // EEVEE folds primitive inputs on CPU; non-primitive nodes use its GPU spectrum lookup.
+        let [red, green, blue] = if self.hit_ctx.path_traced
+            || super::inline_fold::node_inputs_all_primitive(self.group, id)
+        {
             super::blackbody::blackbody_rgb(temperature).map(|channel| channel.max(0.0))
         } else {
             super::converters::eevee_blackbody_rgb(temperature)
@@ -4195,6 +4175,21 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         }
     }
 
+    fn texture_position(&self) -> DVec3 {
+        if self.hit_ctx.path_traced {
+            self.hit_ctx.position
+        } else {
+            let position = match self.hit_ctx.realtime_position_f32 {
+                Some(position) => position,
+                None => f32_vector(self.hit_ctx.position),
+            };
+            DVec3::new(
+                f64::from(position.x),
+                f64::from(position.y),
+                f64::from(position.z),
+            )
+        }
+    }
     fn geometry(&self, id: &Id, socket: &str) -> Result<Value> {
         if self.hit_ctx.bump_height_shifted
             && (matches!(socket, "Incoming" | "Tangent")
@@ -4207,7 +4202,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             ));
         }
         match socket {
-            "Position" => Ok(Value::Vector(self.hit_ctx.position)),
+            "Position" => Ok(Value::Vector(self.texture_position())),
             "Normal" => Ok(Value::Vector(self.hit_ctx.normal)),
             // Both SVM `shading_incoming` and EEVEE `coordinate_incoming` point toward the viewer.
             "Incoming" => Ok(Value::Vector(self.hit_ctx.view_direction)),
@@ -5064,7 +5059,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                     f64::from(normal.z),
                 )
             }
-            "Position" => self.hit_ctx.position,
+            "Position" => self.texture_position(),
             "Reflection" => normalize_or(
                 -self
                     .hit_ctx
@@ -6873,6 +6868,7 @@ mod tests {
             links: None,
             group_input_binding: None,
             group_depth: 0,
+            texture_mapping_unsupported: &alpha_linked_images,
         };
         let node_id = Id::new("node".to_owned()).unwrap();
         let super::Value::Vector(value) = evaluator.output(&node_id, output, 0).unwrap() else {
@@ -6904,6 +6900,7 @@ mod tests {
             links: None,
             group_input_binding: None,
             group_depth: 0,
+            texture_mapping_unsupported: &alpha_linked_images,
         };
         let node_id = Id::new("node".to_owned()).unwrap();
         let super::Value::Vector(value) = evaluator.output(&node_id, "View Vector", 0).unwrap()
@@ -7594,6 +7591,66 @@ mod tests {
         assert_eq!(shading.volume[0].params.volume_anisotropy, 0.35);
     }
 
+    #[test]
+    fn mesh_volume_color_attribute_defaults_are_engine_specific() {
+        let volume_graph = |color_attribute: &str| {
+            let mut graph = NodeGroup::new("Mesh Volume Color Attribute", GraphKind::Shader);
+            insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+            insert_node(
+                &mut graph,
+                "volume",
+                "ShaderNodeVolumePrincipled",
+                json!({
+                    "Density": 0.8,
+                    "Color": [1.0, 1.0, 1.0, 1.0],
+                    "Color Attribute": color_attribute
+                }),
+            );
+            link(&mut graph, "volume", "Volume", "output", "Volume");
+            graph
+        };
+        let named_graph_id = Id::new("mesh_volume_color_attribute").unwrap();
+        let empty_graph_id = Id::new("mesh_volume_empty_color_attribute").unwrap();
+        let mut groups = Registry::new();
+        groups.insert(named_graph_id.clone(), volume_graph("mesh_tint"));
+        groups.insert(empty_graph_id.clone(), volume_graph(""));
+        let named_material = Material {
+            node_tree: Some(named_graph_id),
+            ..Material::default()
+        };
+        let empty_material = Material {
+            node_tree: Some(empty_graph_id),
+            ..Material::default()
+        };
+        let layers = [("mesh_tint", [0.1, 0.8, 0.2, 1.0])];
+
+        for (path_traced, named_scatter, named_absorption, empty_scatter, empty_absorption) in [
+            (false, [0.8; 3], [0.0; 3], [0.8; 3], [0.0; 3]),
+            (true, [0.0; 3], [0.8; 3], [0.8; 3], [0.0; 3]),
+        ] {
+            let mut context = HitContext::new(&groups).with_color_layers(&layers, None);
+            context.path_traced = path_traced;
+            let named = evaluate_surface(&named_material, &context).unwrap();
+            let empty = evaluate_surface(&empty_material, &context).unwrap();
+            assert!(channels_close(
+                weighted_volume(&named, |params| params.volume_scatter),
+                named_scatter
+            ));
+            assert!(channels_close(
+                weighted_volume(&named, |params| params.volume_absorption),
+                named_absorption
+            ));
+            assert!(channels_close(
+                weighted_volume(&empty, |params| params.volume_scatter),
+                empty_scatter
+            ));
+            assert!(channels_close(
+                weighted_volume(&empty, |params| params.volume_absorption),
+                empty_absorption
+            ));
+        }
+    }
+
     fn channels_close(actual: [f64; 3], expected: [f64; 3]) -> bool {
         actual
             .iter()
@@ -7902,6 +7959,8 @@ mod tests {
             workspace: &mut workspace,
             alpha_linked_images: &empty,
             links: None,
+            group_input_binding: None,
+            group_depth: 0,
             texture_mapping_unsupported: &empty,
         };
         evaluator.attribute(&node_id, socket)
@@ -8342,6 +8401,59 @@ mod tests {
     }
 
     #[test]
+    fn unlinked_voronoi_vector_matches_explicit_generated_input() {
+        let mut group = NodeGroup::new("Voronoi Defaults", GraphKind::Shader);
+        let inputs = json!({
+            "Scale": 2.3,
+            "Detail": 20.0,
+            "Roughness": 1.4,
+            "Randomness": 0.73
+        });
+        insert_node(
+            &mut group,
+            "unlinked",
+            "ShaderNodeTexVoronoi",
+            inputs.clone(),
+        );
+        insert_node(&mut group, "linked", "ShaderNodeTexVoronoi", inputs);
+        insert_node(&mut group, "coordinates", "ShaderNodeTexCoord", json!({}));
+        link(&mut group, "coordinates", "Generated", "linked", "Vector");
+
+        let graph_id = Id::new("voronoi_defaults".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), group);
+        let mut context = HitContext::new(&groups);
+        context.generated = DVec3::new(0.382_812_5, 0.460_937_5, 0.5);
+        context.object = DVec3::new(-0.093_75, -0.031_25, 0.0);
+        context.position = DVec3::new(1.406_25, -0.031_25, 0.0);
+
+        for path_traced in [false, true] {
+            context.path_traced = path_traced;
+            let ShaderValue::Scalar(unlinked) = evaluate_input_node_output(
+                &groups,
+                &graph_id,
+                &Id::new("unlinked".to_owned()).unwrap(),
+                "Distance",
+                &context,
+            )
+            .unwrap() else {
+                panic!("unlinked Voronoi Distance must be scalar")
+            };
+            let ShaderValue::Scalar(linked) = evaluate_input_node_output(
+                &groups,
+                &graph_id,
+                &Id::new("linked".to_owned()).unwrap(),
+                "Distance",
+                &context,
+            )
+            .unwrap() else {
+                panic!("generated-linked Voronoi Distance must be scalar")
+            };
+            assert_eq!(unlinked, linked);
+        }
+    }
+
+    #[test]
     fn engine_specific_normal_map_hsv_and_wavelength_outputs_are_distinct() {
         let mut graph = NodeGroup::new("Engine Semantics", GraphKind::Shader);
         insert_node(
@@ -8519,7 +8631,7 @@ mod tests {
         assert!(cycles_normal.z > 0.6);
         assert!(eevee_wavelength[2] > 0.0);
         assert!(cycles_wavelength[..3].iter().all(|channel| *channel == 0.0));
-        assert_ne!(eevee_blackbody[0], cycles_blackbody[0]);
+        assert_eq!(eevee_blackbody, cycles_blackbody);
     }
 
     #[test]
@@ -8679,6 +8791,7 @@ mod tests {
             links: None,
             group_input_binding: None,
             group_depth: 0,
+            texture_mapping_unsupported: &alpha_linked_images,
         };
         evaluator.output(node_id, output, 0)
     }

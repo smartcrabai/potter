@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 
 use crate::{
     error::Result,
@@ -20,6 +20,10 @@ use crate::{
 
 /// Texels along each cube face's edge.
 const FACE_TEXELS: usize = 64;
+/// EEVEE's sphere-probe capture face extent at the default 512 cubemap setting.
+const VOLUME_PROBE_FACE_TEXELS: usize = 256;
+const SPHERE_PROBE_REMAP_GROUP_SIZE: usize = 32;
+const SPHERE_PROBE_SH_GROUP_SIZE: usize = 256;
 
 /// The world's radiance by direction, sampled at the centre of each texel of a cube map.
 pub(super) struct WorldProbe {
@@ -56,13 +60,190 @@ impl WorldProbe {
         self.average_irradiance
     }
 }
-/// EEVEE's isotropic volume-light SH L0, captured from the world probe (`eevee_volume.bsl.hh`).
+/// EEVEE's isotropic volume-world result: project the half-float sphere probe to L0, then dot
+/// its half-float volume-probe coefficient with the isotropic phase (`eevee_volume.bsl.hh`).
+/// The second result reports sampled directional variation that can contribute through SH L1.
 pub(super) fn volume_ambient_l0(
     world: &World,
     groups: &Registry<NodeGroup>,
     images: &BTreeMap<String, ImageData>,
-) -> Result<DVec3> {
-    sample_world_probe(world, groups, images, |_| {})
+) -> Result<(DVec3, bool)> {
+    let mut cubemap = Vec::with_capacity(6 * VOLUME_PROBE_FACE_TEXELS * VOLUME_PROBE_FACE_TEXELS);
+    let mut first_radiance: Option<[f32; 3]> = None;
+    let mut nonuniform = false;
+    for face in 0..6 {
+        for row in 0..VOLUME_PROBE_FACE_TEXELS {
+            for column in 0..VOLUME_PROBE_FACE_TEXELS {
+                let direction = face_direction(
+                    face,
+                    texel_centre_at(column, VOLUME_PROBE_FACE_TEXELS),
+                    texel_centre_at(row, VOLUME_PROBE_FACE_TEXELS),
+                );
+                let radiance = evaluate_world(world, groups, images, direction, false)?;
+                let radiance = [
+                    exr::prelude::f16::from_f32(radiance.x as f32).to_f32(),
+                    exr::prelude::f16::from_f32(radiance.y as f32).to_f32(),
+                    exr::prelude::f16::from_f32(radiance.z as f32).to_f32(),
+                ];
+                if let Some(first) = first_radiance {
+                    nonuniform |= first.map(f32::to_bits) != radiance.map(f32::to_bits);
+                } else {
+                    first_radiance = Some(radiance);
+                }
+                cubemap.push(radiance);
+            }
+        }
+    }
+
+    // EEVEE projects the half-float cubemap through its double-resolution octahedral atlas.
+    let extent = 2 * VOLUME_PROBE_FACE_TEXELS;
+    let groups_per_axis = extent / SPHERE_PROBE_REMAP_GROUP_SIZE;
+    let mut coefficients = vec![[0.0_f32; 3]; groups_per_axis * groups_per_axis];
+    let mut samples = [[0.0_f32; 3]; SPHERE_PROBE_REMAP_GROUP_SIZE * SPHERE_PROBE_REMAP_GROUP_SIZE];
+    let l0 = 0.282_094_8_f32;
+    for group_y in 0..groups_per_axis {
+        for group_x in 0..groups_per_axis {
+            for local_y in 0..SPHERE_PROBE_REMAP_GROUP_SIZE {
+                for local_x in 0..SPHERE_PROBE_REMAP_GROUP_SIZE {
+                    let local_index = local_y * SPHERE_PROBE_REMAP_GROUP_SIZE + local_x;
+                    let column = group_x * SPHERE_PROBE_REMAP_GROUP_SIZE + local_x;
+                    let row = group_y * SPHERE_PROBE_REMAP_GROUP_SIZE + local_y;
+                    let weight = octahedral_texel_solid_angle(column, row, extent);
+                    if weight == 0.0 {
+                        samples[local_index] = [0.0; 3];
+                        continue;
+                    }
+                    let denominator = (extent - 2) as f32;
+                    let direction =
+                        octahedral_direction(column as f32 / denominator, row as f32 / denominator);
+                    let radiance = cube_probe_sample(&cubemap, direction);
+                    samples[local_index] = radiance.map(|channel| channel * weight);
+                }
+            }
+            let mut stride = samples.len() / 2;
+            while stride != 0 {
+                for index in 0..stride {
+                    let source = samples[index + stride];
+                    for (target, source) in samples[index].iter_mut().zip(source) {
+                        *target += source;
+                    }
+                }
+                stride /= 2;
+            }
+            coefficients[group_y * groups_per_axis + group_x] =
+                samples[0].map(|radiance| radiance * l0);
+        }
+    }
+    let mut stride = SPHERE_PROBE_SH_GROUP_SIZE / 2;
+    while stride != 0 {
+        for index in 0..stride {
+            let source = coefficients[index + stride];
+            for (target, source) in coefficients[index].iter_mut().zip(source) {
+                *target += source;
+            }
+        }
+        stride /= 2;
+    }
+    let coefficient = coefficients[0];
+    Ok((
+        DVec3::new(
+            f64::from(exr::prelude::f16::from_f32(coefficient[0]).to_f32() * l0),
+            f64::from(exr::prelude::f16::from_f32(coefficient[1]).to_f32() * l0),
+            f64::from(exr::prelude::f16::from_f32(coefficient[2]).to_f32() * l0),
+        ),
+        nonuniform,
+    ))
+}
+
+fn octahedral_direction(u: f32, v: f32) -> Vec3 {
+    let x = 2.0 * u - 1.0;
+    let y = 2.0 * v - 1.0;
+    let mut direction = Vec3::new(x, y, 1.0 - (x.abs() + y.abs()));
+    if x.abs() + y.abs() > 1.0 {
+        let sign_x = if x >= 0.0 { 1.0 } else { -1.0 };
+        let sign_y = if y >= 0.0 { 1.0 } else { -1.0 };
+        direction.x = (y.abs() - 1.0) * -sign_x;
+        direction.y = (x.abs() - 1.0) * -sign_y;
+    }
+    direction
+}
+
+fn octahedral_texel_solid_angle(column: usize, row: usize, extent: usize) -> f32 {
+    if column == extent - 1 || row == extent - 1 {
+        return 0.0;
+    }
+    let half = extent / 2;
+    let padded = extent - 2;
+    let wrapped_x = if column >= half {
+        padded - column
+    } else {
+        column
+    };
+    let wrapped_y = if row >= half { padded - row } else { row };
+    let clamp = |coordinate: f32| coordinate.clamp(0.0, (half - 1) as f32);
+    let direction = |x: f32, y: f32| {
+        octahedral_direction(
+            clamp(x) / (extent - 2) as f32,
+            clamp(y) / (extent - 2) as f32,
+        )
+        .normalize()
+    };
+    let x = wrapped_x as f32;
+    let y = wrapped_y as f32;
+    let v00 = direction(x - 0.5, y - 0.5);
+    let v10 = direction(x + 0.5, y - 0.5);
+    let v01 = direction(x - 0.5, y + 0.5);
+    let v11 = direction(x + 0.5, y + 0.5);
+    let triangle_area = |a: Vec3, b: Vec3, c: Vec3| {
+        2.0 * a
+            .dot(b.cross(c))
+            .abs()
+            .atan2(1.0 + b.dot(c) + a.dot(c) + a.dot(b))
+    };
+    let mut area = triangle_area(v00, v10, v01) + triangle_area(v01, v10, v11);
+    if wrapped_x == half - 1 {
+        area *= 2.0;
+    }
+    if wrapped_y == half - 1 {
+        area *= 2.0;
+    }
+    area
+}
+
+fn cube_probe_sample(cubemap: &[[f32; 3]], direction: Vec3) -> [f32; 3] {
+    let extent = VOLUME_PROBE_FACE_TEXELS as f32;
+    let (face, s, t) = cube_coordinates(direction.as_dvec3());
+    let x = (f64::midpoint(s, 1.0) * f64::from(extent) - 0.5) as f32;
+    let y = (f64::midpoint(t, 1.0) * f64::from(extent) - 0.5) as f32;
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let fraction_x = x - x.floor();
+    let fraction_y = y - y.floor();
+    let p00 = cube_probe_tap(cubemap, face, x0, y0);
+    let p10 = cube_probe_tap(cubemap, face, x0 + 1, y0);
+    let p01 = cube_probe_tap(cubemap, face, x0, y0 + 1);
+    let p11 = cube_probe_tap(cubemap, face, x0 + 1, y0 + 1);
+    std::array::from_fn(|channel| {
+        let lower = p00[channel] * (1.0 - fraction_x) + p10[channel] * fraction_x;
+        let upper = p01[channel] * (1.0 - fraction_x) + p11[channel] * fraction_x;
+        lower * (1.0 - fraction_y) + upper * fraction_y
+    })
+}
+
+fn cube_probe_tap(cubemap: &[[f32; 3]], face: usize, column: i32, row: i32) -> [f32; 3] {
+    let extent = VOLUME_PROBE_FACE_TEXELS as i32;
+    if (0..extent).contains(&column) && (0..extent).contains(&row) {
+        return cubemap
+            [(face * extent as usize + row as usize) * extent as usize + column as usize];
+    }
+    let s = 2.0 * (column as f64 + 0.5) / f64::from(extent) - 1.0;
+    let t = 2.0 * (row as f64 + 0.5) / f64::from(extent) - 1.0;
+    let direction = face_direction(face, s, t);
+    let (face, s, t) = cube_coordinates(direction);
+    let column = (f64::midpoint(s, 1.0) * f64::from(extent)).floor() as usize;
+    let row = (f64::midpoint(t, 1.0) * f64::from(extent)).floor() as usize;
+    cubemap[(face * extent as usize + row.min(extent as usize - 1)) * extent as usize
+        + column.min(extent as usize - 1)]
 }
 
 fn sample_world_probe(
@@ -89,7 +270,11 @@ fn sample_world_probe(
     Ok(average_irradiance / total_solid_angle)
 }
 fn cube_texel_solid_angle(column: usize, row: usize) -> f64 {
-    let edge = FACE_TEXELS as f64;
+    cube_texel_solid_angle_at(column, row, FACE_TEXELS)
+}
+
+fn cube_texel_solid_angle_at(column: usize, row: usize, face_texels: usize) -> f64 {
+    let edge = face_texels as f64;
     let s0 = 2.0 * column as f64 / edge - 1.0;
     let s1 = 2.0 * (column + 1) as f64 / edge - 1.0;
     let t0 = 2.0 * row as f64 / edge - 1.0;
@@ -100,7 +285,11 @@ fn cube_texel_solid_angle(column: usize, row: usize) -> f64 {
 
 /// The centre of texel `index` along a face edge, in `-1..1`.
 fn texel_centre(index: usize) -> f64 {
-    2.0 * (index as f64 + 0.5) / FACE_TEXELS as f64 - 1.0
+    texel_centre_at(index, FACE_TEXELS)
+}
+
+fn texel_centre_at(index: usize, face_texels: usize) -> f64 {
+    2.0 * (index as f64 + 0.5) / face_texels as f64 - 1.0
 }
 
 /// The texel index that holds `coordinate`, in `-1..1`.
@@ -142,7 +331,6 @@ fn cube_coordinates(direction: DVec3) -> (usize, f64, f64) {
         (5, -direction.x / magnitude.z, -direction.y / magnitude.z)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +355,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn octahedral_probe_texel_weights_cover_the_sphere() {
+        let extent = 32;
+        let mut total = 0.0_f32;
+        for row in 0..extent {
+            for column in 0..extent {
+                total += octahedral_texel_solid_angle(column, row, extent);
+            }
+        }
+        assert!((f64::from(total) - std::f64::consts::TAU * 2.0).abs() < 1.0e-4);
     }
 
     #[test]

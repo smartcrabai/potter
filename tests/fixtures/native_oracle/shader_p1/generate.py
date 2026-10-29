@@ -10,6 +10,12 @@ and shader evaluation in ``intern/cycles/kernel/svm/``. Run with Blender 5.2.2 o
     /Applications/Blender.app/Contents/MacOS/Blender --background --factory-startup \\
       --threads 1 --python-exit-code 3 --python generate.py -- FIXTURE_DIR
 
+To generate only the Voronoi fold invariant fixture:
+
+    /Applications/Blender.app/Contents/MacOS/Blender --background --factory-startup \\
+      --threads 1 --python-exit-code 3 --python generate.py -- \\
+      --only-voronoi-fold-invariants FIXTURE_DIR
+
 The committed JSON values come from Blender's rendered pixels; they are not Potter output.
 """
 
@@ -31,8 +37,14 @@ TILE = 1.0
 
 def argv_output():
     try:
-        return sys.argv[sys.argv.index("--") + 1]
-    except (ValueError, IndexError) as error:
+        args = sys.argv[sys.argv.index("--") + 1:]
+    except ValueError as error:
+        raise RuntimeError("expected output directory after --") from error
+    if args and args[0] == "--only-voronoi-fold-invariants":
+        args = args[1:]
+    try:
+        return args[0]
+    except IndexError as error:
         raise RuntimeError("expected output directory after --") from error
 
 
@@ -792,7 +804,7 @@ def build_voronoi_fold_fields_fixture(out_dir):
     cases = []
     for name, centre_x, coordinate_source in (
         ("voronoi_constant_folded", 0.0, "constant"),
-        ("voronoi_unlinked_position", 1.5, "position"),
+        ("voronoi_unlinked_generated", 1.5, "unlinked"),
         ("voronoi_texcoord_generated", -1.5, "generated"),
     ):
         def configure(node, tree, coordinate_source=coordinate_source):
@@ -820,7 +832,7 @@ def build_voronoi_fold_fields_fixture(out_dir):
         bpy.context.object.name = name
         bpy.context.object.data.materials.append(material)
         probe_x = round(width / 2 + centre_x * width / 4)
-        if name == "voronoi_unlinked_position":
+        if name == "voronoi_unlinked_generated":
             probe_x -= 2
         cases.append({
             "name": name,
@@ -852,7 +864,143 @@ def build_voronoi_fold_fields_fixture(out_dir):
                 "eevee": "Blender 5.2.2 EEVEE Next; 1 TAA sample; Raw",
                 "cycles": "Blender 5.2.2 Cycles CPU; 1 sample; Raw; box filter 0.001",
             },
-            "source": "Blender 5.2.2 source/blender/nodes/shader/nodes/node_shader_tex_voronoi.cc, node_shader_tex_coord.cc (unlinked Vector uses implicit Position), source/blender/gpu/shaders/material/gpu_shader_material_tex_voronoi.glsl, and intern/cycles/kernel/svm/voronoi.h",
+            "source": "Blender 5.2.2: unlinked EEVEE Voronoi Vector uses CD_ORCO, the same attribute as TexCoord.Generated (node_shader_util.cc, node_shader_tex_coord.cc); Cycles lowers it to LINK_TEXTURE_GENERATED (intern/cycles/scene/shader_nodes.cpp); node_shader_tex_voronoi.cc, gpu_shader_material_tex_voronoi.glsl, intern/cycles/kernel/svm/voronoi.h",
+            "cases": cases,
+        }, output, indent=2, allow_nan=False)
+        output.write("\n")
+
+
+def build_voronoi_fold_invariants_fixture(out_dir):
+    width = 64
+    height = 32
+    scene = configure_scene()
+    scene.render.resolution_x = width
+    scene.render.resolution_y = height
+    scene.camera.data.ortho_scale = 4.0
+    set_black_world(scene)
+
+    def configure_voronoi(node, detail, roughness):
+        node.voronoi_dimensions = "3D"
+        node.feature = "F1"
+        node.distance = "EUCLIDEAN"
+        set_input(node, "Scale", 2.3)
+        set_input(node, "Detail", detail)
+        set_input(node, "Roughness", roughness)
+        set_input(node, "Lacunarity", 1.8)
+        set_input(node, "Smoothness", 0.31)
+        set_input(node, "Randomness", 0.73)
+
+    def constant_material():
+        def configure(node, tree):
+            configure_voronoi(node, 5.0, 0.5)
+            combine = tree.nodes.new("ShaderNodeCombineXYZ")
+            for axis, value in zip("XYZ", (0.23, 0.41, 0.67)):
+                set_input(combine, axis, value)
+            tree.links.new(combine.outputs["Vector"], node.inputs["Vector"])
+
+        return emission_material(
+            "voronoi_constant_low_detail_absolute",
+            "ShaderNodeTexVoronoi",
+            "Distance",
+            configure,
+        )[0]
+
+    def difference_material(name, left_detail, left_roughness,
+                            right_detail, right_roughness, unlinked_left=False):
+        material = bpy.data.materials.new(name)
+        material.use_nodes = True
+        tree = material.node_tree
+        tree.nodes.clear()
+        output = tree.nodes.new("ShaderNodeOutputMaterial")
+        emission = tree.nodes.new("ShaderNodeEmission")
+        left = tree.nodes.new("ShaderNodeTexVoronoi")
+        right = tree.nodes.new("ShaderNodeTexVoronoi")
+        configure_voronoi(left, left_detail, left_roughness)
+        configure_voronoi(right, right_detail, right_roughness)
+        texcoord = tree.nodes.new("ShaderNodeTexCoord")
+        if not unlinked_left:
+            tree.links.new(texcoord.outputs["Generated"], left.inputs["Vector"])
+        tree.links.new(texcoord.outputs["Generated"], right.inputs["Vector"])
+        subtract = tree.nodes.new("ShaderNodeMath")
+        subtract.operation = "SUBTRACT"
+        tree.links.new(left.outputs["Distance"], subtract.inputs[0])
+        tree.links.new(right.outputs["Distance"], subtract.inputs[1])
+        tree.links.new(subtract.outputs["Value"], emission.inputs["Color"])
+        tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
+        return material
+
+    def add_probe_plane(name, material, location):
+        bpy.ops.mesh.primitive_plane_add(size=0.8, location=location)
+        obj = bpy.context.object
+        obj.name = name
+        obj.data.materials.append(material)
+
+    def probe(center_x, center_y):
+        return [
+            round(width / 2 + center_x * width / 4),
+            round(height / 2 - center_y * width / 4),
+        ]
+
+    constant_name = "voronoi_constant_low_detail_absolute"
+    constant_x, constant_y = -1.4, -0.5
+    add_probe_plane(constant_name, constant_material(), (constant_x, constant_y, 0.0))
+
+    clamp_name = "voronoi_kernel_clamp_difference_zero"
+    clamp_x, clamp_y = -0.1, -0.5
+    add_probe_plane(
+        clamp_name,
+        difference_material(clamp_name, 20.0, 1.4, 15.0, 1.0),
+        (clamp_x, clamp_y, 0.0),
+    )
+
+    generated_name = "voronoi_generated_default_difference_zero"
+    generated_material = difference_material(
+        generated_name, 5.0, 0.5, 5.0, 0.5, unlinked_left=True
+    )
+    generated_mesh = bpy.data.meshes.new(generated_name + " Mesh")
+    generated_mesh.from_pydata(
+        [(0.0, 0.0, 0.5), (1.0, 0.0, 0.5), (1.0, 1.0, 0.5), (0.0, 1.0, 0.5)],
+        [],
+        [(0, 1, 2, 3)],
+    )
+    generated_mesh.update()
+    generated_plane = bpy.data.objects.new(generated_name, generated_mesh)
+    scene.collection.objects.link(generated_plane)
+    generated_plane.data.materials.append(generated_material)
+
+    cases = [
+        {"name": constant_name, "probe": probe(constant_x, constant_y)},
+        {"name": clamp_name, "probe": probe(clamp_x, clamp_y)},
+        {"name": generated_name, "probe": probe(0.5, 0.5)},
+    ]
+    save_blend(os.path.join(out_dir, "voronoi_fold_invariants.blend"))
+    references = {}
+    for engine in ("eevee", "cycles"):
+        references[engine] = render_engine_image(
+            scene, out_dir, "voronoi_fold_invariants_" + engine, width, height, engine
+        )
+    zero_cases = {clamp_name, generated_name}
+    for case in cases:
+        x, y = case["probe"]
+        for engine, key in (("eevee", "eevee_rgb"), ("cycles", "cycles_rgb")):
+            rgb = pixel_rgb(references[engine], width, height, x, y)
+            if case["name"] in zero_cases:
+                if rgb != [0.0, 0.0, 0.0]:
+                    raise RuntimeError(
+                        f"Voronoi invariant {case['name']} was nonzero in {engine}: {rgb}"
+                    )
+                rgb = [0, 0, 0]
+            case[key] = rgb
+    with open(os.path.join(out_dir, "voronoi_fold_invariants.json"), "w", encoding="utf-8") as output:
+        json.dump({
+            "resolution": [width, height],
+            "samples": {"eevee": 1, "cycles": 1},
+            "seed": 0,
+            "renderer": {
+                "eevee": "Blender 5.2.2 EEVEE Next; 1 TAA sample; Raw",
+                "cycles": "Blender 5.2.2 Cycles CPU; 1 sample; Raw; box filter 0.001",
+            },
+            "source": "Blender 5.2.2 source/blender/nodes/shader/nodes/node_shader_tex_voronoi.cc, node_shader_tex_coord.cc, source/blender/gpu/shaders/material/gpu_shader_material_tex_voronoi.glsl, and intern/cycles/kernel/svm/voronoi.h",
             "cases": cases,
         }, output, indent=2, allow_nan=False)
         output.write("\n")
@@ -1332,6 +1480,74 @@ def build_realtime_volume_world_ambient_fixture(out_dir):
                 "rgb": volume_rgb,
                 "background_rgb": background_rgb,
             },
+        }, output, indent=2, allow_nan=False)
+        output.write("\n")
+
+def build_realtime_anisotropic_world_volume_refusal_fixture(out_dir):
+    width = 16
+    height = 16
+    samples = 1
+    scene = configure_scene()
+    scene.render.engine = "BLENDER_EEVEE"
+    scene.render.resolution_x = width
+    scene.render.resolution_y = height
+    scene.eevee.taa_render_samples = samples
+    scene.camera.data.ortho_scale = 4.0
+    scene.camera.location = (0.0, 0.0, 10.0)
+
+    world = bpy.data.worlds.new("Anisotropic Volume Nonuniform World")
+    world.use_nodes = True
+    world_tree = world.node_tree
+    world_tree.nodes.clear()
+    world_output = world_tree.nodes.new("ShaderNodeOutputWorld")
+    background = world_tree.nodes.new("ShaderNodeBackground")
+    environment = world_tree.nodes.new("ShaderNodeTexEnvironment")
+    environment.image = image_texture("Anisotropic Volume Nonuniform Environment")
+    environment.projection = "EQUIRECTANGULAR"
+    environment.interpolation = "Linear"
+    set_input(background, "Strength", 1.0)
+    connect_named(world_tree, environment, "Color", background, "Color")
+    connect_named(world_tree, background, "Background", world_output, "Surface")
+    scene.world = world
+
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+    volume_object = bpy.context.object
+    volume_object.name = "Anisotropic Volume Refusal Mesh"
+    material = bpy.data.materials.new("Anisotropic Volume Refusal Material")
+    material.use_nodes = True
+    tree = material.node_tree
+    tree.nodes.clear()
+    output = tree.nodes.new("ShaderNodeOutputMaterial")
+    volume = tree.nodes.new("ShaderNodeVolumePrincipled")
+    set_input(volume, "Density", 0.6)
+    set_input(volume, "Color", (1.0, 1.0, 1.0, 1.0))
+    set_input(volume, "Anisotropy", 0.5)
+    connect_named(tree, volume, "Volume", output, "Volume")
+    volume_object.data.materials.append(material)
+
+    blend_name = "volume_world_ambient_anisotropic.blend"
+    save_blend(os.path.join(out_dir, blend_name))
+    with open(
+        os.path.join(out_dir, "volume_world_ambient_refusal.json"), "w", encoding="utf-8"
+    ) as output:
+        json.dump({
+            "samples": samples,
+            "seed": 0,
+            "renderer": "Blender 5.2.2 EEVEE Next; 1 TAA sample",
+            "world": {
+                "environment_image_nonuniform": True,
+                "projection": "EQUIRECTANGULAR",
+                "interpolation": "Linear",
+            },
+            "cases": [{
+                "name": "anisotropic_volume_nonuniform_world",
+                "blend": blend_name,
+                "engine": "realtime",
+                "anisotropy": 0.5,
+                "error_code": "UNSUPPORTED_FEATURE",
+                "feature_id": "shader.volume.world_probe_l1.realtime_scattering",
+            }],
+            "source": "Blender 5.2.2 node_shader_tex_environment.cc and node_shader_volume_principled.cc; EEVEE realtime volume scattering under a nonuniform world environment",
         }, output, indent=2, allow_nan=False)
         output.write("\n")
 
@@ -2039,7 +2255,15 @@ def main():
     if bpy.app.version[:3] != (5, 2, 2):
         raise RuntimeError(f"oracle requires Blender 5.2.2, got {bpy.app.version_string}")
     out_dir = os.path.abspath(argv_output())
+    args = sys.argv[sys.argv.index("--") + 1:]
+    only_voronoi_fold_invariants = (
+        bool(args) and args[0] == "--only-voronoi-fold-invariants"
+    )
     os.makedirs(out_dir, exist_ok=True)
+    if only_voronoi_fold_invariants:
+        build_voronoi_fold_invariants_fixture(out_dir)
+        print("SHADER_P1_VORONOI_FOLD_INVARIANTS", json.dumps({"output": out_dir}))
+        return
     scene = configure_scene()
     cases = []
     checker_cases(cases)
@@ -2068,6 +2292,7 @@ def main():
     build_displacement_fixture(out_dir)
     build_environment_world_fixture(out_dir)
     build_realtime_volume_world_ambient_fixture(out_dir)
+    build_realtime_anisotropic_world_volume_refusal_fixture(out_dir)
     build_mapping_refusal_fixtures(out_dir)
     build_spatial_volume_fixture(out_dir)
     build_temperature_volume_fixture(out_dir)

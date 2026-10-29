@@ -29,8 +29,8 @@
 use glam::DVec3;
 
 use super::{
-    eevee_ltc::{PackedMatrix, sample_matrix},
-    eevee_transmission_tables::{brdf, bsdf, btdf},
+    eevee_ltc::PackedMatrix,
+    eevee_transmission_tables::{brdf, bsdf, btdf, ltc_matrix},
 };
 use crate::shader::{BsdfParams, GlassDistribution};
 
@@ -42,6 +42,11 @@ const ROUGHNESS_LAYERS: usize = 16;
 /// Linear blend of `a` and `b` at `t`.
 pub(super) fn blend(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
+}
+
+/// Blender uploads the utility LUTs as `SFLOAT_16_16_16_16` before shader filtering.
+fn utility_texel(value: f64) -> f64 {
+    f64::from(exr::prelude::f16::from_f32(value as f32).to_f32())
 }
 
 /// EEVEE's `sample_lut` addressing for a coordinate in `[0, 1]`: the two texels around it and the blend weight of the
@@ -72,8 +77,16 @@ fn brdf_channel(channel: usize, roughness: f64, n_dot_v: f64) -> f64 {
     let (x0, x1, fx) = texel_weights(roughness);
     let (y0, y1, fy) = texel_weights(sqrt_one_minus(n_dot_v));
     blend(
-        blend(brdf(x0, y0, channel), brdf(x1, y0, channel), fx),
-        blend(brdf(x0, y1, channel), brdf(x1, y1, channel), fx),
+        blend(
+            utility_texel(brdf(x0, y0, channel)),
+            utility_texel(brdf(x1, y0, channel)),
+            fx,
+        ),
+        blend(
+            utility_texel(brdf(x0, y1, channel)),
+            utility_texel(brdf(x1, y1, channel)),
+            fx,
+        ),
         fy,
     )
 }
@@ -87,8 +100,16 @@ fn transmission_factor(roughness: f64, n_dot_v: f64, amplitude: f64) -> f64 {
     let (y0, y1, fy) = texel_weights(sqrt_one_minus(n_dot_v));
     let layer_value = |layer: usize| {
         blend(
-            blend(btdf(layer, x0, y0), btdf(layer, x1, y0), fx),
-            blend(btdf(layer, x0, y1), btdf(layer, x1, y1), fx),
+            blend(
+                utility_texel(btdf(layer, x0, y0)),
+                utility_texel(btdf(layer, x1, y0)),
+                fx,
+            ),
+            blend(
+                utility_texel(btdf(layer, x0, y1)),
+                utility_texel(btdf(layer, x1, y1)),
+                fx,
+            ),
             fy,
         )
     };
@@ -115,13 +136,13 @@ fn bsdf_channels(ior: f64, roughness: f64, n_dot_v: f64) -> [f64; 3] {
     let channel = |layer: usize, channel: usize| {
         blend(
             blend(
-                bsdf(layer, x0, y0, channel),
-                bsdf(layer, x1, y0, channel),
+                utility_texel(bsdf(layer, x0, y0, channel)),
+                utility_texel(bsdf(layer, x1, y0, channel)),
                 fx,
             ),
             blend(
-                bsdf(layer, x0, y1, channel),
-                bsdf(layer, x1, y1, channel),
+                utility_texel(bsdf(layer, x0, y1, channel)),
+                utility_texel(bsdf(layer, x1, y1, channel)),
                 fx,
             ),
             fy,
@@ -522,13 +543,7 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -> 
         thin_wall: params.thin_wall,
         split: if params.thin_wall {
             if params.glass_distribution == GlassDistribution::MultiGgx {
-                thin_glass_split(
-                    ior,
-                    roughness,
-                    normal.dot(view),
-                    f0,
-                    lut_base_color,
-                )
+                thin_glass_split(ior, roughness, normal.dot(view), f0, lut_base_color)
             } else {
                 thin_glass_split_with_multiscatter(
                     ior,
@@ -594,6 +609,26 @@ pub(crate) fn glass_closures(
     })
 }
 
+fn sample_glass_matrix(cos_theta: f64, roughness: f64) -> PackedMatrix {
+    let (x0, x1, fx) = texel_weights(roughness);
+    let (y0, y1, fy) = texel_weights(sqrt_one_minus(cos_theta));
+    std::array::from_fn(|channel| {
+        blend(
+            blend(
+                utility_texel(ltc_matrix(x0, y0, channel)),
+                utility_texel(ltc_matrix(x1, y0, channel)),
+                fx,
+            ),
+            blend(
+                utility_texel(ltc_matrix(x0, y1, channel)),
+                utility_texel(ltc_matrix(x1, y1, channel)),
+                fx,
+            ),
+            fy,
+        )
+    })
+}
+
 /// The direct light of the glass closures at a shading point: `glass_closures`' colours with the LTC inputs of
 /// `bxdf_ggx_light_reflection` and `bxdf_ggx_light_transmission`. `None` where `glass_closures` is `None`.
 pub(crate) fn glass_light(
@@ -621,10 +656,10 @@ pub(crate) fn glass_light(
     Some(GlassLight {
         oriented_normal: lobe.normal,
         reflection: lobe.split.reflectance * lobe.reflection_tint * lobe.lobe_weight,
-        reflection_matrix: sample_matrix(lobe.normal.dot(view), lobe.roughness),
+        reflection_matrix: sample_glass_matrix(lobe.normal.dot(view), lobe.roughness),
         transmission,
         transmission_normal,
-        transmission_matrix: sample_matrix(cos_theta, transmission_roughness),
+        transmission_matrix: sample_glass_matrix(cos_theta, transmission_roughness),
     })
 }
 
@@ -719,6 +754,77 @@ mod tests {
             return Err(
                 "the tinted thick transmission is not the square of the single event".to_owned(),
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_glass_applies_color_after_the_white_multiscatter_lut() -> Result<(), String> {
+        let tint = DVec3::new(0.82, 0.18, 0.07);
+        for distribution in [GlassDistribution::Ggx, GlassDistribution::MultiGgx] {
+            let mut colored = glass(0.9);
+            colored.standalone_glass = true;
+            colored.glass_distribution = distribution;
+            colored.glass_reflection_tint = tint.to_array();
+            colored.glass_transmission_tint = tint.to_array();
+            let mut white = colored;
+            white.glass_reflection_tint = [1.0; 3];
+            white.glass_transmission_tint = [1.0; 3];
+
+            let colored_lobe = glass_lobe(&colored, DVec3::Z, DVec3::Z, DVec3::ONE)
+                .ok_or_else(|| "colored standalone Glass lobe is missing".to_owned())?;
+            let white_lobe = glass_lobe(&white, DVec3::Z, DVec3::Z, DVec3::ONE)
+                .ok_or_else(|| "white standalone Glass lobe is missing".to_owned())?;
+            assert!(
+                colored_lobe
+                    .split
+                    .reflectance
+                    .abs_diff_eq(white_lobe.split.reflectance, 1.0e-12)
+            );
+            assert!(
+                colored_lobe
+                    .split
+                    .transmittance
+                    .abs_diff_eq(white_lobe.split.transmittance, 1.0e-12)
+            );
+
+            for thickness in [Thickness::None, Thickness::Sphere(2.0)] {
+                let transmission_tint = match thickness {
+                    Thickness::None => tint,
+                    Thickness::Sphere(_) | Thickness::Slab(_) => tint * tint,
+                };
+                let colored_closures =
+                    glass_closures(&colored, DVec3::Z, DVec3::Z, DVec3::ONE, thickness)
+                        .ok_or_else(|| {
+                            "colored standalone Glass closures are missing".to_owned()
+                        })?;
+                let white_closures =
+                    glass_closures(&white, DVec3::Z, DVec3::Z, DVec3::ONE, thickness)
+                        .ok_or_else(|| "white standalone Glass closures are missing".to_owned())?;
+                assert!(
+                    (colored_closures.reflection - white_closures.reflection * tint)
+                        .abs_diff_eq(DVec3::ZERO, 1.0e-12)
+                );
+                assert!(
+                    (colored_closures.transmission
+                        - white_closures.transmission * transmission_tint)
+                        .abs_diff_eq(DVec3::ZERO, 1.0e-12)
+                );
+
+                let colored_light =
+                    glass_light(&colored, DVec3::Z, DVec3::Z, DVec3::ONE, thickness)
+                        .ok_or_else(|| "colored standalone Glass light is missing".to_owned())?;
+                let white_light = glass_light(&white, DVec3::Z, DVec3::Z, DVec3::ONE, thickness)
+                    .ok_or_else(|| "white standalone Glass light is missing".to_owned())?;
+                assert!(
+                    (colored_light.reflection - white_light.reflection * tint)
+                        .abs_diff_eq(DVec3::ZERO, 1.0e-12)
+                );
+                assert!(
+                    (colored_light.transmission - white_light.transmission * transmission_tint)
+                        .abs_diff_eq(DVec3::ZERO, 1.0e-12)
+                );
+            }
         }
         Ok(())
     }

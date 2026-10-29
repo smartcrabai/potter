@@ -93,9 +93,6 @@ pub(super) struct ObjectRecord {
     pub object_pass_index: f64,
     #[serde(skip)]
     pub object_random_number: Option<f64>,
-    /// Evaluated object-to-world transform, retained for shader projections.
-    #[serde(skip)]
-    pub object_to_world: DMat4,
 }
 
 /// Color state per material of one object, keyed by `Triangle::material_index` and sorted by it, so a hit
@@ -1745,7 +1742,6 @@ fn subdivide_displaced_triangle(
                 back_facing: false,
                 path_traced,
                 view: DVec3::Z,
-                back_facing: false,
                 barycentric: sample.barycentric,
             },
             Some(sample.uv),
@@ -2578,7 +2574,6 @@ impl SceneShaderCore<'_> {
                 back_facing: hit.back_facing,
                 path_traced: false,
                 view: hit.view,
-                back_facing: hit.view.dot(hit.geometric) < 0.0,
                 barycentric: hit.barycentric,
             },
             None,
@@ -2948,7 +2943,6 @@ pub(super) struct HitPose {
     pub(super) path_traced: bool,
     /// Unit direction from the hit back toward the camera.
     pub(super) view: DVec3,
-    pub(super) back_facing: bool,
     pub(super) barycentric: [f64; 3],
 }
 
@@ -3002,17 +2996,12 @@ pub(super) fn layered_context<'a>(
     context = context.with_generated_corners(triangle.generated, pose.barycentric);
     context.position = pose.point;
     context.object = pose.object;
-    context.object_to_world = object.object_to_world;
-    context.world_to_object = object
-        .world_to_local
-        .unwrap_or_else(|| DMat4::from_cols_array(&[f64::NAN; 16]));
     context.object_color = object.object_color;
     context.object_pass_index = object.object_pass_index;
     context.object_random_number = object.object_random_number;
     context.material_pass_index = material_colors.and_then(|colors| colors.material_pass_index);
     context.normal = pose.normal;
     context.geometric_normal = pose.geometric_normal;
-    context.back_facing = pose.back_facing;
     context.path_traced = pose.path_traced;
     if !pose.path_traced {
         context = context.with_realtime_position_f32(triangle.positions, pose.barycentric);
@@ -3248,6 +3237,8 @@ fn shade(
             params.thickness_slab,
         );
         let mut lobes = DVec3::ZERO;
+        // EEVEE packs each glass closure's summed direct radiance before multiplying its closure colour.
+        let mut glass_direct_radiance = (DVec3::ZERO, DVec3::ZERO);
         if let (Some(world), Some(diffuse_environment)) = (world, diffuse_environment) {
             let diffuse_albedo = if params.thin_wall {
                 let subsurface = params.subsurface_weight.clamp(0.0, 1.0);
@@ -3322,7 +3313,7 @@ fn shade(
                 thickness,
             ) * influence;
             if let Some(glass) = &glass {
-                lobes += glass_direct_contribution(
+                let (reflection, transmission) = glass_direct_contribution(
                     light,
                     matrix,
                     receiver,
@@ -3331,8 +3322,15 @@ fn shade(
                     ray_visibility,
                     shadow,
                     point_shadow,
-                ) * influence;
+                );
+                glass_direct_radiance.0 += reflection * influence;
+                glass_direct_radiance.1 += transmission * influence;
             }
+        }
+        if let Some(glass) = &glass {
+            let reflection = rgb9e5_roundtrip(glass_direct_radiance.0);
+            let transmission = rgb9e5_roundtrip(glass_direct_radiance.1);
+            lobes += glass.reflection * reflection + glass.transmission * transmission;
         }
         // Reflectance weights every reflective closure (ambient, direct, environment); Emission has none.
         reflected += lobes * (share * params.reflectance.clamp(0.0, 1.0));
@@ -4074,9 +4072,8 @@ fn area_transmitted_fraction(
     visible_weight / total_weight
 }
 
-/// EEVEE's direct light through the glass closures (`light_eval_single`, with `eevee_light_eval.bsl.hh`'s attenuation):
-/// each closure's colour, times the light's colour and radiance, its attenuation, its visibility, and the LTC form
-/// factor of the emitter through the closure's inverse matrix. The reflection is shadowed from the shading point; the
+/// The per-light direct radiance for EEVEE's reflection and transmission closures. The caller sums each lobe over lights,
+/// packs the sums as RGB9E5, then applies the closure colour. The reflection is shadowed from the shading point; the
 /// transmission from the point moved through the object by its thickness (`transmission_origin`).
 fn glass_direct_contribution(
     light: &crate::model::LightData,
@@ -4087,12 +4084,12 @@ fn glass_direct_contribution(
     ray_visibility: RayVisibility,
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
-) -> DVec3 {
+) -> (DVec3, DVec3) {
     let Some(direct) = direct_emitter(light, matrix, receiver.point) else {
-        return DVec3::ZERO;
+        return (DVec3::ZERO, DVec3::ZERO);
     };
     let factors = LightFactors::of(light);
-    let mut result = DVec3::ZERO;
+    let mut result = (DVec3::ZERO, DVec3::ZERO);
 
     // The reflection, lit from the normal's side.
     let facing = facing_attenuation(
@@ -4131,9 +4128,8 @@ fn glass_direct_contribution(
             glass.reflection_matrix,
             direct.to_centre,
         );
-        result += glass.reflection
-            * direct.radiance
-            * (direct.attenuation * facing * visibility * form * factors.specular);
+        result.0 +=
+            direct.radiance * (direct.attenuation * facing * visibility * form * factors.specular);
     }
 
     // The transmission, lit from the reverse side, where the lobe's normal points.
@@ -4168,11 +4164,31 @@ fn glass_direct_contribution(
             glass.transmission_matrix,
             direct.to_centre,
         );
-        result += glass.transmission
-            * direct.radiance
+        result.1 += direct.radiance
             * (direct.attenuation * facing * visibility * form * factors.transmission);
     }
     result
+}
+/// EEVEE's `rgb9e5_encode`/`rgb9e5_decode` boundary for a closure's summed direct radiance.
+fn rgb9e5_roundtrip(radiance: DVec3) -> DVec3 {
+    let color = [
+        (radiance.x as f32).clamp(0.0, 65_408.0),
+        (radiance.y as f32).clamp(0.0, 65_408.0),
+        (radiance.z as f32).clamp(0.0, 65_408.0),
+    ];
+    let max_component = color[0].max(color[1]).max(color[2]);
+    let log2_floored = ((max_component.to_bits() >> 23) as i32) - 127;
+    let exponent = log2_floored.max(-16) + 16;
+    let mut denominator = f32::from_bits(((exponent - 24 + 127) as u32) << 23);
+    if (max_component / denominator + 0.5) as i32 == 512 {
+        denominator *= 2.0;
+    }
+
+    DVec3::new(
+        (((color[0] / denominator + 0.5) as u32) as f32 * denominator) as f64,
+        (((color[1] / denominator + 0.5) as u32) as f32 * denominator) as f64,
+        (((color[2] / denominator + 0.5) as u32) as f32 * denominator) as f64,
+    )
 }
 
 /// A sun's direct light, integrated over the sun's disc as EEVEE's sun is. The diffuse class is flat over the disc, so its
@@ -4738,12 +4754,6 @@ mod shading_normal_tests {
                     camera_matrices: None,
                     barycentric: [1.0 / 3.0; 3],
                     view: DVec3::Z,
-                    realtime_differentials: crate::shader::HitDifferentials {
-                        world_dx: DVec3::ZERO,
-                        world_dy: DVec3::ZERO,
-                        uv_dx: [0.0; 2],
-                        uv_dy: [0.0; 2],
-                    },
                 },
             )?
             .color;
@@ -5273,5 +5283,22 @@ mod beauty_tint_tests {
     fn fully_opaque_surface_has_a_white_tint() {
         let actual = weighted_tint([(1.0, 1.0, [0.2, 0.8, 0.4])].into_iter(), 1.0);
         assert_eq!(actual, [1.0; 3]);
+    }
+}
+
+#[cfg(test)]
+mod rgb9e5_tests {
+    use super::rgb9e5_roundtrip;
+    use glam::DVec3;
+
+    #[test]
+    fn packs_the_sum_of_direct_lights_not_each_light_separately() {
+        let first = DVec3::new(0.000_901, 0.000_40, 0.000_20);
+        let second = DVec3::new(0.000_902, 0.000_41, 0.000_21);
+        let summed = rgb9e5_roundtrip(first + second);
+        let separately_packed = rgb9e5_roundtrip(first) + rgb9e5_roundtrip(second);
+
+        assert_eq!(summed.x, 946.0 / 524_288.0);
+        assert_ne!(summed, separately_packed);
     }
 }

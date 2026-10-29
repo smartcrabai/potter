@@ -3,7 +3,7 @@ use serde_json::{Map, Value as JsonValue, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    image::ImageInterpolation,
+    image::{ImageData, ImageExtension, ImageInterpolation, ImageTileData},
     model::Id,
 };
 
@@ -83,6 +83,165 @@ pub(crate) fn unsupported_realtime_environment_filtering(id: &Id, image_id: &str
             "projection": "MIRROR_BALL",
         }),
     )
+}
+/// Samples an environment image with the renderer's interpolation path. EEVEE's cubic shader is a 4-filtered-tap
+/// B-spline, unlike Cycles' 4×4 cubic image interpolation.
+pub(crate) fn sample_environment_texture(
+    image: &ImageData,
+    uv: [f64; 2],
+    interpolation: ImageInterpolation,
+    extensions: [ImageExtension; 2],
+    path_traced: bool,
+) -> [f64; 4] {
+    if !path_traced && interpolation == ImageInterpolation::Cubic {
+        return sample_eevee_environment_cubic(image, uv, extensions);
+    }
+    if !path_traced && image.udim {
+        crate::image::sampling::sample_with_extension_alpha_first_tile_axes(
+            image,
+            uv,
+            interpolation,
+            extensions,
+            false,
+        )
+    } else {
+        crate::image::sampling::sample_with_extension_alpha_axes(
+            image,
+            uv,
+            false,
+            interpolation,
+            extensions,
+            false,
+        )
+    }
+}
+
+fn sample_eevee_environment_cubic(
+    image: &ImageData,
+    uv: [f64; 2],
+    extensions: [ImageExtension; 2],
+) -> [f64; 4] {
+    if !uv[0].is_finite() || !uv[1].is_finite() {
+        return [0.0; 4];
+    }
+    let (width, height) = image_dimensions(image);
+    if width == 0 || height == 0 {
+        return [0.0; 4];
+    }
+    let width = width as f32;
+    let height = height as f32;
+    let coordinate = [uv[0] as f32 * width, uv[1] as f32 * height];
+    let center = [
+        (coordinate[0] - 0.5).floor() + 0.5,
+        (coordinate[1] - 0.5).floor() + 0.5,
+    ];
+    let (weights_x, weights_y) = (
+        eevee_cubic_bspline_coefficients(coordinate[0] - center[0]),
+        eevee_cubic_bspline_coefficients(coordinate[1] - center[1]),
+    );
+    let (sum_x0, sum_x1) = (weights_x[0] + weights_x[1], weights_x[2] + weights_x[3]);
+    let (sum_y0, sum_y1) = (weights_y[0] + weights_y[1], weights_y[2] + weights_y[3]);
+    let (fraction_x0, fraction_x1) = (weights_x[1] / sum_x0, weights_x[3] / sum_x1);
+    let (fraction_y0, fraction_y1) = (weights_y[1] / sum_y0, weights_y[3] / sum_y1);
+    let u0 = (center[0] - 1.0 + fraction_x0) / width;
+    let u1 = (center[0] + 1.0 + fraction_x1) / width;
+    let v0 = (center[1] - 1.0 + fraction_y0) / height;
+    let v1 = (center[1] + 1.0 + fraction_y1) / height;
+    let sample =
+        |u: f32, v: f32| sample_eevee_linear_texture(image, [u, v], width, height, extensions);
+    let sample00 = sample(u0, v0);
+    let sample10 = sample(u1, v0);
+    let sample01 = sample(u0, v1);
+    let sample11 = sample(u1, v1);
+    std::array::from_fn(|channel| {
+        f64::from(
+            (((sample00[channel] * sum_x0) * sum_y0 + (sample10[channel] * sum_x1) * sum_y0)
+                + (sample01[channel] * sum_x0) * sum_y1)
+                + (sample11[channel] * sum_x1) * sum_y1,
+        )
+    })
+}
+fn sample_eevee_linear_texture(
+    image: &ImageData,
+    uv: [f32; 2],
+    width: f32,
+    height: f32,
+    extensions: [ImageExtension; 2],
+) -> [f32; 4] {
+    let coordinate = [uv[0] * width - 0.5, uv[1] * height - 0.5];
+    if !coordinate[0].is_finite() || !coordinate[1].is_finite() {
+        return [0.0; 4];
+    }
+    let lower = [coordinate[0].floor(), coordinate[1].floor()];
+    let fraction = [coordinate[0] - lower[0], coordinate[1] - lower[1]];
+    let texel = |x: f32, y: f32| {
+        let uv = [f64::from((x + 0.5) / width), f64::from((y + 0.5) / height)];
+        let color = if image.udim {
+            crate::image::sampling::sample_with_extension_alpha_first_tile_axes(
+                image,
+                uv,
+                ImageInterpolation::Closest,
+                extensions,
+                false,
+            )
+        } else {
+            crate::image::sampling::sample_with_extension_alpha_axes(
+                image,
+                uv,
+                false,
+                ImageInterpolation::Closest,
+                extensions,
+                false,
+            )
+        };
+        color.map(|channel| crate::image::sampling::round_to_half(channel) as f32)
+    };
+    let color00 = texel(lower[0], lower[1]);
+    let color10 = texel(lower[0] + 1.0, lower[1]);
+    let color01 = texel(lower[0], lower[1] + 1.0);
+    let color11 = texel(lower[0] + 1.0, lower[1] + 1.0);
+    let top: [f32; 4] = std::array::from_fn(|channel| {
+        color00[channel] + (color10[channel] - color00[channel]) * fraction[0]
+    });
+    let bottom: [f32; 4] = std::array::from_fn(|channel| {
+        color01[channel] + (color11[channel] - color01[channel]) * fraction[0]
+    });
+    std::array::from_fn(|channel| top[channel] + (bottom[channel] - top[channel]) * fraction[1])
+}
+
+fn eevee_cubic_bspline_coefficients(fraction: f32) -> [f32; 4] {
+    let squared = fraction * fraction;
+    let cubed = squared * fraction;
+    let weight3 = cubed / 6.0;
+    let weight0 = -weight3 + squared * 0.5 - fraction * 0.5 + 1.0 / 6.0;
+    let weight1 = cubed * 0.5 - squared + 2.0 / 3.0;
+    let weight2 = 1.0 - weight0 - weight1 - weight3;
+    [weight0, weight1, weight2, weight3]
+}
+
+fn image_dimensions(image: &ImageData) -> (u32, u32) {
+    let has_pixels = |tile: &ImageTileData| {
+        usize::try_from(tile.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(tile.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .is_some_and(|count| tile.width > 0 && tile.height > 0 && count == tile.pixels.len())
+    };
+    if image.udim {
+        image
+            .tiles
+            .get(&1001)
+            .filter(|tile| has_pixels(tile))
+            .or_else(|| image.tiles.values().find(|tile| has_pixels(tile)))
+            .map_or((image.width, image.height), |tile| {
+                (tile.width, tile.height)
+            })
+    } else {
+        (image.width, image.height)
+    }
 }
 
 /// Cycles' Image Texture projections and their BOX face weights.

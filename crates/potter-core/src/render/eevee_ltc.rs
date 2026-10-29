@@ -18,9 +18,11 @@ use std::f64::consts::TAU;
 
 use glam::{DMat3, DVec3};
 
+#[cfg(test)]
+use super::eevee_transmission_tables::ltc_matrix;
 use super::{
     eevee_transmission::{blend, texel_weights},
-    eevee_transmission_tables::{disk_integral, ltc_matrix},
+    eevee_transmission_tables::disk_integral,
 };
 
 /// The packed inverse LTC matrix `(m11, m13, m31, m33)`, as `eevee::lut::ltc::unpack` reads it.
@@ -31,6 +33,7 @@ pub(crate) type PackedMatrix = [f64; 4];
 const IDENTITY: PackedMatrix = [1.0, 0.0, 0.0, 1.0];
 
 /// EEVEE's `sample_utility_tx` for the GGX matrix: the bilinear sample at `(roughness, sqrt(1 - cos θ))`.
+#[cfg(test)]
 pub(crate) fn sample_matrix(cos_theta: f64, roughness: f64) -> PackedMatrix {
     let (x0, x1, fx) = texel_weights(roughness);
     let (y0, y1, fy) = texel_weights((1.0 - cos_theta.clamp(0.0, 1.0)).sqrt());

@@ -1445,7 +1445,6 @@ pub(super) fn render(
         snapshot,
         true,
         scene.unit.scale_length,
-        true,
         images,
         &geometry.shader_warnings,
         crate::node_kernels::MathSemantics::Cycles,
@@ -2394,7 +2393,9 @@ mod camera_light_shape_tests {
 
     use glam::{DMat4, DQuat, DVec3};
 
-    use super::{PointLight, camera_light_shape_hit, camera_sun_discs, light_hit};
+    use super::{
+        PointLight, camera_light_shape_hit, camera_sun_discs, eevee_volume_light_sample, light_hit,
+    };
     use crate::{
         eval::{EvaluationContext, Snapshot},
         model::{DataBlock, Id, LightData, LightType, Node, RayKind, SceneDoc},
@@ -2442,6 +2443,20 @@ mod camera_light_shape_tests {
             ray_mask: RayKind::Camera.bit(),
             camera_shape_eligible: true,
         }
+    }
+
+    #[test]
+    fn eevee_area_volume_lights_sample_the_closest_emitter_point() -> Result<(), Box<dyn Error>> {
+        let mut light = local_light(LightType::Area, DVec3::new(0.0, 0.0, 3.0), -DVec3::Z, 0.0);
+        light.area = Some(AreaShape::new(DVec3::X, DVec3::Y, 0.75, 0.75, true));
+        light.volume_factor = 1.0;
+        light.volume_radius_squared = f64::INFINITY;
+
+        let sample = eevee_volume_light_sample(&light, DVec3::new(0.2, 0.1, 0.0))
+            .ok_or("area volume-light sample is missing")?;
+        assert!((sample.distance - 3.0).abs() <= f64::EPSILON);
+        assert!(sample.direction.abs_diff_eq(DVec3::Z, 1.0e-12));
+        Ok(())
     }
 
     #[test]
@@ -2697,10 +2712,13 @@ pub(super) struct RealtimeVolumeTransport<'a> {
     bvh: Option<&'a Bvh>,
     volumes: Vec<VolumeInstance<'a>>,
     volume_temperatures: Vec<Option<VolumeTemperature>>,
+    has_temperature_emission: bool,
     lights: Vec<PointLight>,
     camera_light_prepared: Vec<CameraLightPrepared>,
     /// EEVEE's isotropic world-probe SH L0 used for volume in-scattering.
     world_ambient: DVec3,
+    /// Whether the L0-only world probe loses directional radiance needed by anisotropic scattering.
+    world_nonuniform: bool,
     meters_per_unit: f64,
     has_mesh_volumes: bool,
     volumetric_shadows: bool,
@@ -2727,7 +2745,9 @@ pub(super) struct RealtimeVolumeScratch {
     froxel_hit_media: Vec<FroxelMeshMedium>,
     froxel_mesh_boundary_hits: Vec<(f64, FroxelMeshMedium)>,
     froxel_extinction: Vec<DVec3>,
+    froxel_source: Vec<DVec3>,
     froxel_prefix: Vec<DVec3>,
+    froxel_scattering: Vec<DVec3>,
     froxel_boundaries: Vec<(usize, FroxelMeshMedium)>,
     froxel_resolve: [Option<RealtimeVolumeResolveCache>; 2],
 }
@@ -2741,8 +2761,10 @@ struct RealtimeVolumeResolveCache {
     slice_count: usize,
     sample_count: usize,
     depth_start: f64,
+    has_temperature_emission: bool,
     column_slots: Vec<FroxelColumnCacheSlot>,
     column_prefix: Vec<DVec3>,
+    column_radiance: Vec<DVec3>,
     column_clock: u64,
 }
 
@@ -2782,11 +2804,20 @@ impl RealtimeVolumeResolveCache {
             .map(|(offset, _)| first + offset)
     }
 
-    fn store_column(&mut self, slot: usize, column: usize, prefix: &[DVec3]) -> Result<()> {
-        if prefix.len() != self.slice_count {
+    fn store_column(
+        &mut self,
+        slot: usize,
+        column: usize,
+        prefix: &[DVec3],
+        radiance: &[DVec3],
+    ) -> Result<()> {
+        if prefix.len() != self.slice_count
+            || (self.has_temperature_emission && radiance.len() != self.slice_count)
+            || (!self.has_temperature_emission && !radiance.is_empty())
+        {
             return Err(PotError::new(
                 ErrorCode::InternalError,
-                "realtime froxel prefix has an invalid slice count",
+                "realtime froxel column has an invalid slice count",
             ));
         }
         let start = slot.checked_mul(self.slice_count).ok_or_else(|| {
@@ -2810,6 +2841,17 @@ impl RealtimeVolumeResolveCache {
                 )
             })?
             .copy_from_slice(prefix);
+        if self.has_temperature_emission {
+            self.column_radiance
+                .get_mut(start..end)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "realtime froxel cache slot is out of range",
+                    )
+                })?
+                .copy_from_slice(radiance);
+        }
         let entry = self.column_slots.get_mut(slot).ok_or_else(|| {
             PotError::new(
                 ErrorCode::InternalError,
@@ -2831,6 +2873,15 @@ impl RealtimeVolumeResolveCache {
         let start = slot.checked_mul(self.slice_count)?;
         let end = start.checked_add(self.slice_count)?;
         self.column_prefix.get(start..end)
+    }
+
+    fn column_radiance(&self, slot: usize, column: usize) -> Option<&[DVec3]> {
+        if !self.has_temperature_emission || self.column_slots.get(slot)?.column != Some(column) {
+            return None;
+        }
+        let start = slot.checked_mul(self.slice_count)?;
+        let end = start.checked_add(self.slice_count)?;
+        self.column_radiance.get(start..end)
     }
 
     // Preserve the allocated prefix buffers while invalidating cached column keys.
@@ -3041,10 +3092,10 @@ impl RealtimeVolumeSample<'_, '_> {
             })
     }
 
-    /// Resolves the cumulative froxel transmittance with EEVEE's XY/Z texture filtering.
-    fn resolve_froxel_transmittance_to(&mut self, end_distance: f64) -> Result<DVec3> {
+    /// Resolves cumulative froxel radiance and transmittance with EEVEE's XY/Z texture filtering.
+    fn resolve_froxel_prefix_to(&mut self, end_distance: f64) -> Result<(DVec3, DVec3)> {
         if !self.initialize_froxel_resolve()? {
-            return Ok(DVec3::ONE);
+            return Ok((DVec3::ZERO, DVec3::ONE));
         }
         let sample_index = usize::try_from(self.sample_index).map_err(|_| {
             PotError::new(
@@ -3055,6 +3106,9 @@ impl RealtimeVolumeSample<'_, '_> {
         let event_depth = self
             .camera
             .depth_of(self.origin + self.direction * end_distance);
+        if event_depth <= self.resolve_cache()?.depth_start {
+            return Ok((DVec3::ZERO, DVec3::ONE));
+        }
         let (x_weights, y_weights, z_weights, grid_width) = {
             let cache = self.resolve_cache()?;
             let coord_z = resolve_z_with_end_of_slice_bias(
@@ -3104,11 +3158,17 @@ impl RealtimeVolumeSample<'_, '_> {
                                 "realtime volume froxel cache is unavailable",
                             )
                         })?;
-                    cache.store_column(slot, column, &scratch.froxel_prefix)?;
+                    cache.store_column(
+                        slot,
+                        column,
+                        &scratch.froxel_prefix,
+                        &scratch.froxel_scattering,
+                    )?;
                 }
             }
         }
 
+        let mut radiance = DVec3::ZERO;
         let mut transmittance = DVec3::ZERO;
         for (x, x_weight) in axis_weights(x_weights) {
             for (y, y_weight) in axis_weights(y_weights) {
@@ -3123,17 +3183,31 @@ impl RealtimeVolumeSample<'_, '_> {
                         )
                     })?;
                 let cache = self.resolve_cache()?;
-                let column = cache.column_prefix(slot, index).ok_or_else(|| {
+                let weight = x_weight * y_weight;
+                if cache.has_temperature_emission {
+                    let column_radiance = cache.column_radiance(slot, index).ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "realtime volume radiance column was not prepared",
+                        )
+                    })?;
+                    radiance += axis_sample(column_radiance, z_weights) * weight;
+                }
+                let column_prefix = cache.column_prefix(slot, index).ok_or_else(|| {
                     PotError::new(
                         ErrorCode::InternalError,
-                        "realtime volume froxel column was not prepared",
+                        "realtime volume transmittance column was not prepared",
                     )
                 })?;
-                let z_value = axis_sample(column, z_weights);
-                transmittance += z_value * (x_weight * y_weight);
+                transmittance += axis_sample(column_prefix, z_weights) * weight;
             }
         }
-        Ok(transmittance)
+        Ok((radiance, transmittance))
+    }
+
+    fn resolve_froxel_transmittance_to(&mut self, end_distance: f64) -> Result<DVec3> {
+        self.resolve_froxel_prefix_to(end_distance)
+            .map(|(_, transmittance)| transmittance)
     }
 
     fn initialize_froxel_resolve(&mut self) -> Result<bool> {
@@ -3232,15 +3306,30 @@ impl RealtimeVolumeSample<'_, '_> {
             )
         })?;
         column_prefix.resize(prefix_count, DVec3::ZERO);
+        let has_temperature_emission = self.transport.has_temperature_emission;
+        let mut column_radiance = Vec::new();
+        if has_temperature_emission {
+            column_radiance
+                .try_reserve_exact(prefix_count)
+                .map_err(|_| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "cannot allocate realtime volume source cache",
+                    )
+                })?;
+            column_radiance.resize(prefix_count, DVec3::ZERO);
+        }
         self.scratch.froxel_resolve[self.resolve_view] = Some(RealtimeVolumeResolveCache {
             layout,
             depth_mapping,
             width: self.layout_width,
+            column_radiance,
             height: self.height,
             tile_size,
             slice_count,
             sample_count,
             depth_start,
+            has_temperature_emission,
             column_slots,
             column_prefix,
             column_clock: 0,
@@ -3389,36 +3478,78 @@ impl RealtimeVolumeSample<'_, '_> {
         Ok(extinction)
     }
 
-    /// Builds one native render sample's prefix transmittance from its jittered froxel column.
+    /// Builds one sample's cumulative source radiance and transmittance from its jittered froxel column.
     fn build_froxel_column(&mut self, column_index: usize) -> Result<()> {
-        let (slice_count, depth_start, depth_mapping) = {
+        let (slice_count, depth_start, depth_mapping, has_temperature_emission) = {
             let cache = self.resolve_cache()?;
-            (cache.slice_count, cache.depth_start, cache.depth_mapping)
+            (
+                cache.slice_count,
+                cache.depth_start,
+                cache.depth_mapping,
+                cache.has_temperature_emission,
+            )
         };
         let Some(integration_direction) = self.accumulate_froxel_extinction(column_index)? else {
             self.scratch.froxel_prefix.clear();
             self.scratch.froxel_prefix.resize(slice_count, DVec3::ONE);
+            self.scratch.froxel_scattering.clear();
+            if has_temperature_emission {
+                self.scratch
+                    .froxel_scattering
+                    .resize(slice_count, DVec3::ZERO);
+            }
             return Ok(());
         };
-        let mut cumulative_optical_depth = DVec3::ZERO;
+        let mut cumulative_radiance = [0.0_f32; 3];
+        let mut cumulative_transmittance = [1.0_f32; 3];
         let mut previous_distance = self
             .camera
             .ray_distance_for_depth(integration_direction, depth_start);
         self.scratch.froxel_prefix.clear();
         self.scratch.froxel_prefix.resize(slice_count, DVec3::ZERO);
+        self.scratch.froxel_scattering.clear();
+        if has_temperature_emission {
+            self.scratch
+                .froxel_scattering
+                .resize(slice_count, DVec3::ZERO);
+        }
         for slice in 0..slice_count {
             let normalized_z = (slice + 1) as f32 / slice_count as f32;
             let slice_depth = -f64::from(depth_mapping.volume_z_to_view_z(normalized_z));
             let end_distance = self
                 .camera
                 .ray_distance_for_depth(integration_direction, slice_depth);
-            let step_length = (end_distance - previous_distance).abs();
-            cumulative_optical_depth += self.scratch.froxel_extinction[slice] * step_length;
-            self.scratch.froxel_prefix[slice] = DVec3::new(
-                (-cumulative_optical_depth.x).exp(),
-                (-cumulative_optical_depth.y).exp(),
-                (-cumulative_optical_depth.z).exp(),
-            );
+            let step_length = (end_distance - previous_distance).abs() as f32;
+            let extinction = eevee_volume_radiance_storage(self.scratch.froxel_extinction[slice])
+                .to_array()
+                .map(|channel| channel as f32);
+            let source = if has_temperature_emission {
+                self.scratch.froxel_source[slice]
+                    .to_array()
+                    .map(|channel| channel as f32)
+            } else {
+                [0.0_f32; 3]
+            };
+            for channel in 0..3 {
+                let attenuation = (-extinction[channel] * step_length).exp();
+                let opacity = 1.0 - attenuation;
+                let source_distance = if extinction[channel] == 0.0 {
+                    step_length
+                } else {
+                    opacity / extinction[channel]
+                };
+                cumulative_radiance[channel] +=
+                    cumulative_transmittance[channel] * source[channel] * source_distance;
+                cumulative_transmittance[channel] *= attenuation;
+            }
+            self.scratch.froxel_prefix[slice] = eevee_volume_radiance_storage(DVec3::from_array(
+                cumulative_transmittance.map(f64::from),
+            ));
+            if has_temperature_emission {
+                self.scratch.froxel_scattering[slice] = eevee_volume_radiance_storage(
+                    DVec3::from_array(cumulative_radiance.map(f64::from)),
+                );
+            }
             previous_distance = end_distance;
         }
         Ok(())
@@ -3445,7 +3576,10 @@ impl RealtimeVolumeSample<'_, '_> {
         self.scratch
             .froxel_extinction
             .resize(slice_count, DVec3::ZERO);
-
+        self.scratch.froxel_source.clear();
+        if self.transport.has_temperature_emission {
+            self.scratch.froxel_source.resize(slice_count, DVec3::ZERO);
+        }
         let [jitter_x, jitter_y] = eevee_volume_jitter(self.sample_index);
         let jitter_z =
             eevee_volume_froxel_jitter(cell_x, cell_y, eevee_volume_w(self.sample_index));
@@ -3539,11 +3673,13 @@ impl RealtimeVolumeSample<'_, '_> {
                 DVec3::ZERO
             };
             let mut extinction = mesh_extinction;
-            for volume in self
+            let mut temperature_emission = DVec3::ZERO;
+            for (volume_index, volume) in self
                 .transport
                 .volumes
                 .iter()
-                .filter(|volume| volume.ray_mask & RayKind::Camera.bit() != 0)
+                .enumerate()
+                .filter(|(_, volume)| volume.ray_mask & RayKind::Camera.bit() != 0)
             {
                 if !volume_contains_point(volume, point) {
                     continue;
@@ -3551,8 +3687,22 @@ impl RealtimeVolumeSample<'_, '_> {
                 let density = volume_density_at(volume, point)?;
                 extinction +=
                     volume.extinction_rgb_scale * (density * self.transport.meters_per_unit);
+                if self.transport.has_temperature_emission
+                    && let Some(temperature) = self
+                        .transport
+                        .volume_temperatures
+                        .get(volume_index)
+                        .and_then(Option::as_ref)
+                {
+                    temperature_emission += volume_emission_at(volume, Some(temperature), point)?
+                        * self.transport.meters_per_unit;
+                }
             }
             self.scratch.froxel_extinction[slice] = extinction;
+            if self.transport.has_temperature_emission {
+                self.scratch.froxel_source[slice] =
+                    eevee_volume_radiance_storage(temperature_emission);
+            }
         }
 
         self.origin = saved.0;
@@ -3564,6 +3714,16 @@ impl RealtimeVolumeSample<'_, '_> {
         Ok(Some(direction))
     }
 
+    fn temperature_emission_segment(
+        &mut self,
+        start_distance: f64,
+        end_distance: f64,
+    ) -> Result<(DVec3, DVec3)> {
+        let start_prefix = self.resolve_froxel_prefix_to(start_distance)?;
+        let end_prefix = self.resolve_froxel_prefix_to(end_distance)?;
+        Ok(froxel_segment_from_prefix(start_prefix, end_prefix))
+    }
+
     fn integrate_segment_with_sources(
         &mut self,
         start_distance: f64,
@@ -3573,7 +3733,6 @@ impl RealtimeVolumeSample<'_, '_> {
         if end_distance <= start_distance {
             return Ok((DVec3::ZERO, DVec3::ONE));
         }
-        let transport = self.transport;
         let ray = RealtimeVolumeRay {
             origin: self.origin,
             direction: self.direction,
@@ -3581,27 +3740,28 @@ impl RealtimeVolumeSample<'_, '_> {
             max_distance: end_distance,
             footprint: self.footprint,
         };
-        if transport.has_mesh_volumes {
+        let use_froxel_temperature = include_sources && self.transport.has_temperature_emission;
+        let (mut radiance, mut transmittance) = if self.transport.has_mesh_volumes {
             let trace_geometry = self.geometry;
-            let bvh = transport.bvh.ok_or_else(|| {
+            let bvh = self.transport.bvh.ok_or_else(|| {
                 PotError::new(
                     ErrorCode::InternalError,
                     "realtime mesh volume tracing requires the geometry BVH",
                 )
             })?;
             let scene = SceneRefs {
-                doc: transport.doc,
-                snapshot: transport.snapshot,
+                doc: self.transport.doc,
+                snapshot: self.transport.snapshot,
                 geometry: &trace_geometry,
                 bvh,
-                lights: &transport.lights,
-                volumes: &transport.volumes,
-                images: transport.images,
+                lights: &self.transport.lights,
+                volumes: &self.transport.volumes,
+                images: self.transport.images,
                 importance: None,
                 camera_matrices: self.camera_matrices.as_ref(),
             };
             let query = RealtimeMeshQuery {
-                transport,
+                transport: self.transport,
                 geometry: &trace_geometry,
                 bvh,
                 scene,
@@ -3627,18 +3787,44 @@ impl RealtimeVolumeSample<'_, '_> {
                 &mut self.rng,
                 &mut self.ambient,
                 include_sources,
-            )
+                use_froxel_temperature,
+            )?
         } else {
-            let (radiance, transmittance) = realtime_voxel_integral(
-                transport,
+            realtime_voxel_integral(
+                self.transport,
                 ray,
                 &mut self.rng,
                 &mut self.ambient,
                 include_sources,
-            )?;
-            Ok((radiance, transmittance))
+                use_froxel_temperature,
+            )?
+        };
+        if use_froxel_temperature {
+            let (temperature_radiance, froxel_transmittance) =
+                self.temperature_emission_segment(start_distance, end_distance)?;
+            radiance += temperature_radiance;
+            transmittance = froxel_transmittance;
+        }
+        Ok((radiance, transmittance))
+    }
+}
+
+// A camera compositor splits the ray at surfaces; derive local source and attenuation from the
+// same cumulative froxel prefix so sequential segments share one transport basis.
+fn froxel_segment_from_prefix(start: (DVec3, DVec3), end: (DVec3, DVec3)) -> (DVec3, DVec3) {
+    let mut radiance = [0.0; 3];
+    let mut transmittance = [0.0; 3];
+    for channel in 0..3 {
+        let start_transmittance = start.1[channel];
+        if start_transmittance > 0.0 {
+            radiance[channel] = (end.0[channel] - start.0[channel]) / start_transmittance;
+            transmittance[channel] = end.1[channel] / start_transmittance;
         }
     }
+    (
+        DVec3::from_array(radiance),
+        DVec3::from_array(transmittance),
+    )
 }
 
 fn axis_weights(weights: LinearSampleWeights) -> [(usize, f64); 2] {
@@ -3718,6 +3904,25 @@ mod volume_jitter_tests {
     }
 
     #[test]
+    fn froxel_temperature_segments_compose_across_half_opacity() {
+        let camera_prefix = (super::DVec3::ZERO, super::DVec3::ONE);
+        let surface_prefix = (super::DVec3::splat(0.2), super::DVec3::splat(0.5));
+        let far_prefix = (super::DVec3::splat(0.26), super::DVec3::splat(0.2));
+        let (front_radiance, front_transmittance) =
+            super::froxel_segment_from_prefix(camera_prefix, surface_prefix);
+        let (behind_radiance, behind_transmittance) =
+            super::froxel_segment_from_prefix(surface_prefix, far_prefix);
+        let pass_through = 0.5;
+        let composed = front_radiance + front_transmittance * pass_through * behind_radiance;
+        let expected = super::DVec3::splat(0.23);
+        assert!(composed.abs_diff_eq(expected, 1.0e-12));
+        assert!((front_transmittance * behind_transmittance).abs_diff_eq(far_prefix.1, 1.0e-12));
+
+        let mismatched = front_radiance + super::DVec3::splat(0.8) * pass_through * behind_radiance;
+        assert!(mismatched.distance(expected) > 1.0e-3);
+    }
+
+    #[test]
     fn froxel_prefix_cache_isolated_by_image_render_sample() {
         let mut cache = RealtimeVolumeResolveCache {
             layout: FroxelTextureLayout::new(8, 8, 8),
@@ -3733,8 +3938,10 @@ mod volume_jitter_tests {
             slice_count: 2,
             sample_count: 2,
             depth_start: 0.1,
+            has_temperature_emission: true,
             column_slots: vec![FroxelColumnCacheSlot::default(); 2 * FROXEL_COLUMN_CACHE_SLOTS],
             column_prefix: vec![super::DVec3::ZERO; 2 * FROXEL_COLUMN_CACHE_SLOTS * 2],
+            column_radiance: vec![super::DVec3::ZERO; 2 * FROXEL_COLUMN_CACHE_SLOTS * 2],
             column_clock: 0,
         };
         let first_slot = cache.replacement_column_slot(0).unwrap_or(usize::MAX);
@@ -3744,7 +3951,8 @@ mod volume_jitter_tests {
                 .store_column(
                     first_slot,
                     3,
-                    &[super::DVec3::ONE, super::DVec3::splat(0.5)]
+                    &[super::DVec3::ONE, super::DVec3::splat(0.5)],
+                    &[super::DVec3::splat(0.25), super::DVec3::splat(0.125)],
                 )
                 .is_ok()
         );
@@ -3759,6 +3967,7 @@ mod volume_jitter_tests {
                     second_slot,
                     3,
                     &[super::DVec3::splat(0.25), super::DVec3::splat(0.125)],
+                    &[super::DVec3::splat(0.5), super::DVec3::splat(0.25)],
                 )
                 .is_ok()
         );
@@ -3770,15 +3979,35 @@ mod volume_jitter_tests {
             cache.column_prefix(second_slot, 3),
             Some(&[super::DVec3::splat(0.25), super::DVec3::splat(0.125)][..])
         );
+        assert_eq!(
+            cache.column_radiance(first_slot, 3),
+            Some(&[super::DVec3::splat(0.25), super::DVec3::splat(0.125)][..])
+        );
+        assert_eq!(
+            cache.column_radiance(second_slot, 3),
+            Some(&[super::DVec3::splat(0.5), super::DVec3::splat(0.25)][..])
+        );
         let slots_ptr = cache.column_slots.as_ptr();
         let prefixes_ptr = cache.column_prefix.as_ptr();
+        let radiance_ptr = cache.column_radiance.as_ptr();
         cache.clear_columns();
         assert_eq!(cache.column_slots.as_ptr(), slots_ptr);
         assert_eq!(cache.column_prefix.as_ptr(), prefixes_ptr);
+        assert_eq!(cache.column_radiance.as_ptr(), radiance_ptr);
         assert!(cache.cached_column_slot(0, 3).is_none());
         assert!(cache.cached_column_slot(1, 3).is_none());
         assert_eq!(cache.sample_count, 2);
     }
+}
+
+fn realtime_world_probe_l1_refusal() -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        "EEVEE realtime anisotropic volume scattering with a nonuniform world requires unavailable world-probe SH L1",
+        serde_json::json!({
+            "feature_id": "shader.volume.world_probe_l1.realtime_scattering",
+        }),
+    )
 }
 
 pub(super) fn prepare_realtime_volume_transport<'a>(
@@ -3801,6 +4030,11 @@ pub(super) fn prepare_realtime_volume_transport<'a>(
         warnings,
         crate::node_kernels::MathSemantics::Eevee,
     )?;
+    let has_temperature_emission = volume_temperatures.iter().any(|temperature| {
+        temperature
+            .as_ref()
+            .is_some_and(|temperature| temperature.blackbody > 1.0e-3)
+    });
     let is_grey =
         |color: DVec3| color.x.total_cmp(&color.y).is_eq() && color.y.total_cmp(&color.z).is_eq();
     if volumes.iter().any(|volume| {
@@ -3827,13 +4061,26 @@ pub(super) fn prepare_realtime_volume_transport<'a>(
             "realtime mesh volume tracing requires the geometry BVH",
         ));
     }
-    let world_ambient = scene
+    let (world_ambient, world_nonuniform) = if let Some(world) = scene
         .world
         .as_ref()
         .and_then(|world_id| doc.worlds.get(world_id))
-        .map(|world| volume_ambient_l0(world, &doc.node_groups, images))
-        .transpose()?
-        .unwrap_or(DVec3::ZERO);
+    {
+        volume_ambient_l0(world, &doc.node_groups, images)?
+    } else {
+        (DVec3::ZERO, false)
+    };
+    if world_nonuniform
+        && volumes.iter().any(|volume| {
+            volume.scattering
+                && volume
+                    .lobes
+                    .iter()
+                    .any(|lobe| lobe.share > 0.0 && lobe.anisotropy != 0.0)
+        })
+    {
+        return Err(realtime_world_probe_l1_refusal());
+    }
     let (lights, camera_light_prepared) = collect_lights_with_camera_data(doc, snapshot);
     Ok(Some(RealtimeVolumeTransport {
         doc,
@@ -3842,9 +4089,11 @@ pub(super) fn prepare_realtime_volume_transport<'a>(
         bvh,
         volumes,
         volume_temperatures,
+        has_temperature_emission,
         lights,
         camera_light_prepared,
         world_ambient,
+        world_nonuniform,
         meters_per_unit: scene.unit.scale_length,
         has_mesh_volumes,
         volumetric_shadows: scene.render.eevee_use_volumetric_shadows,
@@ -3905,6 +4154,18 @@ fn prepare_realtime_mesh_sample(
         Some(&mut *froxel_media),
         Some(&mut *froxel_hit_media),
     )?;
+    if transport.world_nonuniform
+        && media.iter().any(|medium| {
+            medium.params.volume_anisotropy != 0.0
+                && medium
+                    .params
+                    .volume_scatter
+                    .iter()
+                    .any(|scatter| *scatter > 0.0)
+        })
+    {
+        return Err(realtime_world_probe_l1_refusal());
+    }
     initial_media.clone_from(media);
     froxel_initial_media.clone_from(froxel_media);
     boundaries.clear();
@@ -3948,6 +4209,19 @@ fn prepare_realtime_mesh_sample(
                     return false;
                 }
             }
+            if transport.world_nonuniform
+                && hit_media.iter().any(|medium| {
+                    medium.params.volume_anisotropy != 0.0
+                        && medium
+                            .params
+                            .volume_scatter
+                            .iter()
+                            .any(|scatter| *scatter > 0.0)
+                })
+            {
+                failure = Some(realtime_world_probe_l1_refusal());
+                return false;
+            }
             if !hit_media.is_empty() {
                 boundaries.extend(hit_media.iter().copied().map(|medium| (distance, medium)));
             }
@@ -3969,6 +4243,106 @@ fn prepare_realtime_mesh_sample(
     Ok(())
 }
 
+/// EEVEE's `light_shape_vector_get` evaluates an area light at the closest point on its emitting shape.
+fn eevee_volume_light_sample(light: &PointLight, point: DVec3) -> Option<LightSample> {
+    if !light.energy.is_finite() || light.energy <= 0.0 || light.volume_factor <= 0.0 {
+        return None;
+    }
+    let area = if light.kind == LightType::Area {
+        Some(light.area?)
+    } else {
+        None
+    };
+    if area.is_some_and(|shape| shape.half_u <= 0.0 || shape.half_v <= 0.0) {
+        return None;
+    }
+    let directional = light.kind == LightType::Sun;
+    let (direction, distance) = if directional {
+        (-light.direction, f64::INFINITY)
+    } else {
+        let light_point = area.map_or(light.position, |shape| {
+            let offset = point - light.position;
+            let mut u = offset.dot(shape.axis_u);
+            let mut v = offset.dot(shape.axis_v);
+            if shape.ellipse {
+                let radius = (u / shape.half_u).hypot(v / shape.half_v).max(1.0);
+                u /= radius;
+                v /= radius;
+            } else {
+                u = u.clamp(-shape.half_u, shape.half_u);
+                v = v.clamp(-shape.half_v, shape.half_v);
+            }
+            light.position + shape.axis_u * u + shape.axis_v * v
+        });
+        let offset = light_point - point;
+        let distance = offset.length();
+        if !distance.is_finite() {
+            return None;
+        }
+        (
+            if distance > 0.0 {
+                offset / distance
+            } else {
+                DVec3::ZERO
+            },
+            distance,
+        )
+    };
+    let point_power = match light.kind {
+        LightType::Sun => 1.0,
+        LightType::Area => {
+            let area = area?;
+            let rectangle_area = 4.0 * area.half_u * area.half_v;
+            let tmp =
+                std::f64::consts::FRAC_PI_2 / (std::f64::consts::FRAC_PI_2 + rectangle_area.sqrt());
+            let mrp_scaling = tmp + (1.0 - tmp) * std::f64::consts::FRAC_1_PI;
+            std::f64::consts::FRAC_1_PI * mrp_scaling
+        }
+        LightType::Point | LightType::Spot => 1.0 / (4.0 * std::f64::consts::PI),
+    };
+    let distance_power = if directional {
+        1.0
+    } else {
+        // EEVEE's area-size vector already holds half extents; volume shape radius is half its length.
+        let shape_radius = area.map_or(light.radius.max(0.001), |shape| {
+            (shape.half_u.hypot(shape.half_v) * 0.5).max(0.001)
+        });
+        let radius_squared = shape_radius * shape_radius;
+        let distance_squared = distance * distance;
+        let combined = distance_squared + radius_squared;
+        let denominator = combined + distance * combined.sqrt();
+        if denominator <= f64::MIN_POSITIVE {
+            return None;
+        }
+        2.0 / denominator
+    };
+    let area_facing = area.map_or(1.0, |_| (-light.direction).dot(direction).clamp(0.0, 1.0));
+    let attenuation = light.volume_fade(point)
+        * if light.kind == LightType::Spot {
+            light_attenuation(light, -direction)
+        } else {
+            1.0
+        };
+    let radiance = light.color
+        * (light.energy
+            * light.volume_factor
+            * point_power
+            * distance_power
+            * area_facing
+            * attenuation);
+    (radiance.is_finite() && radiance.max_element() > 0.0).then_some(LightSample {
+        direction,
+        distance,
+        radiance,
+        pdf: 0.0,
+    })
+}
+/// EEVEE stores each froxel's accumulated source in an `UFLOAT_11_11_10` image before integration.
+fn eevee_volume_radiance_storage(radiance: DVec3) -> DVec3 {
+    let radiance = DVec3::from_array(radiance.to_array().map(|channel| f64::from(channel as f32)));
+    super::eevee_transmission::probe_radiance(radiance)
+}
+
 fn realtime_mesh_volume_integral(
     query: RealtimeMeshQuery<'_, '_>,
     ray: RealtimeVolumeRay,
@@ -3976,6 +4350,7 @@ fn realtime_mesh_volume_integral(
     rng: &mut Pcg32,
     ambient_cache: &mut Option<DVec3>,
     include_sources: bool,
+    skip_froxel_temperature_emission: bool,
 ) -> Result<(DVec3, DVec3)> {
     let transport = query.transport;
     let origin = ray.origin;
@@ -3996,8 +4371,14 @@ fn realtime_mesh_volume_integral(
             .iter()
             .any(|(distance, _)| *distance <= max_distance);
     if !has_mesh_medium {
-        let (radiance, transmittance) =
-            realtime_voxel_integral(transport, ray, rng, ambient_cache, include_sources)?;
+        let (radiance, transmittance) = realtime_voxel_integral(
+            transport,
+            ray,
+            rng,
+            ambient_cache,
+            include_sources,
+            skip_froxel_temperature_emission,
+        )?;
         return Ok((radiance, transmittance));
     }
 
@@ -4053,8 +4434,14 @@ fn realtime_mesh_volume_integral(
     let entry = mesh_entry.min(voxel_entry).max(start_distance);
     let exit = mesh_exit.max(voxel_exit).min(max_distance);
     if !entry.is_finite() || exit <= entry {
-        let (radiance, transmittance) =
-            realtime_voxel_integral(transport, ray, rng, ambient_cache, include_sources)?;
+        let (radiance, transmittance) = realtime_voxel_integral(
+            transport,
+            ray,
+            rng,
+            ambient_cache,
+            include_sources,
+            skip_froxel_temperature_emission,
+        )?;
         return Ok((radiance, transmittance));
     }
     let voxel_step = if minimum_step.is_finite() {
@@ -4089,6 +4476,7 @@ fn realtime_mesh_volume_integral(
         rng,
         evaluator_workspace,
         include_sources,
+        skip_froxel_temperature_emission,
         radiance: DVec3::ZERO,
         transmittance: DVec3::ONE,
     };
@@ -4141,6 +4529,7 @@ struct RealtimeMeshIntegrator<'a, 'v, 'r> {
     step: f64,
     rng: &'r mut Pcg32,
     include_sources: bool,
+    skip_froxel_temperature_emission: bool,
     evaluator_workspace: &'r mut EvaluatorWorkspace,
     radiance: DVec3,
     transmittance: DVec3,
@@ -4200,8 +4589,13 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
                             .volume_temperatures
                             .get(volume_index)
                             .and_then(Option::as_ref);
-                        voxel_source += volume_emission_at(instance, temperature, point)?
-                            + self.ambient * instance.albedo * scattering;
+                        let emission =
+                            if self.skip_froxel_temperature_emission && temperature.is_some() {
+                                DVec3::ZERO
+                            } else {
+                                volume_emission_at(instance, temperature, point)?
+                            };
+                        voxel_source += emission + self.ambient * instance.albedo * scattering;
                     }
                     if self.include_sources && scattering.max_element() > 0.0 {
                         for light in &self.query.transport.lights {
@@ -4243,45 +4637,43 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
                     if light.ray_mask & RayKind::VolumeScatter.bit() == 0 {
                         continue;
                     }
-                    // EEVEE's `volume_factor` scales only direct in-scatter from this light.
-                    let gain = light.volume_factor * light.volume_fade(point);
-                    if gain <= 0.0 {
-                        continue;
-                    }
-                    let Some(sample) = sample_light(light, point, self.rng) else {
+                    let Some(sample) = eevee_volume_light_sample(light, point) else {
                         continue;
                     };
-                    if sample.radiance.max_element() <= 0.0 {
-                        continue;
-                    }
-                    let visibility = shadow_transmittance_with_volumetric_shadows(
-                        scene,
-                        media,
-                        ShadowRay {
-                            point,
-                            normal: DVec3::ZERO,
-                            shading: DVec3::ZERO,
-                            direction: sample.direction,
-                            distance: sample.distance,
-                            footprint: self.footprint.at_distance(distance),
-                        },
-                        u32::MAX,
-                        self.query.transport.volumetric_shadows,
-                        self.rng,
-                        self.evaluator_workspace,
-                    )?;
+                    let visibility = if self.query.transport.volumetric_shadows {
+                        shadow_transmittance_with_volumetric_shadows(
+                            scene,
+                            media,
+                            ShadowRay {
+                                point,
+                                normal: DVec3::ZERO,
+                                shading: DVec3::ZERO,
+                                direction: sample.direction,
+                                distance: sample.distance,
+                                footprint: self.footprint.at_distance(distance),
+                            },
+                            u32::MAX,
+                            true,
+                            self.rng,
+                            self.evaluator_workspace,
+                        )?
+                    } else {
+                        DVec3::ONE
+                    };
                     let cosine = self.direction.dot(sample.direction);
                     let mut scatter = DVec3::ZERO;
                     for medium in media {
                         scatter += DVec3::from_array(medium.params.volume_scatter)
                             * henyey_greenstein(cosine, medium.params.volume_anisotropy);
                     }
-                    mesh_source += sample.radiance * visibility * scatter * gain;
+                    mesh_source += sample.radiance * visibility * scatter;
                 }
             }
             let extinction = mesh_extinction + voxel_extinction * self.meters_per_unit;
             let attenuation = if self.include_sources {
-                let source = mesh_source + voxel_source * self.meters_per_unit;
+                let source = eevee_volume_radiance_storage(
+                    mesh_source + voxel_source * self.meters_per_unit,
+                );
                 let (attenuation_x, source_distance_x) =
                     homogeneous_segment_integral(extinction.x, step);
                 let (attenuation_y, source_distance_y) =
@@ -4311,6 +4703,7 @@ fn realtime_voxel_integral(
     rng: &mut Pcg32,
     ambient_cache: &mut Option<DVec3>,
     include_sources: bool,
+    skip_froxel_temperature_emission: bool,
 ) -> Result<(DVec3, DVec3)> {
     let RealtimeVolumeRay {
         origin,
@@ -4383,7 +4776,11 @@ fn realtime_voxel_integral(
                     .volume_temperatures
                     .get(volume_index)
                     .and_then(Option::as_ref);
-                source += volume_emission_at(instance, temperature, point)?;
+                source += if skip_froxel_temperature_emission && temperature.is_some() {
+                    DVec3::ZERO
+                } else {
+                    volume_emission_at(instance, temperature, point)?
+                };
                 if instance.scattering {
                     source += ambient * instance.albedo * scattering_coefficient;
                     for light in &transport.lights {
@@ -4430,6 +4827,7 @@ fn realtime_voxel_integral(
             let attenuation = DVec3::new(attenuation_x, attenuation_y, attenuation_z);
             let source_distance =
                 DVec3::new(source_distance_x, source_distance_y, source_distance_z);
+            let source = eevee_volume_radiance_storage(source);
             radiance += source * transmittance * source_distance;
             attenuation
         } else {
@@ -6241,7 +6639,6 @@ fn with_hit_frame<T>(
             back_facing,
             path_traced,
             view: -direction,
-            back_facing,
             barycentric: hit.barycentric,
         },
         None,
@@ -8435,12 +8832,15 @@ fn collect_volumes<'a>(
                 volume_temperature = Some(temperature);
             }
         }
-        // A sample reads the neighbours of its cell: linear reads one voxel beyond the box and cubic two. Cycles pads a
-        // volume's mesh by the same counts (`scene/volume.cpp`, `create_volume_mesh`), so a ray does not stop at the active
-        // box and lose that shell. The pad is per axis in index space: a VDB pads its index box before it is transformed.
-        let pad_voxels = match interpolation {
-            crate::model::VolumeInterpolation::Linear => 1.0,
-            crate::model::VolumeInterpolation::Cubic => 2.0,
+        // EEVEE's volume mesh bounds pad active grids by half a voxel (`BKE_volume_grid_bounds`); Cycles extends them
+        // by the sampler's full support so rays do not stop before the interpolation shell.
+        let pad_voxels = if path_traced {
+            match interpolation {
+                crate::model::VolumeInterpolation::Linear => 1.0,
+                crate::model::VolumeInterpolation::Cubic => 2.0,
+            }
+        } else {
+            0.5
         };
         let (bounds_min, bounds_max) = if let Some(decoded) = volume.decoded_vdb.as_ref() {
             let Some(grid) = decoded.density_grid() else {
@@ -8552,17 +8952,31 @@ fn blackbody_emission(
     let temperature_squared = temperature * temperature;
     let temperature_fourth = temperature_squared * temperature_squared;
     let sigma = 5.670_373e-8_f32 * 1.0e-6_f32 / std::f32::consts::PI;
-    let intensity = sigma * (1.0 + (temperature_fourth - 1.0) * blackbody);
+    let intensity = sigma * blackbody.mul_add(temperature_fourth - 1.0, 1.0);
+    let minimum_intensity = if path_traced { 0.0 } else { 1.0e-5 };
+    if intensity.partial_cmp(&minimum_intensity) != Some(std::cmp::Ordering::Greater) {
+        return DVec3::ZERO;
+    }
     let color = if path_traced {
         crate::shader::blackbody::blackbody_rgb(temperature)
     } else {
         crate::shader::converters::eevee_blackbody_rgb(temperature)
     };
     DVec3::new(
-        f64::from(tint[0] * intensity * color[0]),
-        f64::from(tint[1] * intensity * color[1]),
-        f64::from(tint[2] * intensity * color[2]),
+        f64::from(color[0] * tint[0] * intensity),
+        f64::from(color[1] * tint[1] * intensity),
+        f64::from(color[2] * tint[2] * intensity),
     )
+}
+
+#[cfg(test)]
+mod volume_blackbody_tests {
+    use super::*;
+
+    #[test]
+    fn realtime_zero_temperature_emits_nothing() {
+        assert_eq!(blackbody_emission(0.0, 0.2, [1.0; 3], false), DVec3::ZERO);
+    }
 }
 
 fn volume_emission_at(
@@ -8926,7 +9340,7 @@ mod volume_shader_context_tests {
         let images = BTreeMap::new();
         let warnings = RefCell::new(Vec::new());
         for (path_traced, falloff) in [(false, 5.0), (true, 0.0)] {
-            let volumes = collect_volumes(
+            let (volumes, _) = collect_volumes(
                 &doc,
                 &snapshot,
                 path_traced,

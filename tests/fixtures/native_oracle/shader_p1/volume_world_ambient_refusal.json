@@ -1,0 +1,21 @@
+{
+  "samples": 1,
+  "seed": 0,
+  "renderer": "Blender 5.2.2 EEVEE Next; 1 TAA sample",
+  "world": {
+    "environment_image_nonuniform": true,
+    "projection": "EQUIRECTANGULAR",
+    "interpolation": "Linear"
+  },
+  "cases": [
+    {
+      "name": "anisotropic_volume_nonuniform_world",
+      "blend": "volume_world_ambient_anisotropic.blend",
+      "engine": "realtime",
+      "anisotropy": 0.5,
+      "error_code": "UNSUPPORTED_FEATURE",
+      "feature_id": "shader.volume.world_probe_l1.realtime_scattering"
+    }
+  ],
+  "source": "Blender 5.2.2 node_shader_tex_environment.cc and node_shader_volume_principled.cc; EEVEE realtime volume scattering under a nonuniform world environment"
+}

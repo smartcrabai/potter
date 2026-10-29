@@ -3424,6 +3424,11 @@ def _eevee_volumetric_end(scene):
     eevee = getattr(scene, "eevee", None)
     return float(getattr(eevee, "volumetric_end", 100.0)) if eevee is not None else 100.0
 
+def _eevee_gi_cubemap_resolution(scene):
+    eevee = getattr(scene, "eevee", None)
+    return int(getattr(eevee, "gi_cubemap_resolution", 512)) if eevee is not None else 512
+
+
 def _cryptomatte_accurate(scene):
     return any(bool(getattr(layer, CRYPTOMATTE_ACCURATE_PROP, False)) for layer in scene.view_layers)
 
@@ -3752,6 +3757,7 @@ def dump_scene(scene):
                 "passes": _render_passes(scene),
                 "cryptomatte_accurate": _cryptomatte_accurate(scene),
                 "eevee_light_threshold": _eevee_light_threshold(scene),
+                "eevee_gi_cubemap_resolution": _eevee_gi_cubemap_resolution(scene),
                 "eevee_use_volumetric_shadows": _eevee_use_volumetric_shadows(scene),
                 "eevee_volumetric_tile_size": _eevee_volumetric_tile_size(scene),
                 "eevee_volumetric_samples": _eevee_volumetric_samples(scene),

@@ -438,40 +438,32 @@ fn sample_vdb_scalar_realtime(
     {
         return 0.0;
     }
+    let index = index.as_vec3();
+    let lower = index.floor();
     let base = lower.as_ivec3();
-    let tap = |point| round_scalar_to_f16(vdb_texture_tap(grid, point, 0));
+    let tap = |point| round_scalar_to_f16(vdb_texture_tap(grid, point, 0)) as f32;
     match interpolation {
         VolumeInterpolation::Linear => {
-            let fraction = (index - lower).to_array();
-            let mut result = 0.0;
+            let fraction = index - lower;
+            let mut result = 0.0_f32;
             for z in 0..=1 {
                 for y in 0..=1 {
                     for x in 0..=1 {
-                        let weight = (if x == 0 {
-                            1.0 - fraction[0]
-                        } else {
-                            fraction[0]
-                        }) * (if y == 0 {
-                            1.0 - fraction[1]
-                        } else {
-                            fraction[1]
-                        }) * (if z == 0 {
-                            1.0 - fraction[2]
-                        } else {
-                            fraction[2]
-                        });
+                        let weight = (if x == 0 { 1.0 - fraction.x } else { fraction.x })
+                            * (if y == 0 { 1.0 - fraction.y } else { fraction.y })
+                            * (if z == 0 { 1.0 - fraction.z } else { fraction.z });
                         result += tap([base.x + x, base.y + y, base.z + z]) * weight;
                     }
                 }
             }
-            result
+            f64::from(result)
         }
         VolumeInterpolation::Cubic => {
             let fraction = index - lower;
-            let weight_x = cubic_weights(fraction.x);
-            let weight_y = cubic_weights(fraction.y);
-            let weight_z = cubic_weights(fraction.z);
-            let mut result = 0.0;
+            let weight_x = cubic_weights(f64::from(fraction.x)).map(|weight| weight as f32);
+            let weight_y = cubic_weights(f64::from(fraction.y)).map(|weight| weight as f32);
+            let weight_z = cubic_weights(f64::from(fraction.z)).map(|weight| weight as f32);
+            let mut result = 0.0_f32;
             for (z, wz) in weight_z.iter().enumerate() {
                 for (y, wy) in weight_y.iter().enumerate() {
                     for (x, wx) in weight_x.iter().enumerate() {
@@ -483,7 +475,7 @@ fn sample_vdb_scalar_realtime(
                     }
                 }
             }
-            result
+            f64::from(result)
         }
     }
 }
@@ -506,9 +498,12 @@ fn sample_vdb_color_realtime(
     {
         return [0.0; 3];
     }
+    let index = index.as_vec3();
+    let lower = index.floor();
     let base = lower.as_ivec3();
-    let tap = |point, component| round_scalar_to_f16(vdb_texture_tap(grid, point, component));
-    let mut result = [0.0; 3];
+    let tap =
+        |point, component| round_scalar_to_f16(vdb_texture_tap(grid, point, component)) as f32;
+    let mut result = [0.0_f32; 3];
     match interpolation {
         VolumeInterpolation::Linear => {
             let fraction = (index - lower).to_array();
@@ -538,9 +533,9 @@ fn sample_vdb_color_realtime(
         }
         VolumeInterpolation::Cubic => {
             let fraction = index - lower;
-            let weight_x = cubic_weights(fraction.x);
-            let weight_y = cubic_weights(fraction.y);
-            let weight_z = cubic_weights(fraction.z);
+            let weight_x = cubic_weights(f64::from(fraction.x)).map(|weight| weight as f32);
+            let weight_y = cubic_weights(f64::from(fraction.y)).map(|weight| weight as f32);
+            let weight_z = cubic_weights(f64::from(fraction.z)).map(|weight| weight as f32);
             for (z, wz) in weight_z.iter().enumerate() {
                 for (y, wy) in weight_y.iter().enumerate() {
                     for (x, wx) in weight_x.iter().enumerate() {
@@ -557,7 +552,7 @@ fn sample_vdb_color_realtime(
             }
         }
     }
-    result
+    result.map(f64::from)
 }
 
 /// Map all possible Cycles VDB taps before averaging their shader outputs, the stochastic-filtering

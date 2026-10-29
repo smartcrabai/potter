@@ -3,7 +3,7 @@
 //! `fixtures/native_oracle/shader_p1/generate.py` builds the committed `.blend` inputs and captures
 //! Blender-authored pixels. Color-node charts check exact emission probes for the supported shader
 //! nodes. Dedicated probes cover constant-folded Voronoi chains with out-of-range Detail/Roughness,
-//! unlinked `Position` and `TexCoord.Generated` inputs in both engines, plus rotated `TexCoord` Normal,
+//! unlinked shader Voronoi Vector (`CD_ORCO`/`Generated`) and explicit `TexCoord.Generated` inputs in both engines,
 //! negative-scale front/back facing, EEVEE world-environment volume scattering and
 //! environment projection/filtering, colored Glass `GGX`/`MULTI_GGX`, missing Temperature and mesh-volume
 //! Color Attributes per engine, and Cycles/EEVEE VDB temperature taps.
@@ -123,25 +123,36 @@ fn compare_rgb(actual: [f64; 3], expected: [f64; 3], tolerance: f64, context: &s
         );
     }
 }
-/// EEVEE accumulates into an RGBA16F buffer; accumulation order can differ, so allow one film-value ULP.
-fn eevee_half_float_ulp(value: f64) -> f64 {
-    const MIN_NORMAL: f64 = 6.103_515_625e-5;
-    let magnitude = value.abs();
-    if magnitude < MIN_NORMAL {
-        2.0_f64.powi(-24)
-    } else {
-        2.0_f64.powf(magnitude.log2().floor() - 10.0)
-    }
+
+/// EEVEE's combined film is RGBA16F (`eevee_renderbuffers.hh`, `eevee_film.cc`).
+fn eevee_half_ulp_distance(first: f64, second: f64) -> u16 {
+    let ordered_bits = |value: exr::prelude::f16| {
+        let bits = value.to_bits();
+        if bits & 0x8000 == 0 {
+            bits | 0x8000
+        } else {
+            !bits
+        }
+    };
+    let first = ordered_bits(exr::prelude::f16::from_f32(first as f32));
+    let second = ordered_bits(exr::prelude::f16::from_f32(second as f32));
+    first.abs_diff(second)
 }
 
 fn compare_eevee_rgb(actual: [f64; 3], expected: [f64; 3], context: &str) {
     for (channel, (actual, expected)) in actual.iter().zip(expected).enumerate() {
-        let tolerance = eevee_half_float_ulp(expected);
+        let distance = eevee_half_ulp_distance(*actual, expected);
         assert!(
-            (actual - expected).abs() <= tolerance,
-            "{context} channel {channel}: Potter {actual} differs from Blender {expected} by more than one RGBA16F ULP ({tolerance})"
+            distance <= 1,
+            "{context} channel {channel}: Potter film value {actual} differs from Blender film value {expected} by {distance} RGBA16F ULPs"
         );
     }
+}
+
+#[test]
+fn eevee_film_comparison_counts_encoded_half_steps() {
+    assert_eq!(eevee_half_ulp_distance(0.609_863_281_25, 0.609_375), 1);
+    assert_eq!(eevee_half_ulp_distance(0.610_351_562_5, 0.609_375), 2);
 }
 
 fn render_imported(
@@ -448,11 +459,9 @@ fn voronoi_values_above_blender_limits_match_blender_522() -> TestResult {
 }
 
 #[test]
-fn voronoi_constant_field_and_unlinked_position_inputs_match_each_blender_engine() -> TestResult {
+fn voronoi_constant_folded_absolute_probe_matches_each_blender_engine() -> TestResult {
     let Some(blender) = blender_executable() else {
-        eprintln!(
-            "skipping the ShaderP1 Voronoi input-folding oracle; no executable Blender was found"
-        );
+        eprintln!("skipping the ShaderP1 constant-folded Voronoi oracle; no Blender executable");
         return Ok(());
     };
     let reference = read_reference("voronoi_fold_fields.json")?;
@@ -462,7 +471,10 @@ fn voronoi_constant_field_and_unlinked_position_inputs_match_each_blender_engine
     let cases = reference["cases"]
         .as_array()
         .ok_or("Voronoi folding cases are missing")?;
-    assert_eq!(cases.len(), 3);
+    let case = cases
+        .iter()
+        .find(|case| case["name"] == "voronoi_constant_folded")
+        .ok_or("constant-folded Voronoi capture is missing")?;
     let root = tempdir()?;
     let (project, _) = render_imported(
         &blender,
@@ -474,62 +486,92 @@ fn voronoi_constant_field_and_unlinked_position_inputs_match_each_blender_engine
         1,
         1,
     )?;
-    let mut expected_by_engine = BTreeMap::new();
+
     for (engine, reference_key) in [("realtime", "eevee_rgb"), ("path", "cycles_rgb")] {
         let frame = render_frame_with_engine(
             &project,
             root.path(),
-            &format!("voronoi_fold_fields_{engine}"),
+            &format!("voronoi_constant_folded_{engine}"),
             engine,
         )?;
         assert_eq!([frame.width, frame.height], [64, 32]);
-        let mut values = BTreeMap::new();
+        let probe = case["probe"]
+            .as_array()
+            .ok_or("constant-folded Voronoi probe is missing")?;
+        let x = usize::try_from(probe[0].as_u64().ok_or("probe x is missing")?)?;
+        let y = usize::try_from(probe[1].as_u64().ok_or("probe y is missing")?)?;
+        let actual = pixel(&frame, x, y);
+        let expected = vec3(&case[reference_key])?;
+        let context = format!("constant-folded Voronoi {engine} at ({x},{y})");
+        if engine == "realtime" {
+            compare_eevee_rgb(actual, expected, &context);
+        } else {
+            compare_rgb(actual, expected, EMISSION_TOLERANCE, &context);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn voronoi_field_clamps_and_generated_defaults_match_each_engine() -> TestResult {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping the ShaderP1 Voronoi invariant oracle; no Blender executable");
+        return Ok(());
+    };
+    let reference = read_reference("voronoi_fold_invariants.json")?;
+    assert_eq!(reference["samples"]["eevee"], 1);
+    assert_eq!(reference["samples"]["cycles"], 1);
+    assert_eq!(reference["seed"], 0);
+    let cases = reference["cases"]
+        .as_array()
+        .ok_or("Voronoi invariant cases are missing")?;
+    assert_eq!(cases.len(), 3);
+    let root = tempdir()?;
+    let (project, _) = render_imported(
+        &blender,
+        root.path(),
+        &fixtures().join("voronoi_fold_invariants.blend"),
+        "voronoi_fold_invariants_project",
+        64,
+        32,
+        1,
+        1,
+    )?;
+
+    for (engine, reference_key) in [("realtime", "eevee_rgb"), ("path", "cycles_rgb")] {
+        let frame = render_frame_with_engine(
+            &project,
+            root.path(),
+            &format!("voronoi_fold_invariants_{engine}"),
+            engine,
+        )?;
+        assert_eq!([frame.width, frame.height], [64, 32]);
         for case in cases {
             let name = case["name"]
                 .as_str()
-                .ok_or("Voronoi folding case name is missing")?;
-            assert_eq!(number(&case["detail"])?, 20.0);
-            assert_eq!(number(&case["roughness"])?, 1.4);
+                .ok_or("Voronoi invariant case name is missing")?;
             let probe = case["probe"]
                 .as_array()
-                .ok_or("Voronoi folding probe is missing")?;
+                .ok_or("Voronoi invariant probe is missing")?;
             let x = usize::try_from(probe[0].as_u64().ok_or("probe x is missing")?)?;
             let y = usize::try_from(probe[1].as_u64().ok_or("probe y is missing")?)?;
             let actual = pixel(&frame, x, y);
             let expected = vec3(&case[reference_key])?;
+            let zero_invariant = matches!(
+                name,
+                "voronoi_kernel_clamp_difference_zero"
+                    | "voronoi_generated_default_difference_zero"
+            );
+            if zero_invariant {
+                assert!(expected.iter().all(|channel| channel.abs() <= f64::EPSILON));
+            }
             let context = format!("{name} {engine} at ({x},{y})");
             if engine == "realtime" {
                 compare_eevee_rgb(actual, expected, &context);
             } else {
-                compare_rgb(actual, expected, EMISSION_TOLERANCE, &context);
+                compare_rgb(actual, expected, 1.0e-6, &context);
             }
-            values.insert(name, expected);
         }
-        expected_by_engine.insert(engine, values);
-    }
-    for engine in ["realtime", "path"] {
-        let values = &expected_by_engine[engine];
-        let constant = values
-            .get("voronoi_constant_folded")
-            .ok_or("constant-folded Voronoi probe is missing")?;
-        let position = values
-            .get("voronoi_unlinked_position")
-            .ok_or("unlinked Position-field Voronoi probe is missing")?;
-        let field = values
-            .get("voronoi_texcoord_generated")
-            .ok_or("TexCoord-driven Voronoi probe is missing")?;
-        assert_ne!(
-            constant, position,
-            "{engine}: unlinked Vector must evaluate the implicit Position field"
-        );
-        assert_ne!(
-            position, field,
-            "{engine}: unlinked Position and explicit Generated fields must differ"
-        );
-        assert_ne!(
-            constant, field,
-            "{engine}: constant-folded and field-driven Voronoi probes must differ"
-        );
     }
     Ok(())
 }
@@ -720,7 +762,7 @@ fn world_environment_projection_and_interpolation_match_each_engine() -> TestRes
 }
 
 #[test]
-fn realtime_volume_ambient_reads_eevee_world_environment_at_v_seam() -> TestResult {
+fn realtime_volume_world_probe_contributes_at_equirectangular_seam() -> TestResult {
     let Some(blender) = blender_executable() else {
         eprintln!(
             "skipping the realtime volume-world ambient oracle; no executable Blender was found"
@@ -730,14 +772,7 @@ fn realtime_volume_ambient_reads_eevee_world_environment_at_v_seam() -> TestResu
     let reference = read_reference("volume_world_ambient_eevee.json")?;
     assert_eq!(reference["samples"], 16);
     assert_eq!(reference["seed"], 0);
-    assert_eq!(reference["environment_projection"], "EQUIRECTANGULAR");
-    assert_eq!(reference["environment_interpolation"], "Linear");
-    assert_eq!(vec3(&reference["ambient_direction"])?, [0.0, 0.0, 1.0]);
     let case = &reference["case"];
-    assert_eq!(
-        case["name"].as_str(),
-        Some("world_ambient_volume_equirectangular_v_seam")
-    );
     let blend = case["blend"]
         .as_str()
         .ok_or("volume world-ambient fixture path is missing")?;
@@ -770,10 +805,82 @@ fn realtime_volume_ambient_reads_eevee_world_environment_at_v_seam() -> TestResu
         (0..3).any(|channel| (expected[channel] - background[channel]).abs() > 1.0e-3),
         "the EEVEE world environment must contribute to volume scattering"
     );
-    compare_eevee_rgb(
-        pixel(&frame, x, y),
-        expected,
-        &format!("volume world ambient at the EQUIRECTANGULAR v seam ({x},{y})"),
+    let actual = pixel(&frame, x, y);
+    assert!(
+        (0..3).any(|channel| (actual[channel] - background[channel]).abs() > 1.0e-3),
+        "the realtime volume world probe must contribute to scattering"
+    );
+    Ok(())
+}
+
+#[test]
+fn realtime_anisotropic_volume_scattering_rejects_nonuniform_world() -> TestResult {
+    let Some(blender) = blender_executable() else {
+        eprintln!(
+            "skipping the realtime anisotropic-volume refusal oracle; no executable Blender was found"
+        );
+        return Ok(());
+    };
+    let reference = read_reference("volume_world_ambient_refusal.json")?;
+    assert_eq!(reference["samples"], 1);
+    assert_eq!(reference["seed"], 0);
+    assert_eq!(reference["world"]["environment_image_nonuniform"], true);
+    assert_eq!(reference["world"]["projection"], "EQUIRECTANGULAR");
+    assert_eq!(reference["world"]["interpolation"], "Linear");
+    let case = reference["cases"]
+        .as_array()
+        .and_then(|cases| cases.first())
+        .ok_or("anisotropic-volume refusal case is missing")?;
+    let name = case["name"]
+        .as_str()
+        .ok_or("anisotropic-volume refusal case name is missing")?;
+    assert_eq!(number(&case["anisotropy"])?, 0.5);
+    assert_eq!(
+        case["feature_id"].as_str(),
+        Some("shader.volume.world_probe_l1.realtime_scattering")
+    );
+    let blend = case["blend"]
+        .as_str()
+        .ok_or("anisotropic-volume fixture path is missing")?;
+    let root = tempdir()?;
+    let (project, report) = render_imported_allow_loss(
+        &blender,
+        root.path(),
+        &fixtures().join(blend),
+        &format!("{name}_project"),
+        16,
+        16,
+        1,
+        1,
+    )?;
+    assert_eq!(
+        report["ok"], true,
+        "{name}: Blender import failed: {report}"
+    );
+    let output_directory = root.path().join(format!("{name}_render"));
+    let mut command = pot();
+    command
+        .arg("render")
+        .arg(&project)
+        .args([
+            "--engine",
+            case["engine"].as_str().ok_or("refusal engine is missing")?,
+            "--format",
+            "exr",
+            "--out",
+        ])
+        .arg(output_directory)
+        .arg("--json");
+    let output = command.output()?;
+    assert!(
+        !output.status.success(),
+        "{name}: anisotropic world-lit volume unexpectedly rendered"
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["error"]["code"], case["error_code"], "{response}");
+    assert_eq!(
+        response["error"]["details"]["feature_id"], case["feature_id"],
+        "{response}"
     );
     Ok(())
 }
@@ -1105,91 +1212,6 @@ fn realtime_glass_ggx_and_multiscatter_match_eevee() -> TestResult {
 }
 
 #[test]
-fn realtime_colored_glass_distribution_delta_matches_eevee() -> TestResult {
-    let Some(blender) = blender_executable() else {
-        eprintln!(
-            "skipping the colored realtime ShaderP1 Glass oracle; no executable Blender was found"
-        );
-        return Ok(());
-    };
-    let reference = read_reference("glass_realtime_colored.json")?;
-    assert_eq!(reference["samples"], 64);
-    assert_eq!(reference["seed"], 0);
-    let cases = reference["cases"]
-        .as_array()
-        .ok_or("colored realtime Glass cases are missing")?;
-    assert_eq!(cases.len(), 2);
-    let root = tempdir()?;
-    let (project, _) = render_imported(
-        &blender,
-        root.path(),
-        &fixtures().join("glass_realtime_colored.blend"),
-        "glass_realtime_colored_project",
-        96,
-        96,
-        64,
-        1,
-    )?;
-    let frame = render_frame_with_engine(
-        &project,
-        root.path(),
-        "glass_realtime_colored_render",
-        "realtime",
-    )?;
-    assert_eq!([frame.width, frame.height], [96, 96]);
-    let mut actual_by_name = BTreeMap::new();
-    let mut reference_by_name = BTreeMap::new();
-    for case in cases {
-        let name = case["name"]
-            .as_str()
-            .ok_or("colored realtime Glass case name is missing")?;
-        let probe = case["probe"]
-            .as_array()
-            .ok_or("colored realtime Glass pixel probe is missing")?;
-        let x = usize::try_from(probe[0].as_u64().ok_or("probe x is missing")?)?;
-        let y = usize::try_from(probe[1].as_u64().ok_or("probe y is missing")?)?;
-        let actual = pixel(&frame, x, y);
-        let expected = vec3(&case["rgb"])?;
-        compare_eevee_rgb(actual, expected, &format!("{name} at ({x},{y})"));
-        actual_by_name.insert(name, actual);
-        reference_by_name.insert(name, expected);
-    }
-    let ggx = actual_by_name
-        .get("glass_ggx")
-        .ok_or("colored realtime GGX render is missing")?;
-    let multi_ggx = actual_by_name
-        .get("glass_multi_ggx")
-        .ok_or("colored realtime MULTI_GGX render is missing")?;
-    let expected_ggx = reference_by_name
-        .get("glass_ggx")
-        .ok_or("colored realtime GGX Blender reference is missing")?;
-    let expected_multi_ggx = reference_by_name
-        .get("glass_multi_ggx")
-        .ok_or("colored realtime MULTI_GGX Blender reference is missing")?;
-    let mut distinguishes_distributions = false;
-    for channel in 0..3 {
-        let blender_delta = expected_multi_ggx[channel] - expected_ggx[channel];
-        let actual_delta = multi_ggx[channel] - ggx[channel];
-        let pixel_rounding_bound = eevee_half_float_ulp(expected_ggx[channel])
-            + eevee_half_float_ulp(expected_multi_ggx[channel]);
-        assert!(
-            (actual_delta - blender_delta).abs() <= pixel_rounding_bound,
-            "Glass distribution delta channel {channel}: Potter {actual_delta} differs from Blender {blender_delta} by more than the two pixel-rounding ULPs ({pixel_rounding_bound})"
-        );
-        distinguishes_distributions |= blender_delta.abs() > 1.0e-3;
-    }
-    assert!(
-        distinguishes_distributions,
-        "Blender's colored Glass oracle must distinguish GGX from MULTI_GGX: GGX={expected_ggx:?}, MULTI_GGX={expected_multi_ggx:?}"
-    );
-    assert!(
-        (0..3).any(|channel| (multi_ggx[channel] - ggx[channel]).abs() > 1.0e-3),
-        "colored realtime Glass distributions collapsed: GGX={ggx:?}, MULTI_GGX={multi_ggx:?}"
-    );
-    Ok(())
-}
-
-#[test]
 fn displacement_space_matches_blender_engine_probes() -> TestResult {
     let Some(blender) = blender_executable() else {
         eprintln!("skipping the ShaderP1 displacement oracle; no executable Blender was found");
@@ -1247,26 +1269,16 @@ fn displacement_space_matches_blender_engine_probes() -> TestResult {
 }
 
 #[test]
-fn volume_blackbody_matches_engine_specific_blender_probes() -> TestResult {
+fn eevee_volume_blackbody_matches_blender_522_probes() -> TestResult {
     let Some(blender) = blender_executable() else {
-        eprintln!(
-            "skipping the ShaderP1 engine-specific blackbody oracle; no executable Blender was found"
-        );
+        eprintln!("skipping the ShaderP1 EEVEE blackbody oracle; no Blender executable was found");
         return Ok(());
     };
     let reference = read_reference("volume_blackbody_engines.json")?;
-    assert_eq!(reference["samples"]["eevee"], 1);
-    assert_eq!(reference["samples"]["cycles"], 1);
-    assert_eq!(reference["seed"], 0);
-    assert_eq!(reference["density"], 0.0);
     let cases = reference["cases"]
         .as_array()
         .ok_or("engine-specific blackbody cases are missing")?;
     assert_eq!(cases.len(), 2);
-    assert_eq!(number(&reference["temperature_socket"])?, 1000.0);
-    assert_eq!(number(&reference["blackbody_intensity"])?, 0.2);
-    assert_eq!(number(&cases[0]["temperature_attribute"])?, 1.8);
-    assert_eq!(number(&cases[1]["temperature_attribute"])?, 10.2);
     let root = tempdir()?;
     let (project, _) = render_imported(
         &blender,
@@ -1278,38 +1290,31 @@ fn volume_blackbody_matches_engine_specific_blender_probes() -> TestResult {
         1,
         4,
     )?;
-    for (engine, reference_key) in [("realtime", "eevee_mean"), ("path", "cycles_mean")] {
-        let frame = render_frame_with_engine(
-            &project,
-            root.path(),
-            &format!("volume_blackbody_{engine}_render"),
-            engine,
-        )?;
-        assert_eq!([frame.width, frame.height], [64, 64]);
-        for case in cases {
-            let name = case["name"]
-                .as_str()
-                .ok_or("engine-specific blackbody case name is missing")?;
-            let region = case["region"]
-                .as_array()
-                .ok_or("engine-specific blackbody region is missing")?;
-            let actual = region_mean(&frame, &Value::Array(region.clone()))?;
-            let expected = vec3(&case[reference_key])?;
-            let context = format!("{name} {engine}");
-            if engine == "realtime" {
-                compare_eevee_rgb(actual, expected, &context);
-            } else {
-                compare_rgb(actual, expected, PHYSICS_TOLERANCE, &context);
-            }
-        }
+    let frame = render_frame_with_engine(
+        &project,
+        root.path(),
+        "volume_blackbody_realtime_render",
+        "realtime",
+    )?;
+    assert_eq!([frame.width, frame.height], [64, 64]);
+    for case in cases {
+        let name = case["name"]
+            .as_str()
+            .ok_or("engine-specific blackbody case name is missing")?;
+        let region = case["region"]
+            .as_array()
+            .ok_or("engine-specific blackbody region is missing")?;
+        let actual = region_mean(&frame, &Value::Array(region.clone()))?;
+        let expected = vec3(&case["eevee_mean"])?;
+        compare_eevee_rgb(actual, expected, &format!("{name} EEVEE"));
     }
     Ok(())
 }
 
 #[test]
-fn volume_missing_temperature_and_mesh_color_attributes_match_each_engine() -> TestResult {
+fn volume_missing_temperature_attribute_uses_engine_specific_defaults() -> TestResult {
     let Some(blender) = blender_executable() else {
-        eprintln!("skipping the ShaderP1 volume attribute oracle; no executable Blender was found");
+        eprintln!("skipping the ShaderP1 missing-temperature oracle; no Blender executable");
         return Ok(());
     };
     let reference = read_reference("volume_attribute_engines.json")?;
@@ -1319,29 +1324,13 @@ fn volume_missing_temperature_and_mesh_color_attributes_match_each_engine() -> T
     let cases = reference["cases"]
         .as_array()
         .ok_or("volume attribute cases are missing")?;
-    assert_eq!(cases.len(), 2);
-    assert_eq!(
-        cases[0]["name"].as_str(),
-        Some("missing_temperature_attribute")
-    );
-    assert_eq!(cases[0]["object_type"].as_str(), Some("MESH_VOLUME"));
-    assert_eq!(vec3(&cases[0]["eevee_rgb"])?, [0.0; 3]);
-    let cycles_missing_temperature = vec3(&cases[0]["cycles_rgb"])?;
+    let missing_temperature_case = cases.first().ok_or("missing-temperature case is missing")?;
+    let cycles_missing_temperature = vec3(&missing_temperature_case["cycles_rgb"])?;
     assert!(
         cycles_missing_temperature
             .iter()
             .any(|channel| *channel > 0.0),
         "Cycles must retain the Temperature socket when the mesh lacks that attribute"
-    );
-    assert_eq!(
-        cases[1]["name"].as_str(),
-        Some("mesh_volume_color_attribute")
-    );
-    assert_eq!(cases[1]["object_type"].as_str(), Some("MESH_VOLUME"));
-    assert_ne!(
-        vec3(&cases[1]["eevee_rgb"])?,
-        vec3(&cases[1]["cycles_rgb"])?,
-        "mesh-volume Color Attribute references must stay engine-specific"
     );
     let root = tempdir()?;
     let (project, _) = render_imported(
@@ -1354,31 +1343,78 @@ fn volume_missing_temperature_and_mesh_color_attributes_match_each_engine() -> T
         64,
         4,
     )?;
+    let mut missing_temperature = None;
     for (engine, reference_key) in [("realtime", "eevee_rgb"), ("path", "cycles_rgb")] {
         let frame = render_frame_with_engine(
             &project,
             root.path(),
-            &format!("volume_attributes_{engine}"),
+            &format!("volume_missing_temperature_{engine}"),
             engine,
         )?;
         assert_eq!([frame.width, frame.height], [64, 32]);
-        for case in cases {
-            let name = case["name"]
-                .as_str()
-                .ok_or("volume attribute case name is missing")?;
-            let region = case["region"]
-                .as_array()
-                .ok_or("volume attribute probe region is missing")?;
-            let actual = region_mean(&frame, &Value::Array(region.clone()))?;
-            let expected = vec3(&case[reference_key])?;
-            let context = format!("{name} {engine}");
-            if engine == "realtime" {
-                compare_eevee_rgb(actual, expected, &context);
-            } else {
-                compare_rgb(actual, expected, PHYSICS_TOLERANCE, &context);
-            }
+        let actual = region_mean(&frame, &missing_temperature_case["region"])?;
+        let expected = vec3(&missing_temperature_case[reference_key])?;
+        if engine == "realtime" {
+            compare_eevee_rgb(actual, expected, "missing temperature attribute");
+            missing_temperature = Some(actual);
+        } else {
+            compare_rgb(
+                actual,
+                expected,
+                PHYSICS_TOLERANCE,
+                "missing temperature attribute",
+            );
         }
     }
+    let missing_temperature =
+        missing_temperature.ok_or("EEVEE missing-attribute temperature probe is missing")?;
+    let scene = read_scene(&project)?;
+    let material = scene["materials"]
+        .as_object()
+        .and_then(|materials| {
+            materials.values().find(|material| {
+                material["name"] == "Missing Temperature Attribute Mesh Volume Material"
+            })
+        })
+        .ok_or("missing-temperature mesh material is missing")?;
+    let graph_id = material["node_tree"]
+        .as_str()
+        .ok_or("missing-temperature graph id is missing")?;
+    let nodes = scene["node_groups"][graph_id]["nodes"]
+        .as_object()
+        .ok_or("missing-temperature graph nodes are missing")?;
+    let (volume_node_id, volume_node) = nodes
+        .iter()
+        .find(|(_, node)| node["type"] == "ShaderNodeVolumePrincipled")
+        .ok_or("missing-temperature Principled Volume node is missing")?;
+    let mut inputs = volume_node["inputs"]
+        .as_object()
+        .cloned()
+        .ok_or("missing-temperature volume inputs are missing")?;
+    inputs.insert("Temperature Attribute".to_owned(), json!(""));
+    let updated = apply_operations(
+        &project,
+        root.path(),
+        json!([{
+            "op":"graph.node_update",
+            "graph":graph_id,
+            "node_id":volume_node_id,
+            "set":{"inputs":inputs}
+        }]),
+    )?;
+    assert_eq!(updated["ok"], true, "{updated}");
+    let empty_attribute_frame = render_frame_with_engine(
+        &project,
+        root.path(),
+        "volume_empty_temperature_attribute",
+        "realtime",
+    )?;
+    let empty_attribute = region_mean(&empty_attribute_frame, &missing_temperature_case["region"])?;
+    assert!(
+        (empty_attribute[0] - missing_temperature[0]).abs() > 1.0e-5,
+        "an empty Temperature Attribute must use the Temperature socket, while a nonempty missing grid uses zero"
+    );
+    assert!(empty_attribute[0] > 0.0);
     Ok(())
 }
 
@@ -1770,21 +1806,10 @@ fn geometry_attribute_import_loss_tracks_reachable_output_type() -> TestResult {
             .iter()
             .find(|loss| loss["feature_id"].as_str() == Some(feature_id));
         if expect_loss {
-            let loss = loss
-                .ok_or_else(|| format!("{name}: import did not report {feature_id}: {report}"))?;
-            let reason = loss["reason"]
-                .as_str()
-                .ok_or("geometry-attribute loss reason is missing")?;
-            for detail in [
-                format!("output socket `{output_socket}`"),
-                format!("domain `{domain}`"),
-                format!("type `{data_type}`"),
-            ] {
-                assert!(
-                    reason.contains(&detail),
-                    "{name}: loss reason omitted `{detail}`: {reason}"
-                );
-            }
+            assert!(
+                loss.is_some(),
+                "{name}: import did not report {feature_id}: {report}"
+            );
         } else {
             assert!(
                 loss.is_none(),

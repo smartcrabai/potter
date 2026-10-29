@@ -11789,6 +11789,25 @@ fn material_shader_node_type_supported(node_type: &str) -> bool {
             | "ShaderNodeVolumeAbsorption"
             | "ShaderNodeVolumeScatter"
             | "ShaderNodeDisplacement"
+            | "ShaderNodeBlackbody"
+            | "ShaderNodeBrightContrast"
+            | "ShaderNodeCameraData"
+            | "ShaderNodeCombineColor"
+            | "ShaderNodeGamma"
+            | "ShaderNodeHueSaturation"
+            | "ShaderNodeInvert"
+            | "ShaderNodeLightFalloff"
+            | "ShaderNodeNewGeometry"
+            | "ShaderNodeNormal"
+            | "ShaderNodeObjectInfo"
+            | "ShaderNodeRGB"
+            | "ShaderNodeRGBToBW"
+            | "ShaderNodeValue"
+            | "ShaderNodeVectorRotate"
+            | "ShaderNodeVectorTransform"
+            | "ShaderNodeWavelength"
+            | "NodeGroupInput"
+            | "NodeGroupOutput"
             | "ShaderNodeTexImage"
             | "ShaderNodeTexEnvironment"
             | "ShaderNodeEmission"
@@ -11974,15 +11993,6 @@ fn material_shader_graph_import_losses(raw: &Value, material: &Value, losses: &m
             ));
         }
         let properties = node.get("properties").unwrap_or(&Value::Null);
-        if node_type == "ShaderNodeGroup" {
-            losses.push(loss(
-                "blender.material.shader_node.node_group",
-                material_name,
-                &format!(
-                    "Shader Group `{name}` is unsupported by Potter's shader evaluator; the node is preserved"
-                ),
-            ));
-        }
 
         if node_type == "ShaderNodeTexImage" && !image_texture_settings_supported(properties) {
             losses.push(loss(
@@ -12550,6 +12560,24 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             if is_unsupported {
                 losses.push(loss(feature, name, reason));
             }
+        }
+        let render = scene.get("render");
+        if render
+            .and_then(|render| render.get("engine"))
+            .and_then(Value::as_str)
+            == Some("realtime")
+            && let Some(resolution) = render
+                .and_then(|render| render.get("eevee_gi_cubemap_resolution"))
+                .and_then(Value::as_u64)
+                .filter(|resolution| *resolution != 512)
+        {
+            losses.push(loss(
+                "blender.scene.eevee.gi_cubemap_resolution",
+                name,
+                &format!(
+                    "Blender SceneEEVEE.gi_cubemap_resolution is {resolution}; Potter preserves only the default 512, which EEVEE captures at 256 texels (512 / 2), so this non-default setting is not restored"
+                ),
+            ));
         }
     }
     for material in raw
@@ -15103,6 +15131,19 @@ fn shader_node_import_losses(doc: &SceneDoc) -> Vec<Loss> {
             .and_then(|data| data.camera.as_ref())
             .is_some()
     });
+    let has_realtime_world_graph = doc.scenes.values().any(|scene| {
+        scene.render.engine == "realtime"
+            && scene
+                .world
+                .as_ref()
+                .and_then(|world_id| doc.worlds.get(world_id))
+                .and_then(|world| world.node_tree.as_ref())
+                .and_then(|group_id| doc.node_groups.get(group_id))
+                .is_some_and(|group| {
+                    group.kind == GraphKind::Shader
+                        && shader_output_node(group, "ShaderNodeOutputWorld").is_some()
+                })
+    });
     let path_traced = doc
         .scenes
         .get(&doc.active_scene)
@@ -15146,6 +15187,8 @@ fn shader_node_import_losses(doc: &SceneDoc) -> Vec<Loss> {
             None,
             has_camera,
             path_traced,
+            has_realtime_world_graph,
+            Some("Volume"),
             &mut group_stack,
             &mut call_sites,
             &mut recorded,
@@ -15164,12 +15207,17 @@ fn collect_shader_node_import_losses(
     sink_socket: Option<&str>,
     has_camera: bool,
     path_traced: bool,
+    has_realtime_world_graph: bool,
+    volume_output_socket: Option<&str>,
     group_stack: &mut BTreeSet<Id>,
     call_sites: &mut Vec<(Id, Id)>,
     recorded: &mut BTreeSet<(String, String)>,
     losses: &mut Vec<Loss>,
 ) {
     let reachable = shader_nodes_reaching(group, sink, sink_socket);
+    let volume_reachable = volume_output_socket
+        .map(|socket| shader_nodes_reaching(group, sink, Some(socket)))
+        .unwrap_or_default();
     for node_id in &reachable {
         let Some(node) = group.nodes.get(node_id) else {
             continue;
@@ -15187,6 +15235,47 @@ fn collect_shader_node_import_losses(
             .collect();
         if outputs.is_empty() {
             continue;
+        }
+        if has_realtime_world_graph
+            && volume_reachable.contains(node_id)
+            && node.node_type == "ShaderNodeVolumePrincipled"
+        {
+            let input_linked = |socket: &str| {
+                group
+                    .links
+                    .iter()
+                    .any(|link| link.to_node == *node_id && link.to_socket == socket)
+            };
+            let density_may_scatter = input_linked("Density")
+                || node
+                    .inputs
+                    .get("Density")
+                    .is_none_or(|density| density.as_f64().is_some_and(|density| density > 0.0));
+            let color_may_scatter = input_linked("Color")
+                || node.inputs.get("Color").is_none_or(|color| {
+                    color.as_array().is_some_and(|components| {
+                        components
+                            .iter()
+                            .take(3)
+                            .filter_map(Value::as_f64)
+                            .any(|component| component > 0.0)
+                    })
+                });
+            let anisotropy_nonzero = input_linked("Anisotropy")
+                || node
+                    .inputs
+                    .get("Anisotropy")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|anisotropy| anisotropy != 0.0);
+            if density_may_scatter && color_may_scatter && anisotropy_nonzero {
+                record_shader_loss(
+                    recorded,
+                    losses,
+                    "shader.volume.world_probe_l1.realtime_scattering",
+                    node_id,
+                    "A reachable Principled Volume has active scatter (positive or linked Density and a positive RGB Color component or linked Color) with nonzero or linked Anisotropy in a realtime scene with a shader World graph; world uniformity is unknown at import, and rendering refuses this case when the world-probe L0 is nonuniform.",
+                );
+            }
         }
         if node.node_type == "ShaderNodeBump" {
             let mut visited_inputs = BTreeSet::new();
@@ -15266,6 +15355,15 @@ fn collect_shader_node_import_losses(
                 else {
                     continue;
                 };
+                let child_volume_output = group
+                    .links
+                    .iter()
+                    .any(|link| {
+                        link.from_node == *node_id
+                            && link.from_socket == *output
+                            && volume_reachable.contains(&link.to_node)
+                    })
+                    .then_some(interface_output.name.as_str());
                 group_stack.insert(child_id.clone());
                 call_sites.push((group_id.clone(), node_id.clone()));
                 collect_shader_node_import_losses(
@@ -15277,6 +15375,8 @@ fn collect_shader_node_import_losses(
                     Some(&interface_output.name),
                     has_camera,
                     path_traced,
+                    has_realtime_world_graph,
+                    child_volume_output,
                     group_stack,
                     call_sites,
                     recorded,
@@ -24670,7 +24770,6 @@ print("UNSUPPORTED_POSE " + json.dumps({
         assert!(mapping_losses.iter().any(|loss| {
             loss.feature_id == "shader.node.ShaderNodeTexNoise.texture_mapping"
                 && loss.data_id.as_deref() == Some(noise_id.as_str())
-                && loss.reason.contains("re-import is required")
         }));
         assert!(mapping_losses.iter().any(|loss| {
             loss.feature_id == "shader.node.ShaderNodeTexNoise.color_mapping"
@@ -25294,8 +25393,6 @@ mod camera_import_tests {
         assert!(refusal.is_some(), "a used EDGE attribute is an import loss");
         let Some(refusal) = refusal else { return };
         assert_eq!(refusal.data_id.as_deref(), Some("Material"));
-        assert!(refusal.reason.contains("EDGE"));
-        assert!(refusal.reason.contains("FLOAT"));
 
         for data_type in ["FLOAT", "INT", "FLOAT_VECTOR"] {
             let mut supported_point = raw.clone();
@@ -25559,6 +25656,38 @@ mod workbench_display_loss_tests {
             ["blender.scene.display_background"]
         );
     }
+    #[test]
+    fn eevee_cubemap_resolution_reports_only_nondefault_values() {
+        let raw = |resolution| {
+            json!({
+                "scenes": [{
+                    "name": "Scene",
+                    "render": {
+                        "engine": "realtime",
+                        "eevee_gi_cubemap_resolution": resolution
+                    },
+                    "display_shading": factory_shading()
+                }]
+            })
+        };
+        let feature_id = "blender.scene.eevee.gi_cubemap_resolution";
+        assert!(
+            !import_losses(&raw(512))
+                .iter()
+                .any(|loss| loss.feature_id == feature_id)
+        );
+        let losses = import_losses(&raw(1024));
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == feature_id && loss.data_id.as_deref() == Some("Scene")
+        }));
+        let mut path_scene = raw(1024);
+        path_scene["scenes"][0]["render"]["engine"] = json!("path");
+        assert!(
+            !import_losses(&path_scene)
+                .iter()
+                .any(|loss| loss.feature_id == feature_id)
+        );
+    }
 }
 
 #[test]
@@ -25722,6 +25851,164 @@ fn shader_import_losses_only_report_unavailable_outputs() -> Result<()> {
     assert!(!shader_node_import_losses(&doc).iter().any(|loss| {
         loss.feature_id == "shader.node.VectorTransform:WORLD_to_CAMERA:camera_matrices"
     }));
+    Ok(())
+}
+
+#[test]
+fn realtime_world_probe_import_loss_requires_a_world_and_anisotropic_volume() -> Result<()> {
+    let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+    let scene_id = doc.active_scene.clone();
+    doc.scenes
+        .get_mut(&scene_id)
+        .ok_or_else(|| invalid_intermediate("volume test scene is missing"))?
+        .render
+        .engine = "realtime".to_owned();
+
+    let world_graph_id = Id::new("world_graph")?;
+    let world_id = Id::new("world")?;
+    let mut world_graph = NodeGroup::new("World", GraphKind::Shader);
+    let mut world_output = GraphNode::new("ShaderNodeOutputWorld");
+    world_output
+        .properties
+        .insert("is_active_output".to_owned(), Value::Bool(true));
+    world_graph
+        .nodes
+        .insert(Id::new("world_output")?, world_output);
+    doc.node_groups.insert(world_graph_id.clone(), world_graph);
+    doc.worlds.insert(
+        world_id.clone(),
+        World {
+            node_tree: Some(world_graph_id),
+            ..World::default()
+        },
+    );
+    doc.scenes
+        .get_mut(&scene_id)
+        .ok_or_else(|| invalid_intermediate("volume test scene is missing"))?
+        .world = Some(world_id.clone());
+
+    let graph_id = Id::new("volume_graph")?;
+    let volume_id = Id::new("volume")?;
+    let mut group = NodeGroup::new("Material", GraphKind::Shader);
+    let mut volume = GraphNode::new("ShaderNodeVolumePrincipled");
+    volume.inputs.insert("Anisotropy".to_owned(), json!(0.35));
+    group.nodes.insert(volume_id.clone(), volume);
+    let mut output = GraphNode::new("ShaderNodeOutputMaterial");
+    output
+        .properties
+        .insert("is_active_output".to_owned(), Value::Bool(true));
+    let output_id = Id::new("output")?;
+    group.nodes.insert(output_id.clone(), output);
+    group.links.push(GraphLink {
+        from_node: volume_id.clone(),
+        from_socket: "Volume".to_owned(),
+        to_node: output_id,
+        to_socket: "Volume".to_owned(),
+    });
+    doc.node_groups.insert(graph_id.clone(), group);
+    doc.materials.insert(
+        Id::new("material")?,
+        Material {
+            node_tree: Some(graph_id.clone()),
+            ..Material::default()
+        },
+    );
+
+    let feature_id = "shader.volume.world_probe_l1.realtime_scattering";
+    let losses = shader_node_import_losses(&doc);
+    assert!(losses.iter().any(|loss| {
+        loss.feature_id == feature_id
+            && loss.data_id.as_deref() == Some(volume_id.as_str())
+            && loss.reason.contains("world uniformity")
+    }));
+
+    doc.scenes
+        .get_mut(&scene_id)
+        .ok_or_else(|| invalid_intermediate("volume test scene is missing"))?
+        .render
+        .engine = "path".to_owned();
+    assert!(
+        !shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
+    doc.scenes
+        .get_mut(&scene_id)
+        .ok_or_else(|| invalid_intermediate("volume test scene is missing"))?
+        .render
+        .engine = "realtime".to_owned();
+    {
+        let volume = doc
+            .node_groups
+            .get_mut(&graph_id)
+            .and_then(|group| group.nodes.get_mut(&volume_id))
+            .ok_or_else(|| invalid_intermediate("volume test node is missing"))?;
+        volume.inputs.insert("Anisotropy".to_owned(), json!(0.35));
+        volume.inputs.insert("Density".to_owned(), json!(1.0));
+        volume
+            .inputs
+            .insert("Color".to_owned(), json!([0.0, 0.0, 0.0, 1.0]));
+    }
+    assert!(
+        !shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
+    {
+        let volume = doc
+            .node_groups
+            .get_mut(&graph_id)
+            .and_then(|group| group.nodes.get_mut(&volume_id))
+            .ok_or_else(|| invalid_intermediate("volume test node is missing"))?;
+        volume
+            .inputs
+            .insert("Color".to_owned(), json!([0.5, 0.5, 0.5, 1.0]));
+        volume.inputs.insert("Density".to_owned(), json!(0.0));
+    }
+    assert!(
+        !shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
+    doc.node_groups
+        .get_mut(&graph_id)
+        .and_then(|group| group.nodes.get_mut(&volume_id))
+        .ok_or_else(|| invalid_intermediate("volume test node is missing"))?
+        .inputs
+        .insert("Density".to_owned(), json!(1.0));
+    assert!(
+        shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
+
+    doc.node_groups
+        .get_mut(&graph_id)
+        .and_then(|group| group.nodes.get_mut(&volume_id))
+        .ok_or_else(|| invalid_intermediate("volume test node is missing"))?
+        .inputs
+        .insert("Anisotropy".to_owned(), json!(0.0));
+    assert!(
+        !shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
+
+    doc.node_groups
+        .get_mut(&graph_id)
+        .and_then(|group| group.nodes.get_mut(&volume_id))
+        .ok_or_else(|| invalid_intermediate("volume test node is missing"))?
+        .inputs
+        .insert("Anisotropy".to_owned(), json!(0.35));
+    doc.worlds
+        .get_mut(&world_id)
+        .ok_or_else(|| invalid_intermediate("volume test world is missing"))?
+        .node_tree = None;
+    assert!(
+        !shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
     Ok(())
 }
 

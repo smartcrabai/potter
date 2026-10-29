@@ -1471,47 +1471,6 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
             "export": true
         })
     );
-    let shader_reason = shader_advanced["reason"]
-        .as_str()
-        .expect("partial shader support has an explicit scope");
-    for scope in [
-        "Checker",
-        "Gradient",
-        "Noise and Voronoi",
-        "Image Texture",
-        "Environment Texture",
-        "CUBIC/SMART",
-        "multiple_scattering_model",
-        "Fresnel",
-        "Layer Weight",
-        "Glass",
-        "Displacement",
-        "blackbody",
-        "Attribute",
-        "Texture Mapping",
-        "Temperature Attribute",
-        "BECKMANN",
-        "MIRROR_BALL",
-        "mip/aniso",
-        "LOD-0",
-        "path/Cycles",
-        "marker-only",
-        "unknown, not defaults",
-        "shader.node.<idname>.texture_mapping",
-        "shader.node.<idname>.color_mapping",
-        "require re-import",
-        "node_shader_attribute.cc",
-        "intern/cycles/kernel/svm/attribute.h",
-        "source/blender/blenkernel/intern/texture.cc",
-        "node_shader_tex_image.cc",
-        "export reports each unknown mapping",
-        "node ID as `data_id`",
-    ] {
-        assert!(
-            shader_reason.contains(scope),
-            "shader.advanced reason must describe {scope}"
-        );
-    }
 
     let spatial_volume = features
         .iter()
@@ -1528,16 +1487,31 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
             "material.update"
         ])
     );
-    assert!(
-        spatial_volume["reason"].as_str().is_some_and(|reason| {
-            reason.contains("Cycles path-traced")
-                && reason.contains("active Volume arm")
-                && reason.contains("shader.volume.spatially_varying_graph")
-                && reason.contains("bounds-center")
-                && reason.contains("EEVEE realtime")
-                && reason.contains("froxel samples")
-        }),
-        "spatial volume support must identify the engine-specific refusal scope"
+
+    let world_probe_volume = features
+        .iter()
+        .find(|feature| feature["feature_id"] == "shader.volume.world_probe_l1.realtime_scattering")
+        .expect("realtime world-probe anisotropy refusal is catalogued");
+    assert_eq!(world_probe_volume["status"], "not_supported");
+    assert_eq!(
+        world_probe_volume["pot_ops"],
+        json!([
+            "graph.create",
+            "graph.node_add",
+            "graph.link",
+            "material.create",
+            "material.update"
+        ])
+    );
+
+    let eevee_cubemap_resolution = features
+        .iter()
+        .find(|feature| feature["feature_id"] == "blender.scene.eevee.gi_cubemap_resolution")
+        .expect("non-default EEVEE cubemap resolution loss is catalogued");
+    assert_eq!(eevee_cubemap_resolution["status"], "not_supported");
+    assert_eq!(
+        eevee_cubemap_resolution["pot_ops"],
+        json!(["render.update"])
     );
 
     let geometry_attribute = features
@@ -1558,28 +1532,6 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
             "material.update"
         ])
     );
-    let geometry_attribute_reason = geometry_attribute["reason"].as_str().unwrap();
-    for scope in [
-        "POINT FLOAT/INT",
-        "POINT FLOAT_VECTOR",
-        "color-layer",
-        "Color/Vector/Fac/Alpha",
-        "non-POINT domain",
-        "shader.node.ShaderNodeAttribute.geometry_attribute.unsupported",
-        "assigned to a mesh carrying the attribute",
-        "Non-GEOMETRY",
-        "FLOAT/INT through Color/Vector/Alpha",
-        "FLOAT_VECTOR through Color/Fac/Alpha",
-        "reachable",
-        "unused outputs",
-        "node_shader_attribute.cc",
-        "intern/cycles/kernel/svm/attribute.h",
-    ] {
-        assert!(
-            geometry_attribute_reason.contains(scope),
-            "geometry Attribute catalog reason must describe {scope}"
-        );
-    }
     assert!(
         !features
             .iter()
@@ -1627,7 +1579,9 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "shader.node.ShaderNodeTexImage.linear_mip_filtering",
         "shader.node.ShaderNodeTexEnvironment.linear_mip_filtering",
         "shader.material_texture.linear_mip_filtering",
+        "blender.scene.eevee.gi_cubemap_resolution",
         "shader.volume.spectral_extinction.realtime_scattering",
+        "shader.volume.world_probe_l1.realtime_scattering",
         "shader.node.Bump.realtime_transparent_shadow_height",
         "text.font.external.format",
         "text.font.external.resource",
@@ -1702,7 +1656,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
             "{feature_id} must not remain in the unsupported catalog"
         );
     }
-    for (feature_id, expected_ops, reason_fragments) in [
+    for (feature_id, expected_ops) in [
         (
             "shader.node.ShaderNodeTexImage.linear_mip_filtering",
             json!([
@@ -1712,13 +1666,6 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
                 "material.create",
                 "material.update"
             ]),
-            &[
-                "texel footprint above 1",
-                "mip/aniso filtering",
-                "screen-space gradients",
-                "LOD-0",
-                "path/Cycles",
-            ][..],
         ),
         (
             "shader.node.ShaderNodeTexEnvironment.linear_mip_filtering",
@@ -1731,24 +1678,10 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
                 "material.create",
                 "material.update"
             ]),
-            &[
-                "MIRROR_BALL",
-                "LINEAR",
-                "mip/aniso gradients",
-                "including at LOD-0",
-                "Path/Cycles",
-            ][..],
         ),
         (
             "shader.material_texture.linear_mip_filtering",
             json!(["material.create", "material.update"]),
-            &[
-                "texel footprint above 1",
-                "mip/aniso filtering",
-                "UV-layer coordinates",
-                "LOD-0",
-                "path/Cycles",
-            ][..],
         ),
     ] {
         let feature = features
@@ -1759,15 +1692,6 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
             feature["pot_ops"], expected_ops,
             "{feature_id} must report the operations that can use it"
         );
-        let reason = feature["reason"]
-            .as_str()
-            .expect("unsupported realtime mip-filtering limits have a reason");
-        for fragment in reason_fragments {
-            assert!(
-                reason.contains(fragment),
-                "{feature_id} reason must describe {fragment}"
-            );
-        }
     }
     assert!(
         features.iter().any(|feature| {

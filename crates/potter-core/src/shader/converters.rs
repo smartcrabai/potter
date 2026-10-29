@@ -277,9 +277,10 @@ fn eevee_spectrum_sample(
     maximum: f32,
     table: &EeveeSpectrumTable,
 ) -> [f32; 3] {
-    let coordinate =
-        ((value - minimum) / (maximum - minimum)).clamp(0.0, 1.0) * EEVEE_SPECTRUM_TEXELS as f32;
-    let coordinate = coordinate.clamp(0.0, (EEVEE_SPECTRUM_TEXELS - 1) as f32);
+    let coordinate = (((value - minimum) / (maximum - minimum)).clamp(0.0, 1.0)
+        * EEVEE_SPECTRUM_TEXELS as f32
+        - 0.5)
+        .clamp(0.0, (EEVEE_SPECTRUM_TEXELS - 1) as f32);
     let index = coordinate as usize;
     let fraction = coordinate - index as f32;
     let first = table[index];
@@ -396,4 +397,29 @@ fn hsl_to_rgb([hue, saturation, lightness]: [f32; 3]) -> [f32; 3] {
 
 fn fract(value: f32) -> f32 {
     value - value.floor()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eevee_blackbody_rgb;
+
+    #[test]
+    fn eevee_blackbody_lookup_matches_blender_522_temperature_samples() {
+        let samples = [
+            (1800.0, [2.802_176_5, 0.567_417_7, 0.0]),
+            (3200.0, [1.688_616, 0.863_839_27, 0.320_033_5]),
+        ];
+        for (temperature, expected) in samples {
+            for (channel, (actual, expected)) in eevee_blackbody_rgb(temperature)
+                .into_iter()
+                .zip(expected)
+                .enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 2.0e-6,
+                    "{temperature} K channel {channel}: {actual} != {expected}"
+                );
+            }
+        }
+    }
 }

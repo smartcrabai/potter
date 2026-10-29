@@ -342,24 +342,13 @@ impl<'a> WorldEvaluator<'a> {
                 } else {
                     [ImageExtension::Repeat, ImageExtension::Extend]
                 };
-                let color = if !self.path_traced && image.udim {
-                    crate::image::sampling::sample_with_extension_alpha_first_tile_axes(
-                        image,
-                        uv,
-                        interpolation,
-                        extensions,
-                        false,
-                    )
-                } else {
-                    crate::image::sampling::sample_with_extension_alpha_axes(
-                        image,
-                        uv,
-                        false,
-                        interpolation,
-                        extensions,
-                        false,
-                    )
-                };
+                let color = crate::shader::texture::sample_environment_texture(
+                    image,
+                    uv,
+                    interpolation,
+                    extensions,
+                    self.path_traced,
+                );
                 Ok(WorldValue::Color(color))
             }
             "ShaderNodeTexCoord" => match socket {
@@ -667,16 +656,34 @@ pub(crate) fn environment_texture_uv(
             Ok(equirectangular(direction))
         }
         Some(JsonValue::String(projection)) if projection.eq_ignore_ascii_case("MIRROR_BALL") => {
-            let mut direction = direction.normalize_or_zero();
-            direction.y -= 1.0;
-            let divisor = 2.0 * (-0.5 * direction.y).max(0.0).sqrt();
-            if divisor > 0.0 {
-                direction /= divisor;
+            if path_traced {
+                let mut direction = direction.normalize_or_zero();
+                direction.y -= 1.0;
+                let divisor = 2.0 * (-0.5 * direction.y).max(0.0).sqrt();
+                if divisor > 0.0 {
+                    direction /= divisor;
+                }
+                Ok([
+                    f64::midpoint(direction.x, 1.0),
+                    f64::midpoint(direction.z, 1.0),
+                ])
+            } else {
+                let vector =
+                    glam::Vec3::new(direction.x as f32, direction.y as f32, direction.z as f32);
+                // EEVEE's vector_math_safe_normalize uses this squared-length cutoff.
+                let mut direction = if vector.dot(vector) > 1.0e-35_f32 {
+                    vector.normalize()
+                } else {
+                    glam::Vec3::ZERO
+                };
+                direction.y -= 1.0;
+                let divisor = 2.0 * (-0.5 * direction.y).max(0.0).sqrt();
+                direction /= divisor.max(1.0e-8);
+                Ok([
+                    f64::from(0.5 * direction.x + 0.5),
+                    f64::from(0.5 * direction.z + 0.5),
+                ])
             }
-            Ok([
-                f64::midpoint(direction.x, 1.0),
-                f64::midpoint(direction.z, 1.0),
-            ])
         }
         Some(projection) => Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
@@ -712,6 +719,23 @@ mod tests {
             eevee_equirectangular_uv(DVec3::new(tiny, 1.0, 0.0)),
             [0.0; 2]
         );
+    }
+    #[test]
+    fn mirror_ball_uses_eevee_safe_normalize_cutoff() -> Result<()> {
+        let mut node = GraphNode::new("ShaderNodeTexEnvironment");
+        node.properties
+            .insert("projection".to_owned(), json!("MIRROR_BALL"));
+        let id = Id::new("mirror_ball")?;
+        let below =
+            environment_texture_uv(&id, &node, DVec3::new(1.0e-18, 0.0, 0.0), DVec3::Z, false)?;
+        let above =
+            environment_texture_uv(&id, &node, DVec3::new(1.0e-17, 0.0, 0.0), DVec3::Z, false)?;
+
+        assert!((below[0] - 0.5).abs() <= f64::EPSILON);
+        assert!((below[1] - 0.5).abs() <= f64::EPSILON);
+        assert!((above[0] - 0.853_553_390_593_273_7).abs() <= 1.0e-7);
+        assert!((above[1] - 0.5).abs() <= f64::EPSILON);
+        Ok(())
     }
 
     /// Blender 5.2.2's environment colours (`tests/fixtures/repeat_edge/generate_world_env_oracle.py`): 256 ray directions
