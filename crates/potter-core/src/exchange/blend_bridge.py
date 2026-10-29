@@ -420,8 +420,6 @@ def rna_props(block, omit=()):
         else:
             result[key] = plain(val)
     return result
-
-
 def _curve_profile_params(profile):
     """Capture Blender 5.2.2 CurveProfile points, including RNA-hidden handle coordinates."""
     handle_types = {"ALIGN": "ALIGNED"}

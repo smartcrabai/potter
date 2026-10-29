@@ -13,6 +13,9 @@ use crate::{
     image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
     model::{Id, Material, Registry, TextureRef, ThicknessMode},
 };
+use super::texture_procedural_kernels::{
+    self as procedural_texture, WaveBandsDirection, WaveProfile, WaveRingsDirection, WaveType,
+};
 
 /// Blender's Principled "Specular IOR Level" default: `SOCKET_IN_FLOAT(specular_ior_level,
 /// "Specular IOR Level", 0.5f)` in `intern/cycles/scene/shader_nodes.cpp`, `PrincipledBsdfNode`.
@@ -1364,6 +1367,11 @@ enum NodeKind {
     Noise,
     Voronoi,
     Gradient,
+    Wave,
+    Magic,
+    Brick,
+    WhiteNoise,
+    Gabor,
     ColorRamp,
     MixRgb,
     Math,
@@ -1428,6 +1436,11 @@ impl NodeKind {
             "ShaderNodeTexNoise" => Self::Noise,
             "ShaderNodeTexVoronoi" => Self::Voronoi,
             "ShaderNodeTexGradient" => Self::Gradient,
+            "ShaderNodeTexWave" => Self::Wave,
+            "ShaderNodeTexMagic" => Self::Magic,
+            "ShaderNodeTexBrick" => Self::Brick,
+            "ShaderNodeTexWhiteNoise" => Self::WhiteNoise,
+            "ShaderNodeTexGabor" => Self::Gabor,
             "ShaderNodeValToRGB" => Self::ColorRamp,
             "ShaderNodeMixRGB" | "ShaderNodeMix" => Self::MixRgb,
             "ShaderNodeMath" => Self::Math,
@@ -1747,10 +1760,10 @@ impl PreparedMaterial {
             .nodes
             .iter()
             .filter_map(|(id, node)| {
-                let has_mapping = node.properties.contains_key("texture_mapping")
-                    || node.properties.contains_key("color_mapping");
-                let unsupported = has_mapping
-                    && !crate::shader::texture::texture_node_mapping_is_default(&node.properties);
+                let unsupported = !crate::shader::texture::texture_node_mapping_is_default_for_node(
+                    &node.node_type,
+                    &node.properties,
+                );
                 unsupported.then(|| id.clone())
             })
             .collect();
@@ -2429,6 +2442,26 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             NodeKind::Noise => self.noise(node_id, socket),
             NodeKind::Voronoi => self.voronoi(node_id, socket),
             NodeKind::Gradient => self.gradient(node_id, socket),
+            NodeKind::Wave => {
+                self.validate_procedural_texture_input_sockets(node_id)?;
+                self.wave(node_id, socket)
+            }
+            NodeKind::Magic => {
+                self.validate_procedural_texture_input_sockets(node_id)?;
+                self.magic(node_id, socket)
+            }
+            NodeKind::Brick => {
+                self.validate_procedural_texture_input_sockets(node_id)?;
+                self.brick(node_id, socket)
+            }
+            NodeKind::WhiteNoise => {
+                self.validate_procedural_texture_input_sockets(node_id)?;
+                self.white_noise(node_id, socket)
+            }
+            NodeKind::Gabor => {
+                self.validate_procedural_texture_input_sockets(node_id)?;
+                self.gabor(node_id, socket)
+            }
             NodeKind::ColorRamp => self.color_ramp(node_id, socket),
             NodeKind::MixRgb => self.mix_rgb(node_id, socket),
             NodeKind::Math => self.math(node_id, socket),
@@ -3416,6 +3449,343 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             ))),
         }
     }
+    fn validate_procedural_texture_input_sockets(&self, id: &Id) -> Result<()> {
+        let node = self.node(id)?;
+        let valid: &[&str] = match node.node_type.as_str() {
+            "ShaderNodeTexWave" => &[
+                "Vector",
+                "Scale",
+                "Distortion",
+                "Detail",
+                "Detail Scale",
+                "Detail Roughness",
+                "Phase Offset",
+            ],
+            "ShaderNodeTexMagic" => &["Vector", "Scale", "Distortion"],
+            "ShaderNodeTexBrick" => &[
+                "Vector",
+                "Color1",
+                "Color2",
+                "Mortar",
+                "Scale",
+                "Mortar Size",
+                "Mortar Smooth",
+                "Bias",
+                "Brick Width",
+                "Row Height",
+            ],
+            "ShaderNodeTexWhiteNoise" => &["Vector", "W"],
+            "ShaderNodeTexGabor" => &[
+                "Vector",
+                "Scale",
+                "Frequency",
+                "Anisotropy",
+                "Orientation 2D",
+                "Orientation 3D",
+            ],
+            _ => return Err(invalid("procedural texture node type is invalid")),
+        };
+        if let Some(socket) = self.group.links.iter().find(|link| {
+            link.to_node == *id && !valid.contains(&link.to_socket.as_str())
+        }) {
+            return Err(invalid(format!(
+                "unknown input socket `{}` on `{}`",
+                socket.to_socket, node.node_type
+            )));
+        }
+        if let Some(socket) = node
+            .inputs
+            .keys()
+            .find(|socket| !valid.contains(&socket.as_str()))
+        {
+            return Err(invalid(format!(
+                "unknown input socket `{socket}` on `{}`",
+                node.node_type
+            )));
+        }
+        let inactive = match node.node_type.as_str() {
+            "ShaderNodeTexWhiteNoise" => match shader_node_string(node, "noise_dimensions", "3D")? {
+                "1D" => Some("Vector"),
+                "2D" | "3D" => Some("W"),
+                "4D" => None,
+                _ => None,
+            },
+            "ShaderNodeTexGabor" => match shader_node_string(node, "gabor_type", "2D")? {
+                "2D" => Some("Orientation 3D"),
+                "3D" => Some("Orientation 2D"),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(socket) = inactive
+            && self.group.links.iter().any(|link| {
+                link.to_node == *id && link.to_socket == socket
+            })
+        {
+            return Err(invalid(format!(
+                "input socket `{socket}` is unavailable on `{}`",
+                node.node_type
+            )));
+        }
+        Ok(())
+    }
+
+    fn wave(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if !matches!(socket, "Color" | "Fac") {
+            return Err(invalid(format!("unknown Wave Texture output `{socket}`")));
+        }
+        let (wave_type, bands_direction, rings_direction, profile) = {
+            let node = self.node(id)?;
+            let wave_type = match shader_node_string(node, "wave_type", "BANDS")? {
+                "BANDS" => WaveType::Bands,
+                "RINGS" => WaveType::Rings,
+                value => {
+                    return Err(unsupported_node(
+                        id,
+                        &format!("ShaderNodeTexWave.wave_type:{value}"),
+                    ));
+                }
+            };
+            let bands_direction = if matches!(wave_type, WaveType::Bands) {
+                match shader_node_string(node, "bands_direction", "X")? {
+                    "X" => WaveBandsDirection::X,
+                    "Y" => WaveBandsDirection::Y,
+                    "Z" => WaveBandsDirection::Z,
+                    "DIAGONAL" => WaveBandsDirection::Diagonal,
+                    value => {
+                        return Err(unsupported_node(
+                            id,
+                            &format!("ShaderNodeTexWave.bands_direction:{value}"),
+                        ));
+                    }
+                }
+            } else {
+                WaveBandsDirection::X
+            };
+            let rings_direction = if matches!(wave_type, WaveType::Rings) {
+                match shader_node_string(node, "rings_direction", "X")? {
+                    "X" => WaveRingsDirection::X,
+                    "Y" => WaveRingsDirection::Y,
+                    "Z" => WaveRingsDirection::Z,
+                    "SPHERICAL" => WaveRingsDirection::Spherical,
+                    value => {
+                        return Err(unsupported_node(
+                            id,
+                            &format!("ShaderNodeTexWave.rings_direction:{value}"),
+                        ));
+                    }
+                }
+            } else {
+                WaveRingsDirection::X
+            };
+            let profile = match shader_node_string(node, "wave_profile", "SIN")? {
+                "SIN" => WaveProfile::Sine,
+                "SAW" => WaveProfile::Saw,
+                "TRI" => WaveProfile::Triangle,
+                value => {
+                    return Err(unsupported_node(
+                        id,
+                        &format!("ShaderNodeTexWave.wave_profile:{value}"),
+                    ));
+                }
+            };
+            (wave_type, bands_direction, rings_direction, profile)
+        };
+        let vector = texture_vector(self.texture_vector_input(id, self.hit_ctx.generated)?)?;
+        let value = procedural_texture::wave(
+            vector,
+            texture_f32(self.scalar_input(id, &["Scale"], 5.0)?)?,
+            texture_f32(self.scalar_input(id, &["Distortion"], 0.0)?)?,
+            texture_f32(self.scalar_input(id, &["Detail"], 2.0)?)?,
+            texture_f32(self.scalar_input(id, &["Detail Scale"], 1.0)?)?,
+            texture_f32(self.scalar_input(id, &["Detail Roughness"], 0.5)?)?,
+            texture_f32(self.scalar_input(id, &["Phase Offset"], 0.0)?)?,
+            wave_type,
+            bands_direction,
+            rings_direction,
+            profile,
+        );
+        match socket {
+            "Color" => Ok(Value::Color([
+                f64::from(value),
+                f64::from(value),
+                f64::from(value),
+                1.0,
+            ])),
+            "Fac" => Ok(Value::Scalar(f64::from(value))),
+            _ => unreachable!(),
+        }
+    }
+
+    fn magic(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if !matches!(socket, "Color" | "Fac") {
+            return Err(invalid(format!("unknown Magic Texture output `{socket}`")));
+        }
+        let depth = {
+            let node = self.node(id)?;
+            shader_node_integer(node, "turbulence_depth", 2)?
+        };
+        let depth = depth.clamp(0, 10) as u8;
+        let vector = texture_vector(self.texture_vector_input(id, self.hit_ctx.generated)?)?;
+        let scale = texture_f32(self.scalar_input(id, &["Scale"], 5.0)?)?;
+        let distortion = texture_f32(self.scalar_input(id, &["Distortion"], 1.0)?)?;
+        let path_traced = self.hit_ctx.path_traced;
+        let (color, factor) =
+            procedural_texture::magic_shader(vector, scale, distortion, depth, path_traced);
+        match socket {
+            "Color" => Ok(Value::Color(color.map(f64::from))),
+            "Fac" => Ok(Value::Scalar(f64::from(factor))),
+            _ => unreachable!(),
+        }
+    }
+
+    fn brick(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if !matches!(socket, "Color" | "Fac") {
+            return Err(invalid(format!("unknown Brick Texture output `{socket}`")));
+        }
+        let (offset, offset_frequency, squash, squash_frequency) = {
+            let node = self.node(id)?;
+            (
+                shader_node_float(node, "offset", 0.5)?,
+                shader_node_integer(node, "offset_frequency", 2)?,
+                shader_node_float(node, "squash", 1.0)?,
+                shader_node_integer(node, "squash_frequency", 2)?,
+            )
+        };
+        let vector = texture_vector(self.texture_vector_input(id, self.hit_ctx.generated)?)?;
+        let color1 = texture_color(self.color_input(id, &["Color1"], [0.8, 0.8, 0.8, 1.0])?)?;
+        let color2 = texture_color(self.color_input(id, &["Color2"], [0.2, 0.2, 0.2, 1.0])?)?;
+        let mortar = texture_color(self.color_input(id, &["Mortar"], [0.0, 0.0, 0.0, 1.0])?)?;
+        let scale = texture_f32(self.scalar_input(id, &["Scale"], 5.0)?)?;
+        let mortar_size = texture_f32(self.scalar_input(id, &["Mortar Size"], 0.02)?)?;
+        let mortar_smooth = texture_f32(self.scalar_input(id, &["Mortar Smooth"], 0.1)?)?;
+        let bias = texture_f32(self.scalar_input(id, &["Bias"], 0.0)?)?;
+        let width = texture_f32(self.scalar_input(id, &["Brick Width"], 0.5)?)?;
+        let row_height = texture_f32(self.scalar_input(id, &["Row Height"], 0.25)?)?;
+        if width == 0.0 || row_height == 0.0 {
+            return Err(eval_error("Brick Texture width and row height must be nonzero"));
+        }
+        let (mut color, factor) = procedural_texture::brick(
+            vector,
+            color1,
+            color2,
+            mortar,
+            scale,
+            mortar_size,
+            mortar_smooth,
+            bias,
+            width,
+            row_height,
+            offset,
+            offset_frequency,
+            squash,
+            squash_frequency,
+        );
+        // Cycles SVM stores Brick colors as RGB; EEVEE preserves the socket alpha.
+        if self.hit_ctx.path_traced {
+            color[3] = 1.0;
+        }
+        match socket {
+            "Color" => Ok(Value::Color(color.map(f64::from))),
+            "Fac" => Ok(Value::Scalar(f64::from(factor))),
+            _ => unreachable!(),
+        }
+    }
+
+    fn white_noise(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if !matches!(socket, "Value" | "Color") {
+            return Err(invalid(format!(
+                "unknown White Noise Texture output `{socket}`"
+            )));
+        }
+        let dimensions = {
+            let node = self.node(id)?;
+            match shader_node_string(node, "noise_dimensions", "3D")? {
+                "1D" => 1,
+                "2D" => 2,
+                "3D" => 3,
+                "4D" => 4,
+                value => {
+                    return Err(unsupported_node(
+                        id,
+                        &format!("ShaderNodeTexWhiteNoise.noise_dimensions:{value}"),
+                    ));
+                }
+            }
+        };
+        let vector = if dimensions == 1 {
+            [0.0; 3]
+        } else {
+            texture_vector(self.vector_input(id, &["Vector"], DVec3::ZERO)?)?
+        };
+        let w = if matches!(dimensions, 1 | 4) {
+            texture_f32(self.scalar_input(id, &["W"], 0.0)?)?
+        } else {
+            0.0
+        };
+        match socket {
+            "Value" => procedural_texture::white_noise_value(dimensions, vector, w)
+                .map(|value| Value::Scalar(f64::from(value)))
+                .ok_or_else(|| invalid("White Noise Texture dimensions are invalid")),
+            "Color" => procedural_texture::white_noise_color(dimensions, vector, w)
+                .map(|color| Value::Color(color.map(f64::from)))
+                .ok_or_else(|| invalid("White Noise Texture dimensions are invalid")),
+            _ => unreachable!(),
+        }
+    }
+
+    fn gabor(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if !matches!(socket, "Value" | "Phase" | "Intensity") {
+            return Err(invalid(format!("unknown Gabor Texture output `{socket}`")));
+        }
+        let dimensions = {
+            let node = self.node(id)?;
+            match shader_node_string(node, "gabor_type", "2D")? {
+                "2D" => 2,
+                "3D" => 3,
+                value => {
+                    return Err(unsupported_node(
+                        id,
+                        &format!("ShaderNodeTexGabor.gabor_type:{value}"),
+                    ));
+                }
+            }
+        };
+        let vector = texture_vector(self.texture_vector_input(id, self.hit_ctx.generated)?)?;
+        let scale = texture_f32(self.scalar_input(id, &["Scale"], 5.0)?)?;
+        let frequency = texture_f32(self.scalar_input(id, &["Frequency"], 2.0)?)?;
+        let anisotropy = texture_f32(self.scalar_input(id, &["Anisotropy"], 1.0)?)?;
+        let outputs = if dimensions == 2 {
+            let orientation = texture_f32(self.scalar_input(
+                id,
+                &["Orientation 2D"],
+                std::f64::consts::FRAC_PI_4,
+            )?)?;
+            procedural_texture::gabor_2d(vector, scale, frequency, anisotropy, orientation)
+        } else {
+            let orientation = texture_vector(self.vector_input(
+                id,
+                &["Orientation 3D"],
+                DVec3::new(std::f64::consts::SQRT_2, std::f64::consts::SQRT_2, 0.0),
+            )?)?;
+            procedural_texture::gabor_3d_shader(
+                vector,
+                scale,
+                frequency,
+                anisotropy,
+                orientation,
+                self.hit_ctx.path_traced,
+            )
+        };
+        let value = match socket {
+            "Value" => outputs[0],
+            "Phase" => outputs[1],
+            "Intensity" => outputs[2],
+            _ => unreachable!(),
+        };
+        Ok(Value::Scalar(f64::from(value)))
+    }
+
 
     fn noise(&mut self, id: &Id, socket: &str) -> Result<Value> {
         use super::texture_kernels::NoiseType;
@@ -5704,11 +6074,21 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     fn texture_vector_input(&mut self, id: &Id, default: DVec3) -> Result<DVec3> {
         if self.links.is_none() || self.texture_mapping_unsupported.contains(id) {
             let node = self.node(id)?;
-            crate::shader::texture::validate_texture_node_mapping(
-                id,
+            if crate::shader::texture::texture_node_color_mapping_is_inert(
                 node.node_type.as_str(),
-                &node.properties,
-            )?;
+            ) {
+                crate::shader::texture::validate_texture_mapping_only(
+                    id,
+                    node.node_type.as_str(),
+                    &node.properties,
+                )?;
+            } else {
+                crate::shader::texture::validate_texture_node_mapping(
+                    id,
+                    node.node_type.as_str(),
+                    &node.properties,
+                )?;
+            }
         }
         if self.is_linked(id, "Vector") {
             self.vector_input(id, &["Vector"], default)
@@ -6718,6 +7098,65 @@ pub fn height_gradient<'a>(
     Ok(world_u * along_u + world_v * along_v)
 }
 
+fn shader_node_string<'a>(
+    node: &'a GraphNode,
+    property: &str,
+    default: &'a str,
+) -> Result<&'a str> {
+    match node.properties.get(property) {
+        None => Ok(default),
+        Some(value) => value.as_str().ok_or_else(|| {
+            invalid(format!("shader node property `{property}` must be a string"))
+        }),
+    }
+}
+
+fn shader_node_float(node: &GraphNode, property: &str, default: f64) -> Result<f32> {
+    let value = match node.properties.get(property) {
+        None => default,
+        Some(value) => value.as_f64().ok_or_else(|| {
+            invalid(format!("shader node property `{property}` must be a number"))
+        })?,
+    };
+    texture_f32(value)
+}
+
+fn shader_node_integer(node: &GraphNode, property: &str, default: i32) -> Result<i32> {
+    let Some(value) = node.properties.get(property) else {
+        return Ok(default);
+    };
+    let value = value
+        .as_i64()
+        .ok_or_else(|| invalid(format!("shader node property `{property}` must be an integer")))?;
+    i32::try_from(value)
+        .map_err(|_| invalid(format!("shader node property `{property}` is out of range")))
+}
+
+fn texture_f32(value: f64) -> Result<f32> {
+    let value = value as f32;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(eval_error("procedural texture input exceeds the float range"))
+    }
+}
+
+fn texture_vector(value: DVec3) -> Result<[f32; 3]> {
+    Ok([
+        texture_f32(value.x)?,
+        texture_f32(value.y)?,
+        texture_f32(value.z)?,
+    ])
+}
+
+fn texture_color(value: [f64; 4]) -> Result<[f32; 4]> {
+    Ok([
+        texture_f32(value[0])?,
+        texture_f32(value[1])?,
+        texture_f32(value[2])?,
+        texture_f32(value[3])?,
+    ])
+}
 fn invalid(message: impl Into<String>) -> PotError {
     PotError::new(ErrorCode::InvalidOperation, message)
 }
