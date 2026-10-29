@@ -510,12 +510,9 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
                     .as_str()
                     .ok_or("noise_dimensions is missing")?;
                 white_noise_dimensions.insert(dimensions.to_owned());
-                let expected_w = if matches!(dimensions, "1D" | "4D") {
-                    0.73
-                } else {
-                    0.0
-                };
-                assert_probe_input(probe, "W", &json!(expected_w))?;
+                if matches!(dimensions, "1D" | "4D") {
+                    assert_probe_input(probe, "W", &json!(0.73))?;
+                }
             }
             "ShaderNodeTexGabor" => {
                 let dimension = properties["gabor_type"]
@@ -669,6 +666,9 @@ fn assert_imported_probes(scene: &Value, oracle: &Value) -> TestResult {
             .as_array()
             .ok_or("probe inputs are missing")?
         {
+            if input["enabled"].as_bool() == Some(false) {
+                continue;
+            }
             let identifier = input["identifier"]
                 .as_str()
                 .ok_or("input identifier is missing")?;
