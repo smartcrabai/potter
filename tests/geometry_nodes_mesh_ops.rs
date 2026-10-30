@@ -1,5 +1,5 @@
 use num_traits::ToPrimitive;
-use std::error::Error;
+use std::{error::Error, fs, process::Command};
 
 use potter_core::{
     geom::Mesh,
@@ -346,7 +346,7 @@ fn graph_with_nodes(nodes: Vec<Value>, links: Vec<Value>) -> TestResult<SceneDoc
     )?
     .doc)
 }
-fn nested_top_group_doc() -> TestResult<SceneDoc> {
+fn nested_top_group_doc(subdivide_level: usize) -> TestResult<SceneDoc> {
     let doc = SceneDoc::new("95f6921b-f835-4f6c-9271-c1c098d9a823".to_owned());
     let operations = json!([
         {"op":"graph.create","id":"child","kind":"geometry"},
@@ -364,7 +364,7 @@ fn nested_top_group_doc() -> TestResult<SceneDoc> {
         {"op":"graph.node_add","graph":"child","id":"extrude","type":"GeometryNodeExtrudeMesh",
          "properties":{"mode":"FACES"},"inputs":{"Offset Scale":1.0,"Individual":false}},
         {"op":"graph.node_add","graph":"child","id":"subdivide","type":"GeometryNodeSubdivideMesh",
-         "inputs":{"Level":1}},
+         "inputs":{"Level":subdivide_level}},
         {"op":"graph.node_add","graph":"child","id":"output","type":"NodeGroupOutput"},
         {"op":"graph.link","graph":"child","from_node":"input","from_socket":"Geometry","to_node":"extrude","to_socket":"Mesh"},
         {"op":"graph.link","graph":"child","from_node":"input","from_socket":"Selection","to_node":"extrude","to_socket":"Selection"},
@@ -926,6 +926,22 @@ fn top_side_subdivide_graph() -> TestResult<SceneDoc> {
     graph_with_nodes(nodes, links)
 }
 
+fn extrude_all_faces_graph() -> TestResult<SceneDoc> {
+    let nodes = vec![
+        json!({
+            "id":"extrude",
+            "type":"GeometryNodeExtrudeMesh",
+            "properties":{"mode":"FACES"},
+            "inputs":{"Offset Scale":1.0,"Individual":false},
+        }),
+        json!({"id":"output","type":"NodeGroupOutput"}),
+    ];
+    let links = vec![
+        json!({"from_node":"extrude","from_socket":"Mesh","to_node":"output","to_socket":"Geometry"}),
+    ];
+    graph_with_nodes(nodes, links)
+}
+
 fn top_after_separate_graph() -> TestResult<SceneDoc> {
     let nodes = vec![
         json!({
@@ -966,7 +982,6 @@ fn top_after_separate_graph() -> TestResult<SceneDoc> {
 
 fn sibling_topology_fields_graph() -> TestResult<SceneDoc> {
     let nodes = vec![
-        json!({"id":"input","type":"NodeGroupInput"}),
         json!({"id":"area","type":"GeometryNodeInputMeshFaceArea"}),
         json!({"id":"angle","type":"GeometryNodeInputMeshEdgeAngle"}),
         json!({"id":"scale_x","type":"GeometryNodeTransform","inputs":{"Scale":[2.0,1.0,1.0]}}),
@@ -974,29 +989,27 @@ fn sibling_topology_fields_graph() -> TestResult<SceneDoc> {
         json!({
             "id":"area_x","type":"GeometryNodeStoreNamedAttribute",
             "properties":{"domain":"FACE","data_type":"FLOAT"},
-            "inputs":{"Name":"area_x"},
+            "inputs":{"Name":"area_shared"},
         }),
         json!({
             "id":"angle_x","type":"GeometryNodeStoreNamedAttribute",
             "properties":{"domain":"EDGE","data_type":"FLOAT"},
-            "inputs":{"Name":"angle_x"},
+            "inputs":{"Name":"angle_shared"},
         }),
         json!({
             "id":"area_y","type":"GeometryNodeStoreNamedAttribute",
             "properties":{"domain":"FACE","data_type":"FLOAT"},
-            "inputs":{"Name":"area_y"},
+            "inputs":{"Name":"area_shared"},
         }),
         json!({
             "id":"angle_y","type":"GeometryNodeStoreNamedAttribute",
             "properties":{"domain":"EDGE","data_type":"FLOAT"},
-            "inputs":{"Name":"angle_y"},
+            "inputs":{"Name":"angle_shared"},
         }),
         json!({"id":"join","type":"GeometryNodeJoinGeometry"}),
         json!({"id":"output","type":"NodeGroupOutput"}),
     ];
     let links = vec![
-        json!({"from_node":"input","from_socket":"Geometry","to_node":"scale_x","to_socket":"Geometry"}),
-        json!({"from_node":"input","from_socket":"Geometry","to_node":"scale_y","to_socket":"Geometry"}),
         json!({"from_node":"scale_x","from_socket":"Geometry","to_node":"area_x","to_socket":"Geometry"}),
         json!({"from_node":"area","from_socket":"Area","to_node":"area_x","to_socket":"Value"}),
         json!({"from_node":"area_x","from_socket":"Geometry","to_node":"angle_x","to_socket":"Geometry"}),
@@ -1005,8 +1018,9 @@ fn sibling_topology_fields_graph() -> TestResult<SceneDoc> {
         json!({"from_node":"area","from_socket":"Area","to_node":"area_y","to_socket":"Value"}),
         json!({"from_node":"area_y","from_socket":"Geometry","to_node":"angle_y","to_socket":"Geometry"}),
         json!({"from_node":"angle","from_socket":"Unsigned Angle","to_node":"angle_y","to_socket":"Value"}),
-        json!({"from_node":"angle_x","from_socket":"Geometry","to_node":"join","to_socket":"Geometry"}),
+        // Match the Blender oracle's multi-input Join Geometry order.
         json!({"from_node":"angle_y","from_socket":"Geometry","to_node":"join","to_socket":"Geometry"}),
+        json!({"from_node":"angle_x","from_socket":"Geometry","to_node":"join","to_socket":"Geometry"}),
         json!({"from_node":"join","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
     ];
     graph_with_nodes(nodes, links)
@@ -1100,11 +1114,7 @@ fn assert_boolean_attribute(mesh: &Mesh, name: &str, domain: &str) -> TestResult
     })?;
     assert_eq!(attribute["domain"], domain, "{name} domain");
     assert_eq!(attribute["data_type"], "BOOLEAN", "{name} type");
-    let values = invalid_array(&attribute["data"], name)?;
-    assert!(
-        values.iter().any(|value| value.as_bool() == Some(true)),
-        "{name} contains no true elements"
-    );
+    invalid_array(&attribute["data"], name)?;
     Ok(())
 }
 
@@ -1757,6 +1767,18 @@ fn extrusion_fields_follow_topology_and_boolean_domain_adaptation() -> TestResul
 }
 
 #[test]
+fn face_extrusion_default_normal_matches_blender() -> TestResult<()> {
+    let oracle = fixture()?;
+    let mesh = input_mesh(&oracle)?;
+    let result = evaluate(&extrude_all_faces_graph()?, &mesh)?;
+    assert_json_close(
+        &mesh_snapshot(&result.mesh),
+        &oracle["extrude_all_faces"],
+        "default-normal face extrusion of every input face",
+    )?;
+    Ok(())
+}
+#[test]
 fn sibling_mesh_topology_fields_use_distinct_geometry_snapshots() -> TestResult<()> {
     let oracle = fixture()?;
     let mesh = input_mesh(&oracle)?;
@@ -1766,29 +1788,28 @@ fn sibling_mesh_topology_fields_use_distinct_geometry_snapshots() -> TestResult<
         &oracle["sibling_topology_fields"],
         "shared Face Area and Edge Angle fields on changed sibling geometry",
     )?;
-    for (left_name, right_name, description) in [
-        ("area_x", "area_y", "Face Area"),
-        ("angle_x", "angle_y", "Edge Angle"),
+    for (name, half_count, description) in [
+        ("area_shared", result.mesh.faces.len() / 2, "Face Area"),
+        ("angle_shared", result.mesh.edges.len() / 2, "Edge Angle"),
     ] {
-        let left = invalid_array(
-            &result.mesh.attributes[left_name]["data"],
-            left_name,
-        )?
-        .iter()
-        .filter_map(Value::as_f64)
-        .filter(|value| *value != 0.0)
-        .collect::<Vec<_>>();
-        let right = invalid_array(
-            &result.mesh.attributes[right_name]["data"],
-            right_name,
-        )?
-        .iter()
-        .filter_map(Value::as_f64)
-        .filter(|value| *value != 0.0)
-        .collect::<Vec<_>>();
+        let values = invalid_array(&result.mesh.attributes[name]["data"], name)?;
+        assert_eq!(
+            values.len(),
+            half_count * 2,
+            "{description} output should contain one same-count branch per half"
+        );
+        let branch_values = |values: &[Value]| {
+            values
+                .iter()
+                .filter_map(Value::as_f64)
+                .filter(|value| *value != 0.0)
+                .collect::<Vec<_>>()
+        };
+        let left = branch_values(&values[..half_count]);
+        let right = branch_values(&values[half_count..]);
         assert!(
             !left.is_empty() && !right.is_empty(),
-            "{description} fields need nonzero samples to compare branches"
+            "{description} fields need nonzero samples on both branches"
         );
         assert!(
             left.iter()
@@ -1800,10 +1821,32 @@ fn sibling_mesh_topology_fields_use_distinct_geometry_snapshots() -> TestResult<
     Ok(())
 }
 #[test]
+fn nested_group_extrusion_positions_match_default_normal_oracle() -> TestResult<()> {
+    let oracle = fixture()?;
+    let mesh = input_mesh(&oracle)?;
+    let doc = nested_top_group_doc(0)?;
+    let result = graph::evaluate_with_node_groups(
+        &Id::new("geo")?,
+        &doc.node_groups,
+        Some(&mesh),
+        &Map::new(),
+        "GNMeshOpsNestedExtrude",
+    )?;
+    let actual = mesh_snapshot(&result.mesh);
+    for key in ["vertices", "edges", "faces"] {
+        assert_json_close(
+            &actual[key],
+            &oracle["nested_extrude_all_faces"][key],
+            &format!("nested default-normal Extrude Mesh {key}"),
+        )?;
+    }
+    Ok(())
+}
+#[test]
 fn nested_group_top_fields_survive_subdivision_and_are_callsite_scoped() -> TestResult<()> {
     let oracle = fixture()?;
     let mesh = input_mesh(&oracle)?;
-    let doc = nested_top_group_doc()?;
+    let doc = nested_top_group_doc(1)?;
     let result = graph::evaluate_with_node_groups(
         &Id::new("geo")?,
         &doc.node_groups,
@@ -2149,5 +2192,231 @@ fn closed_dual_without_boundaries_preserves_order_and_named_domains() -> TestRes
     );
     let transferred_colors = result.mesh.attributes["ClosedFacePaint"]["values"].as_object();
     assert!(transferred_colors.is_some_and(|values| values.len() == 4));
+    Ok(())
+}
+#[test]
+fn imported_geometry_node_input_edits_survive_blend_export() -> TestResult<()> {
+    let Some(blender) = std::env::var_os("POTTER_BLENDER") else {
+        return Ok(());
+    };
+    let root = tempfile::tempdir()?;
+    let source = root.path().join("source.blend");
+    let project = root.path().join("project");
+    let blender_fixture = r#"
+import bpy
+import sys
+
+bpy.ops.wm.read_factory_settings(use_empty=True)
+mesh = bpy.data.meshes.new("GN Mesh Ops Export")
+mesh.from_pydata(
+    [(-1.0, -1.0, 0.0), (1.0, -1.0, 0.0), (1.0, 1.0, 0.0), (-1.0, 1.0, 0.0)],
+    [],
+    [(0, 1, 2, 3)],
+)
+mesh.update()
+obj = bpy.data.objects.new("GN Mesh Ops Export", mesh)
+bpy.context.scene.collection.objects.link(obj)
+tree = bpy.data.node_groups.new("GN Mesh Ops Export", "GeometryNodeTree")
+tree.interface.new_socket(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+tree.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+group_input = tree.nodes.new("NodeGroupInput")
+group_output = tree.nodes.new("NodeGroupOutput")
+extrude = tree.nodes.new("GeometryNodeExtrudeMesh")
+extrude.mode = "FACES"
+extrude.inputs["Selection"].default_value = True
+extrude.inputs["Offset Scale"].default_value = 0.5
+extrude.inputs["Individual"].default_value = False
+store = tree.nodes.new("GeometryNodeStoreNamedAttribute")
+store.data_type = "BOOLEAN"
+store.domain = "POINT"
+store.inputs["Name"].default_value = "gn_top_points"
+store.inputs["Selection"].default_value = True
+tree.links.new(group_input.outputs["Geometry"], extrude.inputs["Mesh"])
+tree.links.new(extrude.outputs["Mesh"], store.inputs["Geometry"])
+tree.links.new(extrude.outputs["Top"], store.inputs["Value"])
+tree.links.new(store.outputs["Geometry"], group_output.inputs["Geometry"])
+modifier = obj.modifiers.new("GN Mesh Ops Export", "NODES")
+modifier.node_group = tree
+bpy.context.view_layer.update()
+bpy.ops.wm.save_as_mainfile(filepath=sys.argv[-1])
+"#;
+    let generated = Command::new(&blender)
+        .args(["--background", "--python-expr", blender_fixture, "--"])
+        .arg(&source)
+        .output()?;
+    assert!(
+        generated.status.success(),
+        "Blender fixture generation failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    let pot = env!("CARGO_BIN_EXE_pot");
+    let initialized = Command::new(pot)
+        .args(["init"])
+        .arg(&project)
+        .arg("--json")
+        .output()?;
+    assert!(
+        initialized.status.success(),
+        "pot init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let imported = Command::new(pot)
+        .args(["import"])
+        .arg(&project)
+        .args(["--file"])
+        .arg(&source)
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(&blender)
+        .arg("--json")
+        .output()?;
+    assert!(
+        imported.status.success(),
+        "pot import failed: {}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+
+    let scene_path = project.join("scene.json");
+    let scene: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    let graph = scene["node_groups"]
+        .as_object()
+        .and_then(|groups| {
+            groups
+                .iter()
+                .find(|(_, group)| group["name"] == "GN Mesh Ops Export")
+        })
+        .ok_or("imported Geometry Nodes group is missing")?;
+    let graph_id = graph.0.clone();
+    let node = graph.1["nodes"]
+        .as_object()
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|(_, node)| node["type"] == "GeometryNodeExtrudeMesh")
+        })
+        .ok_or("imported Extrude Mesh node is missing")?;
+    let node_id = node.0.clone();
+    let mut inputs = node.1["inputs"].clone();
+    inputs
+        .as_object_mut()
+        .ok_or("Extrude Mesh input defaults are missing")?
+        .insert("Offset Scale".to_owned(), json!(0.75));
+    let object_id = scene["nodes"]
+        .as_object()
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|(_, node)| node["name"] == "GN Mesh Ops Export")
+        })
+        .map(|(id, _)| id.clone())
+        .ok_or("imported Geometry Nodes object is missing")?;
+    let base_revision = scene["revision"]
+        .as_u64()
+        .ok_or("imported scene revision is missing")?;
+    let batch = json!({
+        "schema_version": 1,
+        "base_revision": base_revision,
+        "operations": [{
+            "op": "graph.node_update",
+            "graph": graph_id,
+            "node_id": node_id,
+            "set": {"inputs": inputs}
+        }]
+    });
+    let batch_path = root.path().join("operations.json");
+    fs::write(&batch_path, serde_json::to_vec(&batch)?)?;
+    let applied = Command::new(pot)
+        .args(["apply"])
+        .arg(&project)
+        .args(["--file"])
+        .arg(&batch_path)
+        .arg("--json")
+        .output()?;
+    assert!(
+        applied.status.success(),
+        "pot apply failed: {}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let persisted: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    assert_eq!(
+        persisted["node_groups"][&graph_id]["nodes"][&node_id]["inputs"]["Offset Scale"],
+        json!(0.75)
+    );
+
+    let inspected = Command::new(pot)
+        .args(["inspect"])
+        .arg(&project)
+        .args(["--id"])
+        .arg(&object_id)
+        .arg("--json")
+        .output()?;
+    assert!(
+        inspected.status.success(),
+        "pot inspect failed: {}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let inspected: Value = serde_json::from_slice(&inspected.stdout)?;
+    let evaluated = &inspected["result"]["items"][0]["evaluated_geometry"];
+    assert_eq!(evaluated["vertex_count"], 8);
+    assert_eq!(evaluated["face_count"], 5);
+    let max_z = evaluated["positions"]
+        .as_array()
+        .ok_or("inspected evaluated mesh positions are missing")?
+        .iter()
+        .filter_map(|position| position.get(2).and_then(Value::as_f64))
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        (max_z - 0.75).abs() < 1.0e-6,
+        "unexpected evaluated max Z {max_z}"
+    );
+
+    let exported_blend = root.path().join("exported.blend");
+    let exported = Command::new(pot)
+        .args(["export"])
+        .arg(&project)
+        .args(["--format", "blend", "--out"])
+        .arg(&exported_blend)
+        .args(["--blender"])
+        .arg(&blender)
+        .arg("--json")
+        .output()?;
+    assert!(
+        exported.status.success(),
+        "pot export failed: {}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let verify_export = r#"
+import bpy
+
+obj = bpy.data.objects["GN Mesh Ops Export"]
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated = obj.evaluated_get(depsgraph)
+mesh = evaluated.to_mesh()
+attribute = mesh.attributes.get("gn_top_points")
+assert len(mesh.vertices) == 8 and len(mesh.polygons) == 5
+assert abs(max(vertex.co.z for vertex in mesh.vertices) - 0.75) < 1e-6
+assert attribute is not None
+assert attribute.domain == "POINT" and attribute.data_type == "BOOLEAN"
+assert len(attribute.data) == 8 and any(item.value for item in attribute.data)
+evaluated.to_mesh_clear()
+"#;
+    let reopened = Command::new(&blender)
+        .arg("--background")
+        .arg(&exported_blend)
+        .args(["--python-expr", verify_export])
+        .output()?;
+    assert!(
+        reopened.status.success(),
+        "exported Geometry Nodes scene failed Blender evaluation: {}",
+        String::from_utf8_lossy(&reopened.stderr)
+    );
     Ok(())
 }

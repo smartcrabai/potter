@@ -145,7 +145,7 @@ pub(super) fn transfer(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Domain {
     Point,
     Edge,
@@ -333,18 +333,24 @@ fn remap_named_attribute(
         .ok_or_else(|| invalid("Dual Mesh named attribute has no domain"))?;
     let data_type = named_data_type(key, attribute);
     let source_domain = parse_domain(source_name, key, data_type)?;
-    let (target_name, indices) = domain_mapping(
-        source_domain,
-        point_face_sources,
-        face_point_sources,
-        edge_sources,
-        corner_sources,
-    );
-    let target_domain = match source_domain {
-        Domain::Point => Domain::Face,
-        Domain::Face => Domain::Point,
-        Domain::Edge => Domain::Edge,
-        Domain::Corner => Domain::Corner,
+    let crease_vert_on_dual_faces = key == "crease_vert" && source_domain == Domain::Point;
+    let (target_name, indices, target_domain) = if crease_vert_on_dual_faces {
+        (source_name, Indices::Exact(face_point_sources), Domain::Face)
+    } else {
+        let (target_name, indices) = domain_mapping(
+            source_domain,
+            point_face_sources,
+            face_point_sources,
+            edge_sources,
+            corner_sources,
+        );
+        let target_domain = match source_domain {
+            Domain::Point => Domain::Face,
+            Domain::Face => Domain::Point,
+            Domain::Edge => Domain::Edge,
+            Domain::Corner => Domain::Corner,
+        };
+        (target_name, indices, target_domain)
     };
     let type_name = data_type;
     let mut result = attribute
@@ -401,7 +407,21 @@ fn remap_named_attribute(
                     type_name,
                     source_corners,
                 )?;
-                result.insert("values".to_owned(), Value::Object(remapped));
+                if crease_vert_on_dual_faces {
+                    let face_values = output
+                        .faces
+                        .iter()
+                        .map(|face| {
+                            remapped
+                                .get(&format!("f{}", face.id))
+                                .cloned()
+                                .ok_or_else(|| invalid("Dual Mesh face crease value is missing"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    result.insert("values".to_owned(), Value::Array(face_values));
+                } else {
+                    result.insert("values".to_owned(), Value::Object(remapped));
+                }
             }
             _ => {
                 return Err(invalid(

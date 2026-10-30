@@ -205,6 +205,13 @@ pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin
     remap_attributes_skipping(source, output, origin, &[])
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EdgeMixMode {
+    Weighted,
+    DefaultPropagation,
+    Mix2,
+}
+
 /// [`remap_attributes`] without the attributes named in `skipped`, which `output` does not receive.
 /// A caller that rebuilds one of them from `source` skips it here, so no work runs on it and it does
 /// not make corners need sources.
@@ -224,12 +231,12 @@ pub(crate) fn remap_attributes_skipping(
         origin,
         None,
         None,
-        false,
+        EdgeMixMode::Weighted,
         skipped,
         None,
         false,
         None,
-        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0],
     )
 }
 
@@ -248,7 +255,7 @@ pub(crate) fn remap_interpolated_corners_skipping(
         origin,
         None,
         None,
-        false,
+        EdgeMixMode::Weighted,
         skipped,
         None,
         true,
@@ -278,12 +285,12 @@ pub(crate) fn remap_attributes_staged(
         origin,
         staged,
         Some(edges),
-        false,
+        EdgeMixMode::Weighted,
         skipped,
         None,
         false,
         None,
-        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0],
     )
 }
 
@@ -307,12 +314,12 @@ pub(crate) fn remap_attributes_with_basis(
         origin,
         None,
         None,
-        false,
+        EdgeMixMode::Weighted,
         skipped,
         corner_order,
         false,
         None,
-        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0],
     )
 }
 
@@ -335,18 +342,61 @@ pub(crate) fn remap_attributes_with_edges(
         origin,
         None,
         Some(edges),
-        false,
+        EdgeMixMode::Weighted,
         &[],
         None,
         false,
         None,
-        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0],
+    )
+}
+
+/// [`remap_attributes_with_edges`] with Blender's `DefaultPropagationMixer` matrix semantics.
+pub(crate) fn remap_attributes_with_default_edge_mixer(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+    edges: Vec<Vec<(usize, f64)>>,
+) -> Result<()> {
+    remap_attributes_internal(
+        source,
+        output,
+        origin,
+        None,
+        Some(edges),
+        EdgeMixMode::DefaultPropagation,
+        &[],
+        None,
+        false,
+        None,
+        [0.0, 0.0, 0.0, 0.0],
+    )
+}
+
+/// [`remap_attributes_with_basis`] using Blender's default matrix mixer on derived edges.
+pub(crate) fn remap_attributes_with_default_edge_mixer_from_origins(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+) -> Result<()> {
+    remap_attributes_internal(
+        source,
+        output,
+        origin,
+        None,
+        None,
+        EdgeMixMode::DefaultPropagation,
+        &[],
+        None,
+        false,
+        None,
+        [0.0, 0.0, 0.0, 0.0],
     )
 }
 
 /// [`remap_attributes_with_edges`] using Blender's two-source `mix2` interpolation for edge
-/// attributes. Extrude Mesh uses this for generated connecting edges; other topology operations
-/// use [`remap_attributes_with_edges`] and their ordinary source-weight mixer.
+/// attributes. Individual face extrusion uses this for connecting edges; region extrusion uses
+/// [`remap_attributes_with_edges`] and Blender's weighted source mixer.
 pub(crate) fn remap_attributes_with_edge_mix2(
     source: &Mesh,
     output: &mut Mesh,
@@ -359,12 +409,12 @@ pub(crate) fn remap_attributes_with_edge_mix2(
         origin,
         None,
         Some(edges),
-        true,
+        EdgeMixMode::Mix2,
         &[],
         None,
         false,
         None,
-        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0],
     )
 }
 pub(crate) fn copy_direct_matrix_edge_attributes(
@@ -514,12 +564,12 @@ pub(crate) fn remap_attributes_with_edge_identity(
         origin,
         None,
         None,
-        false,
+        EdgeMixMode::Weighted,
         &[],
         None,
         false,
         edge_identity,
-        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0],
     )
 }
 
@@ -529,7 +579,7 @@ fn remap_attributes_internal(
     origin: &Origin,
     staged: Option<&Staged>,
     edges: Option<Vec<Vec<(usize, f64)>>>,
-    edge_mix2: bool,
+    edge_mix_mode: EdgeMixMode,
     skipped: &[&str],
     corner_order: Option<&[usize]>,
     weighted_corner_booleans: bool,
@@ -659,7 +709,7 @@ fn remap_attributes_internal(
         staged,
         point_identity: edge_identity,
         edge_origin: &edge_origin,
-        edge_mix2,
+        edge_mix_mode,
         corner_origin,
         weighted_corner_booleans,
         color_default,
@@ -1125,7 +1175,7 @@ struct Sources<'a> {
     staged: Option<&'a Staged>,
     point_identity: Option<&'a [usize]>,
     edge_origin: &'a [Vec<(usize, f64)>],
-    edge_mix2: bool,
+    edge_mix_mode: EdgeMixMode,
     corner_origin: &'a [Vec<(usize, f64)>],
     weighted_corner_booleans: bool,
     color_default: [f64; 4],
@@ -1297,7 +1347,7 @@ impl Sources<'_> {
         with_values(attribute, Value::Object(output))
     }
 
-    /// Edge values blend over source edges except for operation-specific direct and mix2 transfers.
+    /// Edge values use explicit Blender mixer semantics for special matrix paths.
     fn edge_values(
         &self,
         values: &[Value],
@@ -1307,12 +1357,25 @@ impl Sources<'_> {
         self.edge_origin
             .iter()
             .map(|sources| {
-                if is_float4x4(data_type)
+                if self.edge_mix_mode == EdgeMixMode::DefaultPropagation
+                    && is_float4x4(data_type)
+                {
+                    blend_float4x4_unweighted(values, sources).unwrap_or_else(&default)
+                } else if is_float4x4(data_type)
                     && let [(source, weight)] = sources.as_slice()
                     && weight.to_bits() == 1.0_f64.to_bits()
                 {
                     values.get(*source).cloned().unwrap_or_else(&default)
-                } else if self.edge_mix2
+                } else if self.edge_mix_mode == EdgeMixMode::Mix2
+                    && is_float4x4(data_type)
+                    && let [(first, _), (second, factor)] = sources.as_slice()
+                {
+                    values
+                        .get(*first)
+                        .zip(values.get(*second))
+                        .and_then(|(first, second)| mix_float4x4(first, second, *factor))
+                        .unwrap_or_else(&default)
+                } else if self.edge_mix_mode == EdgeMixMode::Mix2
                     && is_short2(data_type)
                     && let [(first, _), (second, factor)] = sources.as_slice()
                 {
@@ -1740,7 +1803,7 @@ impl Sources<'_> {
                     } else {
                         mix_float_color_by_mix(
                             &layer.values,
-                            self.corner_mix(&self.corner_origin, index),
+                            self.corner_mix(self.corner_origin, index),
                         )
                         .unwrap_or(self.color_default)
                     }
@@ -1998,7 +2061,19 @@ fn mix2_or_blend(
     {
         return quaternion_mix2(first, second, *factor as f32);
     }
-    if let [(first, _), (second, factor)] = items.as_slice() && is_short2(data_type) {
+    if let [(first, _), (second, factor)] = items.as_slice()
+        && is_float4x4(data_type)
+    {
+        return mix_float4x4(first, second, *factor);
+    }
+    if let [(first, _), (second, factor)] = items.as_slice()
+        && is_float4x4(data_type)
+    {
+        return mix_float4x4(first, second, *factor);
+    }
+    if let [(first, _), (second, factor)] = items.as_slice()
+        && is_short2(data_type)
+    {
         return mix_short2(first, second, *factor);
     }
     blend_with_boolean_mixer(items.into_iter(), data_type, weighted_booleans)
@@ -2146,7 +2221,9 @@ pub(crate) fn blend_quaternion<'a>(items: impl Iterator<Item = (&'a Value, f64)>
 fn quaternion_mix2(first: &Value, second: &Value, factor: f32) -> Option<Value> {
     let a = native_quaternion(first)?;
     let b = native_quaternion(second)?;
-    let dot: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+    let [ax, ay, az, aw] = a;
+    let [bx, by, bz, bw] = b;
+    let dot = ((aw * bw + ax * bx) + ay * by) + az * bz;
     let mut difference = quaternion_product(quaternion_conjugate(a), b);
     if dot < 0.0 {
         difference = difference.map(|component| -component);
@@ -2188,16 +2265,28 @@ fn quaternion_product(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     ]
 }
 
-/// Blender's `pow(q, y)` of a unit quaternion (`BLI_math_quaternion.hh:204`): `cos(y * acos(w))` and
-/// `sin(y * acos(w))` times the normalised imaginary part.
+/// Blender's `pow(q, y)` of a unit quaternion (`BLI_math_quaternion.hh:204`).
 fn quaternion_power([x, y, z, w]: [f32; 4], exponent: f32) -> [f32; 4] {
-    let half_angle = exponent * w.clamp(-1.0, 1.0).acos();
-    let axis = Vec3::new(x, y, z).normalize_or_zero();
+    let acos = if w <= -1.0 {
+        std::f32::consts::PI
+    } else if w >= 1.0 {
+        0.0
+    } else {
+        w.acos()
+    };
+    let half_angle = exponent * acos;
+    let length_squared = (x * x + y * y) + z * z;
+    let axis = if length_squared > 1.0e-35_f32 {
+        let length = length_squared.sqrt();
+        [x / length, y / length, z / length]
+    } else {
+        [0.0; 3]
+    };
     let sine = half_angle.sin();
     [
-        axis.x * sine,
-        axis.y * sine,
-        axis.z * sine,
+        axis[0] * sine,
+        axis[1] * sine,
+        axis[2] * sine,
         half_angle.cos(),
     ]
 }
@@ -2321,8 +2410,9 @@ fn blend_color(items: &[(&Value, f64)], data_type: &str) -> Option<Value> {
 }
 
 /// Blend values by Blender data type: numbers and arrays interpolate componentwise, while
-/// `INT16_2D`/`SHORT2` round a float2 accumulation and `FLOAT4X4`/`MATRIX` use Blender's safe TRS
-/// mixer. Booleans OR positive-weight sources, and other values use the heaviest source.
+/// `INT16_2D`/`SHORT2` round a float2 accumulation. `FLOAT4X4`/`MATRIX` use Blender's polar
+/// decomposition for two-source mix2 and its location/rotation/scale mixer for weighted sources.
+/// Booleans OR positive-weight sources, and other values use the heaviest source.
 /// Boolean corner interpolation uses [`blend_with_boolean_mixer`] for Blender's weighted threshold.
 /// `None` when there are no sources.
 fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> Option<Value> {
@@ -2403,8 +2493,341 @@ fn float4x4_value(value: &Value) -> Option<[[f32; 4]; 4]> {
     None
 }
 
-/// Blender's `to_loc_rot_scale_safe<true>` for float matrices, using its normalized Euler
-/// decomposition before converting the result to a quaternion.
+type Matrix3 = [[f32; 3]; 3];
+
+fn matrix3_transpose(matrix: Matrix3) -> Matrix3 {
+    std::array::from_fn(|row| std::array::from_fn(|column| matrix[column][row]))
+}
+
+fn matrix3_multiply(first: Matrix3, second: Matrix3) -> Matrix3 {
+    std::array::from_fn(|row| {
+        std::array::from_fn(|column| {
+            (first[row][0] * second[0][column] + first[row][1] * second[1][column])
+                + first[row][2] * second[2][column]
+        })
+    })
+}
+
+fn matrix3_determinant(matrix: Matrix3) -> f32 {
+    let [[a, b, c], [d, e, f], [g, h, i]] = matrix;
+    (a * (e * i - f * h) - b * (d * i - f * g)) + c * (d * h - e * g)
+}
+fn rotate_matrix3_rows(matrix: &mut Matrix3, first: usize, second: usize, c: f32, s: f32) {
+    let (lower_rows, higher_rows) = matrix.split_at_mut(first);
+    let first_row = &mut higher_rows[0];
+    let second_row = &mut lower_rows[second];
+    for (first_value, second_value) in first_row.iter_mut().zip(second_row.iter_mut()) {
+        let old_first = *first_value;
+        let old_second = *second_value;
+        *first_value = c * old_first + s * old_second;
+        *second_value = -s * old_first + c * old_second;
+    }
+}
+
+fn rotate_matrix3_columns(matrix: &mut Matrix3, first: usize, second: usize, c: f32, s: f32) {
+    for row in matrix {
+        let first_value = row[first];
+        let second_value = row[second];
+        row[first] = c * first_value - s * second_value;
+        row[second] = s * first_value + c * second_value;
+    }
+}
+
+fn matrix3_jacobi_svd_pair(
+    matrix: &Matrix3,
+    first: usize,
+    second: usize,
+) -> ((f32, f32), (f32, f32)) {
+    let a = matrix[first][first];
+    let b = matrix[first][second];
+    let c = matrix[second][first];
+    let d = matrix[second][second];
+    let difference = c - b;
+    let (rotation1_c, rotation1_s) = if difference.abs() < f32::MIN_POSITIVE {
+        (1.0, 0.0)
+    } else {
+        let ratio = (a + d) / difference;
+        let denominator = (1.0 + ratio * ratio).sqrt();
+        (ratio / denominator, 1.0 / denominator)
+    };
+    let rotated_a = rotation1_c * a + rotation1_s * c;
+    let rotated_b = rotation1_c * b + rotation1_s * d;
+    let rotated_d = -rotation1_s * b + rotation1_c * d;
+    let (rotation2_c, rotation2_s) = if 2.0 * rotated_b.abs() < f32::MIN_POSITIVE {
+        (1.0, 0.0)
+    } else {
+        let tau = (rotated_a - rotated_d) / (2.0 * rotated_b.abs());
+        let magnitude = (tau * tau + 1.0).sqrt();
+        let tangent = if tau > 0.0 {
+            1.0 / (tau + magnitude)
+        } else {
+            1.0 / (tau - magnitude)
+        };
+        let sign = if tangent > 0.0 { 1.0 } else { -1.0 };
+        let norm = 1.0 / (tangent * tangent + 1.0).sqrt();
+        (
+            norm,
+            -sign * (rotated_b / rotated_b.abs()) * tangent.abs() * norm,
+        )
+    };
+    let left_c = rotation1_c * rotation2_c + rotation1_s * rotation2_s;
+    let left_s = -rotation1_c * rotation2_s + rotation1_s * rotation2_c;
+    ((left_c, left_s), (rotation2_c, rotation2_s))
+}
+
+fn matrix3_polar_decomposition(matrix: Matrix3) -> Option<(Matrix3, Matrix3)> {
+    // Mirrors Eigen's 3x3 Jacobi SVD used by Blender's float4x4 mix2 path.
+    if matrix.iter().flatten().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let mut scale = matrix
+        .iter()
+        .flatten()
+        .fold(0.0_f32, |largest, value| largest.max(value.abs()));
+    if scale.to_bits() == 0 {
+        scale = 1.0;
+    }
+    let mut work = matrix.map(|row| row.map(|value| value / scale));
+    let mut left_vectors = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let mut right_vectors = left_vectors;
+    let mut largest_diagonal = (0..3)
+        .map(|index| work[index][index].abs())
+        .fold(0.0_f32, f32::max);
+    let precision = 2.0 * f32::EPSILON;
+    loop {
+        let mut converged = true;
+        for first in 1..3 {
+            for second in 0..first {
+                let threshold = f32::MIN_POSITIVE.max(precision * largest_diagonal);
+                if work[first][second].abs() > threshold || work[second][first].abs() > threshold {
+                    converged = false;
+                    let (left, right) = matrix3_jacobi_svd_pair(&work, first, second);
+                    rotate_matrix3_rows(&mut work, first, second, left.0, left.1);
+                    rotate_matrix3_columns(&mut work, first, second, right.0, right.1);
+                    rotate_matrix3_columns(&mut left_vectors, first, second, left.0, -left.1);
+                    rotate_matrix3_columns(&mut right_vectors, first, second, right.0, right.1);
+                    largest_diagonal = largest_diagonal
+                        .max(work[first][first].abs())
+                        .max(work[second][second].abs());
+                }
+            }
+        }
+        if converged {
+            break;
+        }
+    }
+    let mut singular_values = [0.0; 3];
+    for index in 0..3 {
+        let diagonal = work[index][index];
+        singular_values[index] = diagonal.abs() * scale;
+        if diagonal < 0.0 {
+            for row in &mut left_vectors {
+                row[index] = -row[index];
+            }
+        }
+    }
+    for index in 0..3 {
+        let mut largest = index;
+        for candidate in index + 1..3 {
+            if singular_values[candidate] > singular_values[largest] {
+                largest = candidate;
+            }
+        }
+        if largest != index {
+            singular_values.swap(index, largest);
+            for row in &mut left_vectors {
+                row.swap(index, largest);
+            }
+            for row in &mut right_vectors {
+                row.swap(index, largest);
+            }
+        }
+    }
+    let rotation = matrix3_multiply(left_vectors, matrix3_transpose(right_vectors));
+    let stretch = matrix3_multiply(
+        matrix3_multiply(
+            right_vectors,
+            [
+                [singular_values[0], 0.0, 0.0],
+                [0.0, singular_values[1], 0.0],
+                [0.0, 0.0, singular_values[2]],
+            ],
+        ),
+        matrix3_transpose(right_vectors),
+    );
+    if matrix3_determinant(rotation) < 0.0 {
+        Some((
+            rotation.map(|row| row.map(|value| -value)),
+            stretch.map(|row| row.map(|value| -value)),
+        ))
+    } else {
+        Some((rotation, stretch))
+    }
+}
+
+fn is_zero_f32(value: f32) -> bool {
+    value.to_bits().trailing_zeros() >= 31
+}
+
+fn normalized_matrix3_quaternion(mut matrix: Matrix3) -> [f32; 4] {
+    for column in 0..3 {
+        let length_squared = (matrix[0][column] * matrix[0][column]
+            + matrix[1][column] * matrix[1][column])
+            + matrix[2][column] * matrix[2][column];
+        if length_squared > 1.0e-35_f32 {
+            let length = length_squared.sqrt();
+            for row in &mut matrix {
+                row[column] /= length;
+            }
+        } else {
+            for row in &mut matrix {
+                row[column] = 0.0;
+            }
+        }
+    }
+    matrix3_to_quaternion(matrix)
+}
+
+fn matrix3_to_quaternion(matrix: Matrix3) -> [f32; 4] {
+    let determinant = matrix3_determinant(matrix);
+    if !determinant.is_finite() {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let matrix = if determinant < 0.0 {
+        matrix.map(|row| row.map(|value| -value))
+    } else {
+        matrix
+    };
+    let m00 = matrix[0][0];
+    let m01 = matrix[0][1];
+    let m02 = matrix[0][2];
+    let m10 = matrix[1][0];
+    let m11 = matrix[1][1];
+    let m12 = matrix[1][2];
+    let m20 = matrix[2][0];
+    let m21 = matrix[2][1];
+    let m22 = matrix[2][2];
+    let mut quaternion = [0.0_f32; 4];
+    if m22 < 0.0 {
+        if m00 > m11 {
+            let trace = 1.0_f32 + m00 - m11 - m22;
+            let mut scale = 2.0_f32 * trace.sqrt();
+            if m21 < m12 {
+                scale = -scale;
+            }
+            quaternion[0] = 0.25_f32 * scale;
+            scale = 1.0_f32 / scale;
+            quaternion[3] = (m21 - m12) * scale;
+            quaternion[1] = (m01 + m10) * scale;
+            quaternion[2] = (m02 + m20) * scale;
+            if trace.to_bits() == 1.0_f32.to_bits()
+                && is_zero_f32(quaternion[3])
+                && is_zero_f32(quaternion[1])
+                && is_zero_f32(quaternion[2])
+            {
+                quaternion[0] = 1.0;
+            }
+        } else {
+            let trace = 1.0_f32 - m00 + m11 - m22;
+            let mut scale = 2.0_f32 * trace.sqrt();
+            if m02 < m20 {
+                scale = -scale;
+            }
+            quaternion[1] = 0.25_f32 * scale;
+            scale = 1.0_f32 / scale;
+            quaternion[3] = (m02 - m20) * scale;
+            quaternion[0] = (m01 + m10) * scale;
+            quaternion[2] = (m12 + m21) * scale;
+            if trace.to_bits() == 1.0_f32.to_bits()
+                && is_zero_f32(quaternion[3])
+                && is_zero_f32(quaternion[0])
+                && is_zero_f32(quaternion[2])
+            {
+                quaternion[1] = 1.0;
+            }
+        }
+    } else if m00 < -m11 {
+        let trace = 1.0_f32 - m00 - m11 + m22;
+        let mut scale = 2.0_f32 * trace.sqrt();
+        if m10 < m01 {
+            scale = -scale;
+        }
+        quaternion[2] = 0.25_f32 * scale;
+        scale = 1.0_f32 / scale;
+        quaternion[3] = (m10 - m01) * scale;
+        quaternion[0] = (m20 + m02) * scale;
+        quaternion[1] = (m21 + m12) * scale;
+        if trace.to_bits() == 1.0_f32.to_bits()
+            && is_zero_f32(quaternion[3])
+            && is_zero_f32(quaternion[0])
+            && is_zero_f32(quaternion[1])
+        {
+            quaternion[2] = 1.0;
+        }
+    } else {
+        let trace = 1.0_f32 + m00 + m11 + m22;
+        let mut scale = 2.0_f32 * trace.sqrt();
+        quaternion[3] = 0.25_f32 * scale;
+        scale = 1.0_f32 / scale;
+        quaternion[0] = (m21 - m12) * scale;
+        quaternion[1] = (m02 - m20) * scale;
+        quaternion[2] = (m10 - m01) * scale;
+        if trace.to_bits() == 1.0_f32.to_bits()
+            && is_zero_f32(quaternion[0])
+            && is_zero_f32(quaternion[1])
+            && is_zero_f32(quaternion[2])
+        {
+            quaternion[3] = 1.0;
+        }
+    }
+    let length_squared = ((quaternion[0] * quaternion[0] + quaternion[1] * quaternion[1])
+        + quaternion[2] * quaternion[2])
+        + quaternion[3] * quaternion[3];
+    if (length_squared - 1.0).abs() >= 0.0002 {
+        let inverse_length = 1.0_f32 / length_squared.sqrt();
+        quaternion = quaternion.map(|value| value * inverse_length);
+    }
+    quaternion
+}
+
+fn mix_float4x4(first: &Value, second: &Value, factor: f64) -> Option<Value> {
+    let first = float4x4_value(first)?;
+    let second = float4x4_value(second)?;
+    let first_location = [first[0][3], first[1][3], first[2][3]];
+    let second_location = [second[0][3], second[1][3], second[2][3]];
+    let first_linear = std::array::from_fn(|row| std::array::from_fn(|column| first[row][column]));
+    let second_linear =
+        std::array::from_fn(|row| std::array::from_fn(|column| second[row][column]));
+    let (first_rotation, first_stretch) = matrix3_polar_decomposition(first_linear)?;
+    let (second_rotation, second_stretch) = matrix3_polar_decomposition(second_linear)?;
+    let first_rotation = normalized_matrix3_quaternion(first_rotation);
+    let second_rotation = normalized_matrix3_quaternion(second_rotation);
+    let factor = blender_float32(factor)?;
+    let first_factor = 1.0_f32 - factor;
+    let rotation = quaternion_mix2(&json!(first_rotation), &json!(second_rotation), factor)?;
+    let rotation = native_quaternion(&rotation)?;
+    let rotation_matrix = float4x4_from_loc_rot_scale([0.0; 3], rotation, [1.0; 3])?;
+    let stretch = std::array::from_fn(|row| {
+        std::array::from_fn(|column| {
+            first_stretch[row][column] * first_factor + second_stretch[row][column] * factor
+        })
+    });
+    let rotation =
+        std::array::from_fn(|row| std::array::from_fn(|column| rotation_matrix[row][column]));
+    let linear = matrix3_multiply(rotation, stretch);
+    let location: [f32; 3] = std::array::from_fn(|index| {
+        first_location[index] * first_factor + second_location[index] * factor
+    });
+    Some(json!([
+        [linear[0][0], linear[0][1], linear[0][2], location[0]],
+        [linear[1][0], linear[1][1], linear[1][2], location[1]],
+        [linear[2][0], linear[2][1], linear[2][2], location[2]],
+        [0.0, 0.0, 0.0, 1.0]
+    ]))
+}
+
+
+/// Blender's `to_loc_rot_scale_safe<true>` for weighted Geometry Nodes attribute propagation.
 fn float4x4_loc_rot_scale(matrix: [[f32; 4]; 4]) -> ([f32; 3], [f32; 4], [f32; 3]) {
     let location = [matrix[0][3], matrix[1][3], matrix[2][3]];
     let mut rotation_matrix = [[0.0_f32; 3]; 3];
@@ -2588,6 +3011,20 @@ fn float4x4_rotation_from_expmap([x, y, z]: [f32; 3]) -> [f32; 4] {
 }
 
 fn blend_float4x4(items: &[(&Value, f64)]) -> Option<Value> {
+    blend_float4x4_from_items(items.iter().copied())
+}
+
+fn blend_float4x4_unweighted(values: &[Value], sources: &[(usize, f64)]) -> Option<Value> {
+    blend_float4x4_from_items(
+        sources
+            .iter()
+            .filter_map(|(index, _)| values.get(*index).map(|value| (value, 1.0))),
+    )
+}
+
+fn blend_float4x4_from_items<'a>(
+    items: impl Iterator<Item = (&'a Value, f64)>,
+) -> Option<Value> {
     let mut location = [0.0_f32; 3];
     let mut expmap = [0.0_f32; 3];
     let mut scale = [0.0_f32; 3];
@@ -2596,7 +3033,7 @@ fn blend_float4x4(items: &[(&Value, f64)]) -> Option<Value> {
         let matrix = float4x4_value(value)?;
         let (source_location, source_rotation, source_scale) = float4x4_loc_rot_scale(matrix);
         let source_expmap = float4x4_quaternion_expmap(source_rotation);
-        let weight = blender_float32(*weight)?;
+        let weight = blender_float32(weight)?;
         for component in 0..3 {
             location[component] += source_location[component] * weight;
             expmap[component] += source_expmap[component] * weight;

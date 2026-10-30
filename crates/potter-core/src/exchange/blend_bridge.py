@@ -6802,8 +6802,14 @@ def _create_geometry_groups(doc, linked_group_map=None):
                                   group.get("name") or identifier)
         tree_type = {"geometry": "GeometryNodeTree", "shader": "ShaderNodeTree",
                      "compositor": "CompositorNodeTree"}.get(group.get("kind"), "")
-        if identifier not in direct_tree_ids:
-            add_group(name, identifier, tree_type, _model_group_tree(group))
+        if identifier in direct_tree_ids:
+            continue
+        tree_raw = _model_group_tree(group)
+        source = group_sources.get(identifier) or group_sources.get(name)
+        if source is None:
+            add_group(name, identifier, tree_type, tree_raw)
+        else:
+            source["tree"] = tree_raw
     return group_map, group_sources
 
 

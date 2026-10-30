@@ -12,6 +12,7 @@ use crate::{
         clnor::{self, NormalCodeOptions, SetterInput},
         color_layers::{self, ColorDomain, ColorLayer},
         edge_key,
+        provenance::{Origin, remap_attributes_with_edges},
         remesh::{Sample, SourceSampler, face_center, mix3},
         triangulate::{NgonMethod, QuadMethod, triangulate_mesh},
         uv_layers::{self, UvLayer, UvStore},
@@ -3588,11 +3589,40 @@ fn apply_flip_faces(mesh: &mut Mesh, selected: &Selection) -> Result<IdChanges> 
     if selected.domain != Domain::Face {
         return Err(invalid("flip_faces requires face elements"));
     }
-    for face in &mut mesh.faces {
-        if selected.ids.contains(&face.id) && face.vertices.len() > 1 {
+    if selected.ids.is_empty() {
+        return Ok(IdChanges::default());
+    }
+    let source = mesh.clone();
+    let mut faces = Vec::with_capacity(mesh.faces.len());
+    let mut corners = Vec::new();
+    let mut corner_offset = 0;
+    for (face_index, face) in mesh.faces.iter_mut().enumerate() {
+        let flip = selected.ids.contains(&face.id) && face.vertices.len() > 1;
+        let corner_count = face.vertices.len();
+        if flip {
             face.vertices[1..].reverse();
         }
+        for output_corner in 0..corner_count {
+            let source_corner = if flip && output_corner > 0 {
+                corner_count - output_corner
+            } else {
+                output_corner
+            };
+            corners.push(vec![(corner_offset + source_corner, 1.0)]);
+        }
+        corner_offset += corner_count;
+        faces.push(Some(face_index));
     }
+    let origin = Origin {
+        vertices: (0..source.vertices.len()).map(|index| vec![(index, 1.0)]).collect(),
+        faces,
+        corners: Some(corners),
+        ..Origin::default()
+    };
+    let edge_origins = (0..source.edges.len())
+        .map(|index| vec![(index, 1.0)])
+        .collect();
+    remap_attributes_with_edges(&source, mesh, &origin, edge_origins)?;
     Ok(IdChanges::default())
 }
 
@@ -7364,8 +7394,10 @@ fn apply_operation(
     let multires_edit = topology || operation == "flip_normals";
     // Blender's delete (bmesh_delete.cc) removes elements and keeps the survivors' own values, so
     // it does not interpolate attributes; only the other topology edits do.
-    let attribute_source_needed =
-        topology && operation != "delete" && has_interpolatable_attributes(mesh);
+    let attribute_source_needed = topology
+        && operation != "delete"
+        && operation != "flip_faces"
+        && has_interpolatable_attributes(mesh);
     // Deleting faces also invalidates custom normals, so they are rebuilt as for topology edits.
     let normal_source_needed = topology && mesh.attributes.contains_key("custom_normal");
     let multires_source_needed =

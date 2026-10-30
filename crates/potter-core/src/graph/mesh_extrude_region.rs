@@ -9,7 +9,9 @@ use crate::{
     geom::{
         Mesh,
         clnor::{self, NormalCodeOptions},
-        provenance::{Origin, copy_direct_matrix_edge_attributes, remap_attributes_with_edge_mix2},
+        provenance::{
+            Origin, copy_direct_matrix_edge_attributes, remap_attributes_with_default_edge_mixer,
+        },
     },
 };
 
@@ -156,7 +158,8 @@ pub(super) fn extrude_faces_region(
                 let count = offset_counts[vertex_index]
                     .to_f32()
                     .ok_or_else(|| super::evaluation("face region has too many offsets"))?;
-                offset_sums[vertex_index] / count
+                let inverse_count = 1.0_f32 / count;
+                offset_sums[vertex_index] * inverse_count
             };
         }
     }
@@ -413,7 +416,7 @@ pub(super) fn extrude_faces_region(
         corners: Some(corner_origins),
         ..Origin::default()
     };
-    remap_attributes_with_edge_mix2(source, &mut output, &origin, edge_origins)?;
+    remap_attributes_with_default_edge_mixer(source, &mut output, &origin, edge_origins)?;
     copy_direct_matrix_edge_attributes(source, &mut output, &origin)?;
     reset_untransferred_string_attributes(source, &mut output, source_corner_count);
     for key in [

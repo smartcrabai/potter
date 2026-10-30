@@ -60,6 +60,8 @@ mod uv_sphere;
 pub mod vdb;
 pub mod volume;
 
+pub(crate) const MESH_EVALUATION_CONTEXT_ATTRIBUTE: &str = ".potter_gn_evaluation_context";
+
 /// Evaluated per-corner normals of `mesh`, in flattened `mesh.faces` corner order. Authored
 /// custom-normal codes decode on their current fans; Auto corners and meshes without custom normals
 /// take the computed shading. This is the evaluator the renderer and exporters read, not a second
@@ -136,21 +138,34 @@ pub(crate) const ORIGINDEX_NONE: i32 = -1;
 pub(crate) const ORIGINDEX_ATTRIBUTE: &str = "user:__potter_origindex";
 
 /// The evaluation-only index carrier as one entry per vertex, when present.
+fn origindex_value(value: &Value) -> i32 {
+    value
+        .as_i64()
+        .and_then(|index| i32::try_from(index).ok())
+        .unwrap_or(ORIGINDEX_NONE)
+}
+
 pub(crate) fn origindex_values(mesh: &Mesh) -> Option<Vec<i32>> {
-    mesh.attributes
-        .get(ORIGINDEX_ATTRIBUTE)?
-        .as_array()
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_i64()
-                        .and_then(|index| i32::try_from(index).ok())
-                        .unwrap_or(ORIGINDEX_NONE)
-                })
-                .collect()
-        })
+    Some(
+        mesh.attributes
+            .get(ORIGINDEX_ATTRIBUTE)?
+            .as_array()?
+            .iter()
+            .map(origindex_value)
+            .collect(),
+    )
+}
+
+pub(crate) fn append_origindex_values(mesh: &Mesh, output: &mut Vec<i32>) -> bool {
+    let Some(values) = mesh
+        .attributes
+        .get(ORIGINDEX_ATTRIBUTE)
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    output.extend(values.iter().map(origindex_value));
+    true
 }
 
 /// Writes the evaluation-only index carrier, one entry per vertex.

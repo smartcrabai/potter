@@ -209,6 +209,22 @@ impl VertexPositions {
     }
 }
 
+pub(super) struct FaceNormalCalculator {
+    positions: VertexPositions,
+}
+
+impl FaceNormalCalculator {
+    pub(super) fn new(mesh: &Mesh) -> Self {
+        Self {
+            positions: VertexPositions::new(mesh, true),
+        }
+    }
+
+    pub(super) fn face(&self, face: &Face) -> Result<Vec3> {
+        face_normal_with_positions(&self.positions, face)
+    }
+}
+
 fn mesh_input_native_values(mesh: &Mesh, node_type: &str, output: &str) -> Result<Vec<Value>> {
     let edge_faces = edge_face_uses(mesh);
     let with_positions = matches!(
@@ -898,10 +914,6 @@ fn typed_zero(value: &Value) -> Value {
     }
 }
 
-pub(super) fn face_normal(mesh: &Mesh, face: &Face) -> Result<Vec3> {
-    face_normal_with_positions(&VertexPositions::new(mesh, true), face)
-}
-
 fn face_normal_with_positions(positions: &VertexPositions, face: &Face) -> Result<Vec3> {
     let normal = match face.vertices.as_slice() {
         [first, second, third] => (positions.get(*first)? - positions.get(*second)?)
@@ -925,11 +937,17 @@ fn face_normal_with_positions(positions: &VertexPositions, face: &Face) -> Resul
         }
         _ => return Err(evaluation("mesh face has fewer than three vertices")),
     };
-    Ok(if normal == Vec3::ZERO {
-        Vec3::Z
+    let length_squared = (normal.x * normal.x + normal.y * normal.y) + normal.z * normal.z;
+    if length_squared > 1.0e-35_f32 {
+        let inverse_length = 1.0_f32 / length_squared.sqrt();
+        Ok(Vec3::new(
+            normal.x * inverse_length,
+            normal.y * inverse_length,
+            normal.z * inverse_length,
+        ))
     } else {
-        normal.normalize()
-    })
+        Ok(Vec3::Z)
+    }
 }
 
 fn face_area(positions: &VertexPositions, face: &Face) -> Result<f32> {
@@ -1299,7 +1317,10 @@ mod tests {
             &[],
             &[&[0, 1, 2], &[1, 0, 3]],
         );
-        assert_eq!(face_normal(&collinear, &collinear.faces[0])?, Vec3::Z);
+        assert_eq!(
+            FaceNormalCalculator::new(&collinear).face(&collinear.faces[0])?,
+            Vec3::Z
+        );
         assert_eq!(
             mesh_input_field_values(
                 &collinear,

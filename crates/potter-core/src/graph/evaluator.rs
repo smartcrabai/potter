@@ -17,7 +17,8 @@ use crate::{
     blender_rng::BlenderRng,
     error::{ErrorCode, PotError, Result},
     geom::{
-        GridParams, IcosphereParams, Mesh, MeshError, ORIGINDEX_NONE,
+        GridParams, IcosphereParams, MESH_EVALUATION_CONTEXT_ATTRIBUTE, Mesh, MeshError,
+        ORIGINDEX_ATTRIBUTE, ORIGINDEX_NONE, append_origindex_values,
         modifiers::evaluate_modifiers, origindex_values, set_origindex,
     },
     model::{Id, Modifier, Registry},
@@ -45,7 +46,6 @@ type SimulationCache = Mutex<BTreeMap<(String, Id, i64), GeometryValue>>;
 type MeshFieldCache = Rc<RefCell<HashMap<(u64, &'static str), Vec<Value>>>>;
 type DemandedOutputs = BTreeMap<Id, BTreeSet<String>>;
 
-const MESH_EVALUATION_CONTEXT_ATTRIBUTE: &str = ".potter_gn_evaluation_context";
 const ANONYMOUS_ATTRIBUTE_OWNER_MARKER: &str = "potter_gn_anonymous";
 
 static NEXT_MESH_EVALUATION_CONTEXT: AtomicU64 = AtomicU64::new(1);
@@ -1227,10 +1227,14 @@ impl Evaluator<'_> {
                 | "GeometryNodeSetPosition"
                 | "GeometryNodeStoreNamedAttribute"
                 | "GeometryNodeRealizeInstances"
-                | "GeometryNodeCaptureAttribute",
+                | "GeometryNodeCaptureAttribute"
+                | "GeometryNodeMergeByDistance"
+                | "GeometryNodeDeleteGeometry"
+                | "GeometryNodeScaleElements",
                 "Geometry",
                 _,
-            ) => Some("Geometry"),
+            )
+            | ("GeometryNodeSeparateGeometry", "Selection" | "Inverted", _) => Some("Geometry"),
             ("GeometryNodeCaptureAttribute", _, false) => {
                 let (_, outputs) = node_sockets(self.group, id)?;
                 outputs
@@ -1238,32 +1242,18 @@ impl Evaluator<'_> {
                     .any(|(name, _)| name == output_socket)
                     .then_some("Geometry")
             }
-            ("GeometryNodeDistributePointsOnFaces" | "GeometryNodeMeshToPoints", "Points", _) => {
-                Some("Mesh")
-            }
-            ("GeometryNodeSubdivisionSurface", "Mesh", _) => Some("Mesh"),
-            (
-                "GeometryNodeExtrudeMesh"
+            ("GeometryNodeDistributePointsOnFaces" | "GeometryNodeMeshToPoints", "Points", _)
+            | (
+                "GeometryNodeSubdivisionSurface"
+                | "GeometryNodeExtrudeMesh"
                 | "GeometryNodeSplitEdges"
                 | "GeometryNodeFlipFaces"
                 | "GeometryNodeTriangulate"
                 | "GeometryNodeSubdivideMesh",
                 "Mesh",
                 _,
-            ) => Some("Mesh"),
-            (
-                "GeometryNodeMergeByDistance"
-                | "GeometryNodeDeleteGeometry"
-                | "GeometryNodeScaleElements",
-                "Geometry",
-                _,
-            ) => Some("Geometry"),
-            (
-                "GeometryNodeSeparateGeometry",
-                "Selection" | "Inverted",
-                _,
-            ) => Some("Geometry"),
-            ("GeometryNodeDualMesh", "Dual Mesh", _) => Some("Mesh"),
+            )
+            | ("GeometryNodeDualMesh", "Dual Mesh", _) => Some("Mesh"),
             _ => None,
         }
     }
@@ -5681,6 +5671,7 @@ fn field_is_single(field: &Field) -> bool {
             field_is_single(x) && field_is_single(y) && field_is_single(z)
         }
         Field::SeparateXYZ { vector, .. } => field_is_single(vector),
+        Field::ProceduralTexture { inputs, .. } => inputs.iter().all(field_is_single),
         Field::Position
         | Field::Normal
         | Field::Index
@@ -6072,20 +6063,6 @@ fn field_json_in_context(
                     "anonymous mesh attributes are not available on the Instances component",
                 ));
             }
-        },
-        Field::Captured {
-            domain: captured_domain,
-            values,
-        } => {
-            if captured_domain != domain {
-                return Err(evaluation(
-                    "captured attribute domain does not match its consumer",
-                ));
-            }
-            values
-                .get(index)
-                .cloned()
-                .ok_or_else(|| evaluation("captured attribute index is out of range"))?
         },
         Field::ProceduralTexture {
             kind,
@@ -8344,59 +8321,41 @@ fn merge_meshes(meshes: &[Mesh]) -> Result<Mesh> {
             "joined geometry exceeds vertex ID range",
         ));
     }
-    let tracks_origindex = meshes.iter().any(|mesh| origindex_values(mesh).is_some());
+    let tracks_origindex = meshes.iter().any(|mesh| {
+        mesh.attributes
+            .get(ORIGINDEX_ATTRIBUTE)
+            .and_then(Value::as_array)
+            .is_some()
+    });
     let mut original_vertices = tracks_origindex.then(|| Vec::with_capacity(vertex_count));
-    let mut result = Mesh::new();
+    let mut parts = Vec::with_capacity(meshes.len());
     for mesh in meshes {
-        if let Some(output_indices) = &mut original_vertices {
-            match origindex_values(mesh) {
-                Some(indices) => output_indices.extend_from_slice(&indices),
-                None => {
-                    output_indices.extend(std::iter::repeat_n(ORIGINDEX_NONE, mesh.vertices.len()));
-                }
-            }
+        if let Some(output_indices) = &mut original_vertices
+            && !append_origindex_values(mesh, output_indices)
+        {
+            output_indices.extend(std::iter::repeat_n(ORIGINDEX_NONE, mesh.vertices.len()));
         }
-        let mut mapping = HashMap::with_capacity(mesh.vertices.len());
-        for vertex in &mesh.vertices {
-            let id = result
-                .insert_vertex(vertex.co)
-                .map_err(|error| mesh_evaluation_error(&error))?;
-            mapping.insert(vertex.id, id);
-        }
-        for face in &mesh.faces {
-            let vertices = face
-                .vertices
-                .iter()
-                .map(|id| {
-                    mapping
-                        .get(id)
-                        .copied()
-                        .ok_or_else(|| evaluation("joined face references a missing vertex"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            result
-                .insert_face(vertices, face.material_index)
-                .map_err(|error| mesh_evaluation_error(&error))?;
-        }
-        for edge in &mesh.edges {
-            let first = mapping
-                .get(&edge.vertices[0])
-                .copied()
-                .ok_or_else(|| evaluation("joined edge references a missing vertex"))?;
-            let second = mapping
-                .get(&edge.vertices[1])
-                .copied()
-                .ok_or_else(|| evaluation("joined edge references a missing vertex"))?;
-            if !result.edges.iter().any(|existing| {
-                (existing.vertices[0] == first && existing.vertices[1] == second)
-                    || (existing.vertices[0] == second && existing.vertices[1] == first)
-            }) {
-                result
-                    .insert_edge([first, second])
-                    .map_err(|error| mesh_evaluation_error(&error))?;
-            }
-        }
+        let slot_count = match mesh.faces.iter().map(|face| face.material_index).max() {
+            Some(index) => usize::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "joined geometry material slot count overflow",
+                    )
+                })?,
+            None => 1,
+        };
+        parts.push(crate::geom::concat::Part {
+            mesh: std::borrow::Cow::Borrowed(mesh),
+            matrix: DMat4::IDENTITY,
+            material_offset: 0,
+            slot_count,
+            adaptive_normals: None,
+        });
     }
+    let mut result = crate::geom::concat::concatenate(parts)?;
     if let Some(vertices) = original_vertices {
         set_origindex(&mut result, &vertices);
     }

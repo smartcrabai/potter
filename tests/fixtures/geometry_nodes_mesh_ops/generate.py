@@ -736,6 +736,19 @@ def top_side_subdivide_tree():
     tree.links.new(side.outputs["Geometry"], group_output.inputs["Geometry"])
     return tree
 
+
+def extrude_all_faces_tree():
+    tree = new_tree("gn_mesh_ops_extrude_all_faces")
+    group_input = node(tree, "NodeGroupInput", "Group Input")
+    group_output = node(tree, "NodeGroupOutput", "Group Output")
+    extrude = node(tree, "GeometryNodeExtrudeMesh", "Extrude")
+    extrude.mode = "FACES"
+    assign_input(extrude, "Offset Scale", 1.0)
+    assign_input(extrude, "Individual", False)
+    tree.links.new(group_input.outputs["Geometry"], extrude.inputs["Mesh"])
+    tree.links.new(extrude.outputs["Mesh"], group_output.inputs["Geometry"])
+    return tree
+
 def top_after_separate_tree():
     tree = new_tree("gn_mesh_ops_top_after_separate")
     group_input = node(tree, "NodeGroupInput", "Group Input")
@@ -776,19 +789,19 @@ def sibling_topology_fields_tree():
     area_x = node(tree, "GeometryNodeStoreNamedAttribute", "Store Area X")
     area_x.domain = "FACE"
     area_x.data_type = "FLOAT"
-    assign_input(area_x, "Name", "area_x")
+    assign_input(area_x, "Name", "area_shared")
     angle_x = node(tree, "GeometryNodeStoreNamedAttribute", "Store Angle X")
     angle_x.domain = "EDGE"
     angle_x.data_type = "FLOAT"
-    assign_input(angle_x, "Name", "angle_x")
+    assign_input(angle_x, "Name", "angle_shared")
     area_y = node(tree, "GeometryNodeStoreNamedAttribute", "Store Area Y")
     area_y.domain = "FACE"
     area_y.data_type = "FLOAT"
-    assign_input(area_y, "Name", "area_y")
+    assign_input(area_y, "Name", "area_shared")
     angle_y = node(tree, "GeometryNodeStoreNamedAttribute", "Store Angle Y")
     angle_y.domain = "EDGE"
     angle_y.data_type = "FLOAT"
-    assign_input(angle_y, "Name", "angle_y")
+    assign_input(angle_y, "Name", "angle_shared")
     join = node(tree, "GeometryNodeJoinGeometry", "Join")
     tree.links.new(group_input.outputs["Geometry"], scale_x.inputs["Geometry"])
     tree.links.new(group_input.outputs["Geometry"], scale_y.inputs["Geometry"])
@@ -1047,6 +1060,44 @@ def nested_top_group_callsite_tree():
     tree.links.new(calls[1].outputs["Top"], store_b.inputs["Value"])
     tree.links.new(store_b.outputs["Geometry"], group_output.inputs["Geometry"])
     return tree
+
+
+def nested_extrude_all_faces_tree():
+    child = new_tree("gn_mesh_ops_nested_extrude_child")
+    child.interface.new_socket(
+        name="Geometry",
+        in_out="INPUT",
+        socket_type="NodeSocketGeometry",
+    )
+    child.interface.new_socket(
+        name="Selection",
+        in_out="INPUT",
+        socket_type="NodeSocketBool",
+    )
+    child.interface.new_socket(
+        name="Geometry",
+        in_out="OUTPUT",
+        socket_type="NodeSocketGeometry",
+    )
+    child_input = node(child, "NodeGroupInput", "Group Input")
+    child_output = node(child, "NodeGroupOutput", "Group Output")
+    extrude = node(child, "GeometryNodeExtrudeMesh", "Extrude")
+    extrude.mode = "FACES"
+    assign_input(extrude, "Offset Scale", 1.0)
+    assign_input(extrude, "Individual", False)
+    child.links.new(child_input.outputs["Geometry"], extrude.inputs["Mesh"])
+    child.links.new(child_input.outputs["Selection"], extrude.inputs["Selection"])
+    child.links.new(extrude.outputs["Mesh"], child_output.inputs["Geometry"])
+
+    tree = new_tree("gn_mesh_ops_nested_extrude")
+    group_input = node(tree, "NodeGroupInput", "Group Input")
+    group_output = node(tree, "NodeGroupOutput", "Group Output")
+    call = node(tree, "GeometryNodeGroup", "Call")
+    call.node_tree = child
+    assign_input(call, "Selection", True)
+    tree.links.new(group_input.outputs["Geometry"], call.inputs["Geometry"])
+    tree.links.new(call.outputs["Geometry"], group_output.inputs["Geometry"])
+    return tree
 def unrequested_group_top_tree():
     child = new_tree("gn_mesh_ops_unrequested_top_child")
     child.interface.new_socket(
@@ -1155,6 +1206,18 @@ def main():
         input_names + ["top_after_subdivide", "side_after_subdivide"],
         include_special_attributes=True,
     )
+    extrude_all_faces = evaluate_tree(
+        obj,
+        extrude_all_faces_tree(),
+        input_names,
+        include_special_attributes=True,
+    )
+    nested_extrude_all_faces = evaluate_tree(
+        obj,
+        nested_extrude_all_faces_tree(),
+        input_names,
+        include_special_attributes=True,
+    )
     top_after_separate = evaluate_tree(
         obj,
         top_after_separate_tree(),
@@ -1164,7 +1227,7 @@ def main():
     sibling_topology_fields = evaluate_tree(
         obj,
         sibling_topology_fields_tree(),
-        input_names + ["area_x", "angle_x", "area_y", "angle_y"],
+        input_names + ["area_shared", "angle_shared"],
         include_special_attributes=True,
     )
     single_vertex_obj = make_single_vertex_source()
@@ -1229,6 +1292,8 @@ def main():
         "closed_dual": closed_dual,
         "operations": results,
         "top_side_subdivide": top_side_subdivide,
+        "extrude_all_faces": extrude_all_faces,
+        "nested_extrude_all_faces": nested_extrude_all_faces,
         "single_vertex_input": single_vertex_input,
         "vertex_extrude_top_on_edge": vertex_top_edge,
         "top_on_original": top_on_original,

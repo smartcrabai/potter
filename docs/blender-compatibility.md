@@ -123,6 +123,10 @@ Each bake node of a Geometry Nodes modifier's node group maps to one entry of th
 - Import loss `blender.modifier.nodes_bake_packed`: every Blender bake whose effective target is PACKED (its own `bake_target`, or the modifier's when it is INHERIT). Blender 5.2.2 exposes no RNA property for packed bake data (`NodesModifierBake` has no `packed`, `bake_size`, or baked-state property; the pack, unpack, and delete operators poll only for an editable active object, `object_bake_simulation.cc:1204-1281`), so the payload cannot be detected from Python. The loss is conservative: a PACKED bake that holds no payload is reported too. Potter does not read the packed payload, so the bake is re-evaluated live.
 - Directory semantics: the stored `directory` is written as given. A Blender relative path (`//`) resolves against the saved .blend, not against the Potter project root.
 
+### Geometry Nodes Mesh Operations
+
+Blender 5.2.2 mesh topology operations are evaluated natively, including Extrude Mesh, Split Edges, Merge by Distance, Flip Faces, Delete Geometry, Separate Geometry, Dual Mesh, Triangulate, Scale Elements, and Subdivide Mesh. The pinned Geometry Nodes mesh fixture covers topology-input fields, domain adaptation, ordered topology, boundaries, UV/color/crease/shade data, and callsite-scoped Extrude Top/Side fields. Imported Geometry Nodes node-input edits are persisted by `pot apply`, inspected as evaluated geometry, and written back to `.blend`; the CLI regression reopens the exported file in Blender and checks the edited mesh and stored Top field.
+
 ## 4. Import and Export Verification Fixtures
 
 Prepare "create," "edit," "evaluate," and "round trip" fixtures for each feature category. The first release MUST NOT be considered complete until all of the following pass.

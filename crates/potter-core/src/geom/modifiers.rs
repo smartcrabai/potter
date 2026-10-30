@@ -32,7 +32,8 @@ use super::{
     origindex_values,
     provenance::{
         Origin, edge_flags, remap_attributes_staged, remap_attributes_with_basis,
-        remap_attributes_with_edge_identity, remap_attributes_with_edges,
+        remap_attributes_with_default_edge_mixer_from_origins, remap_attributes_with_edge_identity,
+        remap_attributes_with_edges,
     },
     set_origindex, uv_layers,
 };
@@ -1434,6 +1435,73 @@ fn build_topology(
                 .map_err(|error| mesh_error(&error))?;
         }
     }
+    Ok(result)
+}
+
+fn build_topology_with_edge_order(
+    points: Vec<DVec3>,
+    polygons: Vec<Polygon>,
+    edges: Vec<[usize; 2]>,
+) -> Result<Mesh> {
+    let mut result = Mesh::new();
+    for point in points {
+        result
+            .insert_vertex(point)
+            .map_err(|error| mesh_error(&error))?;
+    }
+    let vertex_ids = result
+        .vertices
+        .iter()
+        .map(|vertex| vertex.id)
+        .collect::<Vec<_>>();
+    let edge_count = edges.len();
+    for [first, second] in edges {
+        let first_id = vertex_ids.get(first).copied().ok_or_else(|| {
+            PotError::new(ErrorCode::InvalidArgument, "generated edge index is out of range")
+        })?;
+        let second_id = vertex_ids.get(second).copied().ok_or_else(|| {
+            PotError::new(ErrorCode::InvalidArgument, "generated edge index is out of range")
+        })?;
+        result
+            .insert_edge([first_id, second_id])
+            .map_err(|error| mesh_error(&error))?;
+    }
+    let faces = polygons.into_iter().map(|(indices, material_index)| {
+        let ids = indices
+            .into_iter()
+            .map(|index| {
+                vertex_ids
+                    .get(index)
+                    .copied()
+                    .ok_or(MeshError::InvalidTopology(
+                        "generated polygon index is out of range",
+                    ))
+            })
+            .collect::<std::result::Result<Vec<_>, MeshError>>()?;
+        Ok((ids, material_index))
+    });
+    result
+        .insert_faces(faces)
+        .map_err(|error| mesh_error(&error))?;
+    if result.edges.len() != edge_count {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "merged edge order does not cover every face boundary",
+        ));
+    }
+    Ok(result)
+}
+
+fn build_mesh_with_edge_order(
+    points: Vec<DVec3>,
+    polygons: Vec<Polygon>,
+    edges: Vec<[usize; 2]>,
+    origin: &Origin,
+    source: &Mesh,
+) -> Result<Mesh> {
+    let mut result = build_topology_with_edge_order(points, polygons, edges)?;
+    remap_attributes_with_default_edge_mixer_from_origins(source, &mut result, origin)?;
+    validated(&result)?;
     Ok(result)
 }
 
@@ -3654,13 +3722,11 @@ fn subdivision_with_samples_with_settings(
         };
         let limit =
             subdivision_limit::LimitSurface::build(&base, &positions(mesh), &sharpness, isolation);
-        if !geometry_nodes_simple {
-            if let Some(samples) = limit_samples {
-                let points = limit.evaluate(&samples.vertices);
-                for (vertex, point) in result.vertices.iter_mut().zip(points) {
-                    if let Some(point) = point {
-                        vertex.co = point;
-                    }
+        if !geometry_nodes_simple && let Some(samples) = limit_samples {
+            let points = limit.evaluate(&samples.vertices);
+            for (vertex, point) in result.vertices.iter_mut().zip(points) {
+                if let Some(point) = point {
+                    vertex.co = point;
                 }
             }
         }
@@ -6275,7 +6341,7 @@ fn decimate_compact(
     // The edges take Blender's pool order before the provenance remap writes the edge-indexed data.
     let mut result = build_topology(compact_points, polygons, loose)?;
     order_edges(&mut result, &compact_order)?;
-    remap_attributes_with_basis(source, &mut result, &origin, &[], None)?;
+    remap_attributes_with_default_edge_mixer_from_origins(source, &mut result, &origin)?;
     validated(&result)?;
     Ok(result)
 }
@@ -6630,7 +6696,8 @@ pub(crate) fn merge_by_distance_for_geometry_nodes(
         corners: Some(corner_origins),
         ..Default::default()
     };
-    let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
+    let mut result =
+        build_mesh_with_edge_order(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
     mark_generated_faces_smooth(&mut result, &generated_face_indices);
     clnor::transfer_custom_normals(mesh, &mut result, &sources, NormalCodeOptions::default())?;
     Ok(result)

@@ -7,8 +7,10 @@ use serde_json::{Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        Mesh, attribute_keys, color_layers, edge_key,
-        provenance::{self, Origin, remap_attributes_with_edges},
+        Mesh, attribute_keys, color_layers, edge_key, uv_layers,
+        provenance::{
+            self, Origin, remap_attributes_with_default_edge_mixer,
+        },
     },
 };
 
@@ -111,7 +113,7 @@ pub(super) fn extrude_vertices(
         faces: (0..source.faces.len()).map(Some).collect(),
         ..Default::default()
     };
-    remap_attributes_with_edges(source, &mut result, &origin, edge_origins)?;
+    remap_attributes_with_default_edge_mixer(source, &mut result, &origin, edge_origins)?;
     provenance::copy_direct_matrix_edge_attributes(source, &mut result, &origin)?;
     super::mesh_operations::reset_untransferred_string_attributes(source, &mut result)?;
     remove_unsupported_point_data(&mut result);
@@ -180,9 +182,10 @@ pub(super) fn extrude_edges(
         corners: Some(faces.corners),
         ..Default::default()
     };
-    remap_attributes_with_edges(source, &mut shell.mesh, &origin, shell.edge_origins)?;
+    remap_attributes_with_default_edge_mixer(source, &mut shell.mesh, &origin, shell.edge_origins)?;
     provenance::copy_direct_matrix_edge_attributes(source, &mut shell.mesh, &origin)?;
     mix_generated_face_attributes(source, &mut shell.mesh, &faces.sources, &faces.indices)?;
+    fill_empty_generated_face_uvs(&mut shell.mesh, &faces.indices)?;
     super::mesh_operations::reset_untransferred_string_attributes(source, &mut shell.mesh)?;
     remove_unsupported_point_data(&mut shell.mesh);
     shell.mesh.attributes.remove("multires_displacement");
@@ -202,6 +205,27 @@ pub(super) fn extrude_edges(
         side_domain: "FACE",
         side,
     })
+}
+
+fn fill_empty_generated_face_uvs(mesh: &mut Mesh, faces: &[usize]) -> Result<()> {
+    let mut store = uv_layers::read(mesh);
+    for layer in &mut store.layers {
+        for &face_index in faces {
+            let face = mesh
+                .faces
+                .get(face_index)
+                .ok_or_else(|| evaluation("extrude UV face index is out of range"))?;
+            let uvs = layer
+                .faces
+                .get_mut(face_index)
+                .ok_or_else(|| evaluation("extrude UV layer has an invalid face count"))?;
+            if uvs.is_none() {
+                *uvs = Some(vec![[0.0, 1.0]; face.vertices.len()]);
+            }
+        }
+    }
+    uv_layers::write(mesh, &store);
+    Ok(())
 }
 
 struct EdgeShell {
@@ -524,17 +548,23 @@ fn mix_generated_face_attributes(
             }
         } else if key == "blender_polygon_smooth" {
             mix_polygon_smooth(source_value, output, source_faces, output_faces);
+        } else if key == "shade_smooth" {
+            mix_shade_smooth(source, output, source_value, source_faces, output_faces)?;
         } else if let Some(domain) = source_value.get("domain").and_then(Value::as_str)
             && domain.eq_ignore_ascii_case("face")
         {
-            mix_keyed_face_entry(
-                source,
-                output,
-                key,
-                source_value,
-                source_faces,
-                output_faces,
-            )?;
+            if source_value.get("data").is_some() {
+                mix_stored_face_entry(source, output, key, source_value, source_faces, output_faces)?;
+            } else {
+                mix_keyed_face_entry(
+                    source,
+                    output,
+                    key,
+                    source_value,
+                    source_faces,
+                    output_faces,
+                )?;
+            }
         }
     }
     Ok(())
@@ -570,6 +600,47 @@ fn mix_array_face_entry(
             .map(|index| source_values.get(*index).unwrap_or(&default))
             .collect::<Vec<_>>();
         let mixed = mix_face_values(&values, data_type)?;
+        if let Some(output_value) = output_values.get_mut(*output_index) {
+            *output_value = mixed;
+        }
+    }
+    Ok(())
+}
+
+fn mix_stored_face_entry(
+    source: &Mesh,
+    output: &mut Mesh,
+    key: &str,
+    source_entry: &Value,
+    source_faces: &[Vec<usize>],
+    output_faces: &[usize],
+) -> Result<()> {
+    let Some(source_values) = source_entry.get("data").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let data_type = canonical_face_type(
+        source,
+        key,
+        source_entry
+            .get("data_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    let default = face_default_like(&data_type, source_values.first());
+    let Some(output_values) = output
+        .attributes
+        .get_mut(key)
+        .and_then(|entry| entry.get_mut("data"))
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for (sources, output_index) in source_faces.iter().zip(output_faces) {
+        let values = sources
+            .iter()
+            .map(|index| source_values.get(*index).unwrap_or(&default))
+            .collect::<Vec<_>>();
+        let mixed = mix_face_values(&values, &data_type)?;
         if let Some(output_value) = output_values.get_mut(*output_index) {
             *output_value = mixed;
         }
@@ -657,13 +728,53 @@ fn mix_polygon_smooth(
         return;
     };
     for (sources, output_index) in source_faces.iter().zip(output_faces) {
+        // Blender requires every source face to be smooth; an empty fan keeps the smooth default.
         let smooth = sources
             .iter()
-            .any(|index| source_values.get(*index).and_then(Value::as_bool) == Some(true));
+            .all(|index| source_values.get(*index).and_then(Value::as_bool) == Some(true));
         if let Some(value) = output_values.get_mut(*output_index) {
             *value = json!(smooth);
         }
     }
+}
+
+fn mix_shade_smooth(
+    source: &Mesh,
+    output: &mut Mesh,
+    source_value: &Value,
+    source_faces: &[Vec<usize>],
+    output_faces: &[usize],
+) -> Result<()> {
+    let Some(source_values) = source_value.get("values").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let Some(output_values) = output
+        .attributes
+        .get_mut("shade_smooth")
+        .and_then(|entry| entry.get_mut("values"))
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    for (sources, output_index) in source_faces.iter().zip(output_faces) {
+        let output_face = output
+            .faces
+            .get(*output_index)
+            .ok_or_else(|| evaluation("extrude generated face index is out of range"))?;
+        let mut smooth = true;
+        for source_index in sources {
+            let source_face = source
+                .faces
+                .get(*source_index)
+                .ok_or_else(|| evaluation("extrude source face index is out of range"))?;
+            smooth &= source_values
+                .get(&format!("f{}", source_face.id))
+                .and_then(Value::as_bool)
+                == Some(true);
+        }
+        output_values.insert(format!("f{}", output_face.id), json!(smooth));
+    }
+    Ok(())
 }
 
 fn canonical_face_type(source: &Mesh, key: &str, raw_type: &str) -> String {

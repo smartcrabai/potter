@@ -446,7 +446,23 @@ fn effective_extrusion_offsets(
         super::EvalValue::Scalar(json!(1.0)),
     )?;
     let offset_is_single = super::field_is_single(&offset) && super::field_is_single(&offset_scale);
+    let vertex_normals = if matches!(&offset, Field::Normal) && matches!(domain, "EDGE" | "POINT") {
+        let positions = mesh.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+        Some(crate::geom::normals::geometric_vertex_normals(
+            mesh, &positions,
+        )?)
+    } else {
+        None
+    };
+    let vertex_indices = (domain == "EDGE" && vertex_normals.is_some()).then(|| {
+        mesh.vertices
+            .iter()
+            .enumerate()
+            .map(|(index, vertex)| (vertex.id, index))
+            .collect::<HashMap<_, _>>()
+    });
     let mut offsets = vec![Vec3::ZERO; selection.len()];
+    let mut face_normal_calculator: Option<super::mesh_topology::FaceNormalCalculator> = None;
     for (index, selected) in selection.iter().enumerate() {
         if !selected {
             continue;
@@ -456,12 +472,35 @@ fn effective_extrusion_offsets(
                 .faces
                 .get(index)
                 .ok_or_else(|| evaluation("extrude face index is out of range"))?;
-            let normal = super::mesh_topology::face_normal(mesh, face)?;
+            let normal = if let Some(calculator) = face_normal_calculator.as_ref() {
+                calculator.face(face)?
+            } else {
+                let calculator = super::mesh_topology::FaceNormalCalculator::new(mesh);
+                let normal = calculator.face(face)?;
+                face_normal_calculator = Some(calculator);
+                normal
+            };
             DVec3::new(
                 f64::from(normal.x),
                 f64::from(normal.y),
                 f64::from(normal.z),
             )
+        } else if let Some(vertex_normals) = vertex_normals.as_ref() {
+            match domain {
+                "POINT" | "POINTS" => vertex_normals
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| evaluation("extrude point normal index is out of range"))?,
+                "EDGE" => edge_normal_from_vertex_normals(
+                    mesh,
+                    vertex_normals,
+                    vertex_indices
+                        .as_ref()
+                        .ok_or_else(|| evaluation("edge normal vertex index map is missing"))?,
+                    index,
+                )?,
+                _ => super::field_vec3_in_domain(&offset, mesh, index, domain, DVec3::ZERO)?,
+            }
         } else {
             super::field_vec3_in_domain(&offset, mesh, index, domain, DVec3::ZERO)?
         };
@@ -473,6 +512,47 @@ fn effective_extrusion_offsets(
         offsets[index] = vector.as_vec3() * scale;
     }
     Ok((offsets, offset_is_single))
+}
+
+/// Blender's NormalFieldInput edge branch: normalize the midpoint of its two vertex normals.
+fn edge_normal_from_vertex_normals(
+    mesh: &Mesh,
+    vertex_normals: &[DVec3],
+    vertex_indices: &HashMap<u32, usize>,
+    edge_index: usize,
+) -> Result<DVec3> {
+    let edge = mesh
+        .edges
+        .get(edge_index)
+        .ok_or_else(|| evaluation("edge normal index is out of range"))?;
+    let vertex_normal = |vertex_id| {
+        vertex_indices
+            .get(&vertex_id)
+            .and_then(|index| vertex_normals.get(*index))
+            .copied()
+            .map(DVec3::as_vec3)
+            .ok_or_else(|| evaluation("edge normal references a missing vertex"))
+    };
+    let first = vertex_normal(edge.vertices[0])?;
+    let second = vertex_normal(edge.vertices[1])?;
+    let midpoint = Vec3::new(
+        first.x * 0.5 + second.x * 0.5,
+        first.y * 0.5 + second.y * 0.5,
+        first.z * 0.5 + second.z * 0.5,
+    );
+    let length_squared = (midpoint.x * midpoint.x + midpoint.y * midpoint.y)
+        + midpoint.z * midpoint.z;
+    let normal = if length_squared > 1.0e-35_f32 {
+        let length = length_squared.sqrt();
+        Vec3::new(midpoint.x / length, midpoint.y / length, midpoint.z / length)
+    } else {
+        Vec3::ZERO
+    };
+    Ok(DVec3::new(
+        f64::from(normal.x),
+        f64::from(normal.y),
+        f64::from(normal.z),
+    ))
 }
 
 fn extrude_by_mode(
