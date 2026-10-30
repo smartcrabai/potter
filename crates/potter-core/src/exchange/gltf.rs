@@ -1824,9 +1824,12 @@ fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) 
             // glTF has no texture space: a stored one is a reported loss (`unwritten_attribute_losses`), so lossy export
             // proceeds and strict export refuses through the loss report, as for other unwritten attributes.
             | crate::geom::TEXTURE_SPACE_KEY => true,
-            "blender_metadata" => value["custom_properties"]
-                .as_object()
-                .is_some_and(serde_json::Map::is_empty),
+            "blender_metadata" => match value.get("custom_properties") {
+                None => true,
+                Some(properties) => properties
+                    .as_object()
+                    .is_some_and(serde_json::Map::is_empty),
+            },
             "blender_attributes" => value
                 .as_array()
                 .is_some_and(|entries| entries.iter().all(blender_attribute_exportable)),
