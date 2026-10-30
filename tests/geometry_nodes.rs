@@ -801,6 +801,36 @@ fn mesh_to_points_supports_point_edge_face_and_corner_domains() {
     }
 }
 #[test]
+fn joined_mesh_to_points_preserves_nonempty_radius_attributes_and_fields() {
+    let doc = graph_with_nodes(
+        vec![
+            json!({"id":"line_a","type":"GeometryNodeMeshLine","inputs":{"Count":2}}),
+            json!({"id":"line_b","type":"GeometryNodeMeshLine","inputs":{"Count":2}}),
+            json!({"id":"points_a","type":"GeometryNodeMeshToPoints","properties":{"mode":"VERTICES"},"inputs":{"Radius":0.25}}),
+            json!({"id":"points_b","type":"GeometryNodeMeshToPoints","properties":{"mode":"VERTICES"},"inputs":{"Radius":0.75}}),
+            json!({"id":"join","type":"GeometryNodeJoinGeometry"}),
+            json!({"id":"radius","type":"GeometryNodeInputNamedAttribute","properties":{"data_type":"FLOAT"},"inputs":{"Name":"radius"}}),
+            json!({"id":"store","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"FLOAT"},"inputs":{"Name":"joined_radius"}}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"line_a","from_socket":"Mesh","to_node":"points_a","to_socket":"Mesh"}),
+            json!({"from_node":"line_b","from_socket":"Mesh","to_node":"points_b","to_socket":"Mesh"}),
+            json!({"from_node":"points_a","from_socket":"Points","to_node":"join","to_socket":"Geometry"}),
+            json!({"from_node":"points_b","from_socket":"Points","to_node":"join","to_socket":"Geometry"}),
+            json!({"from_node":"join","from_socket":"Geometry","to_node":"store","to_socket":"Geometry"}),
+            json!({"from_node":"radius","from_socket":"Attribute","to_node":"store","to_socket":"Value"}),
+            json!({"from_node":"store","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let mesh = evaluate(&doc).mesh;
+    let expected = json!([0.25, 0.25, 0.75, 0.75]);
+    assert_eq!(mesh.attributes["radius"]["domain"], "POINT");
+    assert_eq!(mesh.attributes["radius"]["data_type"], "FLOAT");
+    assert_eq!(mesh.attributes["radius"]["data"], expected);
+    assert_eq!(mesh.attributes["joined_radius"]["data"], expected);
+}
+#[test]
 fn random_value_boolean_probability_drives_fields() {
     let doc = graph_with_nodes(
         vec![
