@@ -3179,7 +3179,7 @@ fn build_imported_graph(
     let images = optional_array(raw, "images")?;
     let volumes = optional_array(raw, "volumes")?;
     let mut mappings = BTreeMap::<String, String>::new();
-    let (resource_ids, resource_assets) = import_blender_resources(raw, file, &mut doc)?;
+    let (resource_ids, mut resource_assets) = import_blender_resources(raw, file, &mut doc)?;
     let cache_resource_hashes = doc
         .resources
         .iter()
@@ -3873,6 +3873,9 @@ fn build_imported_graph(
                 image.source_path = Some(path);
             }
             doc.images.insert(id, image);
+        } else if item.get("source").and_then(Value::as_str) == Some("GENERATED") {
+            let image = imported_generated_image(item, &mut resource_assets)?;
+            doc.images.insert(id, image);
         } else if let Some(image) =
             imported_image_from_resource(item, &resource_ids, &resource_assets, &doc)?
         {
@@ -3993,6 +3996,19 @@ fn build_imported_graph(
         }));
         world_shader_group_names.insert(world_name.to_owned(), graph_name);
     }
+    let mut object_ids = BTreeMap::new();
+    for item in objects {
+        let name = string_field(item, "name")?;
+        mapped_id(
+            item,
+            "potter_id",
+            "node",
+            name,
+            &mut object_ids,
+            &mut mappings,
+            "Object",
+        )?;
+    }
     resolve_image_node_ids(&mut graph_sources, &image_ids);
     let node_group_ids = import_node_groups(&graph_sources, &mut doc, &mut mappings)?;
     for (material_name, graph_name) in shader_group_names {
@@ -4106,19 +4122,6 @@ fn build_imported_graph(
             })?;
             data_action_by_id.insert(data_id.clone(), action_id);
         }
-    }
-    let mut object_ids = BTreeMap::new();
-    for item in objects {
-        let name = string_field(item, "name")?;
-        mapped_id(
-            item,
-            "potter_id",
-            "node",
-            name,
-            &mut object_ids,
-            &mut mappings,
-            "Object",
-        )?;
     }
     for item in hair_curves {
         let surface_name = match item.get("surface") {
@@ -5256,6 +5259,57 @@ fn build_imported_graph(
         source,
     })
 }
+fn imported_generated_image(item: &Value, assets: &mut Vec<(String, Vec<u8>)>) -> Result<Image> {
+    let name = string_field(item, "name")?;
+    let width = item
+        .get("generated_width")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| invalid_intermediate("generated image width is missing or invalid"))?;
+    let height = item
+        .get("generated_height")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| invalid_intermediate("generated image height is missing or invalid"))?;
+    let values = item
+        .get("generated_pixels")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_intermediate("generated image pixels are missing"))?;
+    let mut pixels = Vec::with_capacity(values.len());
+    for value in values {
+        let components = value
+            .as_array()
+            .filter(|components| components.len() == 4)
+            .ok_or_else(|| invalid_intermediate("generated image pixel must have four channels"))?;
+        let mut pixel = [0.0; 4];
+        for (component, value) in pixel.iter_mut().zip(components) {
+            *component = value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| invalid_intermediate("generated image pixel channel is invalid"))?;
+        }
+        pixels.push(pixel);
+    }
+    let bytes = crate::image::encode_pixels(width, height, &pixels)?;
+    let blob = crate::hash::sha256(&bytes);
+    if !assets.iter().any(|(existing, _)| existing == &blob) {
+        assets.push((blob.clone(), bytes));
+    }
+    Ok(Image {
+        name: name.to_owned(),
+        source: ImageSource::Generated,
+        colorspace: declared_colorspace(item).unwrap_or_default(),
+        width,
+        height,
+        tiles: Vec::new(),
+        blob: Some(blob),
+        source_path: None,
+        source_hash: None,
+        alpha_mode: imported_alpha_mode(name, item, None)?,
+        tiled: false,
+    })
+}
+
 fn imported_image_from_resource(
     item: &Value,
     resource_ids: &BTreeMap<String, String>,
@@ -5707,6 +5761,29 @@ fn import_node_groups(
             "NodeGroup",
         )?;
     }
+    let mut implicit_geometry_groups = BTreeSet::new();
+    for item in items {
+        let tree = item
+            .get("tree")
+            .filter(|tree| !tree.is_null())
+            .unwrap_or(item);
+        let tree_type = tree
+            .get("type")
+            .or_else(|| item.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let no_outputs = tree
+            .get("interface")
+            .and_then(|interface| interface.get("outputs"))
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty);
+        if tree_type == "GeometryNodeTree" && no_outputs {
+            let name = string_field(item, "name")?;
+            if let Some(id) = group_ids.get(name) {
+                implicit_geometry_groups.insert(id.as_str().to_owned());
+            }
+        }
+    }
     for item in items {
         let name = string_field(item, "name")?;
         let group_id = group_ids
@@ -5743,8 +5820,8 @@ fn import_node_groups(
             .unwrap_or(&[]);
         let mut group = NodeGroup::new(name, kind);
         group.interface = GraphInterface {
-            inputs: convert_graph_sockets(inputs),
-            outputs: convert_graph_sockets(outputs),
+            inputs: convert_graph_sockets(inputs, mappings)?,
+            outputs: convert_graph_sockets(outputs, mappings)?,
         };
         let mut node_ids = BTreeMap::new();
         for raw_node in optional_array(tree, "nodes")? {
@@ -5814,7 +5891,7 @@ fn import_node_groups(
                     name: node_name.to_owned(),
                     location,
                     properties,
-                    inputs: graph_node_inputs(raw_node)?,
+                    inputs: graph_node_inputs(raw_node, mappings)?,
                 },
             );
         }
@@ -5827,11 +5904,37 @@ fn import_node_groups(
             let to_node = node_ids.get(to_name).cloned().ok_or_else(|| {
                 invalid_intermediate("node graph link references an unknown destination node")
             })?;
+            let from_socket = string_field(raw_link, "from_socket")?;
+            let from_socket = if kind == GraphKind::Geometry
+                && group.nodes.get(&from_node).is_some_and(|node| {
+                    node.node_type == "GeometryNodeGroup"
+                        && node
+                            .properties
+                            .get("node_tree")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| implicit_geometry_groups.contains(id))
+                }) {
+                "Geometry".to_owned()
+            } else {
+                from_socket.to_owned()
+            };
+            let to_socket = string_field(raw_link, "to_socket")?;
+            let to_socket = if kind == GraphKind::Geometry
+                && group.interface.outputs.is_empty()
+                && group
+                    .nodes
+                    .get(&to_node)
+                    .is_some_and(|node| node.node_type == "NodeGroupOutput")
+            {
+                "Geometry".to_owned()
+            } else {
+                to_socket.to_owned()
+            };
             group.links.push(GraphLink {
                 from_node,
-                from_socket: string_field(raw_link, "from_socket")?.to_owned(),
+                from_socket,
                 to_node,
-                to_socket: string_field(raw_link, "to_socket")?.to_owned(),
+                to_socket,
             });
         }
         if kind == GraphKind::Shader {
@@ -5842,7 +5945,10 @@ fn import_node_groups(
     Ok(group_ids)
 }
 
-fn convert_graph_sockets(values: &[Value]) -> Vec<GraphSocket> {
+fn convert_graph_sockets(
+    values: &[Value],
+    mappings: &BTreeMap<String, String>,
+) -> Result<Vec<GraphSocket>> {
     values
         .iter()
         .map(|socket| {
@@ -5860,12 +5966,18 @@ fn convert_graph_sockets(values: &[Value]) -> Vec<GraphSocket> {
                 .get("socket_type")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            GraphSocket {
+            let socket_type = blender_graph_socket_type(socket_type).to_owned();
+            let default = resolve_graph_resource_value(
+                &socket.get("default").cloned().unwrap_or(Value::Null),
+                &socket_type,
+                mappings,
+            )?;
+            Ok(GraphSocket {
                 id,
                 name,
-                socket_type: blender_graph_socket_type(socket_type).to_owned(),
-                default: socket.get("default").cloned().unwrap_or(Value::Null),
-            }
+                socket_type,
+                default,
+            })
         })
         .collect()
 }
@@ -5877,16 +5989,22 @@ fn blender_graph_socket_type(value: &str) -> &str {
         "NodeSocketBool" => "boolean",
         "NodeSocketVector" => "vector",
         "NodeSocketRotation" => "rotation",
+        "NodeSocketMatrix" => "matrix",
+        "NodeSocketMenu" => "menu",
         "NodeSocketColor" => "color",
         "NodeSocketString" => "string",
         "NodeSocketObject" => "object",
         "NodeSocketCollection" => "collection",
         "NodeSocketMaterial" => "material",
+        "NodeSocketImage" => "image",
         other => other,
     }
 }
 
-fn graph_node_inputs(raw_node: &Value) -> Result<BTreeMap<String, Value>> {
+fn graph_node_inputs(
+    raw_node: &Value,
+    mappings: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, Value>> {
     match raw_node.get("inputs") {
         None | Some(Value::Null) => Ok(BTreeMap::new()),
         Some(Value::Object(inputs)) => Ok(inputs
@@ -5901,9 +6019,15 @@ fn graph_node_inputs(raw_node: &Value) -> Result<BTreeMap<String, Value>> {
                     .and_then(Value::as_str)
                     .or_else(|| input.get("name").and_then(Value::as_str))
                     .ok_or_else(|| invalid_intermediate("node graph input has no socket name"))?;
+                let value = input.get("default").cloned().unwrap_or(Value::Null);
+                let socket_type = input
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(blender_graph_socket_type)
+                    .unwrap_or_default();
                 converted.insert(
                     name.to_owned(),
-                    input.get("default").cloned().unwrap_or(Value::Null),
+                    resolve_graph_resource_value(&value, socket_type, mappings)?,
                 );
             }
             Ok(converted)
@@ -5912,6 +6036,51 @@ fn graph_node_inputs(raw_node: &Value) -> Result<BTreeMap<String, Value>> {
             "node graph inputs must be an object or array",
         )),
     }
+}
+
+fn resolve_graph_resource_value(
+    value: &Value,
+    socket_type: &str,
+    mappings: &BTreeMap<String, String>,
+) -> Result<Value> {
+    let expected = match socket_type {
+        "object" => Some("Object"),
+        "collection" => Some("Collection"),
+        "material" => Some("Material"),
+        "image" => Some("Image"),
+        _ => None,
+    };
+    let Some(expected) = expected else {
+        return Ok(value.clone());
+    };
+    let Some(reference) = value.as_object() else {
+        return Ok(value.clone());
+    };
+    let id_type = reference.get("id_type").and_then(Value::as_str);
+    let name = reference.get("name").and_then(Value::as_str);
+    if id_type != Some(expected) {
+        return Err(invalid_intermediate(&format!(
+            "{expected} graph socket references a different Blender ID type"
+        )));
+    }
+    let name = name.ok_or_else(|| invalid_intermediate("graph resource reference has no name"))?;
+    let mapping_key = if expected == "Collection" {
+        reference
+            .get("bridge_id")
+            .and_then(Value::as_str)
+            .map_or_else(
+                || format!("{expected}:{name}"),
+                |bridge_id| format!("{expected}:{bridge_id}"),
+            )
+    } else {
+        format!("{expected}:{name}")
+    };
+    let id = mappings.get(&mapping_key).ok_or_else(|| {
+        invalid_intermediate(&format!(
+            "graph {expected} socket references unknown resource `{name}`"
+        ))
+    })?;
+    Ok(json!({"id_type":expected,"id":id}))
 }
 
 fn array<'a>(raw: &'a Value, key: &str) -> Result<&'a [Value]> {
@@ -13241,6 +13410,7 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                             | "lights"
                             | "actions"
                             | "volumes"
+                            | "node_groups"
                             | "worlds"
                     )
                 )
@@ -25233,6 +25403,32 @@ print("UNSUPPORTED_POSE " + json.dumps({
                 .iter()
                 .all(|loss| loss.feature_id != "blender.material.volume"),
             "a stored-nothing Density must read as Blender's default of 1.0"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generated_image_import_preserves_content_addressed_pixels() -> Result<()> {
+        let item = json!({
+            "name":"Generated Pixels",
+            "source":"GENERATED",
+            "generated_width":1,
+            "generated_height":1,
+            "generated_pixels":[[0.125, 0.25, 0.5, 1.0]],
+            "colorspace":"sRGB",
+            "alpha_mode":"straight"
+        });
+        let mut assets = Vec::new();
+        let image = imported_generated_image(&item, &mut assets)?;
+        let blob = image
+            .blob
+            .as_ref()
+            .ok_or_else(|| invalid_intermediate("generated image blob is missing"))?;
+        assert_eq!(assets.len(), 1);
+        assert_eq!(&assets[0].0, blob);
+        assert_eq!(
+            crate::image::decode_pixels(&assets[0].1, image.colorspace)?,
+            (1, 1, vec![[0.125, 0.25, 0.5, 1.0]])
         );
         Ok(())
     }

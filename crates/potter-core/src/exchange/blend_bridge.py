@@ -283,7 +283,10 @@ def plain(value, depth=0):
     if isinstance(value, Matrix):
         return matrix_rows(value)
     if all(hasattr(value, axis) for axis in ("r", "g", "b")):
-        return [float(value.r), float(value.g), float(value.b)]
+        channels = [float(value.r), float(value.g), float(value.b)]
+        if hasattr(value, "a"):
+            channels.append(float(value.a))
+        return channels
     if isinstance(value, Euler):
         return [float(value.x), float(value.y), float(value.z)]
     if hasattr(value, "w") and hasattr(value, "to_euler"):
@@ -1283,11 +1286,14 @@ def tree_dump(tree):
             except Exception:
                 default = None
             socket_type = getattr(socket, "bl_socket_idname", getattr(socket, "bl_idname", socket.type))
-            identifier = (socket.name
-                          if node.bl_idname in ("NodeGroupInput", "NodeGroupOutput",
-                                                "GeometryNodeSimulationInput",
-                                                "GeometryNodeSimulationOutput")
-                          else socket.identifier)
+            if node.bl_idname in ("NodeGroupInput", "NodeGroupOutput"):
+                identifier = (socket.identifier
+                              if tree.bl_rna.identifier == "GeometryNodeTree" else socket.name)
+            elif node.bl_idname in ("GeometryNodeSimulationInput",
+                                    "GeometryNodeSimulationOutput"):
+                identifier = socket.name
+            else:
+                identifier = socket.identifier
             sockets.append({"name": socket.name, "identifier": identifier, "type": socket_type,
                             "enabled": socket.enabled, "default": default})
         custom_properties = custom_props(node)
@@ -1305,6 +1311,9 @@ def tree_dump(tree):
                 node.mapping, "%s node %s" % (tree.name, node.name))
         if node.bl_idname == "ShaderNodeValToRGB":
             properties["color_ramp"] = _color_ramp_settings(node.color_ramp)
+        if node.bl_idname == "GeometryNodeMenuSwitch":
+            properties["potter_menu_items"] = [
+                item.name for item in getattr(node, "enum_items", ())]
         if node.bl_idname in ("ShaderNodeRGB", "ShaderNodeValue", "ShaderNodeNormal"):
             properties["potter_output_defaults"] = [
                 {"identifier": socket.identifier, "default": plain(socket.default_value)}
@@ -1343,19 +1352,24 @@ def tree_dump(tree):
     links = []
     multi_input_positions = {}
     for link in tree.links:
+        from_node = link.from_node
+        to_node = link.to_node
+        geometry_tree = tree.bl_rna.identifier == "GeometryNodeTree"
+        from_socket = link.from_socket.identifier
+        if (from_node.bl_idname in ("GeometryNodeSimulationInput",
+                                    "GeometryNodeSimulationOutput")
+                or (from_node.bl_idname == "NodeGroupInput" and not geometry_tree)):
+            from_socket = link.from_socket.name
+        to_socket = link.to_socket.identifier
+        if (to_node.bl_idname in ("GeometryNodeSimulationInput",
+                                  "GeometryNodeSimulationOutput")
+                or (to_node.bl_idname == "NodeGroupOutput" and not geometry_tree)):
+            to_socket = link.to_socket.name
         entry = {
-            "from_node": link.from_node.name,
-            "from_socket": (link.from_socket.name
-                            if link.from_node.bl_idname in (
-                                "NodeGroupInput", "GeometryNodeSimulationInput",
-                                "GeometryNodeSimulationOutput")
-                            else link.from_socket.identifier),
-            "to_node": link.to_node.name,
-            "to_socket": (link.to_socket.name
-                          if link.to_node.bl_idname in (
-                              "NodeGroupOutput", "GeometryNodeSimulationInput",
-                              "GeometryNodeSimulationOutput")
-                          else link.to_socket.identifier),
+            "from_node": from_node.name,
+            "from_socket": from_socket,
+            "to_node": to_node.name,
+            "to_socket": to_socket,
         }
         links.append(entry)
         if link.to_socket.is_multi_input:
@@ -1448,12 +1462,25 @@ def images_dump():
             colorspace = image.colorspace_settings.name
         except Exception:
             colorspace = None
-        result.append({"name": image.name_full, "potter_id": image.get("potter.id"),
-                       "library": library_reference(image), "filepath": filepath,
-                       "source": image.source, "colorspace": colorspace,
-                       "tile_numbers": _tile_numbers(image), "tile_labels": _tile_labels(image),
-                       "alpha_mode": _image_alpha_mode(image),
-                       "potter_image": image_model})
+        record = {"name": image.name_full, "potter_id": image.get("potter.id"),
+                  "library": library_reference(image), "filepath": filepath,
+                  "source": image.source, "colorspace": colorspace,
+                  "tile_numbers": _tile_numbers(image), "tile_labels": _tile_labels(image),
+                  "alpha_mode": _image_alpha_mode(image), "potter_image": image_model}
+        if image_model is None and image.source == "GENERATED":
+            width, height = (int(size) for size in image.size)
+            if width <= 0 or height <= 0 or width * height > 16_777_216:
+                raise ValueError("generated image %s has unsupported dimensions" % image.name_full)
+            pixels = image.pixels
+            if len(pixels) != width * height * 4:
+                raise ValueError("generated image %s has incomplete pixels" % image.name_full)
+            record["generated_width"] = width
+            record["generated_height"] = height
+            record["generated_pixels"] = [
+                [float(pixels[index + channel]) for channel in range(4)]
+                for index in range(0, len(pixels), 4)
+            ]
+        result.append(record)
     return result
 
 
@@ -6159,8 +6186,17 @@ def compatibility_name(doc, entity_kind, identifier, fallback):
 
 def _resolve_compat_value(value, id_lookup):
     if isinstance(value, dict):
+        if "id_type" in value and "id" in value:
+            candidate = id_lookup.get(value["id"])
+            if candidate is None or candidate.bl_rna.identifier != value["id_type"]:
+                raise ValueError("compatibility data references unavailable %s ID %s"
+                                 % (value["id_type"], value["id"]))
+            return candidate
         if "id_type" in value and "name" in value:
-            candidate = id_lookup.get(value["name"])
+            resource_key = value.get("bridge_id", value["name"])
+            candidate = id_lookup.get("%s:%s" % (value["id_type"], resource_key))
+            if candidate is None:
+                candidate = id_lookup.get(value["name"])
             if candidate is None or candidate.bl_rna.identifier != value["id_type"]:
                 raise ValueError(
                     "compatibility data references unavailable ID %s (available: %s)"
@@ -6214,32 +6250,76 @@ def _restore_bake_items(node, items, owner):
         identifiers[entry.get("id")] = node.inputs[position].identifier
     return identifiers
 
-def _restore_node_tree(tree, raw, id_lookup, owner):
-    if raw.get("name"):
-        tree["potter.graph_name"] = raw["name"]
+def _restore_node_tree_interface(tree, raw, id_lookup, owner):
     interface = getattr(tree, "interface", None)
     socket_map = {}
-    if interface is not None:
-        for direction, entries in (("INPUT", raw.get("interface", {}).get("inputs", [])),
-                                   ("OUTPUT", raw.get("interface", {}).get("outputs", []))):
-            for entry in entries:
-                socket_type = entry.get("socket_type")
-                if not socket_type:
-                    raise ValueError("%s has an interface socket without a socket type" % owner)
-                try:
-                    socket = interface.new_socket(name=entry["name"], in_out=direction,
-                                                  socket_type=socket_type)
-                    socket_map[entry.get("id", "")] = socket.identifier
-                    if entry.get("default") is not None and hasattr(socket, "default_value"):
-                        socket.default_value = _resolve_compat_value(entry["default"], id_lookup)
-                except Exception as error:
-                    raise ValueError("%s cannot restore interface socket %s" %
-                                     (owner, entry.get("name", ""))) from error
-        # A geometry graph with no declared outputs has an implicit Geometry output that its group output node links to
-        # (sockets.rs `NodeGroupOutput`), so Blender needs the socket for those links.
-        if tree.bl_idname == "GeometryNodeTree" and not raw.get("interface", {}).get("outputs"):
-            interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    if interface is None:
+        return socket_map
+    for direction, entries in (("INPUT", raw.get("interface", {}).get("inputs", [])),
+                               ("OUTPUT", raw.get("interface", {}).get("outputs", []))):
+        for entry in entries:
+            socket_type = entry.get("socket_type")
+            if not socket_type:
+                raise ValueError("%s has an interface socket without a socket type" % owner)
+            try:
+                socket = interface.new_socket(name=entry["name"], in_out=direction,
+                                              socket_type=socket_type)
+                socket_map[entry.get("id", "")] = socket.identifier
+            except Exception as error:
+                raise ValueError("%s cannot restore interface socket %s" %
+                                 (owner, entry.get("name", ""))) from error
+    # A geometry graph with no declared outputs has an implicit Geometry output that its group output node links to.
+    if tree.bl_idname == "GeometryNodeTree" and not raw.get("interface", {}).get("outputs"):
+        socket = interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+        socket_map["Geometry"] = socket.identifier
+        output_nodes = {
+            entry.get("name") for entry in raw.get("nodes", [])
+            if entry.get("type") == "NodeGroupOutput"
+        }
+        for link in raw.get("links", []):
+            if link.get("to_node") in output_nodes:
+                socket_map[link.get("to_socket", "Geometry")] = socket.identifier
+    return socket_map
+
+def _restore_node_tree_interface_defaults(tree, raw, id_lookup, owner, socket_map):
+    interface = getattr(tree, "interface", None)
+    if interface is None:
+        return
+    for entries in (raw.get("interface", {}).get("inputs", []),
+                    raw.get("interface", {}).get("outputs", [])):
+        for entry in entries:
+            if entry.get("default") is None:
+                continue
+            identifier = socket_map.get(entry.get("id", ""))
+            socket = next((item for item in getattr(interface, "items_tree", ())
+                           if getattr(item, "item_type", None) == "SOCKET"
+                           and item.identifier == identifier), None)
+            if socket is None or not hasattr(socket, "default_value"):
+                continue
+            try:
+                socket.default_value = _resolve_compat_value(entry["default"], id_lookup)
+            except Exception as error:
+                raise ValueError("%s cannot restore interface socket %s" %
+                                 (owner, entry.get("name", ""))) from error
+
+
+def _restore_node_tree(tree, raw, id_lookup, owner, socket_map=None, group_socket_maps=None):
+    if raw.get("name"):
+        tree["potter.graph_name"] = raw["name"]
+    if socket_map is None:
+        socket_map = _restore_node_tree_interface(tree, raw, id_lookup, owner)
+        if tree.bl_idname != "GeometryNodeTree":
+            _restore_node_tree_interface_defaults(tree, raw, id_lookup, owner, socket_map)
     tree.nodes.clear()
+    def remap_socket_identifier(node, identifier):
+        if node.bl_idname == "GeometryNodeGroup" and node.node_tree is not None:
+            mapping = (group_socket_maps or {}).get(node.node_tree.as_pointer(), {})
+            return mapping.get(identifier, identifier)
+        if tree.bl_idname == "GeometryNodeTree" and node.bl_idname in (
+                "NodeGroupInput", "NodeGroupOutput"):
+            return socket_map.get(identifier, identifier)
+        return identifier
+
     nodes = {}
     # Saved socket identifiers of Bake items, per node name, mapped to the identifiers Blender assigned.
     identifier_remaps = {}
@@ -6254,9 +6334,11 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
         if source.get("location") is not None:
             node.location = source["location"]
         node_properties = dict(source.get("properties", {}))
+        menu_items = node_properties.pop("potter_menu_items", None)
+        node_properties.pop("enum_items", None)
         group_tree_reference = (node_properties.pop("node_tree", None)
-                                if node.bl_idname == "ShaderNodeGroup" else None)
-        # Empty lists mark defaults lost by older imports; Rust's loss gate guards Blender's constructor defaults.
+                                if node.bl_idname in ("ShaderNodeGroup", "GeometryNodeGroup")
+                                else None)
         output_defaults = node_properties.pop("potter_output_defaults", [])
         restore_curve_mapping = (
             node.bl_idname in _NODE_CURVE_MAPPING_TYPES and "mapping" in node_properties)
@@ -6304,13 +6386,20 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
                 (owner, node.name))
         _restore_texture_node_mapping(
             node, texture_mapping, color_mapping, "%s node %s" % (owner, node.name))
+        if menu_items is not None:
+            if node.bl_idname != "GeometryNodeMenuSwitch" or not isinstance(menu_items, list):
+                raise ValueError("%s has invalid menu items on node %s" % (owner, node.name))
+            for name in menu_items:
+                if not isinstance(name, str):
+                    raise ValueError("%s has invalid menu item on node %s" % (owner, node.name))
+                node.enum_items.new(name)
         set_id(node, source.get("potter_id"))
         custom_properties = dict(source.get("custom_properties", {}))
         if simple_material:
             custom_properties["potter_simple_material"] = True
         set_props(node, custom_properties)
         for socket_source in output_defaults:
-            identifier = socket_source.get("identifier")
+            identifier = remap_socket_identifier(node, socket_source.get("identifier"))
             socket = next((value for value in node.outputs
                            if value.identifier == identifier), None)
             if socket is None or not hasattr(socket, "default_value"):
@@ -6323,6 +6412,7 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
         for socket_source in source.get("inputs", []):
             identifier = identifier_remaps.get(node.name, {}).get(
                 socket_source.get("identifier"), socket_source.get("identifier"))
+            identifier = remap_socket_identifier(node, identifier)
             socket = next((value for value in node.inputs
                            if value.identifier == identifier), None)
             if socket is None:
@@ -6346,6 +6436,8 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
             source.get("from_socket"), source.get("from_socket"))
         to_identifier = identifier_remaps.get(to_node.name, {}).get(
             source.get("to_socket"), source.get("to_socket"))
+        from_identifier = remap_socket_identifier(from_node, from_identifier)
+        to_identifier = remap_socket_identifier(to_node, to_identifier)
         from_socket = next((value for value in from_node.outputs
                             if value.identifier == from_identifier), None)
         if from_socket is None:
@@ -6368,6 +6460,8 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
     for links in multi_input_links.values():
         for index in range(len(links) // 2):
             links[index].swap_multi_input_sort_id(links[-index - 1])
+    if tree.bl_idname == "GeometryNodeTree":
+        _restore_node_tree_interface_defaults(tree, raw, id_lookup, owner, socket_map)
     return socket_map
 
 
@@ -6698,22 +6792,42 @@ def _create_geometry_groups(doc, linked_group_map=None):
 
 def _populate_geometry_groups(group_map, group_sources, id_lookup):
     socket_maps = {}
+    group_socket_maps = {}
+    geometry_sources = {}
+    populated_non_geometry = set()
     id_lookup.update(group_map)
     id_lookup.update({tree.name_full: tree for tree in group_map.values()})
-    populated = set()
     for name, source in group_sources.items():
         tree = group_map.get(name)
-        if tree is None:
+        if tree is None or tree.bl_idname == "GeometryNodeTree":
             continue
         pointer = tree.as_pointer()
-        if pointer not in populated:
-            socket_map = _restore_node_tree(tree, source.get("tree") or {}, id_lookup,
-                                            "Node group %s" % tree.name)
-            populated.add(pointer)
+        if pointer not in populated_non_geometry:
+            socket_map = _restore_node_tree(
+                tree, source.get("tree") or {}, id_lookup, "Node group %s" % tree.name)
+            populated_non_geometry.add(pointer)
         else:
             socket_map = socket_maps.get(tree.name_full, {})
         socket_maps[name] = socket_map
         socket_maps[tree.name_full] = socket_map
+    for name, source in group_sources.items():
+        tree = group_map.get(name)
+        if tree is not None and tree.bl_idname == "GeometryNodeTree":
+            geometry_sources.setdefault(tree.as_pointer(), (tree, source))
+    # Create every geometry interface before restoring its nodes so nested group calls can remap IDs.
+    for pointer, (tree, source) in geometry_sources.items():
+        socket_map = _restore_node_tree_interface(
+            tree, source.get("tree") or {}, id_lookup, "Node group %s" % tree.name)
+        group_socket_maps[pointer] = socket_map
+        socket_maps[tree.name_full] = socket_map
+    for name, source in group_sources.items():
+        tree = group_map.get(name)
+        if tree is not None and tree.bl_idname == "GeometryNodeTree":
+            socket_maps[name] = group_socket_maps[tree.as_pointer()]
+    for pointer, (tree, source) in geometry_sources.items():
+        _restore_node_tree(
+            tree, source.get("tree") or {}, id_lookup, "Node group %s" % tree.name,
+            socket_map=group_socket_maps[pointer], group_socket_maps=group_socket_maps)
     return socket_maps
 
 
@@ -10262,6 +10376,11 @@ def export_doc(doc, target, pack, scene_hash, context):
     id_lookup.update({image.name_full: image for image in image_map.values()})
     id_lookup.update(image_map)
     id_lookup.update({image.name_full: image for image in linked_maps["resources"].values()})
+    adapter_ids = (doc.get("compatibility", {}).get("blender_adapter", {})
+                   .get("id_mappings", {}))
+    for reference, identifier in adapter_ids.items():
+        if isinstance(identifier, str) and identifier in id_lookup:
+            id_lookup[reference] = id_lookup[identifier]
     texture_map = _legacy_textures_from_doc(doc, image_map)
     socket_maps = _populate_geometry_groups(group_map, group_sources, id_lookup)
     for material_id, item in doc.get("materials", {}).items():
