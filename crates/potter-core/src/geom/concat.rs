@@ -970,10 +970,26 @@ fn merge_named(name: &str, members: &[Member<'_>]) -> Result<Value> {
 
 fn merge_stored_attribute(name: &str, members: &[Member<'_>]) -> Result<Value> {
     let mut header: Option<Map<String, Value>> = None;
-    for (value, _) in members {
+    let mut empty_header: Option<Map<String, Value>> = None;
+    for (value, piece) in members {
         let Some(value) = value else { continue };
         let object = value.as_object().ok_or_else(|| shape_error(name))?;
-        if object.get("data").and_then(Value::as_array).is_none() {
+        let values = object
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| shape_error(name))?;
+        let domain = object
+            .get("domain")
+            .and_then(Value::as_str)
+            .ok_or_else(|| shape_error(name))?;
+        let count = domain_length(domain, piece).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!("attribute `{name}` uses a domain that cannot be combined"),
+                json!({"attribute": name}),
+            )
+        })?;
+        if values.len() != count {
             return Err(shape_error(name));
         }
         let fields = object
@@ -981,13 +997,17 @@ fn merge_stored_attribute(name: &str, members: &[Member<'_>]) -> Result<Value> {
             .filter(|(key, _)| key.as_str() != "data")
             .map(|(key, field)| (key.clone(), field.clone()))
             .collect::<Map<String, Value>>();
+        if count == 0 {
+            empty_header.get_or_insert(fields);
+            continue;
+        }
         match &header {
             None => header = Some(fields),
             Some(first) if *first != fields => return Err(conflict_error(name)),
             Some(_) => {}
         }
     }
-    let mut header = header.ok_or_else(|| shape_error(name))?;
+    let mut header = header.or(empty_header).ok_or_else(|| shape_error(name))?;
     let domain = header
         .get("domain")
         .and_then(Value::as_str)
@@ -1014,6 +1034,7 @@ fn merge_stored_attribute(name: &str, members: &[Member<'_>]) -> Result<Value> {
                     .ok_or_else(|| shape_error(name))?;
                 output.extend(values.iter().cloned());
             }
+            None if count == 0 => {}
             None => output.extend(std::iter::repeat_n(default_value(data_type), count)),
         }
     }

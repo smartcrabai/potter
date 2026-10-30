@@ -3614,7 +3614,9 @@ fn apply_flip_faces(mesh: &mut Mesh, selected: &Selection) -> Result<IdChanges> 
         faces.push(Some(face_index));
     }
     let origin = Origin {
-        vertices: (0..source.vertices.len()).map(|index| vec![(index, 1.0)]).collect(),
+        vertices: (0..source.vertices.len())
+            .map(|index| vec![(index, 1.0)])
+            .collect(),
         faces,
         corners: Some(corners),
         ..Origin::default()

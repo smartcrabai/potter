@@ -7,10 +7,9 @@ use serde_json::{Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        Mesh, attribute_keys, color_layers, edge_key, uv_layers,
-        provenance::{
-            self, Origin, remap_attributes_with_default_edge_mixer,
-        },
+        Mesh, attribute_keys, color_layers, edge_key,
+        provenance::{self, Origin, remap_attributes_with_default_edge_mixer},
+        uv_layers,
     },
 };
 
@@ -554,7 +553,14 @@ fn mix_generated_face_attributes(
             && domain.eq_ignore_ascii_case("face")
         {
             if source_value.get("data").is_some() {
-                mix_stored_face_entry(source, output, key, source_value, source_faces, output_faces)?;
+                mix_stored_face_entry(
+                    source,
+                    output,
+                    key,
+                    source_value,
+                    source_faces,
+                    output_faces,
+                )?;
             } else {
                 mix_keyed_face_entry(
                     source,

@@ -447,7 +447,11 @@ fn effective_extrusion_offsets(
     )?;
     let offset_is_single = super::field_is_single(&offset) && super::field_is_single(&offset_scale);
     let vertex_normals = if matches!(&offset, Field::Normal) && matches!(domain, "EDGE" | "POINT") {
-        let positions = mesh.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+        let positions = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>();
         Some(crate::geom::normals::geometric_vertex_normals(
             mesh, &positions,
         )?)
@@ -514,7 +518,7 @@ fn effective_extrusion_offsets(
     Ok((offsets, offset_is_single))
 }
 
-/// Blender's NormalFieldInput edge branch: normalize the midpoint of its two vertex normals.
+/// Blender's `NormalFieldInput` edge branch: normalize the midpoint of its two vertex normals.
 fn edge_normal_from_vertex_normals(
     mesh: &Mesh,
     vertex_normals: &[DVec3],
@@ -540,11 +544,15 @@ fn edge_normal_from_vertex_normals(
         first.y * 0.5 + second.y * 0.5,
         first.z * 0.5 + second.z * 0.5,
     );
-    let length_squared = (midpoint.x * midpoint.x + midpoint.y * midpoint.y)
-        + midpoint.z * midpoint.z;
+    let length_squared =
+        (midpoint.x * midpoint.x + midpoint.y * midpoint.y) + midpoint.z * midpoint.z;
     let normal = if length_squared > 1.0e-35_f32 {
         let length = length_squared.sqrt();
-        Vec3::new(midpoint.x / length, midpoint.y / length, midpoint.z / length)
+        Vec3::new(
+            midpoint.x / length,
+            midpoint.y / length,
+            midpoint.z / length,
+        )
     } else {
         Vec3::ZERO
     };

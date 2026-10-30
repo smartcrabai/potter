@@ -335,7 +335,11 @@ fn remap_named_attribute(
     let source_domain = parse_domain(source_name, key, data_type)?;
     let crease_vert_on_dual_faces = key == "crease_vert" && source_domain == Domain::Point;
     let (target_name, indices, target_domain) = if crease_vert_on_dual_faces {
-        (source_name, Indices::Exact(face_point_sources), Domain::Face)
+        (
+            source_name,
+            Indices::Exact(face_point_sources),
+            Domain::Face,
+        )
     } else {
         let (target_name, indices) = domain_mapping(
             source_domain,

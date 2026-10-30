@@ -1357,9 +1357,7 @@ impl Sources<'_> {
         self.edge_origin
             .iter()
             .map(|sources| {
-                if self.edge_mix_mode == EdgeMixMode::DefaultPropagation
-                    && is_float4x4(data_type)
-                {
+                if self.edge_mix_mode == EdgeMixMode::DefaultPropagation && is_float4x4(data_type) {
                     blend_float4x4_unweighted(values, sources).unwrap_or_else(&default)
                 } else if is_float4x4(data_type)
                     && let [(source, weight)] = sources.as_slice()
@@ -2826,7 +2824,6 @@ fn mix_float4x4(first: &Value, second: &Value, factor: f64) -> Option<Value> {
     ]))
 }
 
-
 /// Blender's `to_loc_rot_scale_safe<true>` for weighted Geometry Nodes attribute propagation.
 fn float4x4_loc_rot_scale(matrix: [[f32; 4]; 4]) -> ([f32; 3], [f32; 4], [f32; 3]) {
     let location = [matrix[0][3], matrix[1][3], matrix[2][3]];
@@ -3022,9 +3019,7 @@ fn blend_float4x4_unweighted(values: &[Value], sources: &[(usize, f64)]) -> Opti
     )
 }
 
-fn blend_float4x4_from_items<'a>(
-    items: impl Iterator<Item = (&'a Value, f64)>,
-) -> Option<Value> {
+fn blend_float4x4_from_items<'a>(items: impl Iterator<Item = (&'a Value, f64)>) -> Option<Value> {
     let mut location = [0.0_f32; 3];
     let mut expmap = [0.0_f32; 3];
     let mut scale = [0.0_f32; 3];

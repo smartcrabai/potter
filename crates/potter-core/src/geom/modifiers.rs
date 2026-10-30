@@ -1457,10 +1457,16 @@ fn build_topology_with_edge_order(
     let edge_count = edges.len();
     for [first, second] in edges {
         let first_id = vertex_ids.get(first).copied().ok_or_else(|| {
-            PotError::new(ErrorCode::InvalidArgument, "generated edge index is out of range")
+            PotError::new(
+                ErrorCode::InvalidArgument,
+                "generated edge index is out of range",
+            )
         })?;
         let second_id = vertex_ids.get(second).copied().ok_or_else(|| {
-            PotError::new(ErrorCode::InvalidArgument, "generated edge index is out of range")
+            PotError::new(
+                ErrorCode::InvalidArgument,
+                "generated edge index is out of range",
+            )
         })?;
         result
             .insert_edge([first_id, second_id])
