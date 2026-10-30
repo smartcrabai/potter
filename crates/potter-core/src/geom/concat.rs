@@ -102,9 +102,7 @@ fn concatenate_inner(
     let mut has_adaptive_normals = false;
     // Blender's GeometrySet join omits empty components before collecting attributes.
     for part in parts.into_iter().filter(|part| {
-        !part.mesh.vertices.is_empty()
-            || !part.mesh.edges.is_empty()
-            || !part.mesh.faces.is_empty()
+        !part.mesh.vertices.is_empty() || !part.mesh.edges.is_empty() || !part.mesh.faces.is_empty()
     }) {
         let Placed {
             mut mesh,
