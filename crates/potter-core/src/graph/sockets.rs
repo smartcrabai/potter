@@ -71,6 +71,11 @@ pub fn is_known_node_type(node_type: &str) -> bool {
             | "ShaderNodeFloatCurve"
             | "ShaderNodeVectorCurve"
             | "ShaderNodeRGBCurve"
+            | "ShaderNodeTexWave"
+            | "ShaderNodeTexMagic"
+            | "ShaderNodeTexBrick"
+            | "ShaderNodeTexWhiteNoise"
+            | "ShaderNodeTexGabor"
             | "ShaderNodeBackground"
             | "ShaderNodeEmission"
             | "ShaderNodeOutputMaterial"
@@ -579,6 +584,60 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
         "ShaderNodeTexEnvironment" => (
             sockets(&[("Vector", "vector")]),
             sockets(&[("Color", "color"), ("Alpha", "float")]),
+        ),
+        "ShaderNodeTexWave" => (
+            sockets(&[
+                ("Vector", "vector"),
+                ("Scale", "float"),
+                ("Distortion", "float"),
+                ("Detail", "float"),
+                ("Detail Scale", "float"),
+                ("Detail Roughness", "float"),
+                ("Phase Offset", "float"),
+            ]),
+            sockets(&[("Color", "color"), ("Fac", "float")]),
+        ),
+        "ShaderNodeTexMagic" => (
+            sockets(&[
+                ("Vector", "vector"),
+                ("Scale", "float"),
+                ("Distortion", "float"),
+            ]),
+            sockets(&[("Color", "color"), ("Fac", "float")]),
+        ),
+        "ShaderNodeTexBrick" => (
+            sockets(&[
+                ("Vector", "vector"),
+                ("Color1", "color"),
+                ("Color2", "color"),
+                ("Mortar", "color"),
+                ("Scale", "float"),
+                ("Mortar Size", "float"),
+                ("Mortar Smooth", "float"),
+                ("Bias", "float"),
+                ("Brick Width", "float"),
+                ("Row Height", "float"),
+            ]),
+            sockets(&[("Color", "color"), ("Fac", "float")]),
+        ),
+        "ShaderNodeTexWhiteNoise" => (
+            sockets(&[("Vector", "vector"), ("W", "float")]),
+            sockets(&[("Value", "float"), ("Color", "color")]),
+        ),
+        "ShaderNodeTexGabor" => (
+            sockets(&[
+                ("Vector", "vector"),
+                ("Scale", "float"),
+                ("Frequency", "float"),
+                ("Anisotropy", "float"),
+                ("Orientation 2D", "float"),
+                ("Orientation 3D", "vector"),
+            ]),
+            sockets(&[
+                ("Value", "float"),
+                ("Phase", "float"),
+                ("Intensity", "float"),
+            ]),
         ),
         "ShaderNodeTexCoord" => (
             Vec::new(),
@@ -1110,6 +1169,9 @@ fn socket_type(
         };
         return socket.and_then(|socket| graph_socket_type(&socket.socket_type).map(str::to_owned));
     }
+    if !output && !procedural_texture_input_available(node, socket_name) {
+        return None;
+    }
     if let Some((inputs, outputs)) = node_sockets(group, node_id) {
         let sockets = if output { outputs } else { inputs };
         if let Some((_, socket_type)) = sockets.iter().find(|(name, _)| name == socket_name) {
@@ -1120,6 +1182,36 @@ fn socket_type(
         }
     }
     None
+}
+fn procedural_texture_input_available(node: &super::GraphNode, socket: &str) -> bool {
+    match node.node_type.as_str() {
+        "ShaderNodeTexWhiteNoise" => {
+            let dimensions = node
+                .properties
+                .get("noise_dimensions")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("3D");
+            match dimensions {
+                "1D" => socket == "W",
+                "2D" | "3D" => socket == "Vector",
+                "4D" => matches!(socket, "Vector" | "W"),
+                _ => false,
+            }
+        }
+        "ShaderNodeTexGabor" => {
+            let dimensions = node
+                .properties
+                .get("gabor_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("2D");
+            match socket {
+                "Orientation 2D" => dimensions == "2D",
+                "Orientation 3D" => dimensions == "3D",
+                _ => true,
+            }
+        }
+        _ => true,
+    }
 }
 
 fn graph_socket_type(socket_type: &str) -> Option<&'static str> {

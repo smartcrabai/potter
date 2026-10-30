@@ -15,7 +15,7 @@ use crate::{
     graph::NodeGroup,
     image::ImageData,
     model::{Registry, World},
-    shader::evaluate_world,
+    shader::{EvaluatorWorkspace, evaluate_world_with_workspace},
 };
 
 /// Texels along each cube face's edge.
@@ -68,6 +68,7 @@ pub(super) fn volume_ambient_l0(
     groups: &Registry<NodeGroup>,
     images: &BTreeMap<String, ImageData>,
 ) -> Result<(DVec3, bool)> {
+    let mut workspace = EvaluatorWorkspace::default();
     let mut cubemap = Vec::with_capacity(6 * VOLUME_PROBE_FACE_TEXELS * VOLUME_PROBE_FACE_TEXELS);
     let mut first_radiance: Option<[f32; 3]> = None;
     let mut nonuniform = false;
@@ -79,7 +80,14 @@ pub(super) fn volume_ambient_l0(
                     texel_centre_at(column, VOLUME_PROBE_FACE_TEXELS),
                     texel_centre_at(row, VOLUME_PROBE_FACE_TEXELS),
                 );
-                let radiance = evaluate_world(world, groups, images, direction, false)?;
+                let radiance = evaluate_world_with_workspace(
+                    world,
+                    groups,
+                    images,
+                    direction,
+                    false,
+                    &mut workspace,
+                )?;
                 let radiance = [
                     exr::prelude::f16::from_f32(radiance.x as f32).to_f32(),
                     exr::prelude::f16::from_f32(radiance.y as f32).to_f32(),
@@ -252,13 +260,21 @@ fn sample_world_probe(
     images: &BTreeMap<String, ImageData>,
     mut capture_radiance: impl FnMut(DVec3),
 ) -> Result<DVec3> {
+    let mut workspace = EvaluatorWorkspace::default();
     let mut average_irradiance = DVec3::ZERO;
     let mut total_solid_angle = 0.0;
     for face in 0..6 {
         for row in 0..FACE_TEXELS {
             for column in 0..FACE_TEXELS {
                 let direction = face_direction(face, texel_centre(column), texel_centre(row));
-                let radiance = evaluate_world(world, groups, images, direction, false)?;
+                let radiance = evaluate_world_with_workspace(
+                    world,
+                    groups,
+                    images,
+                    direction,
+                    false,
+                    &mut workspace,
+                )?;
                 let solid_angle = cube_texel_solid_angle(column, row);
                 average_irradiance +=
                     super::eevee_transmission::irradiance_probe_radiance(radiance) * solid_angle;

@@ -3,6 +3,7 @@ pub(crate) mod converters;
 pub(crate) mod inline_fold;
 pub(crate) mod texture;
 mod texture_kernels;
+pub(crate) mod texture_procedural_kernels;
 mod world;
 
 mod evaluator;
@@ -21,5 +22,7 @@ pub use evaluator::{
     fill_color_layers, height_gradient,
 };
 pub use world::evaluate_world;
-pub(crate) use world::world_mix_supported;
 pub(crate) use world::{environment_texture_uv, equirectangular_uv, sky_property_is_default};
+pub(crate) use world::{
+    evaluate_world_with_prepared, evaluate_world_with_workspace, prepare_world, world_mix_supported,
+};

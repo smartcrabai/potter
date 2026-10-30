@@ -1,8 +1,12 @@
 use std::collections::BTreeSet;
 
+use super::EvaluatorWorkspace;
 use glam::DVec3;
 use serde_json::{Value as JsonValue, json};
 
+use super::texture_procedural_kernels::{
+    self as procedural_texture, WaveBandsDirection, WaveProfile, WaveRingsDirection, WaveType,
+};
 #[cfg(test)]
 use crate::image::sample_with_extension_alpha;
 use crate::{
@@ -57,6 +61,33 @@ pub(crate) fn world_mix_supported(data_type: Option<&str>, blend_type: Option<&s
     world_mix_mode(data_type, blend_type).is_ok()
 }
 
+pub(crate) struct PreparedWorld {
+    graph_id: Id,
+    fold_index: super::inline_fold::FoldIndex,
+}
+
+impl PreparedWorld {
+    pub(super) fn new(graph_id: &Id, group: &NodeGroup, node_groups: &Registry<NodeGroup>) -> Self {
+        Self {
+            graph_id: graph_id.clone(),
+            fold_index: super::inline_fold::FoldIndex::new(graph_id, group, node_groups),
+        }
+    }
+    pub(super) fn graph_id(&self) -> &Id {
+        &self.graph_id
+    }
+}
+
+pub(crate) fn prepare_world(
+    world: &World,
+    groups: &Registry<NodeGroup>,
+) -> Result<Option<PreparedWorld>> {
+    let Some((graph_id, group)) = world_graph(world, groups)? else {
+        return Ok(None);
+    };
+    Ok(Some(PreparedWorld::new(graph_id, group, groups)))
+}
+
 /// Evaluates the World node graph for a single outgoing direction.
 ///
 /// `path_traced` selects Cycles semantics when true and EEVEE semantics otherwise.
@@ -67,8 +98,60 @@ pub fn evaluate_world(
     direction: DVec3,
     path_traced: bool,
 ) -> Result<DVec3> {
+    let mut workspace = EvaluatorWorkspace::default();
+    evaluate_world_with_workspace(
+        world,
+        groups,
+        images,
+        direction,
+        path_traced,
+        &mut workspace,
+    )
+}
+
+pub(crate) fn evaluate_world_with_workspace(
+    world: &World,
+    groups: &Registry<NodeGroup>,
+    images: &std::collections::BTreeMap<String, ImageData>,
+    direction: DVec3,
+    path_traced: bool,
+    workspace: &mut EvaluatorWorkspace,
+) -> Result<DVec3> {
+    let Some((graph_id, group)) = world_graph(world, groups)? else {
+        return Ok(world_color(world));
+    };
+    let prepared = workspace.prepared_world(graph_id, group, groups);
+    evaluate_world_graph(group, &prepared.fold_index, images, direction, path_traced)
+}
+
+pub(crate) fn evaluate_world_with_prepared(
+    world: &World,
+    groups: &Registry<NodeGroup>,
+    images: &std::collections::BTreeMap<String, ImageData>,
+    direction: DVec3,
+    path_traced: bool,
+    prepared: Option<&PreparedWorld>,
+) -> Result<DVec3> {
+    let Some((graph_id, group)) = world_graph(world, groups)? else {
+        return Ok(world_color(world));
+    };
+    let prepared = prepared
+        .filter(|prepared| prepared.graph_id == *graph_id)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "prepared World shader graph does not match the active world",
+            )
+        })?;
+    evaluate_world_graph(group, &prepared.fold_index, images, direction, path_traced)
+}
+
+fn world_graph<'world, 'groups>(
+    world: &'world World,
+    groups: &'groups Registry<NodeGroup>,
+) -> Result<Option<(&'world Id, &'groups NodeGroup)>> {
     let Some(graph_id) = &world.node_tree else {
-        return Ok(DVec3::from_array(world.color) * world.strength);
+        return Ok(None);
     };
     let group = groups.get(graph_id).ok_or_else(|| {
         PotError::with_details(
@@ -83,6 +166,20 @@ pub fn evaluate_world(
             format!("world graph `{graph_id}` is not a shader graph"),
         ));
     }
+    Ok(Some((graph_id, group)))
+}
+
+fn world_color(world: &World) -> DVec3 {
+    DVec3::from_array(world.color) * world.strength
+}
+
+fn evaluate_world_graph(
+    group: &NodeGroup,
+    fold_index: &super::inline_fold::FoldIndex,
+    images: &std::collections::BTreeMap<String, ImageData>,
+    direction: DVec3,
+    path_traced: bool,
+) -> Result<DVec3> {
     let output = group
         .nodes
         .iter()
@@ -113,6 +210,7 @@ pub fn evaluate_world(
         })?;
     let mut evaluator = WorldEvaluator {
         group,
+        fold_index,
         images,
         direction: normalize_or(direction, DVec3::Z),
         path_traced,
@@ -132,6 +230,7 @@ pub fn evaluate_world(
 
 struct WorldEvaluator<'a> {
     group: &'a NodeGroup,
+    fold_index: &'a super::inline_fold::FoldIndex,
     images: &'a std::collections::BTreeMap<String, ImageData>,
     direction: DVec3,
     path_traced: bool,
@@ -178,6 +277,428 @@ impl<'a> WorldEvaluator<'a> {
                 format!("world graph references missing node `{id}`"),
             )
         })
+    }
+    fn procedural_texture_node(
+        &mut self,
+        id: &Id,
+        node: &GraphNode,
+        socket: &str,
+    ) -> Result<WorldValue> {
+        self.validate_procedural_texture_sockets(id, node)?;
+        if node.node_type != "ShaderNodeTexWhiteNoise" {
+            crate::shader::texture::validate_texture_mapping_only(
+                id,
+                node.node_type.as_str(),
+                &node.properties,
+            )?;
+        }
+        match node.node_type.as_str() {
+            "ShaderNodeTexWave" => {
+                if !matches!(socket, "Color" | "Fac") {
+                    return Err(world_error(
+                        id,
+                        &format!("unknown Wave Texture output `{socket}`"),
+                    ));
+                }
+                let wave_type = match world_texture_string(id, node, "wave_type", "BANDS")? {
+                    "BANDS" => WaveType::Bands,
+                    "RINGS" => WaveType::Rings,
+                    value => {
+                        return Err(world_texture_mode_error(
+                            id,
+                            "ShaderNodeTexWave",
+                            "wave_type",
+                            value,
+                        ));
+                    }
+                };
+                let bands_direction = if matches!(wave_type, WaveType::Bands) {
+                    match world_texture_string(id, node, "bands_direction", "X")? {
+                        "X" => WaveBandsDirection::X,
+                        "Y" => WaveBandsDirection::Y,
+                        "Z" => WaveBandsDirection::Z,
+                        "DIAGONAL" => WaveBandsDirection::Diagonal,
+                        value => {
+                            return Err(world_texture_mode_error(
+                                id,
+                                "ShaderNodeTexWave",
+                                "bands_direction",
+                                value,
+                            ));
+                        }
+                    }
+                } else {
+                    WaveBandsDirection::X
+                };
+                let rings_direction = if matches!(wave_type, WaveType::Rings) {
+                    match world_texture_string(id, node, "rings_direction", "X")? {
+                        "X" => WaveRingsDirection::X,
+                        "Y" => WaveRingsDirection::Y,
+                        "Z" => WaveRingsDirection::Z,
+                        "SPHERICAL" => WaveRingsDirection::Spherical,
+                        value => {
+                            return Err(world_texture_mode_error(
+                                id,
+                                "ShaderNodeTexWave",
+                                "rings_direction",
+                                value,
+                            ));
+                        }
+                    }
+                } else {
+                    WaveRingsDirection::X
+                };
+                let profile = match world_texture_string(id, node, "wave_profile", "SIN")? {
+                    "SIN" => WaveProfile::Sine,
+                    "SAW" => WaveProfile::Saw,
+                    "TRI" => WaveProfile::Triangle,
+                    value => {
+                        return Err(world_texture_mode_error(
+                            id,
+                            "ShaderNodeTexWave",
+                            "wave_profile",
+                            value,
+                        ));
+                    }
+                };
+                let value = procedural_texture::wave(
+                    self.procedural_texture_vector(id, self.direction)?,
+                    self.procedural_texture_scalar(id, "Scale", 5.0)?,
+                    self.procedural_texture_scalar(id, "Distortion", 0.0)?,
+                    self.procedural_texture_scalar(id, "Detail", 2.0)?,
+                    self.procedural_texture_scalar(id, "Detail Scale", 1.0)?,
+                    self.procedural_texture_scalar(id, "Detail Roughness", 0.5)?,
+                    self.procedural_texture_scalar(id, "Phase Offset", 0.0)?,
+                    wave_type,
+                    bands_direction,
+                    rings_direction,
+                    profile,
+                );
+                match socket {
+                    "Color" => Ok(WorldValue::Color([
+                        f64::from(value),
+                        f64::from(value),
+                        f64::from(value),
+                        1.0,
+                    ])),
+                    "Fac" => Ok(WorldValue::Scalar(f64::from(value))),
+                    _ => Err(world_error(id, "unknown Wave Texture output")),
+                }
+            }
+            "ShaderNodeTexMagic" => {
+                if !matches!(socket, "Color" | "Fac") {
+                    return Err(world_error(
+                        id,
+                        &format!("unknown Magic Texture output `{socket}`"),
+                    ));
+                }
+                let depth =
+                    world_texture_integer(id, node, "turbulence_depth", 2)?.clamp(0, 10) as u8;
+                let vector = self.procedural_texture_vector(id, self.direction)?;
+                let scale = self.procedural_texture_scalar(id, "Scale", 5.0)?;
+                let distortion = self.procedural_texture_scalar(id, "Distortion", 1.0)?;
+                let (color, factor) = if self.fold_index.primitive_nodes.contains(id) {
+                    procedural_texture::magic(vector, scale, distortion, depth)
+                } else {
+                    procedural_texture::magic_shader(
+                        vector,
+                        scale,
+                        distortion,
+                        depth,
+                        self.path_traced,
+                    )
+                };
+                match socket {
+                    "Color" => Ok(WorldValue::Color(color.map(f64::from))),
+                    "Fac" => Ok(WorldValue::Scalar(f64::from(factor))),
+                    _ => Err(world_error(id, "unknown Magic Texture output")),
+                }
+            }
+            "ShaderNodeTexBrick" => {
+                if !matches!(socket, "Color" | "Fac") {
+                    return Err(world_error(
+                        id,
+                        &format!("unknown Brick Texture output `{socket}`"),
+                    ));
+                }
+                let offset = world_texture_float(id, node, "offset", 0.5)?;
+                let offset_frequency = world_texture_integer(id, node, "offset_frequency", 2)?;
+                let squash = world_texture_float(id, node, "squash", 1.0)?;
+                let squash_frequency = world_texture_integer(id, node, "squash_frequency", 2)?;
+                let vector = self.procedural_texture_vector(id, self.direction)?;
+                let color1 = self.procedural_texture_color(id, "Color1", [0.8, 0.8, 0.8, 1.0])?;
+                let color2 = self.procedural_texture_color(id, "Color2", [0.2, 0.2, 0.2, 1.0])?;
+                let mortar = self.procedural_texture_color(id, "Mortar", [0.0, 0.0, 0.0, 1.0])?;
+                let scale = self.procedural_texture_scalar(id, "Scale", 5.0)?;
+                let mortar_size = self.procedural_texture_scalar(id, "Mortar Size", 0.02)?;
+                let mortar_smooth = self.procedural_texture_scalar(id, "Mortar Smooth", 0.1)?;
+                let bias = self.procedural_texture_scalar(id, "Bias", 0.0)?;
+                let width = self.procedural_texture_scalar(id, "Brick Width", 0.5)?;
+                let row_height = self.procedural_texture_scalar(id, "Row Height", 0.25)?;
+                if width == 0.0 || row_height == 0.0 {
+                    return Err(PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        "Brick Texture width and row height must be nonzero",
+                    ));
+                }
+                let (mut color, factor) = procedural_texture::brick(
+                    vector,
+                    color1,
+                    color2,
+                    mortar,
+                    scale,
+                    mortar_size,
+                    mortar_smooth,
+                    bias,
+                    width,
+                    row_height,
+                    offset,
+                    offset_frequency,
+                    squash,
+                    squash_frequency,
+                );
+                if self.path_traced {
+                    // Cycles SVM stores Brick colors as RGB; EEVEE preserves the socket alpha.
+                    color[3] = 1.0;
+                }
+                match socket {
+                    "Color" => Ok(WorldValue::Color(color.map(f64::from))),
+                    "Fac" => Ok(WorldValue::Scalar(f64::from(factor))),
+                    _ => Err(world_error(id, "unknown Brick Texture output")),
+                }
+            }
+            "ShaderNodeTexWhiteNoise" => {
+                if !matches!(socket, "Value" | "Color") {
+                    return Err(world_error(
+                        id,
+                        &format!("unknown White Noise output `{socket}`"),
+                    ));
+                }
+                let dimensions = match world_texture_string(id, node, "noise_dimensions", "3D")? {
+                    "1D" => 1,
+                    "2D" => 2,
+                    "3D" => 3,
+                    "4D" => 4,
+                    value => {
+                        return Err(world_texture_mode_error(
+                            id,
+                            "ShaderNodeTexWhiteNoise",
+                            "noise_dimensions",
+                            value,
+                        ));
+                    }
+                };
+                let vector = if dimensions == 1 {
+                    [0.0; 3]
+                } else {
+                    self.procedural_texture_vector_input(id, "Vector", [0.0; 3])?
+                };
+                let w = if matches!(dimensions, 1 | 4) {
+                    self.procedural_texture_scalar(id, "W", 0.0)?
+                } else {
+                    0.0
+                };
+                match socket {
+                    "Value" => procedural_texture::white_noise_value(dimensions, vector, w)
+                        .map(|value| WorldValue::Scalar(f64::from(value)))
+                        .ok_or_else(|| world_error(id, "White Noise dimensions are invalid")),
+                    "Color" => procedural_texture::white_noise_color(dimensions, vector, w)
+                        .map(|color| WorldValue::Color(color.map(f64::from)))
+                        .ok_or_else(|| world_error(id, "White Noise dimensions are invalid")),
+                    _ => Err(world_error(id, "unknown White Noise output")),
+                }
+            }
+            "ShaderNodeTexGabor" => {
+                if !matches!(socket, "Value" | "Phase" | "Intensity") {
+                    return Err(world_error(
+                        id,
+                        &format!("unknown Gabor Texture output `{socket}`"),
+                    ));
+                }
+                let dimensions = match world_texture_string(id, node, "gabor_type", "2D")? {
+                    "2D" => 2,
+                    "3D" => 3,
+                    value => {
+                        return Err(world_texture_mode_error(
+                            id,
+                            "ShaderNodeTexGabor",
+                            "gabor_type",
+                            value,
+                        ));
+                    }
+                };
+                let vector = self.procedural_texture_vector(id, self.direction)?;
+                let scale = self.procedural_texture_scalar(id, "Scale", 5.0)?;
+                let frequency = self.procedural_texture_scalar(id, "Frequency", 2.0)?;
+                let anisotropy = self.procedural_texture_scalar(id, "Anisotropy", 1.0)?;
+                let values = if dimensions == 2 {
+                    procedural_texture::gabor_2d(
+                        vector,
+                        scale,
+                        frequency,
+                        anisotropy,
+                        self.procedural_texture_scalar(
+                            id,
+                            "Orientation 2D",
+                            std::f32::consts::FRAC_PI_4,
+                        )?,
+                    )
+                } else {
+                    let orientation = self.procedural_texture_vector_input(
+                        id,
+                        "Orientation 3D",
+                        [std::f32::consts::SQRT_2, std::f32::consts::SQRT_2, 0.0],
+                    )?;
+                    if self.fold_index.primitive_nodes.contains(id) {
+                        procedural_texture::gabor_3d(
+                            vector,
+                            scale,
+                            frequency,
+                            anisotropy,
+                            orientation,
+                        )
+                    } else {
+                        procedural_texture::gabor_3d_shader(
+                            vector,
+                            scale,
+                            frequency,
+                            anisotropy,
+                            orientation,
+                            self.path_traced,
+                        )
+                    }
+                };
+                let value = match socket {
+                    "Value" => values[0],
+                    "Phase" => values[1],
+                    "Intensity" => values[2],
+                    _ => return Err(world_error(id, "unknown Gabor Texture output")),
+                };
+                Ok(WorldValue::Scalar(f64::from(value)))
+            }
+            _ => Err(world_error(id, "unknown procedural texture node")),
+        }
+    }
+
+    fn validate_procedural_texture_sockets(&self, id: &Id, node: &GraphNode) -> Result<()> {
+        let valid: &[&str] = match node.node_type.as_str() {
+            "ShaderNodeTexWave" => &[
+                "Vector",
+                "Scale",
+                "Distortion",
+                "Detail",
+                "Detail Scale",
+                "Detail Roughness",
+                "Phase Offset",
+            ],
+            "ShaderNodeTexMagic" => &["Vector", "Scale", "Distortion"],
+            "ShaderNodeTexBrick" => &[
+                "Vector",
+                "Color1",
+                "Color2",
+                "Mortar",
+                "Scale",
+                "Mortar Size",
+                "Mortar Smooth",
+                "Bias",
+                "Brick Width",
+                "Row Height",
+            ],
+            "ShaderNodeTexWhiteNoise" => &["Vector", "W"],
+            "ShaderNodeTexGabor" => &[
+                "Vector",
+                "Scale",
+                "Frequency",
+                "Anisotropy",
+                "Orientation 2D",
+                "Orientation 3D",
+            ],
+            _ => return Err(world_error(id, "unknown procedural texture node")),
+        };
+        if let Some(socket) = node
+            .inputs
+            .keys()
+            .find(|socket| !valid.contains(&socket.as_str()))
+        {
+            return Err(world_error(
+                id,
+                &format!("unknown procedural texture input `{socket}`"),
+            ));
+        }
+        let inactive = match node.node_type.as_str() {
+            "ShaderNodeTexWhiteNoise" => {
+                match world_texture_string(id, node, "noise_dimensions", "3D")? {
+                    "1D" => Some("Vector"),
+                    "2D" | "3D" => Some("W"),
+                    _ => None,
+                }
+            }
+            "ShaderNodeTexGabor" => match world_texture_string(id, node, "gabor_type", "2D")? {
+                "2D" => Some("Orientation 3D"),
+                "3D" => Some("Orientation 2D"),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(socket) = inactive
+            && self
+                .group
+                .links
+                .iter()
+                .any(|link| link.to_node == *id && link.to_socket == socket)
+        {
+            return Err(world_error(
+                id,
+                &format!("procedural texture input `{socket}` is unavailable"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn procedural_texture_vector(&mut self, id: &Id, default: DVec3) -> Result<[f32; 3]> {
+        let linked = self
+            .group
+            .links
+            .iter()
+            .any(|link| link.to_node == *id && socket_matches(&link.to_socket, "Vector"));
+        let value = if linked {
+            self.input(id, "Vector", WorldValue::Vector(default))?
+        } else {
+            WorldValue::Vector(default)
+        };
+        world_texture_vector(as_vector(value))
+    }
+
+    fn procedural_texture_vector_input(
+        &mut self,
+        id: &Id,
+        socket: &str,
+        default: [f32; 3],
+    ) -> Result<[f32; 3]> {
+        let fallback = WorldValue::Vector(DVec3::new(
+            f64::from(default[0]),
+            f64::from(default[1]),
+            f64::from(default[2]),
+        ));
+        world_texture_vector(as_vector(self.input(id, socket, fallback)?))
+    }
+
+    fn procedural_texture_scalar(&mut self, id: &Id, socket: &str, default: f32) -> Result<f32> {
+        world_texture_value(as_scalar(self.input(
+            id,
+            socket,
+            WorldValue::Scalar(f64::from(default)),
+        )?))
+    }
+
+    fn procedural_texture_color(
+        &mut self,
+        id: &Id,
+        socket: &str,
+        default: [f32; 4],
+    ) -> Result<[f32; 4]> {
+        let fallback = WorldValue::Color(default.map(f64::from));
+        world_texture_color(as_color(self.input(id, socket, fallback)?))
     }
 
     fn eval_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<WorldValue> {
@@ -351,6 +872,11 @@ impl<'a> WorldEvaluator<'a> {
                 );
                 Ok(WorldValue::Color(color))
             }
+            "ShaderNodeTexWave"
+            | "ShaderNodeTexMagic"
+            | "ShaderNodeTexBrick"
+            | "ShaderNodeTexWhiteNoise"
+            | "ShaderNodeTexGabor" => self.procedural_texture_node(id, node, socket),
             "ShaderNodeTexCoord" => match socket {
                 "Normal" | "Generated" | "Object" | "Window" | "Camera" | "Incoming" => {
                     Ok(WorldValue::Vector(self.direction))
@@ -514,6 +1040,103 @@ fn sky_radiance(direction: DVec3, sun: DVec3) -> [f64; 4] {
         0.06 + daylight * (0.48 + 0.38 * zenith) + warmth * 0.06 + disc * 0.48,
         1.0,
     ]
+}
+fn world_texture_string<'a>(
+    id: &Id,
+    node: &'a GraphNode,
+    property: &str,
+    default: &'a str,
+) -> Result<&'a str> {
+    match node.properties.get(property) {
+        None => Ok(default),
+        Some(value) => value.as_str().ok_or_else(|| {
+            world_error(
+                id,
+                &format!("texture property `{property}` must be a string"),
+            )
+        }),
+    }
+}
+
+fn world_texture_float(id: &Id, node: &GraphNode, property: &str, default: f32) -> Result<f32> {
+    let value = match node.properties.get(property) {
+        None => f64::from(default),
+        Some(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| world_error(id, &format!("texture property `{property}` is invalid")))?,
+    } as f32;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(world_error(
+            id,
+            &format!("texture property `{property}` exceeds float range"),
+        ))
+    }
+}
+
+fn world_texture_integer(id: &Id, node: &GraphNode, property: &str, default: i32) -> Result<i32> {
+    match node.properties.get(property) {
+        None => Ok(default),
+        Some(value) => value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| world_error(id, &format!("texture property `{property}` is invalid"))),
+    }
+}
+
+fn world_texture_value(value: f64) -> Result<f32> {
+    let value = value as f32;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "world procedural texture input exceeds the float range",
+        ))
+    }
+}
+
+fn world_texture_vector(value: DVec3) -> Result<[f32; 3]> {
+    let vector = [value.x as f32, value.y as f32, value.z as f32];
+    if vector.iter().all(|component| component.is_finite()) {
+        Ok(vector)
+    } else {
+        Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "world procedural texture vector exceeds the float range",
+        ))
+    }
+}
+
+fn world_texture_color(value: [f64; 4]) -> Result<[f32; 4]> {
+    let color = [
+        value[0] as f32,
+        value[1] as f32,
+        value[2] as f32,
+        value[3] as f32,
+    ];
+    if color.iter().all(|component| component.is_finite()) {
+        Ok(color)
+    } else {
+        Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "world procedural texture color exceeds the float range",
+        ))
+    }
+}
+
+fn world_texture_mode_error(id: &Id, node_type: &str, property: &str, mode: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!("world `{node_type}` mode `{mode}` is not implemented"),
+        json!({
+            "feature_id": format!("shader.node.{node_type}.{property}"),
+            "node_id": id,
+            "value": mode,
+        }),
+    )
 }
 
 fn parse_value(value: &JsonValue, fallback: WorldValue) -> WorldValue {

@@ -425,11 +425,11 @@ fn hash_float_to_float3_scalar(value: f32) -> [f32; 3] {
     ]
 }
 
-fn uint_to_float(value: u32) -> f32 {
+pub(super) fn uint_to_float(value: u32) -> f32 {
     value as f32 / u32::MAX as f32
 }
 
-fn hash_uint(value: u32) -> u32 {
+pub(super) fn hash_uint(value: u32) -> u32 {
     let mut a = 0xdead_beef_u32.wrapping_add(17);
     let mut b = a;
     let mut c = a;
@@ -438,7 +438,7 @@ fn hash_uint(value: u32) -> u32 {
     c
 }
 
-fn hash_uint2(first: u32, second: u32) -> u32 {
+pub(super) fn hash_uint2(first: u32, second: u32) -> u32 {
     let mut a = 0xdead_beef_u32.wrapping_add(21);
     let mut b = a.wrapping_add(second);
     let mut c = a;
@@ -447,7 +447,7 @@ fn hash_uint2(first: u32, second: u32) -> u32 {
     c
 }
 
-fn hash_uint3(first: u32, second: u32, third: u32) -> u32 {
+pub(super) fn hash_uint3(first: u32, second: u32, third: u32) -> u32 {
     let mut a = 0xdead_beef_u32.wrapping_add(25);
     let mut b = a.wrapping_add(second);
     let mut c = a.wrapping_add(third);
@@ -456,7 +456,7 @@ fn hash_uint3(first: u32, second: u32, third: u32) -> u32 {
     c
 }
 
-fn hash_uint4(first: u32, second: u32, third: u32, fourth: u32) -> u32 {
+pub(super) fn hash_uint4(first: u32, second: u32, third: u32, fourth: u32) -> u32 {
     let mut a = 0xdead_beef_u32.wrapping_add(29).wrapping_add(first);
     let mut b = 0xdead_beef_u32.wrapping_add(29).wrapping_add(second);
     let mut c = 0xdead_beef_u32.wrapping_add(29).wrapping_add(third);

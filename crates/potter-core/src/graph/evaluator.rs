@@ -16,6 +16,9 @@ use crate::{
         modifiers::evaluate_modifiers, origindex_values, set_origindex,
     },
     model::{Id, Modifier, Registry},
+    shader::texture_procedural_kernels::{
+        self as procedural_texture, WaveBandsDirection, WaveProfile, WaveRingsDirection, WaveType,
+    },
 };
 
 use super::{
@@ -264,12 +267,63 @@ enum Field {
         inputs: BTreeMap<String, Box<Field>>,
         output: String,
     },
+    ProceduralTexture {
+        kind: TextureFieldKind,
+        inputs: Vec<Field>,
+        output: String,
+    },
+}
+#[derive(Clone, Copy, Debug)]
+enum TextureFieldKind {
+    Wave {
+        wave_type: WaveType,
+        bands_direction: WaveBandsDirection,
+        rings_direction: WaveRingsDirection,
+        profile: WaveProfile,
+    },
+    Magic {
+        depth: u8,
+    },
+    Brick {
+        offset: f32,
+        offset_frequency: i32,
+        squash: f32,
+        squash_frequency: i32,
+    },
+    WhiteNoise {
+        dimensions: u8,
+    },
+    Gabor {
+        dimensions: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum MixOutput {
     Value,
     Color,
+}
+enum OutputDependencies {
+    Single(Option<(Id, String)>),
+    Multiple(Vec<(Id, String)>),
+}
+
+impl OutputDependencies {
+    fn get(&self, index: usize) -> Option<&(Id, String)> {
+        match self {
+            Self::Single(Some(dependency)) if index == 0 => Some(dependency),
+            Self::Single(_) => None,
+            Self::Multiple(dependencies) => dependencies.get(index),
+        }
+    }
+}
+
+struct OutputWorkFrame {
+    id: Id,
+    socket: String,
+    node: GraphNode,
+    dependencies: OutputDependencies,
+    next_dependency: usize,
 }
 
 struct Evaluator<'a> {
@@ -1078,26 +1132,216 @@ impl Evaluator<'_> {
                 json!({"node_id":id}),
             ));
         }
-        let node = self.group.nodes.get(id).cloned().ok_or_else(|| {
-            PotError::new(
+        let result = if let Some(node) = self.group.nodes.get(id).cloned() {
+            match self.output_geometry_dependencies(id, &node, socket) {
+                Some(dependencies) => self.evaluate_output_worklist(id, socket, node, dependencies),
+                None => self.evaluate_node(id, &node, socket),
+            }
+        } else {
+            Err(PotError::new(
                 ErrorCode::TargetNotFound,
                 format!("graph node `{id}` was not found"),
-            )
-        })?;
-        let result = self.evaluate_node(id, &node, socket);
+            ))
+        };
         self.active.remove(id);
-        let mut value = result?;
-        if let EvalValue::Geometry(geometry) = &mut value
+        Ok(self.finalize_output_value(key, result?))
+    }
+
+    /// Finalizes and caches each completed output for both traversal paths.
+    fn finalize_output_value(&mut self, key: (Id, String), mut value: EvalValue) -> EvalValue {
+        self.apply_output_origindex(&mut value);
+        self.cache.insert(key, value.clone());
+        value
+    }
+
+    fn apply_output_origindex(&self, value: &mut EvalValue) {
+        if let EvalValue::Geometry(geometry) = value
             && origindex_values(&geometry.mesh).is_none()
             && self.input.and_then(origindex_values).is_some()
         {
             let vertex_count = geometry.mesh.vertices.len();
             set_origindex(&mut geometry.mesh, &vec![ORIGINDEX_NONE; vertex_count]);
         }
-        self.cache.insert(key, value.clone());
-        Ok(value)
+    }
+    /// Returns a supported single-input geometry dependency for bottom-up evaluation.
+    /// Group and branching nodes remain on the existing demand-driven path.
+    fn geometry_chain_input_socket(
+        &self,
+        id: &Id,
+        node: &GraphNode,
+        output_socket: &str,
+        geometry_output: bool,
+    ) -> Option<&'static str> {
+        match (node.node_type.as_str(), output_socket, geometry_output) {
+            (
+                "GeometryNodeTransform"
+                | "GeometryNodeSetPosition"
+                | "GeometryNodeStoreNamedAttribute"
+                | "GeometryNodeRealizeInstances"
+                | "GeometryNodeCaptureAttribute",
+                "Geometry",
+                _,
+            ) => Some("Geometry"),
+            ("GeometryNodeCaptureAttribute", _, false) => {
+                let (_, outputs) = node_sockets(self.group, id)?;
+                outputs
+                    .iter()
+                    .any(|(name, _)| name == output_socket)
+                    .then_some("Geometry")
+            }
+            ("GeometryNodeDistributePointsOnFaces" | "GeometryNodeMeshToPoints", "Points", _) => {
+                Some("Mesh")
+            }
+            ("GeometryNodeSubdivisionSurface", "Mesh", _) => Some("Mesh"),
+            _ => None,
+        }
     }
 
+    fn output_geometry_dependencies(
+        &self,
+        id: &Id,
+        node: &GraphNode,
+        output_socket: &str,
+    ) -> Option<OutputDependencies> {
+        // Join consumes all connected inputs; Instance on Points reads its linked sockets in node order.
+        if matches!(
+            node.node_type.as_str(),
+            "GeometryNodeJoinGeometry" | "GeometryNodeInstanceOnPoints"
+        ) {
+            let (_, outputs) = node_sockets(self.group, id)?;
+            if !outputs
+                .iter()
+                .any(|(name, socket_type)| name == output_socket && socket_type == "geometry")
+            {
+                return None;
+            }
+            if node.node_type == "GeometryNodeJoinGeometry" {
+                // Join requires every connected input; unconnected sockets are not dependencies.
+                let dependencies = self
+                    .group
+                    .links
+                    .iter()
+                    .filter(|link| &link.to_node == id && link.to_socket == "Geometry")
+                    .map(|link| (link.from_node.clone(), link.from_socket.clone()))
+                    .collect();
+                return Some(OutputDependencies::Multiple(dependencies));
+            }
+            let dependencies = ["Points", "Instance"]
+                .into_iter()
+                .filter_map(|input_socket| {
+                    self.group
+                        .links
+                        .iter()
+                        .find(|link| &link.to_node == id && link.to_socket == input_socket)
+                        .map(|link| (link.from_node.clone(), link.from_socket.clone()))
+                })
+                .collect();
+            return Some(OutputDependencies::Multiple(dependencies));
+        }
+        let input_socket = self.geometry_chain_input_socket(id, node, output_socket, false)?;
+        let mut links = self
+            .group
+            .links
+            .iter()
+            .filter(|link| &link.to_node == id && link.to_socket == input_socket);
+        let dependency = links
+            .next()
+            .map(|link| (link.from_node.clone(), link.from_socket.clone()));
+        if links.next().is_some() {
+            return None;
+        }
+        Some(OutputDependencies::Single(dependency))
+    }
+
+    fn evaluate_output_worklist(
+        &mut self,
+        root_id: &Id,
+        root_socket: &str,
+        root_node: GraphNode,
+        dependencies: OutputDependencies,
+    ) -> Result<EvalValue> {
+        let mut active_dependencies = Vec::new();
+        let result = (|| {
+            let mut frames = vec![OutputWorkFrame {
+                id: root_id.clone(),
+                socket: root_socket.to_owned(),
+                node: root_node,
+                dependencies,
+                next_dependency: 0,
+            }];
+            loop {
+                let dependency = {
+                    let Some(frame) = frames.last_mut() else {
+                        return Err(PotError::new(
+                            ErrorCode::InternalError,
+                            "geometry output worklist lost its root frame",
+                        ));
+                    };
+                    let dependency = frame.dependencies.get(frame.next_dependency).cloned();
+                    if dependency.is_some() {
+                        frame.next_dependency += 1;
+                    }
+                    dependency
+                };
+                if let Some((dependency_id, dependency_socket)) = dependency {
+                    if self.cache.keys().any(|(cached_id, cached_socket)| {
+                        cached_id == &dependency_id && cached_socket == &dependency_socket
+                    }) {
+                        continue;
+                    }
+                    let Some(dependency_node) = self.group.nodes.get(&dependency_id).cloned()
+                    else {
+                        let _ = self.output_value(&dependency_id, &dependency_socket)?;
+                        continue;
+                    };
+                    if let Some(dependencies) = self.output_geometry_dependencies(
+                        &dependency_id,
+                        &dependency_node,
+                        &dependency_socket,
+                    ) {
+                        if !self.active.insert(dependency_id.clone()) {
+                            return Err(PotError::with_details(
+                                ErrorCode::EvaluationFailed,
+                                "geometry node graph contains an evaluation cycle",
+                                json!({"node_id":dependency_id}),
+                            ));
+                        }
+                        active_dependencies.push(dependency_id.clone());
+                        frames.push(OutputWorkFrame {
+                            id: dependency_id,
+                            socket: dependency_socket,
+                            node: dependency_node,
+                            dependencies,
+                            next_dependency: 0,
+                        });
+                    } else {
+                        let _ = self.output_value(&dependency_id, &dependency_socket)?;
+                    }
+                    continue;
+                }
+                let Some(frame) = frames.pop() else {
+                    return Err(PotError::new(
+                        ErrorCode::InternalError,
+                        "geometry output worklist completed without its root frame",
+                    ));
+                };
+                let is_root = &frame.id == root_id;
+                let value = self.evaluate_node(&frame.id, &frame.node, &frame.socket);
+                if !is_root {
+                    self.active.remove(&frame.id);
+                }
+                let value = value?;
+                if is_root {
+                    return Ok(value);
+                }
+                let _ = self.finalize_output_value((frame.id, frame.socket), value);
+            }
+        })();
+        for dependency_id in active_dependencies {
+            self.active.remove(&dependency_id);
+        }
+        result
+    }
     fn evaluate_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
         match node.node_type.as_str() {
             "NodeGroupInput" => self.group_input_value(socket),
@@ -1148,6 +1392,11 @@ impl Evaluator<'_> {
             "ShaderNodeRGBCurve" => self.curve_node(id, node, socket, "RGBA"),
             "ShaderNodeCombineXYZ" => self.combine_xyz(id, node),
             "ShaderNodeSeparateXYZ" => self.separate_xyz(id, node, socket),
+            "ShaderNodeTexWave"
+            | "ShaderNodeTexMagic"
+            | "ShaderNodeTexBrick"
+            | "ShaderNodeTexWhiteNoise"
+            | "ShaderNodeTexGabor" => self.texture_node(id, node, socket),
             "FunctionNodeRandomValue" => self.random_node(id, node, socket),
             "FunctionNodeAlignEulerToVector"
             | "FunctionNodeAlignRotationToVector"
@@ -2004,7 +2253,8 @@ impl Evaluator<'_> {
     }
 
     fn geometry_input(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
-        match self.input_geometry(id, node, socket)? {
+        let input = self.input_geometry(id, node, socket)?;
+        match input {
             EvalValue::Geometry(geometry) => {
                 let instance_aware = matches!(
                     node.node_type.as_str(),
@@ -2360,10 +2610,7 @@ impl Evaluator<'_> {
         let offset = self.vector_input(id, node, "Offset", offset_default, &Mesh::new())?;
 
         let points = (0..count)
-            .map(|index| {
-                let t = interpolation_factor(index, count);
-                start + offset * t
-            })
+            .map(|index| start + offset * index as f64)
             .collect::<Vec<_>>();
         let mut mesh = Mesh::new();
         let mut ids = Vec::with_capacity(points.len());
@@ -3267,6 +3514,242 @@ impl Evaluator<'_> {
             second: Box::new(second),
             third: Box::new(third),
         }))
+    }
+    fn texture_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
+        let mut inputs = Vec::with_capacity(10);
+        let kind = match node.node_type.as_str() {
+            "ShaderNodeTexWave" => {
+                if !matches!(socket, "Color" | "Fac") {
+                    return Err(PotError::new(
+                        ErrorCode::InvalidOperation,
+                        format!("unknown Wave Texture output `{socket}`"),
+                    ));
+                }
+                let wave_type = match texture_string_property(node, "wave_type", "BANDS")? {
+                    "BANDS" => WaveType::Bands,
+                    "RINGS" => WaveType::Rings,
+                    value => {
+                        return Err(unsupported_texture_mode(
+                            id,
+                            "ShaderNodeTexWave",
+                            "wave_type",
+                            value,
+                        ));
+                    }
+                };
+                let bands_direction = if matches!(wave_type, WaveType::Bands) {
+                    match texture_string_property(node, "bands_direction", "X")? {
+                        "X" => WaveBandsDirection::X,
+                        "Y" => WaveBandsDirection::Y,
+                        "Z" => WaveBandsDirection::Z,
+                        "DIAGONAL" => WaveBandsDirection::Diagonal,
+                        value => {
+                            return Err(unsupported_texture_mode(
+                                id,
+                                "ShaderNodeTexWave",
+                                "bands_direction",
+                                value,
+                            ));
+                        }
+                    }
+                } else {
+                    WaveBandsDirection::X
+                };
+                let rings_direction = if matches!(wave_type, WaveType::Rings) {
+                    match texture_string_property(node, "rings_direction", "X")? {
+                        "X" => WaveRingsDirection::X,
+                        "Y" => WaveRingsDirection::Y,
+                        "Z" => WaveRingsDirection::Z,
+                        "SPHERICAL" => WaveRingsDirection::Spherical,
+                        value => {
+                            return Err(unsupported_texture_mode(
+                                id,
+                                "ShaderNodeTexWave",
+                                "rings_direction",
+                                value,
+                            ));
+                        }
+                    }
+                } else {
+                    WaveRingsDirection::X
+                };
+                let profile = match texture_string_property(node, "wave_profile", "SIN")? {
+                    "SIN" => WaveProfile::Sine,
+                    "SAW" => WaveProfile::Saw,
+                    "TRI" => WaveProfile::Triangle,
+                    value => {
+                        return Err(unsupported_texture_mode(
+                            id,
+                            "ShaderNodeTexWave",
+                            "wave_profile",
+                            value,
+                        ));
+                    }
+                };
+                inputs.push(self.texture_vector_input(id, node)?);
+                inputs.push(self.texture_input(id, node, "Scale", json!(5.0))?);
+                inputs.push(self.texture_input(id, node, "Distortion", json!(0.0))?);
+                inputs.push(self.texture_input(id, node, "Detail", json!(2.0))?);
+                inputs.push(self.texture_input(id, node, "Detail Scale", json!(1.0))?);
+                inputs.push(self.texture_input(id, node, "Detail Roughness", json!(0.5))?);
+                inputs.push(self.texture_input(id, node, "Phase Offset", json!(0.0))?);
+                TextureFieldKind::Wave {
+                    wave_type,
+                    bands_direction,
+                    rings_direction,
+                    profile,
+                }
+            }
+            "ShaderNodeTexMagic" => {
+                if !matches!(socket, "Color" | "Fac") {
+                    return Err(PotError::new(
+                        ErrorCode::InvalidOperation,
+                        format!("unknown Magic Texture output `{socket}`"),
+                    ));
+                }
+                let depth = texture_integer_property(node, "turbulence_depth", 2)?;
+                inputs.push(self.texture_vector_input(id, node)?);
+                inputs.push(self.texture_input(id, node, "Scale", json!(5.0))?);
+                inputs.push(self.texture_input(id, node, "Distortion", json!(1.0))?);
+                TextureFieldKind::Magic {
+                    depth: depth.clamp(0, 10) as u8,
+                }
+            }
+            "ShaderNodeTexBrick" => {
+                if !matches!(socket, "Color" | "Fac") {
+                    return Err(PotError::new(
+                        ErrorCode::InvalidOperation,
+                        format!("unknown Brick Texture output `{socket}`"),
+                    ));
+                }
+                let offset = texture_float_property(node, "offset", 0.5)?;
+                let offset_frequency = texture_integer_property(node, "offset_frequency", 2)?;
+                let squash = texture_float_property(node, "squash", 1.0)?;
+                let squash_frequency = texture_integer_property(node, "squash_frequency", 2)?;
+                inputs.push(self.texture_vector_input(id, node)?);
+                inputs.push(self.texture_input(id, node, "Color1", json!([0.8, 0.8, 0.8, 1.0]))?);
+                inputs.push(self.texture_input(id, node, "Color2", json!([0.2, 0.2, 0.2, 1.0]))?);
+                inputs.push(self.texture_input(id, node, "Mortar", json!([0.0, 0.0, 0.0, 1.0]))?);
+                inputs.push(self.texture_input(id, node, "Scale", json!(5.0))?);
+                inputs.push(self.texture_input(id, node, "Mortar Size", json!(0.02))?);
+                inputs.push(self.texture_input(id, node, "Mortar Smooth", json!(0.1))?);
+                inputs.push(self.texture_input(id, node, "Bias", json!(0.0))?);
+                inputs.push(self.texture_input(id, node, "Brick Width", json!(0.5))?);
+                inputs.push(self.texture_input(id, node, "Row Height", json!(0.25))?);
+                TextureFieldKind::Brick {
+                    offset,
+                    offset_frequency,
+                    squash,
+                    squash_frequency,
+                }
+            }
+            "ShaderNodeTexWhiteNoise" => {
+                if !matches!(socket, "Value" | "Color") {
+                    return Err(PotError::new(
+                        ErrorCode::InvalidOperation,
+                        format!("unknown White Noise Texture output `{socket}`"),
+                    ));
+                }
+                let dimensions = match texture_string_property(node, "noise_dimensions", "3D")? {
+                    "1D" => 1,
+                    "2D" => 2,
+                    "3D" => 3,
+                    "4D" => 4,
+                    value => {
+                        return Err(unsupported_texture_mode(
+                            id,
+                            "ShaderNodeTexWhiteNoise",
+                            "noise_dimensions",
+                            value,
+                        ));
+                    }
+                };
+                match dimensions {
+                    1 => inputs.push(self.texture_input(id, node, "W", json!(0.0))?),
+                    2 | 3 => inputs.push(self.texture_vector_input(id, node)?),
+                    4 => {
+                        inputs.push(self.texture_vector_input(id, node)?);
+                        inputs.push(self.texture_input(id, node, "W", json!(0.0))?);
+                    }
+                    _ => unreachable!(),
+                }
+                TextureFieldKind::WhiteNoise { dimensions }
+            }
+            "ShaderNodeTexGabor" => {
+                if !matches!(socket, "Value" | "Phase" | "Intensity") {
+                    return Err(PotError::new(
+                        ErrorCode::InvalidOperation,
+                        format!("unknown Gabor Texture output `{socket}`"),
+                    ));
+                }
+                let dimensions = match texture_string_property(node, "gabor_type", "2D")? {
+                    "2D" => 2,
+                    "3D" => 3,
+                    value => {
+                        return Err(unsupported_texture_mode(
+                            id,
+                            "ShaderNodeTexGabor",
+                            "gabor_type",
+                            value,
+                        ));
+                    }
+                };
+                inputs.push(self.texture_vector_input(id, node)?);
+                inputs.push(self.texture_input(id, node, "Scale", json!(5.0))?);
+                inputs.push(self.texture_input(id, node, "Frequency", json!(2.0))?);
+                inputs.push(self.texture_input(id, node, "Anisotropy", json!(1.0))?);
+                if dimensions == 2 {
+                    inputs.push(self.texture_input(
+                        id,
+                        node,
+                        "Orientation 2D",
+                        json!(std::f64::consts::FRAC_PI_4),
+                    )?);
+                } else {
+                    inputs.push(self.texture_input(
+                        id,
+                        node,
+                        "Orientation 3D",
+                        json!([std::f64::consts::SQRT_2, std::f64::consts::SQRT_2, 0.0]),
+                    )?);
+                }
+                TextureFieldKind::Gabor { dimensions }
+            }
+            _ => return Err(evaluation("unknown procedural texture field node")),
+        };
+        Ok(EvalValue::Field(Field::ProceduralTexture {
+            kind,
+            inputs,
+            output: socket.to_owned(),
+        }))
+    }
+
+    fn texture_input(
+        &mut self,
+        id: &Id,
+        node: &GraphNode,
+        socket: &str,
+        default: Value,
+    ) -> Result<Field> {
+        Ok(as_field(self.input_value_with_node(
+            id,
+            node,
+            socket,
+            EvalValue::Scalar(default),
+        )?))
+    }
+
+    fn texture_vector_input(&mut self, id: &Id, node: &GraphNode) -> Result<Field> {
+        if self
+            .group
+            .links
+            .iter()
+            .any(|link| link.to_node == *id && link.to_socket == "Vector")
+        {
+            self.texture_input(id, node, "Vector", json!([0.0, 0.0, 0.0]))
+        } else {
+            Ok(Field::Position)
+        }
     }
 
     fn vector_math_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
@@ -4952,6 +5435,11 @@ fn field_json_in_context(
                 .cloned()
                 .ok_or_else(|| evaluation("captured attribute index is out of range"))?
         }
+        Field::ProceduralTexture {
+            kind,
+            inputs,
+            output,
+        } => procedural_texture_field_value(kind, inputs, output, context, index, domain)?,
         Field::Math {
             operation,
             clamp,
@@ -5375,6 +5863,243 @@ fn field_json_in_context(
         Ok(value)
     } else {
         Err(evaluation("field produced a non-finite value"))
+    }
+}
+fn procedural_texture_field_value(
+    kind: &TextureFieldKind,
+    inputs: &[Field],
+    output: &str,
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+) -> Result<Value> {
+    match kind {
+        TextureFieldKind::Wave {
+            wave_type,
+            bands_direction,
+            rings_direction,
+            profile,
+        } => {
+            let vector = texture_field_vector(inputs, 0, context, index, domain)?;
+            let value = procedural_texture::wave(
+                vector,
+                texture_field_number(inputs, 1, context, index, domain)?,
+                texture_field_number(inputs, 2, context, index, domain)?,
+                texture_field_number(inputs, 3, context, index, domain)?,
+                texture_field_number(inputs, 4, context, index, domain)?,
+                texture_field_number(inputs, 5, context, index, domain)?,
+                texture_field_number(inputs, 6, context, index, domain)?,
+                *wave_type,
+                *bands_direction,
+                *rings_direction,
+                *profile,
+            );
+            match output {
+                "Color" => Ok(json!([value, value, value, 1.0])),
+                "Fac" => Ok(json!(value)),
+                _ => Err(evaluation("unknown Wave Texture field output")),
+            }
+        }
+        TextureFieldKind::Magic { depth } => {
+            let vector = texture_field_vector(inputs, 0, context, index, domain)?;
+            let (color, factor) = procedural_texture::magic(
+                vector,
+                texture_field_number(inputs, 1, context, index, domain)?,
+                texture_field_number(inputs, 2, context, index, domain)?,
+                *depth,
+            );
+            match output {
+                "Color" => Ok(json!(color.map(f64::from))),
+                "Fac" => Ok(json!(f64::from(factor))),
+                _ => Err(evaluation("unknown Magic Texture field output")),
+            }
+        }
+        TextureFieldKind::Brick {
+            offset,
+            offset_frequency,
+            squash,
+            squash_frequency,
+        } => {
+            let vector = texture_field_vector(inputs, 0, context, index, domain)?;
+            let color1 = texture_field_color(inputs, 1, context, index, domain)?;
+            let color2 = texture_field_color(inputs, 2, context, index, domain)?;
+            let mortar = texture_field_color(inputs, 3, context, index, domain)?;
+            let scale = texture_field_number(inputs, 4, context, index, domain)?;
+            let mortar_size = texture_field_number(inputs, 5, context, index, domain)?;
+            let mortar_smooth = texture_field_number(inputs, 6, context, index, domain)?;
+            let bias = texture_field_number(inputs, 7, context, index, domain)?;
+            let width = texture_field_number(inputs, 8, context, index, domain)?;
+            let row_height = texture_field_number(inputs, 9, context, index, domain)?;
+            if width == 0.0 || row_height == 0.0 {
+                return Err(evaluation(
+                    "Brick Texture width and row height must be nonzero",
+                ));
+            }
+            let (color, factor) = procedural_texture::brick(
+                vector,
+                color1,
+                color2,
+                mortar,
+                scale,
+                mortar_size,
+                mortar_smooth,
+                bias,
+                width,
+                row_height,
+                *offset,
+                *offset_frequency,
+                *squash,
+                *squash_frequency,
+            );
+            match output {
+                "Color" => Ok(json!(color.map(f64::from))),
+                "Fac" => Ok(json!(f64::from(factor))),
+                _ => Err(evaluation("unknown Brick Texture field output")),
+            }
+        }
+        TextureFieldKind::WhiteNoise { dimensions } => {
+            let (vector, w) = match dimensions {
+                1 => (
+                    [0.0; 3],
+                    texture_field_number(inputs, 0, context, index, domain)?,
+                ),
+                2 | 3 => (
+                    texture_field_vector(inputs, 0, context, index, domain)?,
+                    0.0,
+                ),
+                4 => (
+                    texture_field_vector(inputs, 0, context, index, domain)?,
+                    texture_field_number(inputs, 1, context, index, domain)?,
+                ),
+                _ => return Err(evaluation("White Noise Texture dimensions are invalid")),
+            };
+            match output {
+                "Value" => procedural_texture::white_noise_value(*dimensions, vector, w)
+                    .map(|value| json!(value))
+                    .ok_or_else(|| evaluation("White Noise Texture dimensions are invalid")),
+                "Color" => procedural_texture::white_noise_color(*dimensions, vector, w)
+                    .map(|color| json!(color.map(f64::from)))
+                    .ok_or_else(|| evaluation("White Noise Texture dimensions are invalid")),
+                _ => Err(evaluation("unknown White Noise Texture field output")),
+            }
+        }
+        TextureFieldKind::Gabor { dimensions } => {
+            let vector = texture_field_vector(inputs, 0, context, index, domain)?;
+            let scale = texture_field_number(inputs, 1, context, index, domain)?;
+            let frequency = texture_field_number(inputs, 2, context, index, domain)?;
+            let anisotropy = texture_field_number(inputs, 3, context, index, domain)?;
+            let values = match dimensions {
+                2 => procedural_texture::gabor_2d(
+                    vector,
+                    scale,
+                    frequency,
+                    anisotropy,
+                    texture_field_number(inputs, 4, context, index, domain)?,
+                ),
+                3 => procedural_texture::gabor_3d(
+                    vector,
+                    scale,
+                    frequency,
+                    anisotropy,
+                    texture_field_vector(inputs, 4, context, index, domain)?,
+                ),
+                _ => return Err(evaluation("Gabor Texture dimensions are invalid")),
+            };
+            let value = match output {
+                "Value" => values[0],
+                "Phase" => values[1],
+                "Intensity" => values[2],
+                _ => return Err(evaluation("unknown Gabor Texture field output")),
+            };
+            Ok(json!(f64::from(value)))
+        }
+    }
+}
+
+fn texture_field_input(inputs: &[Field], index: usize) -> Result<&Field> {
+    inputs
+        .get(index)
+        .ok_or_else(|| evaluation("procedural texture field input is missing"))
+}
+
+fn texture_field_number(
+    inputs: &[Field],
+    input_index: usize,
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+) -> Result<f32> {
+    let value = numeric_field_in_context(
+        texture_field_input(inputs, input_index)?,
+        context,
+        index,
+        domain,
+        "procedural texture",
+    )? as f32;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(evaluation(
+            "procedural texture field exceeds the float range",
+        ))
+    }
+}
+
+fn texture_field_vector(
+    inputs: &[Field],
+    input_index: usize,
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+) -> Result<[f32; 3]> {
+    let value = vector_field_in_context(
+        texture_field_input(inputs, input_index)?,
+        context,
+        index,
+        domain,
+        "procedural texture",
+    )?;
+    let vector = [value.x as f32, value.y as f32, value.z as f32];
+    if vector.iter().all(|component| component.is_finite()) {
+        Ok(vector)
+    } else {
+        Err(evaluation(
+            "procedural texture vector exceeds the float range",
+        ))
+    }
+}
+
+fn texture_field_color(
+    inputs: &[Field],
+    input_index: usize,
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+) -> Result<[f32; 4]> {
+    let value = field_json_in_context(
+        texture_field_input(inputs, input_index)?,
+        context,
+        index,
+        domain,
+    )?;
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 4)
+        .ok_or_else(|| evaluation("procedural texture color input is not RGBA"))?;
+    let mut color = [0.0; 4];
+    for (output, value) in color.iter_mut().zip(values) {
+        *output = value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| evaluation("procedural texture color input is invalid"))?
+            as f32;
+    }
+    if color.iter().all(|component| component.is_finite()) {
+        Ok(color)
+    } else {
+        Err(evaluation(
+            "procedural texture color exceeds the float range",
+        ))
     }
 }
 
@@ -7485,6 +8210,55 @@ fn property_i64(node: &GraphNode, key: &str, default: i64) -> Result<i64> {
             .as_i64()
             .ok_or_else(|| evaluation(format!("node property `{key}` must be an integer")))
     })
+}
+fn texture_string_property<'a>(
+    node: &'a GraphNode,
+    property: &str,
+    default: &'a str,
+) -> Result<&'a str> {
+    match node.properties.get(property) {
+        None => Ok(default),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| evaluation(format!("texture property `{property}` must be a string"))),
+    }
+}
+
+fn texture_float_property(node: &GraphNode, property: &str, default: f32) -> Result<f32> {
+    let value = property_f64(node, property, f64::from(default))? as f32;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(evaluation(format!(
+            "texture property `{property}` exceeds the float range"
+        )))
+    }
+}
+
+fn texture_integer_property(node: &GraphNode, property: &str, default: i32) -> Result<i32> {
+    let value = property_i64(node, property, i64::from(default))?;
+    i32::try_from(value).map_err(|_| {
+        evaluation(format!(
+            "texture property `{property}` exceeds the integer range"
+        ))
+    })
+}
+
+fn unsupported_texture_mode(
+    node_id: &Id,
+    node_type: &str,
+    property: &str,
+    value: &str,
+) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!("{node_type} mode `{value}` is not implemented"),
+        json!({
+            "feature_id": format!("graph.node.{node_type}.{property}"),
+            "node_id": node_id,
+            "value": value,
+        }),
+    )
 }
 
 #[expect(

@@ -11486,6 +11486,11 @@ fn push_shader_node_mapping_import_losses(
         ("texture_mapping", "TexMapping"),
         ("color_mapping", "ColorMapping"),
     ] {
+        if property == "color_mapping"
+            && crate::shader::texture::texture_node_color_mapping_is_inert(node_type)
+        {
+            continue;
+        }
         let Some(value) = properties.get(property) else {
             continue;
         };
@@ -13318,7 +13323,12 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                                     | "ShaderNodeTexCoord"
                                     | "ShaderNodeMixRGB"
                                     | "ShaderNodeMixShader"
-                                    | "ShaderNodeAddShader",
+                                    | "ShaderNodeAddShader"
+                                    | "ShaderNodeTexWave"
+                                    | "ShaderNodeTexMagic"
+                                    | "ShaderNodeTexBrick"
+                                    | "ShaderNodeTexWhiteNoise"
+                                    | "ShaderNodeTexGabor",
                                 ) => false,
                                 _ => true,
                             }
@@ -15300,6 +15310,49 @@ fn shader_node_import_losses(doc: &SceneDoc) -> Vec<Loss> {
             &mut recorded,
             &mut losses,
         );
+    }
+    for world in doc.worlds.values() {
+        let Some(group_id) = world.node_tree.as_ref() else {
+            continue;
+        };
+        let Some(group) = doc.node_groups.get(group_id) else {
+            continue;
+        };
+        if group.kind != GraphKind::Shader {
+            continue;
+        }
+        let Some(output) = shader_output_node(group, "ShaderNodeOutputWorld") else {
+            continue;
+        };
+        let reachable = shader_nodes_reaching(group, output, None);
+        for node_id in &reachable {
+            let Some(node) = group.nodes.get(node_id) else {
+                continue;
+            };
+            if !matches!(
+                node.node_type.as_str(),
+                "ShaderNodeTexWave"
+                    | "ShaderNodeTexMagic"
+                    | "ShaderNodeTexBrick"
+                    | "ShaderNodeTexGabor"
+            ) || !group.links.iter().any(|link| {
+                link.from_node == *node_id
+                    && (reachable.contains(&link.to_node) || link.to_node == *output)
+            }) || node
+                .properties
+                .get("texture_mapping")
+                .is_none_or(crate::shader::texture::texture_mapping_is_default)
+            {
+                continue;
+            }
+            record_shader_loss(
+                &mut recorded,
+                &mut losses,
+                &format!("shader.node.{}.texture_mapping", node.node_type),
+                node_id,
+                "Non-default world procedural texture coordinates are preserved but native texture mapping is not implemented.",
+            );
+        }
     }
     losses
 }

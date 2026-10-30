@@ -21,15 +21,25 @@ pub(crate) fn validate_texture_node_mapping(
     node_type: &str,
     properties: &Map<String, JsonValue>,
 ) -> Result<()> {
+    validate_texture_mapping_only(id, node_type, properties)?;
+    if !texture_node_color_mapping_is_inert(node_type)
+        && let Some(mapping) = properties.get("color_mapping")
+        && !color_mapping_is_default(mapping)
+    {
+        return Err(unsupported_mapping(id, node_type, "color_mapping"));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_texture_mapping_only(
+    id: &Id,
+    node_type: &str,
+    properties: &Map<String, JsonValue>,
+) -> Result<()> {
     if let Some(mapping) = properties.get("texture_mapping")
         && !texture_mapping_is_default(mapping)
     {
         return Err(unsupported_mapping(id, node_type, "texture_mapping"));
-    }
-    if let Some(mapping) = properties.get("color_mapping")
-        && !color_mapping_is_default(mapping)
-    {
-        return Err(unsupported_mapping(id, node_type, "color_mapping"));
     }
     Ok(())
 }
@@ -49,6 +59,26 @@ pub(crate) fn texture_node_mapping_property_is_default(
         "color_mapping" => Some(color_mapping_is_default(value)),
         _ => None,
     }
+}
+pub(crate) fn texture_node_color_mapping_is_inert(node_type: &str) -> bool {
+    matches!(
+        node_type,
+        "ShaderNodeTexWave"
+            | "ShaderNodeTexMagic"
+            | "ShaderNodeTexBrick"
+            | "ShaderNodeTexWhiteNoise"
+            | "ShaderNodeTexGabor"
+    )
+}
+
+pub(crate) fn texture_node_mapping_is_default_for_node(
+    node_type: &str,
+    properties: &Map<String, JsonValue>,
+) -> bool {
+    properties.iter().all(|(property, value)| {
+        (property == "color_mapping" && texture_node_color_mapping_is_inert(node_type))
+            || texture_node_mapping_property_is_default(property, value).unwrap_or(true)
+    })
 }
 
 pub(crate) fn image_texture_interpolation(
@@ -400,7 +430,7 @@ fn unsupported_option(id: &Id, node_type: &str, property: &str, value: &JsonValu
     )
 }
 
-fn texture_mapping_is_default(value: &JsonValue) -> bool {
+pub(crate) fn texture_mapping_is_default(value: &JsonValue) -> bool {
     let Some(mapping) = value.as_object() else {
         return false;
     };

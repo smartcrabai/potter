@@ -109,6 +109,136 @@ fn cube_transform_graph_evaluates_and_set_position_applies_offset_field() {
 }
 
 #[test]
+fn deep_mixed_geometry_chain_preserves_order_and_fields() {
+    const STEPS: usize = 80;
+    let mut nodes = vec![
+        json!({"id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":1}}),
+        json!({"id":"output","type":"NodeGroupOutput"}),
+    ];
+    let mut links = Vec::new();
+    let mut previous_node = "line".to_owned();
+    let mut previous_socket = "Mesh".to_owned();
+    for index in 0..STEPS {
+        let transform_id = format!("transform_{index}");
+        nodes.push(json!({
+            "id": transform_id.clone(),
+            "type": "GeometryNodeTransform",
+            "inputs": {"Translation": [1.0, 0.0, 0.0]}
+        }));
+        links.push(json!({
+            "from_node": previous_node.clone(),
+            "from_socket": previous_socket.clone(),
+            "to_node": transform_id.clone(),
+            "to_socket": "Geometry"
+        }));
+        previous_node = transform_id;
+        previous_socket = "Geometry".to_owned();
+
+        let position_id = format!("position_{index}");
+        nodes.push(json!({
+            "id": position_id.clone(),
+            "type": "GeometryNodeSetPosition",
+            "inputs": {"Offset": [0.0, 1.0, 0.0]}
+        }));
+        links.push(json!({
+            "from_node": previous_node.clone(),
+            "from_socket": previous_socket.clone(),
+            "to_node": position_id.clone(),
+            "to_socket": "Geometry"
+        }));
+        previous_node = position_id;
+
+        let store_id = format!("store_{index}");
+        nodes.push(json!({
+            "id": store_id.clone(),
+            "type": "GeometryNodeStoreNamedAttribute",
+            "properties": {"domain": "POINT", "data_type": "INT"},
+            "inputs": {
+                "Name": format!("mixed_step_{index}"),
+                "Value": i64::try_from(index).unwrap()
+            }
+        }));
+        links.push(json!({
+            "from_node": previous_node.clone(),
+            "from_socket": previous_socket.clone(),
+            "to_node": store_id.clone(),
+            "to_socket": "Geometry"
+        }));
+        previous_node = store_id;
+    }
+    links.push(json!({
+        "from_node": previous_node,
+        "from_socket": previous_socket,
+        "to_node": "output",
+        "to_socket": "Geometry"
+    }));
+
+    let evaluation = evaluate(&graph_with_nodes(nodes, links));
+    let expected_translation = f64::from(u32::try_from(STEPS).unwrap());
+    assert_eq!(evaluation.mesh.vertices.len(), 1);
+    assert_eq!(evaluation.mesh.vertices[0].co.x, expected_translation);
+    assert_eq!(evaluation.mesh.vertices[0].co.y, expected_translation);
+    for index in [0, STEPS - 1] {
+        let name = format!("mixed_step_{index}");
+        let values = evaluation.mesh.attributes[&name]["data"]
+            .as_array()
+            .unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].as_i64().unwrap(), i64::try_from(index).unwrap());
+    }
+}
+
+#[test]
+fn deep_join_geometry_worklist_reuses_empty_branch() {
+    const STEPS: usize = 256;
+    let mut nodes = vec![
+        json!({"id":"point","type":"GeometryNodeMeshLine","inputs":{"Count":1}}),
+        json!({"id":"empty_source","type":"GeometryNodeMeshLine","inputs":{"Count":1}}),
+        json!({"id":"empty_points","type":"GeometryNodeMeshToPoints","inputs":{"Selection":false}}),
+        json!({"id":"output","type":"NodeGroupOutput"}),
+    ];
+    let mut links = Vec::new();
+    links.push(json!({
+        "from_node": "empty_source",
+        "from_socket": "Mesh",
+        "to_node": "empty_points",
+        "to_socket": "Mesh"
+    }));
+    let mut previous_node = "point".to_owned();
+    let mut previous_socket = "Mesh".to_owned();
+    for index in 0..STEPS {
+        let join_id = format!("join_{index}");
+        nodes.push(json!({"id":join_id.clone(),"type":"GeometryNodeJoinGeometry"}));
+        links.push(json!({
+            "from_node": previous_node.clone(),
+            "from_socket": previous_socket.clone(),
+            "to_node": join_id.clone(),
+            "to_socket": "Geometry"
+        }));
+        links.push(json!({
+            "from_node": "empty_points",
+            "from_socket": "Points",
+            "to_node": join_id.clone(),
+            "to_socket": "Geometry"
+        }));
+        previous_node = join_id;
+        previous_socket = "Geometry".to_owned();
+    }
+    links.push(json!({
+        "from_node": previous_node,
+        "from_socket": previous_socket,
+        "to_node": "output",
+        "to_socket": "Geometry"
+    }));
+
+    let mesh = evaluate(&graph_with_nodes(nodes, links)).mesh;
+    assert_eq!(mesh.vertices.len(), 1);
+    assert_eq!(mesh.vertices[0].co.x, 0.0);
+    assert_eq!(mesh.vertices[0].co.y, 0.0);
+    assert_eq!(mesh.vertices[0].co.z, 0.0);
+}
+
+#[test]
 fn graph_interface_defaults_accept_input_overrides() {
     let doc = apply(
         &SceneDoc::new("c8a8b9d4-2cbf-4bc4-9b17-6297b72e7d22".to_owned()),
