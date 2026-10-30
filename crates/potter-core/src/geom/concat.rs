@@ -100,7 +100,12 @@ fn concatenate_inner(
     let mut pieces = Vec::with_capacity(parts.len());
     let mut adaptive_normals = Vec::new();
     let mut has_adaptive_normals = false;
-    for part in parts {
+    // Blender's GeometrySet join omits empty components before collecting attributes.
+    for part in parts.into_iter().filter(|part| {
+        !part.mesh.vertices.is_empty()
+            || !part.mesh.edges.is_empty()
+            || !part.mesh.faces.is_empty()
+    }) {
         let Placed {
             mut mesh,
             uv_layers,
