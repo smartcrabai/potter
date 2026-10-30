@@ -224,6 +224,7 @@ pub(crate) fn remap_attributes_skipping(
         origin,
         None,
         None,
+        false,
         skipped,
         None,
         false,
@@ -247,6 +248,7 @@ pub(crate) fn remap_interpolated_corners_skipping(
         origin,
         None,
         None,
+        false,
         skipped,
         None,
         true,
@@ -276,6 +278,7 @@ pub(crate) fn remap_attributes_staged(
         origin,
         staged,
         Some(edges),
+        false,
         skipped,
         None,
         false,
@@ -304,6 +307,7 @@ pub(crate) fn remap_attributes_with_basis(
         origin,
         None,
         None,
+        false,
         skipped,
         corner_order,
         false,
@@ -331,6 +335,31 @@ pub(crate) fn remap_attributes_with_edges(
         origin,
         None,
         Some(edges),
+        false,
+        &[],
+        None,
+        false,
+        None,
+        [0.0, 0.0, 0.0, 1.0],
+    )
+}
+
+/// [`remap_attributes_with_edges`] using Blender's two-source `mix2` interpolation for edge
+/// attributes. Extrude Mesh uses this for generated connecting edges; other topology operations
+/// use [`remap_attributes_with_edges`] and their ordinary source-weight mixer.
+pub(crate) fn remap_attributes_with_edge_mix2(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+    edges: Vec<Vec<(usize, f64)>>,
+) -> Result<()> {
+    remap_attributes_internal(
+        source,
+        output,
+        origin,
+        None,
+        Some(edges),
+        true,
         &[],
         None,
         false,
@@ -485,6 +514,7 @@ pub(crate) fn remap_attributes_with_edge_identity(
         origin,
         None,
         None,
+        false,
         &[],
         None,
         false,
@@ -499,6 +529,7 @@ fn remap_attributes_internal(
     origin: &Origin,
     staged: Option<&Staged>,
     edges: Option<Vec<Vec<(usize, f64)>>>,
+    edge_mix2: bool,
     skipped: &[&str],
     corner_order: Option<&[usize]>,
     weighted_corner_booleans: bool,
@@ -628,6 +659,7 @@ fn remap_attributes_internal(
         staged,
         point_identity: edge_identity,
         edge_origin: &edge_origin,
+        edge_mix2,
         corner_origin,
         weighted_corner_booleans,
         color_default,
@@ -1093,6 +1125,7 @@ struct Sources<'a> {
     staged: Option<&'a Staged>,
     point_identity: Option<&'a [usize]>,
     edge_origin: &'a [Vec<(usize, f64)>],
+    edge_mix2: bool,
     corner_origin: &'a [Vec<(usize, f64)>],
     weighted_corner_booleans: bool,
     color_default: [f64; 4],
@@ -1264,7 +1297,7 @@ impl Sources<'_> {
         with_values(attribute, Value::Object(output))
     }
 
-    /// Edge values blend over source edges except for direct transform-matrix copies.
+    /// Edge values blend over source edges except for operation-specific direct and mix2 transfers.
     fn edge_values(
         &self,
         values: &[Value],
@@ -1279,6 +1312,15 @@ impl Sources<'_> {
                     && weight.to_bits() == 1.0_f64.to_bits()
                 {
                     values.get(*source).cloned().unwrap_or_else(&default)
+                } else if self.edge_mix2
+                    && is_short2(data_type)
+                    && let [(first, _), (second, factor)] = sources.as_slice()
+                {
+                    values
+                        .get(*first)
+                        .zip(values.get(*second))
+                        .and_then(|(first, second)| mix_short2(first, second, *factor))
+                        .unwrap_or_else(&default)
                 } else {
                     blend_indexed(values, sources, data_type).unwrap_or_else(&default)
                 }
@@ -1649,7 +1691,7 @@ impl Sources<'_> {
     /// One canonical color layer rebuilt with the Blender mixer named in the source metadata.
     fn color_layer(&self, layer: &ColorLayer) -> ColorLayer {
         let data_type = self.color_data_type(&layer.name);
-        let mix = |sources: &[(usize, f64)]| {
+        let mix_flat = |sources: &[(usize, f64)]| {
             if data_type == "BYTE_COLOR" {
                 if sources.is_empty() {
                     self.color_default
@@ -1657,11 +1699,10 @@ impl Sources<'_> {
                     color_layers::mix_byte_color(&layer.values, sources)
                 }
             } else {
-                blend_rgba(
+                mix_float_color(
                     sources
                         .iter()
                         .filter_map(|(index, weight)| Some((*layer.values.get(*index)?, *weight))),
-                    data_type,
                 )
                 .unwrap_or(self.color_default)
             }
@@ -1671,18 +1712,39 @@ impl Sources<'_> {
                 .origin
                 .vertices
                 .iter()
-                .map(|sources| mix(sources))
+                .enumerate()
+                .map(|(index, sources)| {
+                    if data_type == "BYTE_COLOR" {
+                        mix_flat(sources)
+                    } else {
+                        mix_float_color_by_mix(&layer.values, self.vertex_mix(index))
+                            .unwrap_or(self.color_default)
+                    }
+                })
                 .collect(),
             ColorDomain::Face => self
                 .origin
                 .faces
                 .iter()
-                .map(|source| source.map_or(self.color_default, |source| mix(&[(source, 1.0)])))
+                .map(|source| {
+                    source.map_or(self.color_default, |source| mix_flat(&[(source, 1.0)]))
+                })
                 .collect(),
             ColorDomain::Corner => self
                 .corner_origin
                 .iter()
-                .map(|sources| mix(sources))
+                .enumerate()
+                .map(|(index, sources)| {
+                    if data_type == "BYTE_COLOR" {
+                        mix_flat(sources)
+                    } else {
+                        mix_float_color_by_mix(
+                            &layer.values,
+                            self.corner_mix(&self.corner_origin, index),
+                        )
+                        .unwrap_or(self.color_default)
+                    }
+                })
                 .collect(),
         };
         ColorLayer {
@@ -1923,8 +1985,7 @@ fn present_sources<'a>(
         .collect()
 }
 
-/// Blender's mix of `items`: two quaternion sources with a factor are `mix2` (`math::interpolate`); any
-/// other set is the weighted `mix_indices` of [`blend`].
+/// Blender's two-source `mix2` uses `math::interpolate`; other source sets use weighted `mix_indices`.
 fn mix2_or_blend(
     items: Vec<(&Value, f64)>,
     data_type: &str,
@@ -1936,6 +1997,9 @@ fn mix2_or_blend(
         && is_quaternion(second)
     {
         return quaternion_mix2(first, second, *factor as f32);
+    }
+    if let [(first, _), (second, factor)] = items.as_slice() && is_short2(data_type) {
+        return mix_short2(first, second, *factor);
     }
     blend_with_boolean_mixer(items.into_iter(), data_type, weighted_booleans)
 }
@@ -1962,6 +2026,16 @@ fn blend_mix<'a>(
             data_type,
             weighted_booleans,
         ),
+        Mix::Staged(stages) if data_type == "FLOAT_COLOR" => {
+            let mixed = stages.iter().filter_map(|stage| {
+                let color =
+                    mix_float_color(stage.sources.iter().filter_map(|(index, weight)| {
+                        Some((rgba_value(value(*index)?)?, *weight))
+                    }))?;
+                Some((color, stage.weight))
+            });
+            mix_float_color(mixed).map(|color| json!(color))
+        }
         Mix::Staged(stages) => {
             // A stage of two sources is Blender's `mix2` (an edge midpoint of the slots), while a stage of more
             // sources is the weighted `mix_indices` of the centre slot.
@@ -2174,6 +2248,38 @@ fn blend_rgba(colors: impl Iterator<Item = ([f64; 4], f64)>, data_type: &str) ->
         sums.map(|sum| f64::from(sum * weight_inv))
     })
 }
+/// Blender's `ColorGeometry4f::mix4` uses the supplied weights without normalization.
+fn mix_float_color(colors: impl Iterator<Item = ([f64; 4], f64)>) -> Option<[f64; 4]> {
+    let mut sum = [0.0_f32; 4];
+    let mut found = false;
+    for (color, weight) in colors {
+        found = true;
+        let weight = weight as f32;
+        for (sum, channel) in sum.iter_mut().zip(color) {
+            *sum += channel as f32 * weight;
+        }
+    }
+    found.then(|| sum.map(f64::from))
+}
+fn mix_float_color_by_mix(values: &[[f64; 4]], mix: Mix<'_>) -> Option<[f64; 4]> {
+    let mix_sources = |sources: &[(usize, f64)]| {
+        mix_float_color(
+            sources
+                .iter()
+                .filter_map(|(index, weight)| Some((*values.get(*index)?, *weight))),
+        )
+    };
+    match mix {
+        Mix::Flat(sources) | Mix::Pair(sources) => mix_sources(sources),
+        Mix::Staged(stages) => {
+            let colors = stages
+                .iter()
+                .map(|stage| Some((mix_sources(&stage.sources)?, stage.weight)))
+                .collect::<Option<Vec<_>>>()?;
+            mix_float_color(colors.into_iter())
+        }
+    }
+}
 
 /// Blender data types stored as integers; blended results round to the nearest integer.
 fn is_integer(data_type: &str) -> bool {
@@ -2250,6 +2356,28 @@ fn blend_short2(items: &[(&Value, f64)]) -> Option<Value> {
         [0_i16; 2]
     };
     Some(json!(result))
+}
+fn mix_short2(first: &Value, second: &Value, factor: f64) -> Option<Value> {
+    let components = |value: &Value| {
+        let values = value.as_array().filter(|values| values.len() == 2)?;
+        Some([
+            i16::try_from(values[0].as_i64()?).ok()?,
+            i16::try_from(values[1].as_i64()?).ok()?,
+        ])
+    };
+    let first = components(first)?;
+    let second = components(second)?;
+    let factor = blender_float32(factor)?;
+    let other_factor = 1.0_f32 - factor;
+    let mix_component = |first: i16, second: i16| {
+        let first = num_traits::ToPrimitive::to_i16(&(f32::from(first) * other_factor).trunc())?;
+        let second = num_traits::ToPrimitive::to_i16(&(f32::from(second) * factor).trunc())?;
+        i16::try_from(i32::from(first) + i32::from(second)).ok()
+    };
+    Some(json!([
+        mix_component(first[0], second[0])?,
+        mix_component(first[1], second[1])?
+    ]))
 }
 
 fn float4x4_value(value: &Value) -> Option<[[f32; 4]; 4]> {
@@ -3264,6 +3392,15 @@ mod tests {
             Some(json!([0, 0]))
         );
         assert_eq!(default_value("SHORT2"), json!([0, 0]));
+    }
+    #[test]
+    fn short2_pair_uses_blender_mix2_truncation() {
+        let first = json!([-8, 7]);
+        let second = json!([-5, 5]);
+        assert_eq!(
+            mix2_or_blend(vec![(&first, 0.5), (&second, 0.5)], "INT16_2D", false),
+            Some(json!([-6, 5]))
+        );
     }
 
     #[test]

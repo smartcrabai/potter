@@ -9,7 +9,7 @@ use crate::{
     geom::{
         Mesh,
         clnor::{self, NormalCodeOptions},
-        provenance::{Origin, copy_direct_matrix_edge_attributes, remap_attributes_with_edges},
+        provenance::{Origin, copy_direct_matrix_edge_attributes, remap_attributes_with_edge_mix2},
     },
 };
 
@@ -413,7 +413,7 @@ pub(super) fn extrude_faces_region(
         corners: Some(corner_origins),
         ..Origin::default()
     };
-    remap_attributes_with_edges(source, &mut output, &origin, edge_origins)?;
+    remap_attributes_with_edge_mix2(source, &mut output, &origin, edge_origins)?;
     copy_direct_matrix_edge_attributes(source, &mut output, &origin)?;
     reset_untransferred_string_attributes(source, &mut output, source_corner_count);
     for key in [

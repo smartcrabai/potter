@@ -7,7 +7,7 @@ use crate::{
     error::Result,
     geom::{
         Mesh, clnor, color_layers, edge_key,
-        provenance::{Origin, copy_direct_matrix_edge_attributes, remap_attributes_with_edges},
+        provenance::{Origin, copy_direct_matrix_edge_attributes, remap_attributes_with_edge_mix2},
         uv_layers,
     },
 };
@@ -217,7 +217,7 @@ pub(super) fn extrude_faces_individual(
         corners: Some(corner_origins),
         ..Default::default()
     };
-    remap_attributes_with_edges(source, &mut output, &origin, edge_origins)?;
+    remap_attributes_with_edge_mix2(source, &mut output, &origin, edge_origins)?;
     copy_direct_matrix_edge_attributes(source, &mut output, &origin)?;
     super::mesh_extrude_region::reset_untransferred_string_attributes(
         source,

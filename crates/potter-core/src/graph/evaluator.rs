@@ -1196,6 +1196,9 @@ impl Evaluator<'_> {
     /// Finalizes and caches each completed output for both traversal paths.
     fn finalize_output_value(&mut self, key: (Id, String), mut value: EvalValue) -> EvalValue {
         self.apply_output_origindex(&mut value);
+        if let EvalValue::Geometry(geometry) = &mut value {
+            renew_mesh_evaluation_context(&mut geometry.mesh);
+        }
         self.cache.insert(key, value.clone());
         value
     }
@@ -1239,6 +1242,28 @@ impl Evaluator<'_> {
                 Some("Mesh")
             }
             ("GeometryNodeSubdivisionSurface", "Mesh", _) => Some("Mesh"),
+            (
+                "GeometryNodeExtrudeMesh"
+                | "GeometryNodeSplitEdges"
+                | "GeometryNodeFlipFaces"
+                | "GeometryNodeTriangulate"
+                | "GeometryNodeSubdivideMesh",
+                "Mesh",
+                _,
+            ) => Some("Mesh"),
+            (
+                "GeometryNodeMergeByDistance"
+                | "GeometryNodeDeleteGeometry"
+                | "GeometryNodeScaleElements",
+                "Geometry",
+                _,
+            ) => Some("Geometry"),
+            (
+                "GeometryNodeSeparateGeometry",
+                "Selection" | "Inverted",
+                _,
+            ) => Some("Geometry"),
+            ("GeometryNodeDualMesh", "Dual Mesh", _) => Some("Mesh"),
             _ => None,
         }
     }
@@ -2483,7 +2508,7 @@ impl Evaluator<'_> {
         match self.input_geometry(id, node, socket)? {
             EvalValue::Geometry(mut geometry) => {
                 if mesh_field_context_id(&geometry.mesh) == 0 {
-                    set_mesh_evaluation_context(&mut geometry.mesh);
+                    renew_mesh_evaluation_context(&mut geometry.mesh);
                 }
                 let instance_aware = matches!(
                     node.node_type.as_str(),
@@ -5744,7 +5769,8 @@ pub(super) fn mesh_field_context_id(mesh: &Mesh) -> u64 {
         .unwrap_or(0)
 }
 
-fn set_mesh_evaluation_context(mesh: &mut Mesh) {
+/// Assigns a fresh stable identity to a completed mesh snapshot for batched topology-field caches.
+fn renew_mesh_evaluation_context(mesh: &mut Mesh) {
     let mut context_id = NEXT_MESH_EVALUATION_CONTEXT.fetch_add(1, Ordering::Relaxed);
     if context_id == 0 {
         context_id = NEXT_MESH_EVALUATION_CONTEXT.fetch_add(1, Ordering::Relaxed);

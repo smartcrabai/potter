@@ -3654,11 +3654,13 @@ fn subdivision_with_samples_with_settings(
         };
         let limit =
             subdivision_limit::LimitSurface::build(&base, &positions(mesh), &sharpness, isolation);
-        if let Some(samples) = limit_samples {
-            let points = limit.evaluate(&samples.vertices);
-            for (vertex, point) in result.vertices.iter_mut().zip(points) {
-                if let Some(point) = point {
-                    vertex.co = point;
+        if !geometry_nodes_simple {
+            if let Some(samples) = limit_samples {
+                let points = limit.evaluate(&samples.vertices);
+                for (vertex, point) in result.vertices.iter_mut().zip(points) {
+                    if let Some(point) = point {
+                        vertex.co = point;
+                    }
                 }
             }
         }
@@ -6433,7 +6435,7 @@ fn set_geometry_nodes_simple_positions(
         vertex.co = DVec3::from(*position);
     }
     for (&(first, second), &point) in edge_points {
-        let position = (source_positions[first] + source_positions[second]) * 0.5;
+        let position = source_positions[first] * 0.5 + source_positions[second] * 0.5;
         let vertex = output.vertices.get_mut(point).ok_or_else(|| {
             PotError::new(
                 ErrorCode::EvaluationFailed,
@@ -6460,8 +6462,9 @@ fn set_geometry_nodes_simple_positions(
             )
         })?;
         let mut center = Vec3::ZERO;
+        let share = 1.0 / count;
         for &vertex in face {
-            center += source_positions[vertex];
+            center += source_positions[vertex] * share;
         }
         let face_point = output
             .vertices
@@ -6472,7 +6475,7 @@ fn set_geometry_nodes_simple_positions(
                     "Subdivide Mesh face point is missing",
                 )
             })?;
-        face_point.co = DVec3::from(center / count);
+        face_point.co = DVec3::from(center);
     }
     Ok(())
 }

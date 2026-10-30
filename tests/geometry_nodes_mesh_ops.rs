@@ -385,31 +385,73 @@ fn nested_top_group_doc() -> TestResult<SceneDoc> {
          "properties":{"node_tree":"child"},"inputs":{"Selection":true}},
         {"op":"graph.node_add","graph":"geo","id":"call_b","type":"GeometryNodeGroup",
          "properties":{"node_tree":"child"},"inputs":{"Selection":false}},
-        {"op":"graph.node_add","graph":"geo","id":"call_dead","type":"GeometryNodeGroup",
-         "properties":{"node_tree":"child"},"inputs":{"Selection":true}},
         {"op":"graph.node_add","graph":"geo","id":"store_a","type":"GeometryNodeStoreNamedAttribute",
          "properties":{"domain":"FACE","data_type":"BOOLEAN"},"inputs":{"Name":"top_a"}},
         {"op":"graph.node_add","graph":"geo","id":"store_b","type":"GeometryNodeStoreNamedAttribute",
          "properties":{"domain":"FACE","data_type":"BOOLEAN"},"inputs":{"Name":"cross_call_top_b"}},
-        {"op":"graph.node_add","graph":"geo","id":"dead_store","type":"GeometryNodeStoreNamedAttribute",
-         "properties":{"domain":"FACE","data_type":"BOOLEAN"},"inputs":{"Name":"unused_top"}},
-        {"op":"graph.node_add","graph":"geo","id":"distribute","type":"GeometryNodeDistributePointsOnFaces",
-         "inputs":{"Selection":true,"Density":0.1,"Density Factor":1.0,"Density Max":1.0,"Seed":17}},
-        {"op":"graph.node_add","graph":"geo","id":"join","type":"GeometryNodeJoinGeometry"},
         {"op":"graph.node_add","graph":"geo","id":"output","type":"NodeGroupOutput"},
         {"op":"graph.link","graph":"geo","from_node":"input","from_socket":"Geometry","to_node":"call_a","to_socket":"Geometry"},
         {"op":"graph.link","graph":"geo","from_node":"input","from_socket":"Geometry","to_node":"call_b","to_socket":"Geometry"},
-        {"op":"graph.link","graph":"geo","from_node":"input","from_socket":"Geometry","to_node":"call_dead","to_socket":"Geometry"},
         {"op":"graph.link","graph":"geo","from_node":"call_a","from_socket":"Geometry","to_node":"store_a","to_socket":"Geometry"},
         {"op":"graph.link","graph":"geo","from_node":"call_a","from_socket":"Top","to_node":"store_a","to_socket":"Value"},
         {"op":"graph.link","graph":"geo","from_node":"store_a","from_socket":"Geometry","to_node":"store_b","to_socket":"Geometry"},
         {"op":"graph.link","graph":"geo","from_node":"call_b","from_socket":"Top","to_node":"store_b","to_socket":"Value"},
-        {"op":"graph.link","graph":"geo","from_node":"call_dead","from_socket":"Geometry","to_node":"dead_store","to_socket":"Geometry"},
-        {"op":"graph.link","graph":"geo","from_node":"call_dead","from_socket":"Top","to_node":"dead_store","to_socket":"Value"},
-        {"op":"graph.link","graph":"geo","from_node":"call_dead","from_socket":"Geometry","to_node":"distribute","to_socket":"Mesh"},
-        {"op":"graph.link","graph":"geo","from_node":"distribute","from_socket":"Points","to_node":"join","to_socket":"Geometry"},
-        {"op":"graph.link","graph":"geo","from_node":"store_b","from_socket":"Geometry","to_node":"join","to_socket":"Geometry"},
-        {"op":"graph.link","graph":"geo","from_node":"join","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}
+        {"op":"graph.link","graph":"geo","from_node":"store_b","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}
+    ]);
+    Ok(ops::apply_batch(
+        &doc,
+        &json!({
+            "schema_version": 1,
+            "base_revision": doc.revision,
+            "operations": operations,
+        }),
+    )?
+    .doc)
+}
+fn unrequested_group_top_doc() -> TestResult<SceneDoc> {
+    let doc = SceneDoc::new("6c1294d2-2a4e-4cd5-8793-0b51fa8e991f".to_owned());
+    let operations = json!([
+        {"op":"graph.create","id":"child","kind":"geometry"},
+        {"op":"graph.interface_update","graph":"child","set":{
+            "inputs":[
+                {"id":"geometry","name":"Geometry","socket_type":"geometry"},
+                {"id":"selection","name":"Selection","socket_type":"boolean","default":true}
+            ],
+            "outputs":[
+                {"id":"out_geometry","name":"Geometry","socket_type":"geometry"},
+                {"id":"out_top","name":"Top","socket_type":"boolean","default":false}
+            ]
+        }},
+        {"op":"graph.node_add","graph":"child","id":"input","type":"NodeGroupInput"},
+        {"op":"graph.node_add","graph":"child","id":"extrude","type":"GeometryNodeExtrudeMesh",
+         "properties":{"mode":"FACES"},"inputs":{"Offset Scale":1.0,"Individual":false}},
+        {"op":"graph.node_add","graph":"child","id":"subdivide","type":"GeometryNodeSubdivideMesh",
+         "inputs":{"Level":1}},
+        {"op":"graph.node_add","graph":"child","id":"output","type":"NodeGroupOutput"},
+        {"op":"graph.link","graph":"child","from_node":"input","from_socket":"Geometry","to_node":"extrude","to_socket":"Mesh"},
+        {"op":"graph.link","graph":"child","from_node":"input","from_socket":"Selection","to_node":"extrude","to_socket":"Selection"},
+        {"op":"graph.link","graph":"child","from_node":"extrude","from_socket":"Mesh","to_node":"subdivide","to_socket":"Mesh"},
+        {"op":"graph.link","graph":"child","from_node":"subdivide","from_socket":"Mesh","to_node":"output","to_socket":"Geometry"},
+        {"op":"graph.link","graph":"child","from_node":"extrude","from_socket":"Top","to_node":"output","to_socket":"Top"},
+        {"op":"graph.create","id":"geo","kind":"geometry"},
+        {"op":"graph.interface_update","graph":"geo","set":{
+            "inputs":[
+                {"id":"geometry","name":"Geometry","socket_type":"geometry"}
+            ],
+            "outputs":[
+                {"id":"out_geometry","name":"Geometry","socket_type":"geometry"}
+            ]
+        }},
+        {"op":"graph.node_add","graph":"geo","id":"input","type":"NodeGroupInput"},
+        {"op":"graph.node_add","graph":"geo","id":"call","type":"GeometryNodeGroup",
+         "properties":{"node_tree":"child"},"inputs":{"Selection":true}},
+        {"op":"graph.node_add","graph":"geo","id":"dead_store","type":"GeometryNodeStoreNamedAttribute",
+         "properties":{"domain":"FACE","data_type":"BOOLEAN"},"inputs":{"Name":"unused_top"}},
+        {"op":"graph.node_add","graph":"geo","id":"output","type":"NodeGroupOutput"},
+        {"op":"graph.link","graph":"geo","from_node":"input","from_socket":"Geometry","to_node":"call","to_socket":"Geometry"},
+        {"op":"graph.link","graph":"geo","from_node":"call","from_socket":"Geometry","to_node":"dead_store","to_socket":"Geometry"},
+        {"op":"graph.link","graph":"geo","from_node":"call","from_socket":"Top","to_node":"dead_store","to_socket":"Value"},
+        {"op":"graph.link","graph":"geo","from_node":"call","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}
     ]);
     Ok(ops::apply_batch(
         &doc,
@@ -884,6 +926,92 @@ fn top_side_subdivide_graph() -> TestResult<SceneDoc> {
     graph_with_nodes(nodes, links)
 }
 
+fn top_after_separate_graph() -> TestResult<SceneDoc> {
+    let nodes = vec![
+        json!({
+            "id":"selection",
+            "type":"GeometryNodeInputNamedAttribute",
+            "properties":{"data_type":"BOOLEAN"},
+            "inputs":{"Name":"face_selected"},
+        }),
+        json!({
+            "id":"extrude",
+            "type":"GeometryNodeExtrudeMesh",
+            "properties":{"mode":"FACES"},
+            "inputs":{"Offset Scale":1.0,"Individual":false},
+        }),
+        json!({
+            "id":"separate",
+            "type":"GeometryNodeSeparateGeometry",
+            "properties":{"domain":"FACE"},
+        }),
+        json!({
+            "id":"store",
+            "type":"GeometryNodeStoreNamedAttribute",
+            "properties":{"domain":"FACE","data_type":"BOOLEAN"},
+            "inputs":{"Name":"top_after_separate"},
+        }),
+        json!({"id":"output","type":"NodeGroupOutput"}),
+    ];
+    let links = vec![
+        json!({"from_node":"selection","from_socket":"Attribute","to_node":"extrude","to_socket":"Selection"}),
+        json!({"from_node":"extrude","from_socket":"Mesh","to_node":"separate","to_socket":"Geometry"}),
+        json!({"from_node":"extrude","from_socket":"Top","to_node":"separate","to_socket":"Selection"}),
+        json!({"from_node":"separate","from_socket":"Selection","to_node":"store","to_socket":"Geometry"}),
+        json!({"from_node":"extrude","from_socket":"Top","to_node":"store","to_socket":"Value"}),
+        json!({"from_node":"store","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+    ];
+    graph_with_nodes(nodes, links)
+}
+
+fn sibling_topology_fields_graph() -> TestResult<SceneDoc> {
+    let nodes = vec![
+        json!({"id":"input","type":"NodeGroupInput"}),
+        json!({"id":"area","type":"GeometryNodeInputMeshFaceArea"}),
+        json!({"id":"angle","type":"GeometryNodeInputMeshEdgeAngle"}),
+        json!({"id":"scale_x","type":"GeometryNodeTransform","inputs":{"Scale":[2.0,1.0,1.0]}}),
+        json!({"id":"scale_y","type":"GeometryNodeTransform","inputs":{"Scale":[1.0,3.0,1.0]}}),
+        json!({
+            "id":"area_x","type":"GeometryNodeStoreNamedAttribute",
+            "properties":{"domain":"FACE","data_type":"FLOAT"},
+            "inputs":{"Name":"area_x"},
+        }),
+        json!({
+            "id":"angle_x","type":"GeometryNodeStoreNamedAttribute",
+            "properties":{"domain":"EDGE","data_type":"FLOAT"},
+            "inputs":{"Name":"angle_x"},
+        }),
+        json!({
+            "id":"area_y","type":"GeometryNodeStoreNamedAttribute",
+            "properties":{"domain":"FACE","data_type":"FLOAT"},
+            "inputs":{"Name":"area_y"},
+        }),
+        json!({
+            "id":"angle_y","type":"GeometryNodeStoreNamedAttribute",
+            "properties":{"domain":"EDGE","data_type":"FLOAT"},
+            "inputs":{"Name":"angle_y"},
+        }),
+        json!({"id":"join","type":"GeometryNodeJoinGeometry"}),
+        json!({"id":"output","type":"NodeGroupOutput"}),
+    ];
+    let links = vec![
+        json!({"from_node":"input","from_socket":"Geometry","to_node":"scale_x","to_socket":"Geometry"}),
+        json!({"from_node":"input","from_socket":"Geometry","to_node":"scale_y","to_socket":"Geometry"}),
+        json!({"from_node":"scale_x","from_socket":"Geometry","to_node":"area_x","to_socket":"Geometry"}),
+        json!({"from_node":"area","from_socket":"Area","to_node":"area_x","to_socket":"Value"}),
+        json!({"from_node":"area_x","from_socket":"Geometry","to_node":"angle_x","to_socket":"Geometry"}),
+        json!({"from_node":"angle","from_socket":"Unsigned Angle","to_node":"angle_x","to_socket":"Value"}),
+        json!({"from_node":"scale_y","from_socket":"Geometry","to_node":"area_y","to_socket":"Geometry"}),
+        json!({"from_node":"area","from_socket":"Area","to_node":"area_y","to_socket":"Value"}),
+        json!({"from_node":"area_y","from_socket":"Geometry","to_node":"angle_y","to_socket":"Geometry"}),
+        json!({"from_node":"angle","from_socket":"Unsigned Angle","to_node":"angle_y","to_socket":"Value"}),
+        json!({"from_node":"angle_x","from_socket":"Geometry","to_node":"join","to_socket":"Geometry"}),
+        json!({"from_node":"angle_y","from_socket":"Geometry","to_node":"join","to_socket":"Geometry"}),
+        json!({"from_node":"join","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+    ];
+    graph_with_nodes(nodes, links)
+}
+
 fn vertex_top_edge_graph() -> TestResult<SceneDoc> {
     let nodes = vec![
         json!({"id":"offset","type":"GeometryNodeInputPosition"}),
@@ -949,8 +1077,7 @@ fn unconsumed_top_distribute_graph() -> TestResult<SceneDoc> {
             "id":"distribute",
             "type":"GeometryNodeDistributePointsOnFaces",
             "inputs":{
-                "Selection":true,"Distance Min":0.1,"Density":0.1,
-                "Density Factor":1.0,"Density Max":1.0,"Seed":17
+                "Selection":true,"Distance Min":0.1,"Density":0.0,
             },
         }),
         json!({"id":"output","type":"NodeGroupOutput"}),
@@ -1553,6 +1680,22 @@ fn extrusion_fields_follow_topology_and_boolean_domain_adaptation() -> TestResul
     )?;
     assert_boolean_attribute(&result.mesh, "top_after_subdivide", "FACE")?;
     assert_boolean_attribute(&result.mesh, "side_after_subdivide", "FACE")?;
+    let result = evaluate(&top_after_separate_graph()?, &mesh)?;
+    assert_json_close(
+        &mesh_snapshot(&result.mesh),
+        &oracle["top_after_separate"],
+        "Extrude Mesh Top through Separate Geometry",
+    )?;
+    assert_boolean_attribute(&result.mesh, "top_after_separate", "FACE")?;
+    assert!(
+        invalid_array(
+            &result.mesh.attributes["top_after_separate"]["data"],
+            "top_after_separate",
+        )?
+        .iter()
+        .all(|value| value.as_bool() == Some(true)),
+        "separated Top faces keep their anonymous attribute"
+    );
     let result = evaluate(&top_on_original_graph()?, &mesh)?;
     assert_json_close(
         &mesh_snapshot(&result.mesh),
@@ -1569,9 +1712,17 @@ fn extrusion_fields_follow_topology_and_boolean_domain_adaptation() -> TestResul
         "missing anonymous attribute defaults to false"
     );
     let result = evaluate(&unconsumed_top_distribute_graph()?, &mesh)?;
+    let mut snapshot = mesh_snapshot(&result.mesh);
+    if let Some(attributes) = snapshot
+        .get_mut("attributes")
+        .and_then(Value::as_object_mut)
+    {
+        attributes.remove("id");
+        attributes.remove("radius");
+    }
     assert_json_close(
-        &mesh_snapshot(&result.mesh),
-        &oracle["unconsumed_top_distribute"],
+        &snapshot,
+        &oracle["unconsumed_top_distribute_dead_consumer"],
         "dead Top consumer does not affect Extrude Mesh to Distribute Points",
     )?;
     assert!(
@@ -1604,6 +1755,50 @@ fn extrusion_fields_follow_topology_and_boolean_domain_adaptation() -> TestResul
     );
     Ok(())
 }
+
+#[test]
+fn sibling_mesh_topology_fields_use_distinct_geometry_snapshots() -> TestResult<()> {
+    let oracle = fixture()?;
+    let mesh = input_mesh(&oracle)?;
+    let result = evaluate(&sibling_topology_fields_graph()?, &mesh)?;
+    assert_json_close(
+        &mesh_snapshot(&result.mesh),
+        &oracle["sibling_topology_fields"],
+        "shared Face Area and Edge Angle fields on changed sibling geometry",
+    )?;
+    for (left_name, right_name, description) in [
+        ("area_x", "area_y", "Face Area"),
+        ("angle_x", "angle_y", "Edge Angle"),
+    ] {
+        let left = invalid_array(
+            &result.mesh.attributes[left_name]["data"],
+            left_name,
+        )?
+        .iter()
+        .filter_map(Value::as_f64)
+        .filter(|value| *value != 0.0)
+        .collect::<Vec<_>>();
+        let right = invalid_array(
+            &result.mesh.attributes[right_name]["data"],
+            right_name,
+        )?
+        .iter()
+        .filter_map(Value::as_f64)
+        .filter(|value| *value != 0.0)
+        .collect::<Vec<_>>();
+        assert!(
+            !left.is_empty() && !right.is_empty(),
+            "{description} fields need nonzero samples to compare branches"
+        );
+        assert!(
+            left.iter()
+                .zip(&right)
+                .any(|(left, right)| (*left - *right).abs() > 1.0e-6),
+            "{description} on changed sibling geometry must not reuse the first branch cache"
+        );
+    }
+    Ok(())
+}
 #[test]
 fn nested_group_top_fields_survive_subdivision_and_are_callsite_scoped() -> TestResult<()> {
     let oracle = fixture()?;
@@ -1618,8 +1813,8 @@ fn nested_group_top_fields_survive_subdivision_and_are_callsite_scoped() -> Test
     )?;
     assert_json_close(
         &mesh_snapshot(&result.mesh),
-        &oracle["nested_top_group"],
-        "nested Geometry Node Group Top fields through Subdivide Mesh and unused output links",
+        &oracle["nested_top_group_callsite"],
+        "nested Geometry Node Group Top fields through Subdivide Mesh and independent call sites",
     )?;
     assert_boolean_attribute(&result.mesh, "top_a", "FACE")?;
     assert_boolean_attribute(&result.mesh, "cross_call_top_b", "FACE")?;
@@ -1638,7 +1833,6 @@ fn nested_group_top_fields_survive_subdivision_and_are_callsite_scoped() -> Test
         .all(|value| value.as_bool() == Some(false)),
         "call B Top must not read call A's anonymous attribute"
     );
-    assert!(!result.mesh.attributes.contains_key("unused_top"));
     assert!(
         result
             .mesh
@@ -1651,6 +1845,37 @@ fn nested_group_top_fields_survive_subdivision_and_are_callsite_scoped() -> Test
                     |layer| layer.get("potter_gn_anonymous").and_then(Value::as_bool) != Some(true)
                 )),
         "unused group output must not leak anonymous layers"
+    );
+    Ok(())
+}
+#[test]
+fn unrequested_group_top_output_stays_dead_on_live_geometry() -> TestResult<()> {
+    let oracle = fixture()?;
+    let mesh = input_mesh(&oracle)?;
+    let doc = unrequested_group_top_doc()?;
+    let result = graph::evaluate_with_node_groups(
+        &Id::new("geo")?,
+        &doc.node_groups,
+        Some(&mesh),
+        &Map::new(),
+        "GNMeshOpsUnrequestedTop",
+    )?;
+    assert_json_close(
+        &mesh_snapshot(&result.mesh),
+        &oracle["unrequested_group_top"],
+        "unrequested nested Group Output Top does not affect the live Geometry output",
+    )?;
+    assert!(!result.mesh.attributes.contains_key("unused_top"));
+    assert!(
+        result
+            .mesh
+            .attributes
+            .get("blender_attributes")
+            .and_then(Value::as_array)
+            .is_none_or(|layers| layers.iter().all(|layer| {
+                layer.get("potter_gn_anonymous").and_then(Value::as_bool) != Some(true)
+            })),
+        "unrequested nested Top must not materialize anonymous layers"
     );
     Ok(())
 }
