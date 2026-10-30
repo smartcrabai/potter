@@ -346,6 +346,82 @@ fn graph_with_nodes(nodes: Vec<Value>, links: Vec<Value>) -> TestResult<SceneDoc
     )?
     .doc)
 }
+fn nested_top_group_doc() -> TestResult<SceneDoc> {
+    let doc = SceneDoc::new("95f6921b-f835-4f6c-9271-c1c098d9a823".to_owned());
+    let operations = json!([
+        {"op":"graph.create","id":"child","kind":"geometry"},
+        {"op":"graph.interface_update","graph":"child","set":{
+            "inputs":[
+                {"id":"geometry","name":"Geometry","socket_type":"geometry"},
+                {"id":"selection","name":"Selection","socket_type":"boolean","default":true}
+            ],
+            "outputs":[
+                {"id":"out_geometry","name":"Geometry","socket_type":"geometry"},
+                {"id":"out_top","name":"Top","socket_type":"boolean","default":false}
+            ]
+        }},
+        {"op":"graph.node_add","graph":"child","id":"input","type":"NodeGroupInput"},
+        {"op":"graph.node_add","graph":"child","id":"extrude","type":"GeometryNodeExtrudeMesh",
+         "properties":{"mode":"FACES"},"inputs":{"Offset Scale":1.0,"Individual":false}},
+        {"op":"graph.node_add","graph":"child","id":"subdivide","type":"GeometryNodeSubdivideMesh",
+         "inputs":{"Level":1}},
+        {"op":"graph.node_add","graph":"child","id":"output","type":"NodeGroupOutput"},
+        {"op":"graph.link","graph":"child","from_node":"input","from_socket":"Geometry","to_node":"extrude","to_socket":"Mesh"},
+        {"op":"graph.link","graph":"child","from_node":"input","from_socket":"Selection","to_node":"extrude","to_socket":"Selection"},
+        {"op":"graph.link","graph":"child","from_node":"extrude","from_socket":"Mesh","to_node":"subdivide","to_socket":"Mesh"},
+        {"op":"graph.link","graph":"child","from_node":"subdivide","from_socket":"Mesh","to_node":"output","to_socket":"Geometry"},
+        {"op":"graph.link","graph":"child","from_node":"extrude","from_socket":"Top","to_node":"output","to_socket":"Top"},
+        {"op":"graph.create","id":"geo","kind":"geometry"},
+        {"op":"graph.interface_update","graph":"geo","set":{
+            "inputs":[
+                {"id":"geometry","name":"Geometry","socket_type":"geometry"}
+            ],
+            "outputs":[
+                {"id":"out_geometry","name":"Geometry","socket_type":"geometry"}
+            ]
+        }},
+        {"op":"graph.node_add","graph":"geo","id":"input","type":"NodeGroupInput"},
+        {"op":"graph.node_add","graph":"geo","id":"call_a","type":"GeometryNodeGroup",
+         "properties":{"node_tree":"child"},"inputs":{"Selection":true}},
+        {"op":"graph.node_add","graph":"geo","id":"call_b","type":"GeometryNodeGroup",
+         "properties":{"node_tree":"child"},"inputs":{"Selection":false}},
+        {"op":"graph.node_add","graph":"geo","id":"call_dead","type":"GeometryNodeGroup",
+         "properties":{"node_tree":"child"},"inputs":{"Selection":true}},
+        {"op":"graph.node_add","graph":"geo","id":"store_a","type":"GeometryNodeStoreNamedAttribute",
+         "properties":{"domain":"FACE","data_type":"BOOLEAN"},"inputs":{"Name":"top_a"}},
+        {"op":"graph.node_add","graph":"geo","id":"store_b","type":"GeometryNodeStoreNamedAttribute",
+         "properties":{"domain":"FACE","data_type":"BOOLEAN"},"inputs":{"Name":"cross_call_top_b"}},
+        {"op":"graph.node_add","graph":"geo","id":"dead_store","type":"GeometryNodeStoreNamedAttribute",
+         "properties":{"domain":"FACE","data_type":"BOOLEAN"},"inputs":{"Name":"unused_top"}},
+        {"op":"graph.node_add","graph":"geo","id":"distribute","type":"GeometryNodeDistributePointsOnFaces",
+         "inputs":{"Selection":true,"Density":0.1,"Density Factor":1.0,"Density Max":1.0,"Seed":17}},
+        {"op":"graph.node_add","graph":"geo","id":"join","type":"GeometryNodeJoinGeometry"},
+        {"op":"graph.node_add","graph":"geo","id":"output","type":"NodeGroupOutput"},
+        {"op":"graph.link","graph":"geo","from_node":"input","from_socket":"Geometry","to_node":"call_a","to_socket":"Geometry"},
+        {"op":"graph.link","graph":"geo","from_node":"input","from_socket":"Geometry","to_node":"call_b","to_socket":"Geometry"},
+        {"op":"graph.link","graph":"geo","from_node":"input","from_socket":"Geometry","to_node":"call_dead","to_socket":"Geometry"},
+        {"op":"graph.link","graph":"geo","from_node":"call_a","from_socket":"Geometry","to_node":"store_a","to_socket":"Geometry"},
+        {"op":"graph.link","graph":"geo","from_node":"call_a","from_socket":"Top","to_node":"store_a","to_socket":"Value"},
+        {"op":"graph.link","graph":"geo","from_node":"store_a","from_socket":"Geometry","to_node":"store_b","to_socket":"Geometry"},
+        {"op":"graph.link","graph":"geo","from_node":"call_b","from_socket":"Top","to_node":"store_b","to_socket":"Value"},
+        {"op":"graph.link","graph":"geo","from_node":"call_dead","from_socket":"Geometry","to_node":"dead_store","to_socket":"Geometry"},
+        {"op":"graph.link","graph":"geo","from_node":"call_dead","from_socket":"Top","to_node":"dead_store","to_socket":"Value"},
+        {"op":"graph.link","graph":"geo","from_node":"call_dead","from_socket":"Geometry","to_node":"distribute","to_socket":"Mesh"},
+        {"op":"graph.link","graph":"geo","from_node":"distribute","from_socket":"Points","to_node":"join","to_socket":"Geometry"},
+        {"op":"graph.link","graph":"geo","from_node":"store_b","from_socket":"Geometry","to_node":"join","to_socket":"Geometry"},
+        {"op":"graph.link","graph":"geo","from_node":"join","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}
+    ]);
+    Ok(ops::apply_batch(
+        &doc,
+        &json!({
+            "schema_version": 1,
+            "base_revision": doc.revision,
+            "operations": operations,
+        }),
+    )?
+    .doc)
+}
+
 
 fn evaluate(doc: &SceneDoc, mesh: &Mesh) -> TestResult<GraphEvaluation> {
     let graph_id = Id::new("geo")?;
@@ -874,7 +950,7 @@ fn unconsumed_top_distribute_graph() -> TestResult<SceneDoc> {
             "id":"distribute",
             "type":"GeometryNodeDistributePointsOnFaces",
             "inputs":{
-                "Selection":true,"Distance Min":0.1,"Density":0.0,
+                "Selection":true,"Distance Min":0.1,"Density":0.1,
                 "Density Factor":1.0,"Density Max":1.0,"Seed":17
             },
         }),
@@ -1529,6 +1605,56 @@ fn extrusion_fields_follow_topology_and_boolean_domain_adaptation() -> TestResul
     );
     Ok(())
 }
+#[test]
+fn nested_group_top_fields_survive_subdivision_and_are_callsite_scoped() -> TestResult<()> {
+    let oracle = fixture()?;
+    let mesh = input_mesh(&oracle)?;
+    let doc = nested_top_group_doc()?;
+    let result = graph::evaluate_with_node_groups(
+        &Id::new("geo")?,
+        &doc.node_groups,
+        Some(&mesh),
+        &Map::new(),
+        "GNMeshOpsNestedTop",
+    )?;
+    assert_json_close(
+        &mesh_snapshot(&result.mesh),
+        &oracle["nested_top_group"],
+        "nested Geometry Node Group Top fields through Subdivide Mesh and unused output links",
+    )?;
+    assert_boolean_attribute(&result.mesh, "top_a", "FACE")?;
+    assert_boolean_attribute(&result.mesh, "cross_call_top_b", "FACE")?;
+    assert!(
+        invalid_array(&result.mesh.attributes["top_a"]["data"], "top_a")?
+            .iter()
+            .any(|value| value.as_bool() == Some(true)),
+        "call A Top selection should survive the nested Subdivide Mesh"
+    );
+    assert!(
+        invalid_array(
+            &result.mesh.attributes["cross_call_top_b"]["data"],
+            "cross_call_top_b",
+        )?
+        .iter()
+        .all(|value| value.as_bool() == Some(false)),
+        "call B Top must not read call A's anonymous attribute"
+    );
+    assert!(!result.mesh.attributes.contains_key("unused_top"));
+    assert!(
+        result
+            .mesh
+            .attributes
+            .get("blender_attributes")
+            .and_then(Value::as_array)
+            .is_none_or(|layers| layers
+                .iter()
+                .all(|layer| layer.get("potter_gn_anonymous").and_then(Value::as_bool)
+                    != Some(true))),
+        "unused group output must not leak anonymous layers"
+    );
+    Ok(())
+}
+
 
 #[test]
 fn authored_anonymous_prefix_layer_survives_extrude() -> TestResult<()> {
@@ -1582,6 +1708,102 @@ fn authored_anonymous_prefix_layer_survives_extrude() -> TestResult<()> {
     );
     Ok(())
 }
+#[test]
+fn named_attribute_nodes_cannot_access_anonymous_geometry_layers() -> TestResult<()> {
+    let oracle = fixture()?;
+    let mut mesh = input_mesh(&oracle)?;
+    let name = ".potter_gn_anonymous_private";
+    let values = vec![json!(true); mesh.vertices.len()];
+    mesh.attributes
+        .entry("blender_attributes".to_owned())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Blender attribute layers are malformed",
+            )
+        })?
+        .push(json!({
+            "name": name,
+            "domain": "POINT",
+            "data_type": "BOOLEAN",
+            "values": values.clone(),
+            "potter_gn_anonymous": true,
+        }));
+    let doc = graph_with_nodes(
+        vec![
+            json!({
+                "id":"extrude",
+                "type":"GeometryNodeExtrudeMesh",
+                "properties":{"mode":"FACES"},
+                "inputs":{"Offset Scale":1.0,"Individual":false},
+            }),
+            json!({
+                "id":"named_private",
+                "type":"GeometryNodeInputNamedAttribute",
+                "properties":{"data_type":"BOOLEAN"},
+                "inputs":{"Name":name},
+            }),
+            json!({
+                "id":"named_context",
+                "type":"GeometryNodeInputNamedAttribute",
+                "properties":{"data_type":"BOOLEAN"},
+                "inputs":{"Name":".potter_gn_evaluation_context"},
+            }),
+            json!({
+                "id":"store_private",
+                "type":"GeometryNodeStoreNamedAttribute",
+                "properties":{"domain":"POINT","data_type":"BOOLEAN"},
+                "inputs":{"Name":"private_exists"},
+            }),
+            json!({
+                "id":"store_context",
+                "type":"GeometryNodeStoreNamedAttribute",
+                "properties":{"domain":"POINT","data_type":"BOOLEAN"},
+                "inputs":{"Name":"context_exists"},
+            }),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"extrude","from_socket":"Mesh","to_node":"store_private","to_socket":"Geometry"}),
+            json!({"from_node":"named_private","from_socket":"Exists","to_node":"store_private","to_socket":"Value"}),
+            json!({"from_node":"store_private","from_socket":"Geometry","to_node":"store_context","to_socket":"Geometry"}),
+            json!({"from_node":"named_context","from_socket":"Exists","to_node":"store_context","to_socket":"Value"}),
+            json!({"from_node":"store_context","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    )?;
+    let result = evaluate(&doc, &mesh)?;
+    for name in ["private_exists", "context_exists"] {
+        let exists = invalid_array(&result.mesh.attributes[name]["data"], name)?;
+        assert_eq!(exists.len(), result.mesh.vertices.len());
+        assert!(
+            exists.iter().all(|value| value.as_bool() == Some(false)),
+            "{name} must not expose internal procedural attributes"
+        );
+    }
+    let layer = result.mesh.attributes["blender_attributes"]
+        .as_array()
+        .and_then(|layers| {
+            layers
+                .iter()
+                .find(|layer| layer.get("name").and_then(Value::as_str) == Some(name))
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "input anonymous layer was discarded",
+            )
+        })?;
+    let private_values = invalid_array(&layer["values"], name)?;
+    assert_eq!(private_values.len(), result.mesh.vertices.len());
+    assert!(
+        private_values.iter().all(|value| value.as_bool() == Some(true)),
+        "anonymous input layer must remain attached to the geometry"
+    );
+    Ok(())
+}
+
 
 #[test]
 fn empty_mesh_topology_and_operations_match_blender() -> TestResult<()> {

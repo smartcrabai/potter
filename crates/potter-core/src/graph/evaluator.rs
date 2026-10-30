@@ -576,10 +576,10 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
         })
         .transpose()?;
     let output_node = select_group_output_node(group)?;
-    let output_socket = if group.interface.outputs.is_empty() {
-        "Geometry".to_owned()
+    let (output_socket, output_input_socket) = if group.interface.outputs.is_empty() {
+        ("Geometry".to_owned(), "Geometry".to_owned())
     } else {
-        let socket = group
+        let output_socket = group
             .interface
             .outputs
             .iter()
@@ -590,37 +590,32 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
                     "geometry node group has no geometry output socket",
                 )
             })?;
-        let output_link = group
-            .links
-            .iter()
-            .find(|link| link.to_node == output_node && link.to_socket == socket.id)
-            .or_else(|| {
-                group_socket_name_is_unambiguous(&group.interface.outputs, &socket.name)
-                    .then(|| {
-                        group.links.iter().find(|link| {
-                            link.to_node == output_node && link.to_socket == socket.name
-                        })
-                    })
-                    .flatten()
-            });
-        output_link
+        let output_link = group.links.iter().find(|link| {
+            link.to_node == output_node
+                && group_interface_socket(&group.interface.outputs, &link.to_socket)
+                    .is_some_and(|socket| socket.id == output_socket.id)
+        });
+        let output_input_socket = output_link
             .map(|link| link.to_socket.clone())
             .or_else(|| {
                 group.nodes.get(&output_node).and_then(|node| {
-                    if node.inputs.contains_key(&socket.id) {
-                        Some(socket.id.clone())
-                    } else if group_socket_name_is_unambiguous(
+                    if node.inputs.contains_key(&output_socket.id) {
+                        Some(output_socket.id.clone())
+                    } else if group_interface_socket(
                         &group.interface.outputs,
-                        &socket.name,
-                    ) && node.inputs.contains_key(&socket.name)
+                        &output_socket.name,
+                    )
+                    .is_some_and(|socket| socket.id == output_socket.id)
+                        && node.inputs.contains_key(&output_socket.name)
                     {
-                        Some(socket.name.clone())
+                        Some(output_socket.name.clone())
                     } else {
                         None
                     }
                 })
             })
-            .unwrap_or_else(|| socket.id.clone())
+            .unwrap_or_else(|| output_socket.id.clone());
+        (output_socket.id.clone(), output_input_socket)
     };
     let mut group_stack = group_id.cloned().into_iter().collect::<Vec<_>>();
     let (_, demanded_outputs) = reachable_group_inputs(
@@ -663,7 +658,7 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
     let initial_instances = evaluator.input_instances_for_graph();
     let value = evaluator.input_value(
         &output_node,
-        &output_socket,
+        &output_input_socket,
         EvalValue::Geometry(GeometryValue {
             mesh: input.cloned().unwrap_or_default(),
             instance_paths: evaluator.input_instance_paths_for_graph(),
@@ -1089,28 +1084,11 @@ fn reachable_group_inputs(
                 if !child_inputs.contains(&child_input.id) {
                     continue;
                 }
-                let input_link_socket = if group
-                    .links
-                    .iter()
-                    .any(|link| link.to_node == *node_id && link.to_socket == child_input.id)
-                {
-                    Some(child_input.id.as_str())
-                } else if group_socket_name_is_unambiguous(
-                    &child.interface.inputs,
-                    &child_input.name,
-                ) {
-                    Some(child_input.name.as_str())
-                } else {
-                    None
-                };
-                let Some(input_link_socket) = input_link_socket else {
-                    continue;
-                };
-                for link in group
-                    .links
-                    .iter()
-                    .filter(|link| link.to_node == *node_id && link.to_socket == *input_link_socket)
-                {
+                for link in group.links.iter().filter(|link| {
+                    link.to_node == *node_id
+                        && group_interface_socket(&child.interface.inputs, &link.to_socket)
+                            .is_some_and(|socket| socket.id == child_input.id)
+                }) {
                     visit_output(
                         group,
                         node_groups,
@@ -1148,17 +1126,13 @@ fn reachable_group_inputs(
     let mut demanded = DemandedOutputs::new();
     let mut visited = BTreeSet::new();
     let mut active = BTreeSet::new();
-    let output_socket_name = group
-        .interface
-        .outputs
-        .iter()
-        .find(|socket| socket.id == output_socket)
-        .filter(|socket| group_socket_name_is_unambiguous(&group.interface.outputs, &socket.name))
-        .map(|socket| socket.name.as_str());
+    let output_interface_socket = group_interface_socket(&group.interface.outputs, output_socket);
     for link in group.links.iter().filter(|link| {
         link.to_node == *output_node
-            && (link.to_socket == output_socket
-                || output_socket_name.is_some_and(|name| link.to_socket == name))
+            && output_interface_socket.map_or(link.to_socket == output_socket, |selected| {
+                group_interface_socket(&group.interface.outputs, &link.to_socket)
+                    .is_some_and(|candidate| candidate.id == selected.id)
+            })
     }) {
         visit_output(
             group,
@@ -2133,8 +2107,7 @@ impl Evaluator<'_> {
             .group_stack
             .last()
             .cloned()
-            .or_else(|| Id::new("root".to_owned()).ok())
-            .ok_or_else(|| evaluation("root geometry node group has no stable identity"))?;
+            .ok_or_else(|| evaluation("Geometry Node Group call has no parent group ID"))?;
         let mut group_call_path = self.group_call_path.clone();
         group_call_path.push((parent_group_id, node_id.clone()));
         let mut group_stack = self.group_stack.clone();
@@ -2154,13 +2127,7 @@ impl Evaluator<'_> {
                 None
             } else {
                 Some(
-                    child_group
-                        .interface
-                        .outputs
-                        .iter()
-                        .find(|candidate| {
-                            candidate.id == demanded_output || candidate.name == demanded_output
-                        })
+                    group_interface_socket(&child_group.interface.outputs, &demanded_output)
                         .ok_or_else(|| {
                             evaluation(format!(
                                 "unknown output socket `{demanded_output}` on node group"
@@ -2222,39 +2189,36 @@ impl Evaluator<'_> {
                 "geometry node group output is missing",
             )
         })?;
-        let output_link_socket_name = child_output_socket
-            .as_ref()
-            .filter(|socket| {
-                group_socket_name_is_unambiguous(&child_group.interface.outputs, &socket.name)
-            })
-            .map(|socket| socket.name.as_str());
-        let output_link = child_group
-            .links
-            .iter()
-            .find(|link| link.to_node == output_node && link.to_socket == output_link_socket)
-            .or_else(|| {
-                output_link_socket_name.and_then(|name| {
-                    child_group
-                        .links
-                        .iter()
-                        .find(|link| link.to_node == output_node && link.to_socket == name)
-                })
-            });
+        let output_link = child_group.links.iter().find(|link| {
+            link.to_node == output_node
+                && child_output_socket.as_ref().map_or(
+                    link.to_socket == "Geometry",
+                    |selected| {
+                        group_interface_socket(&child_group.interface.outputs, &link.to_socket)
+                            .is_some_and(|socket| socket.id == selected.id)
+                    },
+                )
+        });
         let output_input_socket = output_link
             .map(|link| link.to_socket.clone())
             .or_else(|| {
+                child_output_socket.as_ref().and_then(|socket| {
+                    output_node_value
+                        .inputs
+                        .get_key_value(&socket.id)
+                        .or_else(|| {
+                            group_interface_socket(&child_group.interface.outputs, &socket.name)
+                                .filter(|resolved| resolved.id == socket.id)
+                                .and_then(|_| output_node_value.inputs.get_key_value(&socket.name))
+                        })
+                        .map(|(key, _)| key.clone())
+                })
+            })
+            .or_else(|| {
                 output_node_value
                     .inputs
-                    .get_key_value(&output_link_socket)
+                    .get_key_value("Geometry")
                     .map(|(key, _)| key.clone())
-                    .or_else(|| {
-                        output_link_socket_name.and_then(|name| {
-                            output_node_value
-                                .inputs
-                                .get_key_value(name)
-                                .map(|(key, _)| key.clone())
-                        })
-                    })
             })
             .unwrap_or_else(|| output_link_socket.clone());
         let simulation_signature = self.nested_group_signature(&group_id, node_id, child_group)?;
@@ -5686,18 +5650,32 @@ fn blender_attribute<'a>(mesh: &'a Mesh, name: &str) -> Option<&'a Value> {
 }
 
 fn mesh_attribute<'a>(mesh: &'a Mesh, name: &str) -> Option<&'a Value> {
+    if name == MESH_EVALUATION_CONTEXT_ATTRIBUTE {
+        return None;
+    }
+    mesh.attributes.get(name).or_else(|| {
+        blender_attribute(mesh, name).filter(|attribute| {
+            attribute
+                .get(ANONYMOUS_ATTRIBUTE_OWNER_MARKER)
+                .and_then(Value::as_bool)
+                != Some(true)
+        })
+    })
+}
+
+fn any_mesh_attribute<'a>(mesh: &'a Mesh, name: &str) -> Option<&'a Value> {
     mesh.attributes
         .get(name)
         .or_else(|| blender_attribute(mesh, name))
 }
 pub(super) fn unique_anonymous_attribute_name(mesh: &Mesh, base: &str) -> Result<String> {
-    if mesh_attribute(mesh, base).is_none() {
+    if any_mesh_attribute(mesh, base).is_none() {
         return Ok(base.to_owned());
     }
     let mut suffix = 1_u64;
     loop {
         let name = format!("{base}_{suffix}");
-        if mesh_attribute(mesh, &name).is_none() {
+        if any_mesh_attribute(mesh, &name).is_none() {
             return Ok(name);
         }
         suffix = suffix

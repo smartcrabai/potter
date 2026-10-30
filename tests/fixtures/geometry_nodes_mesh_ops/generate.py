@@ -823,6 +823,85 @@ def unconsumed_top_distribute_tree():
 
 
 
+def nested_top_group_tree():
+    child = new_tree("gn_mesh_ops_nested_top_child")
+    child.interface.new_socket(
+        name="Selection",
+        in_out="INPUT",
+        socket_type="NodeSocketBool",
+    )
+    child.interface.new_socket(
+        name="Top",
+        in_out="OUTPUT",
+        socket_type="NodeSocketBool",
+    )
+    child_input = node(child, "NodeGroupInput", "Group Input")
+    child_output = node(child, "NodeGroupOutput", "Group Output")
+    extrude = node(child, "GeometryNodeExtrudeMesh", "Extrude")
+    extrude.mode = "FACES"
+    assign_input(extrude, "Offset Scale", 1.0)
+    assign_input(extrude, "Individual", False)
+    subdivide = node(child, "GeometryNodeSubdivideMesh", "Subdivide")
+    assign_input(subdivide, "Level", 1)
+    child.links.new(child_input.outputs["Geometry"], extrude.inputs["Mesh"])
+    child.links.new(child_input.outputs["Selection"], extrude.inputs["Selection"])
+    child.links.new(extrude.outputs["Mesh"], subdivide.inputs["Mesh"])
+    child.links.new(subdivide.outputs["Mesh"], child_output.inputs["Geometry"])
+    child.links.new(extrude.outputs["Top"], child_output.inputs["Top"])
+
+    tree = new_tree("gn_mesh_ops_nested_top_calls")
+    group_input = node(tree, "NodeGroupInput", "Group Input")
+    group_output = node(tree, "NodeGroupOutput", "Group Output")
+    calls = []
+    for name, selected in (("Call A", True), ("Call B", False), ("Call Dead", True)):
+        call = node(tree, "GeometryNodeGroup", name)
+        call.node_tree = child
+        assign_input(call, "Selection", selected)
+        tree.links.new(group_input.outputs["Geometry"], call.inputs["Geometry"])
+        calls.append(call)
+
+    store_a = node(tree, "GeometryNodeStoreNamedAttribute", "Store Top A")
+    store_a.domain = "FACE"
+    store_a.data_type = "BOOLEAN"
+    assign_input(store_a, "Name", "top_a")
+    store_b = node(tree, "GeometryNodeStoreNamedAttribute", "Store Cross-Call Top")
+    store_b.domain = "FACE"
+    store_b.data_type = "BOOLEAN"
+    assign_input(store_b, "Name", "cross_call_top_b")
+    dead_store = node(tree, "GeometryNodeStoreNamedAttribute", "Unused Top Store")
+    dead_store.domain = "FACE"
+    dead_store.data_type = "BOOLEAN"
+    assign_input(dead_store, "Name", "unused_top")
+    distribute = node(tree, "GeometryNodeDistributePointsOnFaces", "Distribute")
+    assign_input(distribute, "Selection", True)
+    assign_input(distribute, "Density", 0.1)
+    assign_input(distribute, "Density Factor", 1.0)
+    assign_input(distribute, "Density Max", 1.0)
+    assign_input(distribute, "Seed", 17)
+    radius_input = node(tree, "GeometryNodeInputRadius", "Input Radius")
+    store_radius = node(tree, "GeometryNodeStoreNamedAttribute", "Store Radius")
+    store_radius.domain = "POINT"
+    store_radius.data_type = "FLOAT"
+    assign_input(store_radius, "Name", "radius_probe")
+    points_to_vertices = node(tree, "GeometryNodePointsToVertices", "Points to Vertices")
+    join = node(tree, "GeometryNodeJoinGeometry", "Join")
+
+    tree.links.new(calls[0].outputs["Geometry"], store_a.inputs["Geometry"])
+    tree.links.new(calls[0].outputs["Top"], store_a.inputs["Value"])
+    tree.links.new(store_a.outputs["Geometry"], store_b.inputs["Geometry"])
+    tree.links.new(calls[1].outputs["Top"], store_b.inputs["Value"])
+    tree.links.new(calls[2].outputs["Geometry"], dead_store.inputs["Geometry"])
+    tree.links.new(calls[2].outputs["Top"], dead_store.inputs["Value"])
+    tree.links.new(calls[2].outputs["Geometry"], distribute.inputs["Mesh"])
+    tree.links.new(distribute.outputs["Points"], store_radius.inputs["Geometry"])
+    tree.links.new(radius_input.outputs["Radius"], store_radius.inputs["Value"])
+    tree.links.new(store_radius.outputs["Geometry"], points_to_vertices.inputs["Points"])
+    tree.links.new(store_b.outputs["Geometry"], join.inputs["Geometry"])
+    tree.links.new(points_to_vertices.outputs["Mesh"], join.inputs["Geometry"])
+    tree.links.new(join.outputs["Geometry"], group_output.inputs["Geometry"])
+    return tree
+
+
 def main():
     bpy.ops.wm.read_factory_settings(use_empty=True)
     obj = make_source()
@@ -911,6 +990,16 @@ def main():
     if radius is None:
         raise RuntimeError("distributed point radius did not survive the mesh oracle conversion")
     unconsumed_top_distribute["attributes"]["radius"] = radius
+    nested_top_group = evaluate_tree(
+        obj,
+        nested_top_group_tree(),
+        input_names + ["id", "radius_probe", "top_a", "cross_call_top_b"],
+        include_special_attributes=True,
+    )
+    radius = nested_top_group["attributes"].pop("radius_probe", None)
+    if radius is None:
+        raise RuntimeError("nested group point radius did not survive the mesh oracle conversion")
+    nested_top_group["attributes"]["radius"] = radius
     payload = {
         "blender_version": bpy.app.version_string,
         "input": input_record,
@@ -926,6 +1015,7 @@ def main():
         "vertex_extrude_top_on_edge": vertex_top_edge,
         "top_on_original": top_on_original,
         "unconsumed_top_distribute": unconsumed_top_distribute,
+        "nested_top_group": nested_top_group,
     }
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
