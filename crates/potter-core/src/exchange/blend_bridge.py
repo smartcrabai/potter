@@ -10379,6 +10379,7 @@ def export_doc(doc, target, pack, scene_hash, context):
     for collection in (mesh_map, camera_map, light_map, armature_map, grease_pencil_map,
                        hair_curves_map, world_map, material_map, collection_map):
         id_lookup.update({block.name_full: block for block in collection.values()})
+    id_lookup.update(material_map)
     # Objects override same-named data blocks: compatibility references with
     # id_type "Object" must resolve to the Object, not identically-named data.
     id_lookup.update(object_lookup)
