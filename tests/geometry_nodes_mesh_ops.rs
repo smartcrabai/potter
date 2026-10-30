@@ -422,7 +422,6 @@ fn nested_top_group_doc() -> TestResult<SceneDoc> {
     .doc)
 }
 
-
 fn evaluate(doc: &SceneDoc, mesh: &Mesh) -> TestResult<GraphEvaluation> {
     let graph_id = Id::new("geo")?;
     let group = doc.node_groups.get(&graph_id).ok_or_else(|| {
@@ -1648,13 +1647,13 @@ fn nested_group_top_fields_survive_subdivision_and_are_callsite_scoped() -> Test
             .and_then(Value::as_array)
             .is_none_or(|layers| layers
                 .iter()
-                .all(|layer| layer.get("potter_gn_anonymous").and_then(Value::as_bool)
-                    != Some(true))),
+                .all(
+                    |layer| layer.get("potter_gn_anonymous").and_then(Value::as_bool) != Some(true)
+                )),
         "unused group output must not leak anonymous layers"
     );
     Ok(())
 }
-
 
 #[test]
 fn authored_anonymous_prefix_layer_survives_extrude() -> TestResult<()> {
@@ -1798,12 +1797,13 @@ fn named_attribute_nodes_cannot_access_anonymous_geometry_layers() -> TestResult
     let private_values = invalid_array(&layer["values"], name)?;
     assert_eq!(private_values.len(), result.mesh.vertices.len());
     assert!(
-        private_values.iter().all(|value| value.as_bool() == Some(true)),
+        private_values
+            .iter()
+            .all(|value| value.as_bool() == Some(true)),
         "anonymous input layer must remain attached to the geometry"
     );
     Ok(())
 }
-
 
 #[test]
 fn empty_mesh_topology_and_operations_match_blender() -> TestResult<()> {

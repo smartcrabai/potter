@@ -601,11 +601,8 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
                 group.nodes.get(&output_node).and_then(|node| {
                     if node.inputs.contains_key(&output_socket.id) {
                         Some(output_socket.id.clone())
-                    } else if group_interface_socket(
-                        &group.interface.outputs,
-                        &output_socket.name,
-                    )
-                    .is_some_and(|socket| socket.id == output_socket.id)
+                    } else if group_interface_socket(&group.interface.outputs, &output_socket.name)
+                        .is_some_and(|socket| socket.id == output_socket.id)
                         && node.inputs.contains_key(&output_socket.name)
                     {
                         Some(output_socket.name.clone())
@@ -2121,20 +2118,19 @@ impl Evaluator<'_> {
             .unwrap_or_default();
         demanded_group_outputs.insert(output_socket.to_owned());
         for demanded_output in demanded_group_outputs {
-            let child_output = if child_group.interface.outputs.is_empty()
-                && demanded_output == "Geometry"
-            {
-                None
-            } else {
-                Some(
-                    group_interface_socket(&child_group.interface.outputs, &demanded_output)
-                        .ok_or_else(|| {
-                            evaluation(format!(
-                                "unknown output socket `{demanded_output}` on node group"
-                            ))
-                        })?,
-                )
-            };
+            let child_output =
+                if child_group.interface.outputs.is_empty() && demanded_output == "Geometry" {
+                    None
+                } else {
+                    Some(
+                        group_interface_socket(&child_group.interface.outputs, &demanded_output)
+                            .ok_or_else(|| {
+                                evaluation(format!(
+                                    "unknown output socket `{demanded_output}` on node group"
+                                ))
+                            })?,
+                    )
+                };
             let child_output_socket = child_output.map_or("Geometry", |socket| socket.id.as_str());
             let (inputs, outputs) = reachable_group_inputs(
                 child_group,
@@ -2191,13 +2187,12 @@ impl Evaluator<'_> {
         })?;
         let output_link = child_group.links.iter().find(|link| {
             link.to_node == output_node
-                && child_output_socket.as_ref().map_or(
-                    link.to_socket == "Geometry",
-                    |selected| {
+                && child_output_socket
+                    .as_ref()
+                    .map_or(link.to_socket == "Geometry", |selected| {
                         group_interface_socket(&child_group.interface.outputs, &link.to_socket)
                             .is_some_and(|socket| socket.id == selected.id)
-                    },
-                )
+                    })
         });
         let output_input_socket = output_link
             .map(|link| link.to_socket.clone())
@@ -5461,8 +5456,9 @@ fn default_input(node_type: &str, socket: &str) -> Option<Value> {
         ("GeometryNodeSubdivideMesh", "Level") | ("GeometryNodeRepeatInput", "Iterations") => {
             json!(1)
         }
-        ("ShaderNodeMath", "Value" | "Value_001" | "Value_002")
-        | ("ShaderNodeMixRGB", "Fac") => json!(0.5),
+        ("ShaderNodeMath", "Value" | "Value_001" | "Value_002") | ("ShaderNodeMixRGB", "Fac") => {
+            json!(0.5)
+        }
         _ => return None,
     };
     Some(value)
@@ -5594,6 +5590,12 @@ fn field_is_single(field: &Field) -> bool {
             second,
             third,
             ..
+        }
+        | Field::IntegerMath {
+            first,
+            second,
+            third,
+            ..
         } => field_is_single(first) && field_is_single(second) && field_is_single(third),
         Field::VectorMath {
             first,
@@ -5607,6 +5609,49 @@ fn field_is_single(field: &Field) -> bool {
                 && field_is_single(third)
                 && field_is_single(scale)
         }
+        Field::BooleanMath { first, second, .. } => {
+            field_is_single(first) && field_is_single(second)
+        }
+        Field::Compare {
+            first,
+            second,
+            parameter,
+            epsilon,
+            ..
+        } => {
+            field_is_single(first)
+                && field_is_single(second)
+                && field_is_single(parameter)
+                && field_is_single(epsilon)
+        }
+        Field::MapRange {
+            value,
+            from_min,
+            from_max,
+            to_min,
+            to_max,
+            steps,
+            ..
+        } => {
+            field_is_single(value)
+                && field_is_single(from_min)
+                && field_is_single(from_max)
+                && field_is_single(to_min)
+                && field_is_single(to_max)
+                && field_is_single(steps)
+        }
+        Field::Clamp {
+            value, min, max, ..
+        } => field_is_single(value) && field_is_single(min) && field_is_single(max),
+        Field::Mix {
+            factor,
+            first,
+            second,
+            ..
+        } => field_is_single(factor) && field_is_single(first) && field_is_single(second),
+        Field::ColorRamp { factor, .. } => field_is_single(factor),
+        Field::Curve { factor, value, .. } => field_is_single(factor) && field_is_single(value),
+        Field::Function { inputs, .. } => inputs.values().all(|input| field_is_single(input)),
         Field::CombineXYZ { x, y, z } => {
             field_is_single(x) && field_is_single(y) && field_is_single(z)
         }

@@ -391,7 +391,9 @@ pub(crate) fn copy_direct_matrix_edge_attributes(
                 output_vertex_indices
                     .get(&id)
                     .and_then(|index| origin.vertices.get(*index))
-                    .filter(|sources| sources.len() == 1 && sources[0].1 == 1.0)
+                    .filter(|sources| {
+                        sources.len() == 1 && sources[0].1.to_bits() == 1.0_f64.to_bits()
+                    })
                     .map(|sources| sources[0].0)
             };
             source_vertex(edge.vertices[0])
@@ -1262,7 +1264,7 @@ impl Sources<'_> {
         with_values(attribute, Value::Object(output))
     }
 
-    /// Edge values blended over each output edge's source edges (see [`blend`]).
+    /// Edge values blend over source edges except for direct transform-matrix copies.
     fn edge_values(
         &self,
         values: &[Value],
@@ -1271,7 +1273,16 @@ impl Sources<'_> {
     ) -> Vec<Value> {
         self.edge_origin
             .iter()
-            .map(|sources| blend_indexed(values, sources, data_type).unwrap_or_else(&default))
+            .map(|sources| {
+                if is_float4x4(data_type)
+                    && let [(source, weight)] = sources.as_slice()
+                    && weight.to_bits() == 1.0_f64.to_bits()
+                {
+                    values.get(*source).cloned().unwrap_or_else(&default)
+                } else {
+                    blend_indexed(values, sources, data_type).unwrap_or_else(&default)
+                }
+            })
             .collect()
     }
 

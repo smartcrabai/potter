@@ -22,6 +22,8 @@ pub fn is_known_node_type(node_type: &str) -> bool {
             | "GeometryNodeMeshCube"
             | "GeometryNodeMeshIcoSphere"
             | "GeometryNodeSetPosition"
+            | "GeometryNodeTransform"
+            | "GeometryNodeJoinGeometry"
             | "GeometryNodeExtrudeMesh"
             | "GeometryNodeSplitEdges"
             | "GeometryNodeMergeByDistance"
