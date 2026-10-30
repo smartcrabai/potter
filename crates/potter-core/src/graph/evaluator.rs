@@ -3335,12 +3335,10 @@ impl Evaluator<'_> {
                 }
             }
         }
-        points
-            .attributes
-            .insert(
-                "radius".to_owned(),
-                json!({"domain":"POINT","data_type":"FLOAT","data":radii}),
-            );
+        points.attributes.insert(
+            "radius".to_owned(),
+            json!({"domain":"POINT","data_type":"FLOAT","data":radii}),
+        );
         if let Some(vertices) = source_vertices {
             set_origindex(&mut points, &vertices);
         }
