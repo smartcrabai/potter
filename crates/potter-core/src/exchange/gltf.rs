@@ -979,6 +979,27 @@ const LOOSE_VERTEX_COLOR: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
 impl CarriedColor {
     fn new(mesh: &Mesh, layer: &ColorLayer) -> Result<Self> {
         match layer.domain {
+            ColorDomain::Face => {
+                if layer.values.len() != mesh.faces.len() {
+                    return Err(PotError::new(
+                        ErrorCode::SceneInvalid,
+                        format!(
+                            "color layer `{}` does not match the face domain",
+                            layer.name
+                        ),
+                    ));
+                }
+                let corners = mesh
+                    .faces
+                    .iter()
+                    .zip(&layer.values)
+                    .flat_map(|(face, value)| std::iter::repeat_n(*value, face.vertices.len()))
+                    .collect();
+                Ok(Self {
+                    corners,
+                    vertices: vec![LOOSE_VERTEX_COLOR; mesh.vertices.len()],
+                })
+            }
             ColorDomain::Corner => Ok(Self {
                 corners: layer.values.clone(),
                 vertices: vec![LOOSE_VERTEX_COLOR; mesh.vertices.len()],
@@ -1025,7 +1046,7 @@ fn potter_color_attributes(mesh: &Mesh) -> Value {
         .iter()
         .map(|layer| {
             let values = match layer.domain {
-                ColorDomain::Point => json!(layer.values),
+                ColorDomain::Point | ColorDomain::Face => json!(layer.values),
                 ColorDomain::Corner => {
                     let mut offset = 0;
                     let rows = mesh
@@ -3559,6 +3580,9 @@ fn slot_has_nonopaque_color_alpha(
     vertex_indices: &mut Option<BTreeMap<u32, usize>>,
 ) -> bool {
     match layer.domain {
+        ColorDomain::Face => mesh.faces.iter().zip(&layer.values).any(|(face, color)| {
+            face.material_index == slot && !crate::float::equal_f64(color[3], 1.0)
+        }),
         ColorDomain::Corner => {
             let mut corner_index = 0;
             for face in &mesh.faces {
@@ -3598,7 +3622,7 @@ fn slot_has_nonopaque_color_alpha(
 }
 
 /// Color losses of one exported mesh. Application extras preserve every named layer and its
-/// POINT/CORNER domain. glTF clamps `COLOR_0` to [0, 1] (glTF 2.0 `COLOR_0` accessor rule); the
+/// POINT/FACE/CORNER domain. glTF clamps `COLOR_0` to [0, 1] (glTF 2.0 `COLOR_0` accessor rule); the
 /// other `COLOR_n` sets keep their stored values, so only a layer read as `COLOR_0` can lose range.
 fn color_losses(
     node_id: &Id,
@@ -8459,6 +8483,7 @@ fn import_potter_color_attributes(
         let domain = match raw["domain"].as_str() {
             Some("point") => ColorDomain::Point,
             Some("corner") => ColorDomain::Corner,
+            Some("face") => ColorDomain::Face,
             _ => return Err(import_error("glTF Potter color layer domain is invalid")),
         };
         let values = match domain {
@@ -8499,6 +8524,47 @@ fn import_potter_color_attributes(
                             .get(id)
                             .copied()
                             .ok_or_else(|| import_error("glTF Potter point color ID is missing"))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            ColorDomain::Face => {
+                if !faces_restored {
+                    return Ok(false);
+                }
+                let Some(face_ids) = face_ids.as_ref() else {
+                    return Ok(false);
+                };
+                let raw_values = raw["values"]
+                    .as_array()
+                    .ok_or_else(|| import_error("glTF Potter face colors are missing"))?;
+                let current_ids = mesh
+                    .faces
+                    .iter()
+                    .map(|face| face.id)
+                    .collect::<BTreeSet<_>>();
+                if face_ids.len() != mesh.faces.len()
+                    || raw_values.len() != mesh.faces.len()
+                    || face_ids.iter().copied().collect::<BTreeSet<_>>() != current_ids
+                {
+                    return Ok(false);
+                }
+                let values_by_id = face_ids
+                    .iter()
+                    .copied()
+                    .zip(
+                        raw_values
+                            .iter()
+                            .map(potter_color_rgba)
+                            .collect::<Result<Vec<_>>>()?,
+                    )
+                    .collect::<BTreeMap<_, _>>();
+                mesh.faces
+                    .iter()
+                    .map(|face| {
+                        values_by_id
+                            .get(&face.id)
+                            .copied()
+                            .ok_or_else(|| import_error("glTF Potter face color ID is missing"))
                     })
                     .collect::<Result<Vec<_>>>()?
             }

@@ -701,6 +701,7 @@ fn check_cache_color_layer(
 ) -> Result<()> {
     let expected = match layer.domain {
         ColorDomain::Point => mesh.vertices.len(),
+        ColorDomain::Face => mesh.faces.len(),
         ColorDomain::Corner => mesh
             .faces
             .iter()

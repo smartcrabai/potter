@@ -590,6 +590,7 @@ fn mesh_summary(
                 .ok_or("Blender color data type metadata is missing")?;
             let domain = match layer.domain {
                 ColorDomain::Point => "POINT",
+                ColorDomain::Face => "FACE",
                 ColorDomain::Corner => "CORNER",
             };
             Ok(json!({

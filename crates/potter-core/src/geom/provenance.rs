@@ -338,6 +338,129 @@ pub(crate) fn remap_attributes_with_edges(
         [0.0, 0.0, 0.0, 1.0],
     )
 }
+pub(crate) fn copy_direct_matrix_edge_attributes(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+) -> Result<()> {
+    let Some(source_layers) = source
+        .attributes
+        .get("blender_attributes")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    let Some(output_layers) = output
+        .attributes
+        .get_mut("blender_attributes")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    let source_vertex_indices = source
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect::<HashMap<_, _>>();
+    let source_edges = source
+        .edges
+        .iter()
+        .enumerate()
+        .filter_map(|(index, edge)| {
+            Some((
+                edge_key(
+                    *source_vertex_indices.get(&edge.vertices[0])?,
+                    *source_vertex_indices.get(&edge.vertices[1])?,
+                ),
+                index,
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let output_vertex_indices = output
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect::<HashMap<_, _>>();
+    let output_edge_sources = output
+        .edges
+        .iter()
+        .map(|edge| {
+            let source_vertex = |id: u32| {
+                output_vertex_indices
+                    .get(&id)
+                    .and_then(|index| origin.vertices.get(*index))
+                    .filter(|sources| sources.len() == 1 && sources[0].1 == 1.0)
+                    .map(|sources| sources[0].0)
+            };
+            source_vertex(edge.vertices[0])
+                .zip(source_vertex(edge.vertices[1]))
+                .and_then(|(first, second)| source_edges.get(&edge_key(first, second)).copied())
+        })
+        .collect::<Vec<_>>();
+    for source_layer in source_layers {
+        if source_layer.get("domain").and_then(Value::as_str) != Some("EDGE")
+            || !matches!(
+                source_layer.get("data_type").and_then(Value::as_str),
+                Some("FLOAT4X4" | "MATRIX")
+            )
+        {
+            continue;
+        }
+        let name = source_layer
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "matrix edge attribute has no name",
+                )
+            })?;
+        let source_values = source_layer
+            .get("values")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "matrix edge attribute has no values",
+                )
+            })?;
+        let Some(output_layer) = output_layers
+            .iter_mut()
+            .find(|layer| layer.get("name").and_then(Value::as_str) == Some(name))
+        else {
+            continue;
+        };
+        let output_values = output_layer
+            .get_mut("values")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "matrix edge attribute output values are malformed",
+                )
+            })?;
+        for (output_index, source_index) in output_edge_sources.iter().enumerate() {
+            if let Some(source_index) = source_index {
+                let source_value = source_values.get(*source_index).ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "matrix edge attribute source is out of range",
+                    )
+                })?;
+                let output_value = output_values.get_mut(output_index).ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "matrix edge attribute output is out of range",
+                    )
+                })?;
+                *output_value = source_value.clone();
+            }
+        }
+    }
+    Ok(())
+}
 
 /// [`remap_attributes`] for a rebuilt mesh whose output points each descend from one source vertex:
 /// `edge_identity` names that source vertex per output point, one entry per point. Point-domain values
@@ -596,8 +719,9 @@ fn remap_attributes_internal(
             "blender_polygon_smooth" => value
                 .as_array()
                 .map(|flags| Value::Array(sources.polygon_smooth(flags))),
-            _ => native_domain(value)
-                .map(|_| sources.native_attribute(key, value))
+            _ => sources
+                .graph_attribute(key, value)
+                .or_else(|| native_domain(value).map(|_| sources.native_attribute(key, value)))
                 .or_else(|| sources.named_attribute(key, value)),
         };
         attributes.insert(key.clone(), remapped.unwrap_or_else(|| value.clone()));
@@ -654,6 +778,16 @@ fn with_values(entry: &Value, values: Value) -> Value {
         }
     }
     fields.insert("values".to_owned(), values);
+    Value::Object(fields)
+}
+fn with_data(entry: &Value, data: Value) -> Value {
+    let mut fields = Map::new();
+    for (key, field) in entry.as_object().into_iter().flatten() {
+        if key.as_str() != "data" {
+            fields.insert(key.clone(), field.clone());
+        }
+    }
+    fields.insert("data".to_owned(), data);
     Value::Object(fields)
 }
 
@@ -1432,13 +1566,40 @@ impl Sources<'_> {
     /// One `blender_attributes` entry; POINT, EDGE, FACE, and CORNER entries are remapped and
     /// unknown domains are returned unchanged.
     fn attribute_entry(&self, entry: &Value) -> Value {
-        let domain = text(entry, "domain");
-        let data_type = text(entry, "data_type");
         let Some(values) = entry.get("values").and_then(Value::as_array) else {
             return entry.clone();
         };
+        let Some(remapped) = self.remap_attribute_values(
+            text(entry, "domain"),
+            text(entry, "data_type"),
+            text(entry, "name"),
+            values,
+        ) else {
+            return entry.clone();
+        };
+        with_values(entry, Value::Array(remapped))
+    }
+
+    fn graph_attribute(&self, name: &str, attribute: &Value) -> Option<Value> {
+        let values = attribute.get("data")?.as_array()?;
+        let remapped = self.remap_attribute_values(
+            text(attribute, "domain"),
+            text(attribute, "data_type"),
+            name,
+            values,
+        )?;
+        Some(with_data(attribute, Value::Array(remapped)))
+    }
+
+    fn remap_attribute_values(
+        &self,
+        domain: &str,
+        data_type: &str,
+        name: &str,
+        values: &[Value],
+    ) -> Option<Vec<Value>> {
         let default = || default_value(data_type);
-        let remapped: Vec<Value> = match domain {
+        Some(match domain {
             "POINT" => self.vertex_values(values, data_type, default),
             "EDGE" => self.edge_values(values, data_type, default),
             "FACE" => self
@@ -1453,7 +1614,7 @@ impl Sources<'_> {
                 .collect(),
             "CORNER" => {
                 let corner_origins = if data_type.eq_ignore_ascii_case("FLOAT2") {
-                    let key = self.blender_attribute_corner_key(text(entry, "name"));
+                    let key = self.blender_attribute_corner_key(name);
                     self.corner_origins_for_layer(data_type, &key)
                 } else {
                     self.corner_origin
@@ -1471,9 +1632,8 @@ impl Sources<'_> {
                     })
                     .collect()
             }
-            _ => return entry.clone(),
-        };
-        with_values(entry, Value::Array(remapped))
+            _ => return None,
+        })
     }
     /// One canonical color layer rebuilt with the Blender mixer named in the source metadata.
     fn color_layer(&self, layer: &ColorLayer) -> ColorLayer {
@@ -1501,6 +1661,12 @@ impl Sources<'_> {
                 .vertices
                 .iter()
                 .map(|sources| mix(sources))
+                .collect(),
+            ColorDomain::Face => self
+                .origin
+                .faces
+                .iter()
+                .map(|source| source.map_or(self.color_default, |source| mix(&[(source, 1.0)])))
                 .collect(),
             ColorDomain::Corner => self
                 .corner_origin
@@ -2037,12 +2203,293 @@ fn blend_color(items: &[(&Value, f64)], data_type: &str) -> Option<Value> {
         .map(|color| Value::Array(color.map(|channel| json!(channel)).into()))
 }
 
-/// Blend values by source: numbers and equal-length number arrays interpolate componentwise (rounded for
-/// integer types), booleans OR positive-weight sources, and other values use the heaviest source.
+/// Blend values by Blender data type: numbers and arrays interpolate componentwise, while
+/// `INT16_2D`/`SHORT2` round a float2 accumulation and `FLOAT4X4`/`MATRIX` use Blender's safe TRS
+/// mixer. Booleans OR positive-weight sources, and other values use the heaviest source.
 /// Boolean corner interpolation uses [`blend_with_boolean_mixer`] for Blender's weighted threshold.
 /// `None` when there are no sources.
 fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> Option<Value> {
     blend_with_boolean_mixer(items, data_type, false)
+}
+fn blender_float32(value: f64) -> Option<f32> {
+    num_traits::ToPrimitive::to_f32(&value)
+}
+
+fn blend_short2(items: &[(&Value, f64)]) -> Option<Value> {
+    let mut accum = [0.0_f32; 2];
+    let mut total_weight = 0.0_f32;
+    for (value, weight) in items {
+        let components = value
+            .as_array()
+            .filter(|components| components.len() == 2)?;
+        let weight = blender_float32(*weight)?;
+        for (sum, component) in accum.iter_mut().zip(components) {
+            let component = i16::try_from(component.as_i64()?).ok()?;
+            *sum += f32::from(component) * weight;
+        }
+        total_weight += weight;
+    }
+    let result = if total_weight > 0.0 {
+        let weight_inv = 1.0_f32 / total_weight;
+        [
+            num_traits::ToPrimitive::to_i16(&((accum[0] * weight_inv).round()))?,
+            num_traits::ToPrimitive::to_i16(&((accum[1] * weight_inv).round()))?,
+        ]
+    } else {
+        [0_i16; 2]
+    };
+    Some(json!(result))
+}
+
+fn float4x4_value(value: &Value) -> Option<[[f32; 4]; 4]> {
+    let values = value.as_array()?;
+    let mut rows = [[0.0_f32; 4]; 4];
+    if values.len() == 4 {
+        for (row, source_row) in values.iter().enumerate() {
+            let source_row = source_row.as_array().filter(|row| row.len() == 4)?;
+            for (column, component) in source_row.iter().enumerate() {
+                rows[row][column] = blender_float32(component.as_f64()?)?;
+            }
+        }
+        return Some(rows);
+    }
+    if values.len() == 16 {
+        for row in 0..4 {
+            for column in 0..4 {
+                rows[row][column] = blender_float32(values[column * 4 + row].as_f64()?)?;
+            }
+        }
+        return Some(rows);
+    }
+    None
+}
+
+/// Blender's `to_loc_rot_scale_safe<true>` for float matrices, using its normalized Euler
+/// decomposition before converting the result to a quaternion.
+fn float4x4_loc_rot_scale(matrix: [[f32; 4]; 4]) -> ([f32; 3], [f32; 4], [f32; 3]) {
+    let location = [matrix[0][3], matrix[1][3], matrix[2][3]];
+    let mut rotation_matrix = [[0.0_f32; 3]; 3];
+    let mut scale = [0.0_f32; 3];
+    for column in 0..3 {
+        let x = matrix[0][column];
+        let y = matrix[1][column];
+        let z = matrix[2][column];
+        let length_squared = (x * x + y * y) + z * z;
+        if length_squared > 1.0e-35_f32 {
+            let length = length_squared.sqrt();
+            scale[column] = length;
+            rotation_matrix[0][column] = x / length;
+            rotation_matrix[1][column] = y / length;
+            rotation_matrix[2][column] = z / length;
+        }
+    }
+    let determinant = rotation_matrix[0][0]
+        * (rotation_matrix[1][1] * rotation_matrix[2][2]
+            - rotation_matrix[1][2] * rotation_matrix[2][1])
+        - rotation_matrix[0][1]
+            * (rotation_matrix[1][0] * rotation_matrix[2][2]
+                - rotation_matrix[1][2] * rotation_matrix[2][0])
+        + rotation_matrix[0][2]
+            * (rotation_matrix[1][0] * rotation_matrix[2][1]
+                - rotation_matrix[1][1] * rotation_matrix[2][0]);
+    if determinant < 0.0 {
+        for row in &mut rotation_matrix {
+            for component in row {
+                *component = -*component;
+            }
+        }
+        scale = scale.map(|component| -component);
+    }
+
+    let cy = rotation_matrix[0][0].hypot(rotation_matrix[1][0]);
+    let (first_euler, second_euler) = if cy > 16.0 * f32::EPSILON {
+        (
+            [
+                rotation_matrix[2][1].atan2(rotation_matrix[2][2]),
+                (-rotation_matrix[2][0]).atan2(cy),
+                rotation_matrix[1][0].atan2(rotation_matrix[0][0]),
+            ],
+            [
+                (-rotation_matrix[2][1]).atan2(-rotation_matrix[2][2]),
+                (-rotation_matrix[2][0]).atan2(-cy),
+                (-rotation_matrix[1][0]).atan2(-rotation_matrix[0][0]),
+            ],
+        )
+    } else {
+        let euler = [
+            (-rotation_matrix[1][2]).atan2(rotation_matrix[1][1]),
+            (-rotation_matrix[2][0]).atan2(cy),
+            0.0,
+        ];
+        (euler, euler)
+    };
+    let first_length = (first_euler[0].abs() + first_euler[1].abs()) + first_euler[2].abs();
+    let second_length = (second_euler[0].abs() + second_euler[1].abs()) + second_euler[2].abs();
+    let [x, y, z] = if first_length > second_length {
+        second_euler
+    } else {
+        first_euler
+    };
+
+    let half_i = x * 0.5;
+    let half_j = y * 0.5;
+    let half_k = z * 0.5;
+    let sin_i = half_i.sin();
+    let cos_i = half_i.cos();
+    let sin_j = half_j.sin();
+    let cos_j = half_j.cos();
+    let sin_k = half_k.sin();
+    let cos_k = half_k.cos();
+    let cos_cos = cos_i * cos_k;
+    let cos_sin = cos_i * sin_k;
+    let sin_cos = sin_i * cos_k;
+    let sin_sin = sin_i * sin_k;
+    let quaternion_w = cos_j * cos_cos + sin_j * sin_sin;
+    let quaternion_x = cos_j * sin_cos - sin_j * cos_sin;
+    let quaternion_y = cos_j * sin_sin + sin_j * cos_cos;
+    let quaternion_z = cos_j * cos_sin - sin_j * sin_cos;
+    (
+        location,
+        [quaternion_x, quaternion_y, quaternion_z, quaternion_w],
+        scale,
+    )
+}
+
+fn float4x4_from_loc_rot_scale(
+    location: [f32; 3],
+    rotation: [f32; 4],
+    scale: [f32; 3],
+) -> Option<[[f32; 4]; 4]> {
+    let [x, y, z, w] = rotation;
+    // Blender's float quaternion-to-matrix path uses double intermediates.
+    let q0 = std::f64::consts::SQRT_2 * f64::from(w);
+    let q1 = std::f64::consts::SQRT_2 * f64::from(x);
+    let q2 = std::f64::consts::SQRT_2 * f64::from(y);
+    let q3 = std::f64::consts::SQRT_2 * f64::from(z);
+    let qda = q0 * q1;
+    let qdb = q0 * q2;
+    let qdc = q0 * q3;
+    let qaa = q1 * q1;
+    let qab = q1 * q2;
+    let qac = q1 * q3;
+    let qbb = q2 * q2;
+    let qbc = q2 * q3;
+    let qcc = q3 * q3;
+    let rotation_matrix = [
+        [
+            blender_float32(1.0 - qbb - qcc)?,
+            blender_float32(-qdc + qab)?,
+            blender_float32(qdb + qac)?,
+        ],
+        [
+            blender_float32(qdc + qab)?,
+            blender_float32(1.0 - qaa - qcc)?,
+            blender_float32(-qda + qbc)?,
+        ],
+        [
+            blender_float32(-qdb + qac)?,
+            blender_float32(qda + qbc)?,
+            blender_float32(1.0 - qaa - qbb)?,
+        ],
+    ];
+    Some([
+        [
+            rotation_matrix[0][0] * scale[0],
+            rotation_matrix[0][1] * scale[1],
+            rotation_matrix[0][2] * scale[2],
+            location[0],
+        ],
+        [
+            rotation_matrix[1][0] * scale[0],
+            rotation_matrix[1][1] * scale[1],
+            rotation_matrix[1][2] * scale[2],
+            location[1],
+        ],
+        [
+            rotation_matrix[2][0] * scale[0],
+            rotation_matrix[2][1] * scale[1],
+            rotation_matrix[2][2] * scale[2],
+            location[2],
+        ],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+}
+
+fn float4x4_quaternion_expmap([x, y, z, w]: [f32; 4]) -> [f32; 3] {
+    let sin_half = ((x * x + y * y) + z * z).sqrt();
+    if sin_half < 0.0005 {
+        return [0.0; 3];
+    }
+    let angle = 2.0 * sin_half.atan2(w);
+    [
+        (x / sin_half) * angle,
+        (y / sin_half) * angle,
+        (z / sin_half) * angle,
+    ]
+}
+
+fn float4x4_rotation_from_expmap([x, y, z]: [f32; 3]) -> [f32; 4] {
+    let length_squared = (x * x + y * y) + z * z;
+    if length_squared > 1.0e-35_f32 {
+        let angle = length_squared.sqrt();
+        let wrapped_angle = angle + std::f32::consts::PI;
+        let wrapped_angle =
+            wrapped_angle - std::f32::consts::TAU * (wrapped_angle / std::f32::consts::TAU).floor();
+        let half_angle = (wrapped_angle - std::f32::consts::PI) * 0.5;
+        let sine = half_angle.sin();
+        [
+            (x / angle) * sine,
+            (y / angle) * sine,
+            (z / angle) * sine,
+            half_angle.cos(),
+        ]
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    }
+}
+
+fn blend_float4x4(items: &[(&Value, f64)]) -> Option<Value> {
+    let mut location = [0.0_f32; 3];
+    let mut expmap = [0.0_f32; 3];
+    let mut scale = [0.0_f32; 3];
+    let mut total_weight = 0.0_f32;
+    for (value, weight) in items {
+        let matrix = float4x4_value(value)?;
+        let (source_location, source_rotation, source_scale) = float4x4_loc_rot_scale(matrix);
+        let source_expmap = float4x4_quaternion_expmap(source_rotation);
+        let weight = blender_float32(*weight)?;
+        for component in 0..3 {
+            location[component] += source_location[component] * weight;
+            expmap[component] += source_expmap[component] * weight;
+            scale[component] += source_scale[component] * weight;
+        }
+        total_weight += weight;
+    }
+    let result = if total_weight > 0.0 {
+        let weight_inv = 1.0_f32 / total_weight;
+        let rotation = float4x4_rotation_from_expmap(expmap.map(|value| value * weight_inv));
+        float4x4_from_loc_rot_scale(
+            location.map(|value| value * weight_inv),
+            rotation,
+            scale.map(|value| value * weight_inv),
+        )?
+    } else {
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    };
+    Some(json!(result))
+}
+
+fn is_short2(data_type: &str) -> bool {
+    matches!(data_type, "INT16_2D" | "SHORT2")
+}
+
+fn is_float4x4(data_type: &str) -> bool {
+    matches!(data_type, "FLOAT4X4" | "MATRIX")
 }
 
 fn blend_with_boolean_mixer<'a>(
@@ -2056,6 +2503,12 @@ fn blend_with_boolean_mixer<'a>(
         && let Some(color) = blend_color(&items, data_type)
     {
         return Some(color);
+    }
+    if is_short2(data_type) {
+        return blend_short2(&items);
+    }
+    if is_float4x4(data_type) {
+        return blend_float4x4(&items);
     }
     if items.iter().all(|(value, _)| value.is_number()) {
         let sum: f64 = items
@@ -2133,7 +2586,13 @@ pub(crate) fn default_value(data_type: &str) -> Value {
         "BOOLEAN" | "BOOL" => json!(false),
         "INT" | "INT8" => json!(0),
         "FLOAT" => json!(0.0),
-        "INT32_2D" => json!([0, 0]),
+        "INT32_2D" | "INT16_2D" | "SHORT2" => json!([0, 0]),
+        "FLOAT4X4" | "MATRIX" => json!([
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ]),
         "FLOAT2" => json!([0.0, 0.0]),
         "FLOAT_VECTOR" => json!([0.0, 0.0, 0.0]),
         "FLOAT_COLOR" | "BYTE_COLOR" | "QUATERNION" => json!([0.0, 0.0, 0.0, 1.0]),
@@ -2775,6 +3234,94 @@ mod tests {
             blend_with_boolean_mixer([(&on, 0.5), (&off, 0.5)].into_iter(), "BOOLEAN", true,),
             Some(json!(true))
         );
+    }
+
+    #[test]
+    fn short2_mixer_rounds_weighted_f32_values_and_uses_zero_default() {
+        let first = json!([1, -1]);
+        let second = json!([2, 0]);
+        assert_eq!(
+            blend_with_boolean_mixer(
+                [(&first, 0.5), (&second, 0.5)].into_iter(),
+                "INT16_2D",
+                false,
+            ),
+            Some(json!([2, -1]))
+        );
+        assert_eq!(
+            blend_with_boolean_mixer([(&first, 0.0)].into_iter(), "SHORT2", false),
+            Some(json!([0, 0]))
+        );
+        assert_eq!(default_value("SHORT2"), json!([0, 0]));
+    }
+
+    #[test]
+    fn float4x4_mixer_reads_rows_and_column_major_values() {
+        let identity = json!([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]);
+        let translated = json!([
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0,
+        ]);
+        let expected = json!([
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]);
+        assert_eq!(
+            blend_with_boolean_mixer(
+                [(&identity, 0.5), (&translated, 0.5)].into_iter(),
+                "FLOAT4X4",
+                false,
+            ),
+            Some(expected)
+        );
+        assert_eq!(
+            blend_with_boolean_mixer([(&translated, 0.0)].into_iter(), "MATRIX", false),
+            Some(json!([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]))
+        );
+        assert_eq!(
+            default_value("FLOAT4X4"),
+            json!([
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ])
+        );
+    }
+
+    #[test]
+    fn float4x4_mixer_blends_rotation_in_expmap_space() {
+        let identity = json!([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]);
+        let quarter_turn = json!([
+            [0.0, -1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]);
+        let mixed = blend_with_boolean_mixer(
+            [(&identity, 0.5), (&quarter_turn, 0.5)].into_iter(),
+            "MATRIX",
+            false,
+        )
+        .expect("matrix mix");
+        assert!(mixed[0][1].as_f64().is_some_and(|value| value < 0.0));
+        assert!(mixed[1][0].as_f64().is_some_and(|value| value > 0.0));
     }
 
     #[test]

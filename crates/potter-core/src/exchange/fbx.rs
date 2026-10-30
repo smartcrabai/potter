@@ -2089,13 +2089,13 @@ fn fbx_decode_color(value: [f64; 4]) -> [f64; 4] {
     std::array::from_fn(|channel| decode_byte_color(value[channel], channel == 3))
 }
 /// Writes FBX `BYTE_COLOR` values: RGB is sRGB encoded, alpha is linear, and all channels are
-/// nearest-byte quantized. Blender imports all color layers into CORNER (`import_fbx.py`:
-/// `blen_read_geom_layer_color`); `ByVertice`/`Direct` expands point values onto loops. POINT
-/// domain loss is reported by `element_data_losses`. CORNER colors use ByPolygonVertex/IndexToDirect.
+/// nearest-byte quantized. POINT uses `ByVertice`, FACE uses `ByPolygon`, and CORNER uses
+/// `ByPolygonVertex`/`IndexToDirect`.
 fn write_color_layers(output: &mut String, mesh: &Mesh, store: &ColorStore) -> Result<()> {
     for (layer_index, layer) in store.layers.iter().enumerate() {
         let expected = match layer.domain {
             ColorDomain::Point => mesh.vertices.len(),
+            ColorDomain::Face => mesh.faces.len(),
             ColorDomain::Corner => mesh
                 .faces
                 .iter()
@@ -2122,6 +2122,17 @@ fn write_color_layers(output: &mut String, mesh: &Mesh, store: &ColorStore) -> R
         let (mapping, reference, values, indices) = match layer.domain {
             ColorDomain::Point => (
                 "ByVertice",
+                "Direct",
+                layer
+                    .values
+                    .iter()
+                    .copied()
+                    .map(fbx_encode_color)
+                    .collect::<Vec<_>>(),
+                None,
+            ),
+            ColorDomain::Face => (
+                "ByPolygon",
                 "Direct",
                 layer
                     .values
@@ -3454,6 +3465,7 @@ fn parse_color_layers(
             .unwrap_or("");
         let domain = match mapping {
             "ByPolygonVertex" => ColorDomain::Corner,
+            "ByPolygon" => ColorDomain::Face,
             "ByVertice" | "ByVertex" | "ByControlPoint" => ColorDomain::Point,
             _ => {
                 losses.push(color_import_loss(
@@ -3501,6 +3513,7 @@ fn parse_color_layers(
         let element_count = indices.as_ref().map_or(direct.len(), Vec::len);
         let expected = match domain {
             ColorDomain::Point => point_count,
+            ColorDomain::Face => faces.len(),
             ColorDomain::Corner => corner_count,
         };
         if element_count != expected {

@@ -415,6 +415,24 @@ pub(super) fn subdivide_simple_once(
     creases: &Creases,
     use_creases: bool,
 ) -> Result<SimpleSubdivision> {
+    subdivide_simple_once_internal(
+        mesh,
+        position,
+        source_polygons,
+        source_edges,
+        creases,
+        use_creases,
+    )
+}
+
+fn subdivide_simple_once_internal(
+    mesh: &Mesh,
+    position: &Position,
+    source_polygons: &[Polygon],
+    source_edges: &[[usize; 2]],
+    creases: &Creases,
+    use_creases: bool,
+) -> Result<SimpleSubdivision> {
     let source_points = positions(mesh);
     let face_points: Vec<DVec3> = source_polygons
         .iter()
@@ -469,15 +487,13 @@ pub(super) fn subdivided_mesh(
             let previous = face[(corner + face.len() - 1) % face.len()];
             let current = face[corner];
             let next = face[(corner + 1) % face.len()];
-            output_polygons.push((
-                vec![
-                    current,
-                    edge_points[&edge_key(current, next)],
-                    face_point_base + face_index,
-                    edge_points[&edge_key(previous, current)],
-                ],
-                *material,
-            ));
+            let vertices = vec![
+                current,
+                edge_points[&edge_key(current, next)],
+                face_point_base + face_index,
+                edge_points[&edge_key(previous, current)],
+            ];
+            output_polygons.push((vertices, *material));
         }
     }
     let mut output_loose_edges = Vec::with_capacity(source_edges.len() * 2);
@@ -517,7 +533,6 @@ pub(super) fn subdivided_mesh(
             .enumerate()
             .flat_map(|(index, (face, _))| std::iter::repeat_n(Some(index), face.len()))
             .collect(),
-        corners: None,
         ..Default::default()
     };
     let mut output = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
@@ -604,6 +619,16 @@ pub(super) fn encode_byte_colors(
                         &source_layer.values,
                         element_mix(mixing, &origin.vertices[index]),
                     )
+                })
+                .collect(),
+            ColorDomain::Face => origin
+                .faces
+                .iter()
+                .map(|source| {
+                    source
+                        .and_then(|index| source_layer.values.get(index))
+                        .copied()
+                        .unwrap_or([0.0; 4])
                 })
                 .collect(),
             ColorDomain::Corner => (0..corners.len())

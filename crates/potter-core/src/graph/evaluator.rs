@@ -1,8 +1,13 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     fmt::Write as _,
     hash::{Hash, Hasher},
-    sync::{Arc, LazyLock, Mutex},
+    rc::Rc,
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use glam::{DMat4, DQuat, DVec3, Vec3};
@@ -25,13 +30,25 @@ use super::{
     GraphKind, GraphNode, NodeBakeFrame, NodeBakeRecord, NodeBakeValue, NodeGroup, same_bake_frame,
     sockets::{bake_item_identifier, is_known_node_type, node_sockets, node_sockets_with_groups},
 };
+#[path = "mesh_extrude_nonface.rs"]
+mod mesh_extrude_nonface;
+#[path = "mesh_operations.rs"]
+mod mesh_operations;
+#[path = "mesh_topology.rs"]
+mod mesh_topology;
 
 const MAX_GENERATED_POINTS: usize = 1_000_000;
 const MAX_ZONE_ITERATIONS: i64 = 100_000;
 const MAX_SIMULATION_CACHE_ENTRIES: usize = 10_000;
 
 type SimulationCache = Mutex<BTreeMap<(String, Id, i64), GeometryValue>>;
+type MeshFieldCache = Rc<RefCell<HashMap<(u64, &'static str), Vec<Value>>>>;
+type DemandedOutputs = BTreeMap<Id, BTreeSet<String>>;
 
+const MESH_EVALUATION_CONTEXT_ATTRIBUTE: &str = ".potter_gn_evaluation_context";
+const ANONYMOUS_ATTRIBUTE_OWNER_MARKER: &str = "potter_gn_anonymous";
+
+static NEXT_MESH_EVALUATION_CONTEXT: AtomicU64 = AtomicU64::new(1);
 static SIMULATION_CACHE: LazyLock<SimulationCache> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -162,9 +179,21 @@ enum Field {
         data_type: Option<String>,
     },
     AttributeExists(String),
-    Captured {
-        domain: String,
-        values: Vec<Value>,
+    AnonymousAttribute {
+        name: String,
+        data_type: String,
+        cache: MeshFieldCache,
+    },
+    MeshInput {
+        node_type: String,
+        output: String,
+        cache: MeshFieldCache,
+    },
+    Topology {
+        node_type: String,
+        output: String,
+        inputs: Vec<Field>,
+        cache: MeshFieldCache,
     },
     Math {
         operation: String,
@@ -330,6 +359,8 @@ struct Evaluator<'a> {
     group: &'a NodeGroup,
     node_groups: &'a Registry<NodeGroup>,
     group_stack: Vec<Id>,
+    group_call_path: Vec<(Id, Id)>,
+    demanded_outputs: DemandedOutputs,
     group_inputs: BTreeMap<String, EvalValue>,
     top_level: bool,
     subject_name: &'a str,
@@ -352,6 +383,7 @@ struct Evaluator<'a> {
     capture_bake_nodes: &'a BTreeSet<String>,
     bake_captures: BTreeMap<String, NodeBakeFrame>,
     bake_material_refs: BTreeMap<String, Vec<Id>>,
+    owned_anonymous_attributes: Rc<RefCell<BTreeSet<String>>>,
 }
 
 /// Evaluate a geometry node group against an optional incoming mesh.
@@ -590,10 +622,20 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
             })
             .unwrap_or_else(|| socket.id.clone())
     };
+    let mut group_stack = group_id.cloned().into_iter().collect::<Vec<_>>();
+    let (_, demanded_outputs) = reachable_group_inputs(
+        group,
+        node_groups,
+        &output_node,
+        &output_socket,
+        &mut group_stack,
+    )?;
     let mut evaluator = Evaluator {
         group,
         node_groups,
-        group_stack: group_id.cloned().into_iter().collect(),
+        group_stack,
+        group_call_path: Vec::new(),
+        demanded_outputs,
         group_inputs: BTreeMap::new(),
         top_level: true,
         subject_name,
@@ -615,6 +657,7 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
         bake_records,
         capture_bake_nodes,
         bake_material_refs: BTreeMap::new(),
+        owned_anonymous_attributes: Rc::new(RefCell::new(BTreeSet::new())),
         bake_captures: BTreeMap::new(),
     };
     let initial_instances = evaluator.input_instances_for_graph();
@@ -627,7 +670,7 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
             instance_attributes: initial_instances,
         }),
     )?;
-    let EvalValue::Geometry(geometry) = value else {
+    let EvalValue::Geometry(mut geometry) = value else {
         return Err(PotError::new(
             ErrorCode::EvaluationFailed,
             "geometry group output is not geometry",
@@ -654,6 +697,10 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
             let _ = evaluator.output_value(&parsed_id, socket)?;
         }
     }
+    remove_anonymous_attributes(
+        &mut geometry.mesh,
+        &evaluator.owned_anonymous_attributes.borrow(),
+    );
     let mut instances = geometry.instance_attributes;
     if !collect_instance_attributes {
         instances.attributes.clear();
@@ -957,7 +1004,7 @@ fn reachable_group_inputs(
     output_node: &Id,
     output_socket: &str,
     group_stack: &mut Vec<Id>,
-) -> Result<BTreeSet<String>> {
+) -> Result<(BTreeSet<String>, DemandedOutputs)> {
     fn visit_output(
         group: &NodeGroup,
         node_groups: &Registry<NodeGroup>,
@@ -967,8 +1014,13 @@ fn reachable_group_inputs(
         visited: &mut BTreeSet<(Id, String)>,
         active: &mut BTreeSet<(Id, String)>,
         required: &mut BTreeSet<String>,
+        demanded: &mut DemandedOutputs,
     ) -> Result<()> {
         let key = (node_id.clone(), socket.to_owned());
+        demanded
+            .entry(node_id.clone())
+            .or_default()
+            .insert(socket.to_owned());
         if visited.contains(&key) {
             return Ok(());
         }
@@ -1025,7 +1077,7 @@ fn reachable_group_inputs(
             let child_output_node = select_group_output_node(child)?;
             let child_output_socket = output_socket.map_or("Geometry", |socket| socket.id.as_str());
             group_stack.push(group_id);
-            let child_inputs = reachable_group_inputs(
+            let (child_inputs, _) = reachable_group_inputs(
                 child,
                 node_groups,
                 &child_output_node,
@@ -1068,6 +1120,7 @@ fn reachable_group_inputs(
                         visited,
                         active,
                         required,
+                        demanded,
                     )?;
                 }
             }
@@ -1082,6 +1135,7 @@ fn reachable_group_inputs(
                     visited,
                     active,
                     required,
+                    demanded,
                 )?;
             }
         }
@@ -1091,6 +1145,7 @@ fn reachable_group_inputs(
     }
 
     let mut required = BTreeSet::new();
+    let mut demanded = DemandedOutputs::new();
     let mut visited = BTreeSet::new();
     let mut active = BTreeSet::new();
     let output_socket_name = group
@@ -1114,9 +1169,29 @@ fn reachable_group_inputs(
             &mut visited,
             &mut active,
             &mut required,
+            &mut demanded,
         )?;
     }
-    Ok(required)
+    Ok((required, demanded))
+}
+
+fn topology_index_input(node: &GraphNode, socket: &str) -> bool {
+    matches!(
+        (node.node_type.as_str(), socket),
+        ("GeometryNodeCornersOfEdge", "Edge Index")
+            | ("GeometryNodeCornersOfFace", "Face Index")
+            | (
+                "GeometryNodeCornersOfVertex" | "GeometryNodeEdgesOfVertex",
+                "Vertex Index"
+            )
+            | (
+                "GeometryNodeEdgesOfCorner"
+                    | "GeometryNodeFaceOfCorner"
+                    | "GeometryNodeVertexOfCorner"
+                    | "GeometryNodeOffsetCornerInFace",
+                "Corner Index",
+            )
+    )
 }
 
 impl Evaluator<'_> {
@@ -1365,6 +1440,30 @@ impl Evaluator<'_> {
             "GeometryNodeMeshLine" => self.mesh_line(id, node),
             "GeometryNodeTransform" => self.transform_node(id, node),
             "GeometryNodeSetPosition" => self.set_position_node(id, node),
+            "GeometryNodeExtrudeMesh"
+            | "GeometryNodeSplitEdges"
+            | "GeometryNodeMergeByDistance"
+            | "GeometryNodeFlipFaces"
+            | "GeometryNodeDeleteGeometry"
+            | "GeometryNodeSeparateGeometry"
+            | "GeometryNodeDualMesh"
+            | "GeometryNodeTriangulate"
+            | "GeometryNodeScaleElements"
+            | "GeometryNodeSubdivideMesh" => self.mesh_operation_node(id, node, socket),
+            "GeometryNodeInputMeshEdgeAngle"
+            | "GeometryNodeInputMeshEdgeNeighbors"
+            | "GeometryNodeInputMeshEdgeVertices"
+            | "GeometryNodeInputMeshFaceArea"
+            | "GeometryNodeInputMeshFaceNeighbors"
+            | "GeometryNodeInputMeshVertexNeighbors"
+            | "GeometryNodeCornersOfEdge"
+            | "GeometryNodeCornersOfFace"
+            | "GeometryNodeCornersOfVertex"
+            | "GeometryNodeEdgesOfCorner"
+            | "GeometryNodeEdgesOfVertex"
+            | "GeometryNodeFaceOfCorner"
+            | "GeometryNodeOffsetCornerInFace"
+            | "GeometryNodeVertexOfCorner" => self.topology_field_node(id, node, socket),
             "GeometryNodeJoinGeometry" => self.join_node(id),
             "GeometryNodeInstanceOnPoints" => self.instance_on_points(id, node),
             "GeometryNodeRealizeInstances" => self.realize_instances(id, node),
@@ -1475,6 +1574,59 @@ impl Evaluator<'_> {
             inputs,
             output: output.to_owned(),
         }))
+    }
+
+    fn topology_field_node(
+        &mut self,
+        id: &Id,
+        node: &GraphNode,
+        output: &str,
+    ) -> Result<EvalValue> {
+        if node.node_type.starts_with("GeometryNodeInputMesh") {
+            return Ok(EvalValue::Field(Field::MeshInput {
+                node_type: node.node_type.clone(),
+                output: output.to_owned(),
+                cache: Rc::new(RefCell::new(HashMap::new())),
+            }));
+        }
+        let input_names: &[&str] = match node.node_type.as_str() {
+            "GeometryNodeCornersOfEdge" => &["Edge Index", "Weights", "Sort Index"],
+            "GeometryNodeCornersOfFace" => &["Face Index", "Weights", "Sort Index"],
+            "GeometryNodeCornersOfVertex" | "GeometryNodeEdgesOfVertex" => {
+                &["Vertex Index", "Weights", "Sort Index"]
+            }
+            "GeometryNodeEdgesOfCorner"
+            | "GeometryNodeFaceOfCorner"
+            | "GeometryNodeVertexOfCorner" => &["Corner Index"],
+            "GeometryNodeOffsetCornerInFace" => &["Corner Index", "Offset"],
+            _ => return Err(evaluation("unknown mesh topology field node")),
+        };
+        let mut inputs = Vec::with_capacity(input_names.len());
+        for name in input_names {
+            let fallback = match *name {
+                "Weights" => EvalValue::Scalar(json!(0.0)),
+                "Offset" | "Sort Index" => EvalValue::Scalar(json!(0)),
+                _ => EvalValue::Field(Field::Index),
+            };
+            inputs.push(as_field(
+                self.input_value_with_node(id, node, name, fallback)?,
+            ));
+        }
+        Ok(EvalValue::Field(Field::Topology {
+            node_type: node.node_type.clone(),
+            output: output.to_owned(),
+            inputs,
+            cache: Rc::new(RefCell::new(HashMap::new())),
+        }))
+    }
+
+    fn mesh_operation_node(
+        &mut self,
+        id: &Id,
+        node: &GraphNode,
+        output: &str,
+    ) -> Result<EvalValue> {
+        mesh_operations::evaluate_node(self, id, node, output)
     }
 
     fn bake_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
@@ -1977,15 +2129,61 @@ impl Evaluator<'_> {
             .as_ref()
             .map_or_else(|| "Geometry".to_owned(), |socket| socket.id.clone());
         let child_input_sockets = child_group.interface.inputs.clone();
+        let parent_group_id = self
+            .group_stack
+            .last()
+            .cloned()
+            .or_else(|| Id::new("root".to_owned()).ok())
+            .ok_or_else(|| evaluation("root geometry node group has no stable identity"))?;
+        let mut group_call_path = self.group_call_path.clone();
+        group_call_path.push((parent_group_id, node_id.clone()));
         let mut group_stack = self.group_stack.clone();
         group_stack.push(group_id.clone());
-        let required_inputs = reachable_group_inputs(
-            child_group,
-            self.node_groups,
-            &output_node,
-            &output_link_socket,
-            &mut group_stack,
-        )?;
+        let mut required_inputs = BTreeSet::new();
+        let mut child_demanded_outputs = DemandedOutputs::new();
+        let mut demanded_group_outputs = self
+            .demanded_outputs
+            .get(node_id)
+            .cloned()
+            .unwrap_or_default();
+        demanded_group_outputs.insert(output_socket.to_owned());
+        for demanded_output in demanded_group_outputs {
+            let child_output = if child_group.interface.outputs.is_empty()
+                && demanded_output == "Geometry"
+            {
+                None
+            } else {
+                Some(
+                    child_group
+                        .interface
+                        .outputs
+                        .iter()
+                        .find(|candidate| {
+                            candidate.id == demanded_output || candidate.name == demanded_output
+                        })
+                        .ok_or_else(|| {
+                            evaluation(format!(
+                                "unknown output socket `{demanded_output}` on node group"
+                            ))
+                        })?,
+                )
+            };
+            let child_output_socket = child_output.map_or("Geometry", |socket| socket.id.as_str());
+            let (inputs, outputs) = reachable_group_inputs(
+                child_group,
+                self.node_groups,
+                &output_node,
+                child_output_socket,
+                &mut group_stack.clone(),
+            )?;
+            required_inputs.extend(inputs);
+            for (child_node, sockets) in outputs {
+                child_demanded_outputs
+                    .entry(child_node)
+                    .or_default()
+                    .extend(sockets);
+            }
+        }
         let mut group_inputs = BTreeMap::new();
         for interface_socket in &child_input_sockets {
             if !required_inputs.contains(&interface_socket.id) {
@@ -2064,6 +2262,8 @@ impl Evaluator<'_> {
             group: child_group,
             node_groups: self.node_groups,
             group_stack,
+            group_call_path,
+            demanded_outputs: child_demanded_outputs,
             group_inputs,
             top_level: false,
             subject_name: self.subject_name,
@@ -2086,6 +2286,7 @@ impl Evaluator<'_> {
             capture_bake_nodes: self.capture_bake_nodes,
             bake_captures: BTreeMap::new(),
             bake_material_refs: BTreeMap::new(),
+            owned_anonymous_attributes: Rc::clone(&self.owned_anonymous_attributes),
         };
         child.input_value(&output_node, &output_input_socket, output_value)
     }
@@ -2182,6 +2383,65 @@ impl Evaluator<'_> {
         })?;
         crate::hash::canonicalize(&serialized).map(|bytes| crate::hash::sha256(&bytes))
     }
+    pub(super) fn anonymous_attribute_name(&self, node_id: &Id, socket: &str) -> String {
+        let mut name = ".potter_gn_anonymous".to_owned();
+        for (parent_group_id, callsite_node_id) in &self.group_call_path {
+            let parent_group_id = parent_group_id.to_string();
+            let callsite_node_id = callsite_node_id.to_string();
+            let _ = write!(
+                name,
+                "_{}:{}_{}:{}",
+                parent_group_id.len(),
+                parent_group_id,
+                callsite_node_id.len(),
+                callsite_node_id
+            );
+        }
+        let group_id = self
+            .group_stack
+            .last()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let group_name = &self.group.name;
+        let node_id = node_id.to_string();
+        let _ = write!(
+            name,
+            "_{}:{}_{}:{}_{}:{}_{}:{}",
+            group_id.len(),
+            group_id,
+            group_name.len(),
+            group_name,
+            node_id.len(),
+            node_id,
+            socket.len(),
+            socket
+        );
+        name
+    }
+    pub(super) fn store_owned_anonymous_attribute(
+        &mut self,
+        mesh: &mut Mesh,
+        name: &str,
+        domain: &str,
+        data_type: &str,
+        values: &[Value],
+    ) -> Result<()> {
+        store_anonymous_attribute(mesh, name, domain, data_type, values)?;
+        self.owned_anonymous_attributes
+            .borrow_mut()
+            .insert(name.to_owned());
+        Ok(())
+    }
+    pub(super) fn output_is_demanded(&self, node_id: &Id, socket: &str) -> bool {
+        self.demanded_outputs
+            .get(node_id)
+            .is_some_and(|sockets| sockets.contains(socket))
+            || self.group.links.iter().any(|link| {
+                &link.from_node == node_id
+                    && link.from_socket == socket
+                    && self.active.contains(&link.to_node)
+            })
+    }
 
     fn input_value(
         &mut self,
@@ -2227,8 +2487,16 @@ impl Evaluator<'_> {
         {
             return self.output_value(&link.from_node, &link.from_socket);
         }
-        if node.node_type == "GeometryNodeSetPosition" && socket == "Position" {
+        if topology_index_input(node, socket) {
+            return Ok(EvalValue::Field(Field::Index));
+        }
+        if node.node_type == "GeometryNodeSetPosition" && socket == "Position"
+            || node.node_type == "GeometryNodeScaleElements" && socket == "Center"
+        {
             return Ok(EvalValue::Field(Field::Position));
+        }
+        if node.node_type == "GeometryNodeExtrudeMesh" && socket == "Offset" {
+            return Ok(EvalValue::Field(Field::Normal));
         }
         if let Some(value) = node.inputs.get(socket) {
             return Ok(EvalValue::Scalar(value.clone()));
@@ -2253,9 +2521,11 @@ impl Evaluator<'_> {
     }
 
     fn geometry_input(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
-        let input = self.input_geometry(id, node, socket)?;
-        match input {
-            EvalValue::Geometry(geometry) => {
+        match self.input_geometry(id, node, socket)? {
+            EvalValue::Geometry(mut geometry) => {
+                if mesh_field_context_id(&geometry.mesh) == 0 {
+                    set_mesh_evaluation_context(&mut geometry.mesh);
+                }
                 let instance_aware = matches!(
                     node.node_type.as_str(),
                     "GeometryNodeRealizeInstances"
@@ -3419,24 +3689,27 @@ impl Evaluator<'_> {
     }
 
     fn capture_attribute(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
-        if socket != "Attribute" {
-            return self.geometry_input(id, node, "Geometry");
-        }
         if node
             .properties
             .get("capture_items")
             .and_then(Value::as_array)
             .is_some_and(|items| !items.is_empty())
         {
+            if socket != "Attribute" {
+                return self.geometry_input(id, node, "Geometry");
+            }
             return Err(unsupported_graph_feature(
                 id,
                 "graph.node.capture_attribute.dynamic_items",
                 "Capture Attribute nodes with dynamic capture items are not implemented",
             ));
         }
+        if socket != "Attribute" && !self.output_is_demanded(id, "Attribute") {
+            return self.geometry_input(id, node, "Geometry");
+        }
         let data_type =
             named_attribute_data_type(id, node, "graph.node.capture_attribute.data_type")?;
-        let geometry = into_geometry(self.geometry_input(id, node, "Geometry")?)?;
+        let mut geometry = into_geometry(self.geometry_input(id, node, "Geometry")?)?;
         let domain = node
             .properties
             .get("domain")
@@ -3472,10 +3745,24 @@ impl Evaluator<'_> {
                 values.push(named_attribute_zero(&data_type));
             }
         }
-        Ok(EvalValue::Field(Field::Captured {
-            domain: domain.to_owned(),
-            values,
-        }))
+        let base_name = self.anonymous_attribute_name(id, "Attribute");
+        let attribute_name = unique_anonymous_attribute_name(&geometry.mesh, &base_name)?;
+        if socket == "Attribute" {
+            Ok(EvalValue::Field(Field::AnonymousAttribute {
+                name: attribute_name,
+                data_type,
+                cache: Rc::default(),
+            }))
+        } else {
+            self.store_owned_anonymous_attribute(
+                &mut geometry.mesh,
+                &attribute_name,
+                domain,
+                &data_type,
+                &values,
+            )?;
+            Ok(EvalValue::Geometry(geometry))
+        }
     }
 
     fn math_node(&mut self, id: &Id, node: &GraphNode) -> Result<EvalValue> {
@@ -5174,11 +5461,19 @@ fn default_input(node_type: &str, socket: &str) -> Option<Value> {
             "GeometryNodeSetPosition"
             | "GeometryNodeInstanceOnPoints"
             | "GeometryNodeDistributePointsOnFaces"
-            | "GeometryNodeMeshToPoints",
+            | "GeometryNodeMeshToPoints"
+            | "GeometryNodeSplitEdges"
+            | "GeometryNodeFlipFaces"
+            | "GeometryNodeMergeByDistance"
+            | "GeometryNodeDeleteGeometry"
+            | "GeometryNodeSeparateGeometry"
+            | "GeometryNodeTriangulate"
+            | "GeometryNodeScaleElements",
             "Selection",
         )
         | ("GeometryNodeRealizeInstances", "Selection" | "Realize All")
-        | ("GeometryNodeSubdivisionSurface", "Limit Surface") => json!(true),
+        | ("GeometryNodeSubdivisionSurface", "Limit Surface")
+        | ("GeometryNodeExtrudeMesh", "Selection" | "Individual") => json!(true),
         ("GeometryNodeRealizeInstances", "Depth")
         | ("GeometryNodeDistributePointsOnFaces", "Seed")
         | ("FunctionNodeIntegerMath", "Value" | "Value_001" | "Value_002") => json!(0),
@@ -5186,15 +5481,138 @@ fn default_input(node_type: &str, socket: &str) -> Option<Value> {
         ("GeometryNodeDistributePointsOnFaces", "Density" | "Density Max") => json!(10.0),
         ("GeometryNodeSubdivisionSurface", "Quality") => json!(3),
         ("GeometryNodeSubdivisionSurface", "UV Smooth") => json!("PRESERVE_BOUNDARIES"),
-        ("GeometryNodeSubdivisionSurface", "Boundary Smooth") => json!("ALL"),
-        ("GeometryNodeSimulationOutput", "Skip") => json!(false),
-        ("GeometryNodeRepeatInput", "Iterations") => json!(1),
-        ("ShaderNodeMath", "Value" | "Value_001" | "Value_002") | ("ShaderNodeMixRGB", "Fac") => {
-            json!(0.5)
+        ("GeometryNodeSubdivisionSurface", "Boundary Smooth")
+        | ("GeometryNodeMergeByDistance", "Mode") => json!("ALL"),
+        ("GeometryNodeSimulationOutput", "Skip") | ("GeometryNodeDualMesh", "Keep Boundaries") => {
+            json!(false)
         }
+        ("GeometryNodeExtrudeMesh", "Offset Scale") | ("GeometryNodeScaleElements", "Scale") => {
+            json!(1.0)
+        }
+        ("GeometryNodeMergeByDistance", "Distance") => json!(0.001),
+        ("GeometryNodeTriangulate", "Quad Method") => json!("SHORTEST_DIAGONAL"),
+        ("GeometryNodeTriangulate", "N-gon Method") => json!("BEAUTY"),
+        ("GeometryNodeScaleElements", "Scale Mode") => json!("UNIFORM"),
+        ("GeometryNodeScaleElements", "Axis") => json!([1.0, 0.0, 0.0]),
+        ("GeometryNodeSubdivideMesh", "Level") | ("GeometryNodeRepeatInput", "Iterations") => {
+            json!(1)
+        }
+        ("ShaderNodeMath", "Value" | "Value_001" | "Value_002")
+        | ("ShaderNodeMixRGB", "Fac") => json!(0.5),
         _ => return None,
     };
     Some(value)
+}
+fn scalar_input(
+    evaluator: &mut Evaluator<'_>,
+    id: &Id,
+    node: &GraphNode,
+    socket: &str,
+    fallback: Value,
+) -> Result<Value> {
+    match evaluator.input_value_with_node(id, node, socket, EvalValue::Scalar(fallback))? {
+        EvalValue::Scalar(value) | EvalValue::Field(Field::Constant(value)) => Ok(value),
+        EvalValue::Field(_) => Err(evaluation(format!(
+            "input `{socket}` on `{}` must be a single value",
+            node.node_type
+        ))),
+        EvalValue::Geometry(_) => Err(evaluation(format!(
+            "input `{socket}` on `{}` is not a value",
+            node.node_type
+        ))),
+    }
+}
+
+fn scalar_bool_input(
+    evaluator: &mut Evaluator<'_>,
+    id: &Id,
+    node: &GraphNode,
+    socket: &str,
+    fallback: bool,
+) -> Result<bool> {
+    scalar_input(evaluator, id, node, socket, json!(fallback))?
+        .as_bool()
+        .ok_or_else(|| evaluation(format!("input `{socket}` must be boolean")))
+}
+
+fn scalar_number_input(
+    evaluator: &mut Evaluator<'_>,
+    id: &Id,
+    node: &GraphNode,
+    socket: &str,
+    fallback: f64,
+) -> Result<f64> {
+    scalar_input(evaluator, id, node, socket, json!(fallback))?
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| evaluation(format!("input `{socket}` must be a finite number")))
+}
+
+fn scalar_integer_input(
+    evaluator: &mut Evaluator<'_>,
+    id: &Id,
+    node: &GraphNode,
+    socket: &str,
+    fallback: i64,
+) -> Result<i64> {
+    scalar_input(evaluator, id, node, socket, json!(fallback))?
+        .as_i64()
+        .ok_or_else(|| evaluation(format!("input `{socket}` must be an integer")))
+}
+
+fn scalar_string_input(
+    evaluator: &mut Evaluator<'_>,
+    id: &Id,
+    node: &GraphNode,
+    socket: &str,
+    fallback: &str,
+) -> Result<String> {
+    scalar_input(evaluator, id, node, socket, json!(fallback))?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| evaluation(format!("input `{socket}` must be a menu value")))
+}
+
+fn property_string(node: &GraphNode, name: &str, default: &str) -> Result<String> {
+    node.properties.get(name).map_or_else(
+        || Ok(default.to_owned()),
+        |value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| evaluation(format!("node property `{name}` must be a string")))
+        },
+    )
+}
+
+fn canonical_mesh_domain(domain: &str) -> Result<&'static str> {
+    match domain {
+        "POINT" | "POINTS" | "VERTEX" | "VERTICES" => Ok("POINT"),
+        "EDGE" | "EDGES" => Ok("EDGE"),
+        "FACE" | "FACES" => Ok("FACE"),
+        _ => Err(evaluation(format!("unsupported mesh domain `{domain}`"))),
+    }
+}
+
+fn parse_quad_method(value: &str) -> Result<crate::geom::triangulate::QuadMethod> {
+    use crate::geom::triangulate::QuadMethod;
+    match value {
+        "BEAUTY" | "Beauty" => Ok(QuadMethod::Beauty),
+        "FIXED" | "Fixed" => Ok(QuadMethod::Fixed),
+        "FIXED_ALTERNATE" | "Fixed Alternate" => Ok(QuadMethod::FixedAlternate),
+        "SHORTEST_DIAGONAL" | "Shortest Diagonal" => Ok(QuadMethod::ShortestDiagonal),
+        "LONGEST_DIAGONAL" | "Longest Diagonal" => Ok(QuadMethod::LongestDiagonal),
+        _ => Err(evaluation("unsupported Triangulate quad method")),
+    }
+}
+
+fn parse_ngon_method(value: &str) -> Result<crate::geom::triangulate::NgonMethod> {
+    use crate::geom::triangulate::NgonMethod;
+    match value {
+        "BEAUTY" | "Beauty" => Ok(NgonMethod::Beauty),
+        "CLIP" | "Clip" => Ok(NgonMethod::Clip),
+        _ => Err(evaluation("unsupported Triangulate n-gon method")),
+    }
 }
 
 fn as_field(value: EvalValue) -> Field {
@@ -5202,6 +5620,43 @@ fn as_field(value: EvalValue) -> Field {
         EvalValue::Field(field) => field,
         EvalValue::Scalar(value) => Field::Constant(value),
         EvalValue::Geometry(_) => Field::Constant(Value::Null),
+    }
+}
+fn field_is_single(field: &Field) -> bool {
+    match field {
+        Field::Constant(_) => true,
+        Field::Math {
+            first,
+            second,
+            third,
+            ..
+        } => field_is_single(first) && field_is_single(second) && field_is_single(third),
+        Field::VectorMath {
+            first,
+            second,
+            third,
+            scale,
+            ..
+        } => {
+            field_is_single(first)
+                && field_is_single(second)
+                && field_is_single(third)
+                && field_is_single(scale)
+        }
+        Field::CombineXYZ { x, y, z } => {
+            field_is_single(x) && field_is_single(y) && field_is_single(z)
+        }
+        Field::SeparateXYZ { vector, .. } => field_is_single(vector),
+        Field::Position
+        | Field::Normal
+        | Field::Index
+        | Field::IdOrIndex
+        | Field::Attribute { .. }
+        | Field::AttributeExists(_)
+        | Field::AnonymousAttribute { .. }
+        | Field::MeshInput { .. }
+        | Field::Topology { .. }
+        | Field::Random { .. } => false,
     }
 }
 
@@ -5220,6 +5675,112 @@ enum FieldEvaluationContext<'a> {
         transform: &'a [f64; 16],
         instance_count: usize,
     },
+}
+
+fn blender_attribute<'a>(mesh: &'a Mesh, name: &str) -> Option<&'a Value> {
+    mesh.attributes
+        .get("blender_attributes")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|attribute| attribute.get("name").and_then(Value::as_str) == Some(name))
+}
+
+fn mesh_attribute<'a>(mesh: &'a Mesh, name: &str) -> Option<&'a Value> {
+    mesh.attributes
+        .get(name)
+        .or_else(|| blender_attribute(mesh, name))
+}
+pub(super) fn unique_anonymous_attribute_name(mesh: &Mesh, base: &str) -> Result<String> {
+    if mesh_attribute(mesh, base).is_none() {
+        return Ok(base.to_owned());
+    }
+    let mut suffix = 1_u64;
+    loop {
+        let name = format!("{base}_{suffix}");
+        if mesh_attribute(mesh, &name).is_none() {
+            return Ok(name);
+        }
+        suffix = suffix
+            .checked_add(1)
+            .ok_or_else(|| evaluation("anonymous attribute name space is exhausted"))?;
+    }
+}
+
+fn anonymous_attribute<'a>(mesh: &'a Mesh, name: &str) -> Option<&'a Value> {
+    let attribute = blender_attribute(mesh, name)?;
+    (attribute
+        .get(ANONYMOUS_ATTRIBUTE_OWNER_MARKER)
+        .and_then(Value::as_bool)
+        == Some(true))
+    .then_some(attribute)
+}
+pub(super) fn mesh_field_context_id(mesh: &Mesh) -> u64 {
+    mesh.attributes
+        .get(MESH_EVALUATION_CONTEXT_ATTRIBUTE)
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn set_mesh_evaluation_context(mesh: &mut Mesh) {
+    let mut context_id = NEXT_MESH_EVALUATION_CONTEXT.fetch_add(1, Ordering::Relaxed);
+    if context_id == 0 {
+        context_id = NEXT_MESH_EVALUATION_CONTEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    mesh.attributes.insert(
+        MESH_EVALUATION_CONTEXT_ATTRIBUTE.to_owned(),
+        json!(context_id),
+    );
+}
+
+pub(super) fn store_anonymous_attribute(
+    mesh: &mut Mesh,
+    name: &str,
+    domain: &str,
+    data_type: &str,
+    values: &[Value],
+) -> Result<()> {
+    let layers = mesh
+        .attributes
+        .entry("blender_attributes".to_owned())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| evaluation("Blender mesh attribute layers are malformed"))?;
+    layers.retain(|layer| layer.get("name").and_then(Value::as_str) != Some(name));
+    layers.push(json!({
+        "name": name,
+        "domain": domain,
+        "data_type": data_type,
+        "values": values,
+        "potter_gn_anonymous": true,
+    }));
+    Ok(())
+}
+
+fn remove_anonymous_attributes(mesh: &mut Mesh, owned: &BTreeSet<String>) {
+    let remove_container = if let Some(layers) = mesh
+        .attributes
+        .get_mut("blender_attributes")
+        .and_then(Value::as_array_mut)
+    {
+        layers.retain(|layer| {
+            let owned_name = layer
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| owned.contains(name));
+            !owned_name
+                || layer
+                    .get(ANONYMOUS_ATTRIBUTE_OWNER_MARKER)
+                    .and_then(Value::as_bool)
+                    != Some(true)
+        });
+        layers.is_empty()
+    } else {
+        false
+    };
+    if remove_container {
+        mesh.attributes.remove("blender_attributes");
+    }
+    mesh.attributes.remove(MESH_EVALUATION_CONTEXT_ATTRIBUTE);
 }
 
 fn field_json(field: &Field, mesh: &Mesh, index: usize, domain: &str) -> Result<Value> {
@@ -5346,9 +5907,7 @@ fn field_json_in_context(
         Field::IdOrIndex => id_or_index_value(context, index, domain)?,
         Field::Attribute { name, data_type } => match context {
             FieldEvaluationContext::Mesh(mesh) => {
-                let attribute = mesh
-                    .attributes
-                    .get(name)
+                let attribute = mesh_attribute(mesh, name)
                     .ok_or_else(|| evaluation("named attribute does not exist"))?;
                 if attribute
                     .get("domain")
@@ -5361,6 +5920,7 @@ fn field_json_in_context(
                 }
                 let values = attribute
                     .get("data")
+                    .or_else(|| attribute.get("values"))
                     .and_then(Value::as_array)
                     .ok_or_else(|| evaluation("named attribute payload is malformed"))?;
                 validate_named_attribute_conversion(data_type.as_deref(), attribute, values)?;
@@ -5416,9 +5976,52 @@ fn field_json_in_context(
             }
         },
         Field::AttributeExists(name) => match context {
-            FieldEvaluationContext::Mesh(mesh) => json!(mesh.attributes.contains_key(name)),
+            FieldEvaluationContext::Mesh(mesh) => json!(mesh_attribute(mesh, name).is_some()),
             FieldEvaluationContext::Instance { attributes, .. } => {
                 json!(name == "instance_transform" || attributes.contains_key(name))
+            }
+        },
+        Field::AnonymousAttribute {
+            name,
+            data_type,
+            cache,
+        } => match context {
+            FieldEvaluationContext::Mesh(mesh) => {
+                if let Some(attribute) = anonymous_attribute(mesh, name) {
+                    let source_domain = attribute
+                        .get("domain")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| evaluation("anonymous attribute domain is malformed"))?;
+                    let values = attribute
+                        .get("data")
+                        .or_else(|| attribute.get("values"))
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| evaluation("anonymous attribute payload is malformed"))?;
+                    let empty_value = named_attribute_zero(data_type);
+                    mesh_topology::cached_mesh_field_value(
+                        cache,
+                        mesh,
+                        domain,
+                        index,
+                        |cached_mesh, destination_domain| {
+                            mesh_topology::adapt_mesh_field_values(
+                                values,
+                                source_domain,
+                                destination_domain,
+                                cached_mesh,
+                                &empty_value,
+                            )
+                        },
+                    )?
+                } else {
+                    named_attribute_zero(data_type)
+                }
+            }
+            FieldEvaluationContext::Instance { .. } => {
+                return Err(unsupported_instance_field_feature(
+                    "constraint.geometry_attribute.instances.anonymous_mesh_attribute",
+                    "anonymous mesh attributes are not available on the Instances component",
+                ));
             }
         },
         Field::Captured {
@@ -5434,12 +6037,66 @@ fn field_json_in_context(
                 .get(index)
                 .cloned()
                 .ok_or_else(|| evaluation("captured attribute index is out of range"))?
-        }
+        },
         Field::ProceduralTexture {
             kind,
             inputs,
             output,
         } => procedural_texture_field_value(kind, inputs, output, context, index, domain)?,
+        Field::MeshInput {
+            node_type,
+            output,
+            cache,
+        } => match context {
+            FieldEvaluationContext::Mesh(mesh) => mesh_topology::cached_mesh_field_value(
+                cache,
+                mesh,
+                domain,
+                index,
+                |cached_mesh, cached_domain| {
+                    mesh_topology::mesh_input_field_values(
+                        cached_mesh,
+                        node_type,
+                        output,
+                        cached_domain,
+                    )
+                },
+            )?,
+            FieldEvaluationContext::Instance { .. } => {
+                return Err(unsupported_instance_field_feature(
+                    "constraint.geometry_attribute.instances.mesh_topology",
+                    "mesh topology fields are not supported on the Instances component",
+                ));
+            }
+        },
+        Field::Topology {
+            node_type,
+            output,
+            inputs,
+            cache,
+        } => match context {
+            FieldEvaluationContext::Mesh(mesh) => mesh_topology::cached_mesh_field_value(
+                cache,
+                mesh,
+                domain,
+                index,
+                |cached_mesh, cached_domain| {
+                    mesh_topology::mesh_topology_field_values(
+                        cached_mesh,
+                        node_type,
+                        output,
+                        inputs,
+                        cached_domain,
+                    )
+                },
+            )?,
+            FieldEvaluationContext::Instance { .. } => {
+                return Err(unsupported_instance_field_feature(
+                    "constraint.geometry_attribute.instances.mesh_topology",
+                    "mesh topology fields are not supported on the Instances component",
+                ));
+            }
+        },
         Field::Math {
             operation,
             clamp,
@@ -8451,5 +9108,61 @@ mod node_bake_tests {
             }
         );
         Ok(())
+    }
+}
+#[cfg(test)]
+mod anonymous_attribute_cleanup_tests {
+    use std::collections::BTreeSet;
+
+    use serde_json::json;
+
+    use super::{MESH_EVALUATION_CONTEXT_ATTRIBUTE, remove_anonymous_attributes};
+    use crate::geom::Mesh;
+
+    #[test]
+    fn cleanup_removes_only_attributes_owned_by_this_evaluation() {
+        let mut mesh = Mesh::new();
+        mesh.attributes.insert(
+            "blender_attributes".to_owned(),
+            json!([
+                {
+                    "name": ".potter_gn_anonymous_owned",
+                    "domain": "POINT",
+                    "data_type": "BOOLEAN",
+                    "values": [],
+                    "potter_gn_anonymous": true,
+                },
+                {
+                    "name": ".potter_gn_anonymous_incoming",
+                    "domain": "POINT",
+                    "data_type": "BOOLEAN",
+                    "values": [],
+                    "potter_gn_anonymous": true,
+                },
+            ]),
+        );
+        mesh.attributes
+            .insert(MESH_EVALUATION_CONTEXT_ATTRIBUTE.to_owned(), json!(7));
+
+        remove_anonymous_attributes(
+            &mut mesh,
+            &BTreeSet::from([".potter_gn_anonymous_owned".to_owned()]),
+        );
+
+        assert_eq!(
+            mesh.attributes["blender_attributes"],
+            json!([{
+                "name": ".potter_gn_anonymous_incoming",
+                "domain": "POINT",
+                "data_type": "BOOLEAN",
+                "values": [],
+                "potter_gn_anonymous": true,
+            }])
+        );
+        assert!(
+            !mesh
+                .attributes
+                .contains_key(MESH_EVALUATION_CONTEXT_ATTRIBUTE)
+        );
     }
 }

@@ -1596,6 +1596,11 @@ fn transfer_float_color_layers(
                     .get(corner_starts[slot][local_face] + corner)
                     .copied()
                     .unwrap_or([1.0, 1.0, 1.0, 1.0]),
+                ColorDomain::Face => source
+                    .values
+                    .get(local_face)
+                    .copied()
+                    .unwrap_or([1.0, 1.0, 1.0, 1.0]),
                 ColorDomain::Point => vertex_indices[slot]
                     .get(&vertex_id)
                     .and_then(|&index| source.values.get(index).copied())

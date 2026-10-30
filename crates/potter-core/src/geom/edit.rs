@@ -3584,6 +3584,18 @@ fn apply_flip_normals(mesh: &mut Mesh, selected: &Selection) -> Result<IdChanges
     Ok(IdChanges::default())
 }
 
+fn apply_flip_faces(mesh: &mut Mesh, selected: &Selection) -> Result<IdChanges> {
+    if selected.domain != Domain::Face {
+        return Err(invalid("flip_faces requires face elements"));
+    }
+    for face in &mut mesh.faces {
+        if selected.ids.contains(&face.id) && face.vertices.len() > 1 {
+            face.vertices[1..].reverse();
+        }
+    }
+    Ok(IdChanges::default())
+}
+
 fn attribute_domain(value: &Value) -> Result<(&'static str, Domain)> {
     match value.as_str() {
         Some("point" | "vertex" | "vertices") => Ok(("point", Domain::Vertex)),
@@ -3727,6 +3739,7 @@ fn create_color_layer(
     let color = color_components(default)?;
     let count: usize = match domain {
         ColorDomain::Point => mesh.vertices.len(),
+        ColorDomain::Face => mesh.faces.len(),
         ColorDomain::Corner => mesh.faces.iter().map(|face| face.vertices.len()).sum(),
     };
     color_layers::validate(mesh)?;
@@ -3786,8 +3799,13 @@ fn apply_attribute_create(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<
     if attribute_type == "color" {
         let domain = match domain_name {
             "point" => ColorDomain::Point,
+            "face" => ColorDomain::Face,
             "corner" => ColorDomain::Corner,
-            _ => return Err(invalid("color attributes use the point or corner domain")),
+            _ => {
+                return Err(invalid(
+                    "color attributes use the point, face, or corner domain",
+                ));
+            }
         };
         create_color_layer(mesh, name, domain, &default)?;
         return Ok(IdChanges::default());
@@ -4627,6 +4645,7 @@ fn is_topology_operation(operation: &str, args: &Map<String, Value>) -> bool {
             | "bevel"
             | "subdivide"
             | "triangulate"
+            | "flip_faces"
             | "poke"
             | "rip"
             | "merge"
@@ -5364,7 +5383,7 @@ fn rebase_multires(
     operation: &str,
     sources_by_face: &HashMap<u32, Vec<MdispLoopSource>>,
 ) -> Result<()> {
-    if operation == "flip_normals" {
+    if matches!(operation, "flip_normals" | "flip_faces") {
         flip_multires(source, target, data)
     } else {
         interpolate_multires(source, target, data, sources_by_face)
@@ -7320,7 +7339,7 @@ fn apply_operation(
         "screw" => &["elements", "axis", "angle", "center", "distance", "steps"],
         "merge" => &["elements", "mode", "cursor"],
         "rip" | "shade_smooth" | "shade_flat" | "triangulate" | "poke" | "delete" | "dissolve"
-        | "fill" | "flip_normals" | "bridge" | "split" => &["elements"],
+        | "fill" | "flip_normals" | "flip_faces" | "bridge" | "split" => &["elements"],
         "auto_smooth" | "mark_sharp_by_angle" => &["elements", "angle"],
         "set_custom_normals" => &["elements", "normals"],
         "bevel" => &["elements", "width", "amount"],
@@ -7424,6 +7443,7 @@ fn apply_operation(
         "symmetrize" => apply_symmetrize(mesh, args, multires_data.as_mut())?,
         "mirror" => apply_mirror(mesh, args)?,
         "flip_normals" => apply_flip_normals(mesh, &required_selection(mesh, args)?)?,
+        "flip_faces" => apply_flip_faces(mesh, &required_selection(mesh, args)?)?,
         "shade_smooth" => apply_shade(mesh, &required_selection(mesh, args)?, true)?,
         "shade_flat" => apply_shade(mesh, &required_selection(mesh, args)?, false)?,
         "auto_smooth" => apply_auto_smooth(mesh, args)?,
@@ -8738,13 +8758,9 @@ mod tests {
     }
 
     #[test]
-    fn attribute_create_color_rejects_edge_and_face_domains_and_byte_color() {
+    fn attribute_create_color_rejects_edge_and_byte_color_and_accepts_face() {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        for (domain, kind) in [
-            ("edge", "color"),
-            ("face", "color"),
-            ("point", "byte_color"),
-        ] {
+        for (domain, kind) in [("edge", "color"), ("point", "byte_color")] {
             let result = apply(
                 &mut mesh,
                 "attribute_create",
@@ -8754,6 +8770,15 @@ mod tests {
         }
         assert!(!mesh.attributes.contains_key("Bad"));
         assert!(!mesh.attributes.contains_key(color_layers::ATTRIBUTE));
+        apply(
+            &mut mesh,
+            "attribute_create",
+            &json!({"name":"FaceColor","domain":"face","type":"color","default":[0.25,0.5,0.75,1.0]}),
+        )
+        .unwrap();
+        let store = color_layers::read(&mesh);
+        assert_eq!(store.layers[0].domain, ColorDomain::Face);
+        assert_eq!(store.layers[0].values.len(), mesh.faces.len());
     }
 
     #[test]

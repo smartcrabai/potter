@@ -8257,12 +8257,13 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
             blender_attributes.push(entry.clone());
             continue;
         }
-        if matches!(data_type, "FLOAT_COLOR" | "BYTE_COLOR") && matches!(domain, "POINT" | "CORNER")
+        if matches!(data_type, "FLOAT_COLOR" | "BYTE_COLOR")
+            && matches!(domain, "POINT" | "FACE" | "CORNER")
         {
-            let color_domain = if domain == "POINT" {
-                ColorDomain::Point
-            } else {
-                ColorDomain::Corner
+            let color_domain = match domain {
+                "POINT" => ColorDomain::Point,
+                "FACE" => ColorDomain::Face,
+                _ => ColorDomain::Corner,
             };
             let colors = color_layer_values(&mesh, name, color_domain, array(entry, "values")?)?;
             color_list.push(ColorLayer {
@@ -8645,8 +8646,7 @@ fn native_attribute_entries(
     Ok(entries)
 }
 
-/// One color layer's values in storage order, read as linear RGBA. A point layer has one value per
-/// vertex and a corner layer one per loop. Values are not clamped.
+/// One color layer's values in storage order, read as linear RGBA. Values are not clamped.
 fn color_layer_values(
     mesh: &Mesh,
     name: &str,
@@ -8655,6 +8655,7 @@ fn color_layer_values(
 ) -> Result<Vec<[f64; 4]>> {
     let expected = match domain {
         ColorDomain::Point => mesh.vertices.len(),
+        ColorDomain::Face => mesh.faces.len(),
         ColorDomain::Corner => mesh.faces.iter().map(|face| face.vertices.len()).sum(),
     };
     if values.len() != expected {

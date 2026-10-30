@@ -4638,6 +4638,32 @@ pub(crate) fn write_dynamic_paint_color_layer(
         .map_or(default_domain, |layer| layer.domain);
     let values = match domain {
         crate::geom::color_layers::ColorDomain::Point => colors.to_vec(),
+        crate::geom::color_layers::ColorDomain::Face => {
+            let vertex_indices = mesh
+                .vertices
+                .iter()
+                .enumerate()
+                .map(|(index, vertex)| (vertex.id, index))
+                .collect::<std::collections::HashMap<_, _>>();
+            mesh.faces
+                .iter()
+                .map(|face| {
+                    let mut color = [0.0; 4];
+                    for vertex_id in &face.vertices {
+                        let index = vertex_indices.get(vertex_id).copied().ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::SceneInvalid,
+                                "dynamic-paint face references a missing vertex",
+                            )
+                        })?;
+                        for (component, value) in color.iter_mut().zip(colors[index]) {
+                            *component += value / face.vertices.len() as f64;
+                        }
+                    }
+                    Ok(color)
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
         crate::geom::color_layers::ColorDomain::Corner => {
             let mut vertex_indices = std::collections::HashMap::with_capacity(mesh.vertices.len());
             for (index, vertex) in mesh.vertices.iter().enumerate() {

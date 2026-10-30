@@ -2791,13 +2791,9 @@ fn color_element_layout(
             (0..corner_count).collect(),
         )),
         "uniform" => Ok((
-            ColorDomain::Corner,
+            ColorDomain::Face,
             mesh.faces.len(),
-            mesh.faces
-                .iter()
-                .enumerate()
-                .flat_map(|(face, corners)| std::iter::repeat_n(face, corners.vertices.len()))
-                .collect(),
+            (0..mesh.faces.len()).collect(),
         )),
         other => Err(format!(
             "uses unsupported interpolation `{other}`; only constant, uniform, vertex, varying, and faceVarying color primvars are imported"
@@ -3935,6 +3931,7 @@ fn write_color_primvars(
     for (layer, primvar_name) in store.layers.iter().zip(primvar_names) {
         let (interpolation, expected) = match layer.domain {
             ColorDomain::Point => ("vertex", exchange.positions.len()),
+            ColorDomain::Face => ("uniform", exchange.faces.len()),
             ColorDomain::Corner => ("faceVarying", corner_count),
         };
         if layer.values.len() != expected {
@@ -4576,16 +4573,13 @@ def Material "M"
     }
 
     #[test]
-    fn uniform_display_color_lands_on_corners_one_value_per_face() -> Result<()> {
-        // Blender: a uniform displayColor is copied to the corners of each face (`read_face_display_color`).
+    fn uniform_display_color_stays_on_the_face_domain() -> Result<()> {
         let (store, _) = import_colors(&square(
             r#"    color3f[] primvars:displayColor = [(1, 0, 0), (0, 0, 1)] (interpolation = "uniform")"#,
         ))?;
         let layer = &store.layers[0];
-        assert_eq!(layer.domain, ColorDomain::Corner);
-        let red = [1.0, 0.0, 0.0, 1.0];
-        let blue = [0.0, 0.0, 1.0, 1.0];
-        assert_eq!(layer.values, [red, red, red, blue, blue, blue]);
+        assert_eq!(layer.domain, ColorDomain::Face);
+        assert_eq!(layer.values, [[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]]);
         Ok(())
     }
 

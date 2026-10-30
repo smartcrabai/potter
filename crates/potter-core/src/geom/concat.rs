@@ -581,7 +581,7 @@ fn merge_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Result<Va
             value.get("type").and_then(Value::as_str) == Some("color")
                 && matches!(
                     value.get("domain").and_then(Value::as_str),
-                    Some("point" | "corner")
+                    Some("point" | "face" | "corner")
                 )
                 && piece
                     .attributes
@@ -995,11 +995,12 @@ fn merge_color_layers(name: &str, members: &[Member<'_>]) -> Result<Value> {
     }))
 }
 
-/// Joins canonical named color attributes, filling absent layers with transparent black. When point and
-/// corner members share a layer name, the joined layer becomes corner-domain without losing point
-/// colors: each source vertex value is expanded to every face corner that references it.
+/// Joins canonical color attributes. FACE values stay on FACE when every member uses that domain;
+/// mixed point/face/corner inputs become CORNER so their distinct values remain representable.
 fn merge_color_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Result<Value> {
     const DEFAULT: [f64; 4] = [0.0, 0.0, 0.0, 0.0];
+    let mut point_domain = false;
+    let mut face_domain = false;
     let mut corner_domain = false;
     for (value, _) in members {
         let Some(value) = value else { continue };
@@ -1007,11 +1008,14 @@ fn merge_color_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Res
             return Err(conflict_error(name));
         }
         match text(value, "domain") {
-            "point" => {}
+            "point" => point_domain = true,
+            "face" => face_domain = true,
             "corner" => corner_domain = true,
             _ => return Err(conflict_error(name)),
         }
     }
+    corner_domain |= face_domain && point_domain;
+    face_domain &= !corner_domain;
     let mut values = Map::new();
     if corner_domain {
         for (attribute, piece) in members {
@@ -1033,6 +1037,12 @@ fn merge_color_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Res
                             .map(|value| color_value(value, name))
                             .collect::<Result<Vec<_>>>()?
                     }
+                    (Some(attribute), Some(fields)) if text(attribute, "domain") == "face" => {
+                        let color = fields
+                            .get(&format!("f{}", face.id))
+                            .map_or(Ok(json!(DEFAULT)), |value| color_value(value, name))?;
+                        vec![color; face.vertices.len()]
+                    }
                     (Some(_), Some(fields)) => face
                         .vertices
                         .iter()
@@ -1046,6 +1056,21 @@ fn merge_color_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Res
                     _ => return Err(shape_error(name)),
                 };
                 values.insert(format!("f{}", face.id), Value::Array(row));
+            }
+        }
+    } else if face_domain {
+        for (attribute, piece) in members {
+            let fields = attribute
+                .and_then(|attribute| attribute.get("values"))
+                .and_then(Value::as_object);
+            if attribute.is_some() && fields.is_none() {
+                return Err(shape_error(name));
+            }
+            for face in &mesh.faces[piece.face_base..piece.face_base + piece.faces] {
+                let color = fields
+                    .and_then(|fields| fields.get(&format!("f{}", face.id)))
+                    .map_or(Ok(json!(DEFAULT)), |value| color_value(value, name))?;
+                values.insert(format!("f{}", face.id), color);
             }
         }
     } else {
@@ -1065,7 +1090,7 @@ fn merge_color_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Res
         }
     }
     Ok(json!({
-        "domain": if corner_domain { "corner" } else { "point" },
+        "domain": if corner_domain { "corner" } else if face_domain { "face" } else { "point" },
         "type": "color",
         "values": values
     }))

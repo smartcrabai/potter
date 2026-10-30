@@ -105,6 +105,30 @@ pub(crate) fn triangulate_mesh(
     }
     slots.into_iter().flatten().collect()
 }
+/// `GEO_mesh_triangulate` corner order for one Geometry Nodes face.
+pub(crate) fn triangulate_face_for_geometry_nodes(
+    corners: &[Vec3],
+    quad_method: QuadMethod,
+    ngon_method: NgonMethod,
+) -> Vec<[usize; 3]> {
+    match corners {
+        [_, _, _] => vec![[0, 1, 2]],
+        [a, b, c, d] => {
+            let triangles = triangulate_quad([*a, *b, *c, *d], quad_method);
+            if triangles[0].contains(&0) && triangles[0].contains(&2) {
+                vec![[2, 0, 1], [0, 2, 3]]
+            } else {
+                vec![[1, 3, 0], [3, 1, 2]]
+            }
+        }
+        [_, _, _, _, ..] => triangulate_ngon(
+            corners,
+            face_normal(corners).unwrap_or([0.0; 3]),
+            ngon_method,
+        ),
+        _ => Vec::new(),
+    }
+}
 
 /// `BM_face_triangulate` for one face: the triangles as indices into `corners`.
 fn triangulate_face(

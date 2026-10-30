@@ -338,7 +338,7 @@ impl Aabb {
 }
 
 /// Invalid mesh data, primitive arguments, unsupported features, or exhausted element IDs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshError {
     /// A parameter does not satisfy its documented domain.
     InvalidParameter(&'static str),
