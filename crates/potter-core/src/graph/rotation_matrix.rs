@@ -14,7 +14,7 @@ const IDENTITY4: Mat4 = [
     [0.0, 0.0, 1.0, 0.0],
     [0.0, 0.0, 0.0, 1.0],
 ];
-const EULER_C_GIMBAL_EPSILON: f32 = 0.0000375;
+const EULER_C_GIMBAL_EPSILON: f32 = 0.000_037_5;
 const EULER_MATH_GIMBAL_EPSILON: f32 = 16.0 * f32::EPSILON;
 
 fn invalid(message: impl Into<String>) -> PotError {
@@ -23,7 +23,7 @@ fn invalid(message: impl Into<String>) -> PotError {
 
 fn normalized_eq(a: &str, b: &str) -> bool {
     a.bytes()
-        .filter(|byte| byte.is_ascii_alphanumeric())
+        .filter(u8::is_ascii_alphanumeric)
         .map(|byte| byte.to_ascii_lowercase())
         .eq(b
             .bytes()
@@ -221,10 +221,25 @@ fn normalized_angle(a: Vec3, b: Vec3) -> f32 {
 fn length(value: Vec3) -> f32 {
     dot(value, value).sqrt()
 }
+fn is_exact_zero(value: f32) -> bool {
+    value.to_bits().trailing_zeros() >= 31
+}
+
+fn is_exact(value: f32, expected: f32) -> bool {
+    if is_exact_zero(expected) {
+        is_exact_zero(value)
+    } else {
+        value.to_bits() == expected.to_bits()
+    }
+}
+
+fn is_zero_vector(value: Vec3) -> bool {
+    value.iter().all(|component| is_exact_zero(*component))
+}
 
 fn normalize_vector(value: Vec3) -> Vec3 {
     let length = length(value);
-    if length == 0.0 {
+    if is_exact_zero(length) {
         [0.0; 3]
     } else {
         [value[0] / length, value[1] / length, value[2] / length]
@@ -236,7 +251,7 @@ fn normalize_quaternion(value: Quat, name: &str) -> Result<Quat> {
         .iter()
         .map(|component| component * component)
         .sum::<f32>();
-    if length_squared == 0.0 {
+    if is_exact_zero(length_squared) {
         return Ok([1.0, 0.0, 0.0, 0.0]);
     }
     let length = length_squared.sqrt();
@@ -357,7 +372,7 @@ fn euler_matrix3(euler: Vec3) -> Mat3 {
 
 fn axis_angle_matrix3(axis: Vec3, angle: f32) -> Mat3 {
     let axis = normalize_vector(axis);
-    if axis == [0.0; 3] {
+    if is_zero_vector(axis) {
         return IDENTITY3;
     }
     let [x, y, z] = axis;
@@ -405,9 +420,9 @@ fn normalize_matrix3_columns(matrix: Mat3) -> (Mat3, Vec3) {
             + matrix[1][column] * matrix[1][column]
             + matrix[2][column] * matrix[2][column])
             .sqrt();
-        if scales[column] != 0.0 {
-            for row in 0..3 {
-                normalized[row][column] /= scales[column];
+        if !is_exact_zero(scales[column]) {
+            for row in &mut normalized {
+                row[column] /= scales[column];
             }
         }
     }
@@ -473,7 +488,11 @@ fn matrix3_quaternion(matrix: Mat3) -> Result<Quat> {
             q[0] = (m21 - m12) * reciprocal;
             q[2] = (m01 + m10) * reciprocal;
             q[3] = (m02 + m20) * reciprocal;
-            if trace == 1.0 && q[0] == 0.0 && q[2] == 0.0 && q[3] == 0.0 {
+            if is_exact(trace, 1.0)
+                && is_exact_zero(q[0])
+                && is_exact_zero(q[2])
+                && is_exact_zero(q[3])
+            {
                 q[1] = 1.0;
             }
             q
@@ -489,7 +508,11 @@ fn matrix3_quaternion(matrix: Mat3) -> Result<Quat> {
             q[0] = (m02 - m20) * reciprocal;
             q[1] = (m01 + m10) * reciprocal;
             q[3] = (m12 + m21) * reciprocal;
-            if trace == 1.0 && q[0] == 0.0 && q[1] == 0.0 && q[3] == 0.0 {
+            if is_exact(trace, 1.0)
+                && is_exact_zero(q[0])
+                && is_exact_zero(q[1])
+                && is_exact_zero(q[3])
+            {
                 q[2] = 1.0;
             }
             q
@@ -506,7 +529,8 @@ fn matrix3_quaternion(matrix: Mat3) -> Result<Quat> {
         q[0] = (m10 - m01) * reciprocal;
         q[1] = (m02 + m20) * reciprocal;
         q[2] = (m12 + m21) * reciprocal;
-        if trace == 1.0 && q[0] == 0.0 && q[1] == 0.0 && q[2] == 0.0 {
+        if is_exact(trace, 1.0) && is_exact_zero(q[0]) && is_exact_zero(q[1]) && is_exact_zero(q[2])
+        {
             q[3] = 1.0;
         }
         q
@@ -519,7 +543,8 @@ fn matrix3_quaternion(matrix: Mat3) -> Result<Quat> {
         q[1] = (m21 - m12) * reciprocal;
         q[2] = (m02 - m20) * reciprocal;
         q[3] = (m10 - m01) * reciprocal;
-        if trace == 1.0 && q[1] == 0.0 && q[2] == 0.0 && q[3] == 0.0 {
+        if is_exact(trace, 1.0) && is_exact_zero(q[1]) && is_exact_zero(q[2]) && is_exact_zero(q[3])
+        {
             q[0] = 1.0;
         }
         q
@@ -548,9 +573,9 @@ fn axis_vector(axis: usize) -> Vec3 {
 }
 
 fn orthogonal_vector(vector: Vec3) -> Vec3 {
-    if vector[0] != -vector[1] {
+    if !is_exact(vector[0], -vector[1]) {
         [-vector[1], vector[0], 0.0]
-    } else if vector[0] != -vector[2] {
+    } else if !is_exact(vector[0], -vector[2]) {
         [-vector[2], 0.0, vector[0]]
     } else {
         [0.0, -vector[2], vector[1]]
@@ -675,7 +700,7 @@ fn matrix_determinant(matrix: Mat4) -> f32 {
         let Some(pivot) = pivot else {
             return 0.0;
         };
-        if work[pivot][column] == 0.0 {
+        if is_exact_zero(work[pivot][column]) {
             return 0.0;
         }
         if pivot != column {
@@ -684,10 +709,11 @@ fn matrix_determinant(matrix: Mat4) -> f32 {
         }
         let diagonal = work[column][column];
         determinant *= diagonal;
-        for row in (column + 1)..4 {
-            let factor = work[row][column] / diagonal;
-            for col in (column + 1)..4 {
-                work[row][col] -= factor * work[column][col];
+        let pivot_row = work[column];
+        for row in work.iter_mut().skip(column + 1) {
+            let factor = row[column] / diagonal;
+            for (target, pivot_value) in row.iter_mut().zip(pivot_row.iter()).skip(column + 1) {
+                *target -= factor * pivot_value;
             }
         }
     }
@@ -700,7 +726,7 @@ fn matrix_inverse(matrix: Mat4) -> Option<Mat4> {
     for column in 0..4 {
         let pivot =
             (column..4).max_by(|a, b| left[*a][column].abs().total_cmp(&left[*b][column].abs()))?;
-        if left[pivot][column] == 0.0 {
+        if is_exact_zero(left[pivot][column]) {
             return None;
         }
         left.swap(pivot, column);
@@ -727,7 +753,7 @@ fn matrix_inverse(matrix: Mat4) -> Option<Mat4> {
 fn matrix_component(name: &str) -> Option<(usize, usize)> {
     let mut characters = name
         .bytes()
-        .filter(|byte| byte.is_ascii_alphanumeric())
+        .filter(u8::is_ascii_alphanumeric)
         .map(|byte| byte.to_ascii_lowercase());
     for expected in b"column" {
         if characters.next()? != *expected {
@@ -772,7 +798,7 @@ fn matrix_component_input(inputs: &[(&str, Value)], column: usize, row: usize) -
 
 fn axis_angle_quaternion(axis: Vec3, angle: f32) -> Result<Quat> {
     let axis = normalize_vector(axis);
-    if axis == [0.0; 3] {
+    if is_zero_vector(axis) {
         return Ok([1.0, 0.0, 0.0, 0.0]);
     }
     let half_angle = angle * 0.5;
@@ -816,16 +842,16 @@ fn align_rotation(
     if pivot > 0 && axis == pivot - 1 {
         return Ok(rotation);
     }
-    if vector == [0.0; 3] {
+    if is_zero_vector(vector) {
         return Ok(rotation);
     }
     let old_axis = mat3_vector(quaternion_matrix3(rotation), axis_vector(axis));
     let new_axis = normalize_vector(vector);
     let pivot_axis = if pivot == 0 {
         let mut rotation_axis = cross_high_precision(old_axis, new_axis);
-        if rotation_axis == [0.0; 3] {
+        if is_zero_vector(rotation_axis) {
             rotation_axis = cross_high_precision(old_axis, [1.0, 0.0, 0.0]);
-            if rotation_axis == [0.0; 3] {
+            if is_zero_vector(rotation_axis) {
                 rotation_axis = cross_high_precision(old_axis, [0.0, 1.0, 0.0]);
             }
         }
@@ -850,7 +876,7 @@ fn align_rotation(
 }
 
 fn align_euler(euler: Vec3, axis: usize, pivot: usize, vector: Vec3, factor: f32) -> Vec3 {
-    if (pivot > 0 && axis == pivot - 1) || vector == [0.0; 3] {
+    if (pivot > 0 && axis == pivot - 1) || is_zero_vector(vector) {
         return euler;
     }
     let old_matrix = euler_matrix3(euler);
@@ -858,9 +884,9 @@ fn align_euler(euler: Vec3, axis: usize, pivot: usize, vector: Vec3, factor: f32
     let new_axis = normalize_vector(vector);
     let pivot_axis = if pivot == 0 {
         let mut rotation_axis = cross_high_precision(old_axis, new_axis);
-        if rotation_axis == [0.0; 3] {
+        if is_zero_vector(rotation_axis) {
             rotation_axis = cross_high_precision(old_axis, [1.0, 0.0, 0.0]);
-            if rotation_axis == [0.0; 3] {
+            if is_zero_vector(rotation_axis) {
                 rotation_axis = cross_high_precision(old_axis, [0.0, 1.0, 0.0]);
             }
         }
@@ -899,7 +925,7 @@ fn svd3(matrix: Mat3) -> (Mat3, Vec3, Mat3) {
                 let alpha = dot(columns[p], columns[p]);
                 let beta = dot(columns[q], columns[q]);
                 let gamma = dot(columns[p], columns[q]);
-                if gamma == 0.0 || gamma.abs() <= 1.0e-7 * (alpha * beta).sqrt() {
+                if is_exact_zero(gamma) || gamma.abs() <= 1.0e-7 * (alpha * beta).sqrt() {
                     continue;
                 }
                 let zeta = (beta - alpha) / (2.0 * gamma);
@@ -1037,11 +1063,11 @@ pub(super) fn evaluate(
             let mut primary = normalize_vector(vector_input(inputs, "Primary Axis")?);
             let mut secondary = vector_input(inputs, "Secondary Axis")?;
             let mut tertiary;
-            let primary_nonzero = primary != [0.0; 3];
-            let secondary_nonzero = secondary != [0.0; 3];
+            let primary_nonzero = !is_zero_vector(primary);
+            let secondary_nonzero = !is_zero_vector(secondary);
             if primary_nonzero && secondary_nonzero {
                 tertiary = cross(primary, secondary);
-                if tertiary == [0.0; 3] {
+                if is_zero_vector(tertiary) {
                     tertiary = orthogonal_vector(primary);
                 }
                 tertiary = normalize_vector(tertiary);
@@ -1083,9 +1109,9 @@ pub(super) fn evaluate(
         "FunctionNodeCombineMatrix" => {
             require_output(output_socket, &["Matrix"])?;
             let mut matrix = [[0.0; 4]; 4];
-            for column in 0..4 {
-                for row in 0..4 {
-                    matrix[row][column] = matrix_component_input(inputs, column, row)?;
+            for (row_index, row) in matrix.iter_mut().enumerate() {
+                for (column, value) in row.iter_mut().enumerate() {
+                    *value = matrix_component_input(inputs, column, row_index)?;
                 }
             }
             matrix_result(matrix, "combined matrix")

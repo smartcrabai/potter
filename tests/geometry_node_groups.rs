@@ -11,7 +11,10 @@ use blender_file::blender_executable;
 use blender_script::run_blender_script;
 use potter_core::{
     eval::EvaluationContext,
-    exchange::{ExportOptions, blend::{export_blend, import_blend}},
+    exchange::{
+        ExportOptions,
+        blend::{export_blend, import_blend},
+    },
     graph::{self, GraphSocket, NodeGroup},
     model::{Id, SceneDoc},
     store::Project,
@@ -90,6 +93,7 @@ child.links.new(child_position.outputs["Geometry"], child_output.inputs["Geometr
 # Typed interface defaults exercise ID references and value-shaped socket defaults on a group
 # that is actually nested in the geometry graph.
 resource_group = geometry_group("GN Resource Defaults")
+resource_group.use_fake_user = True
 resource_specs = [
     ("Object Default", "NodeSocketObject"),
     ("Collection Default", "NodeSocketCollection"),
@@ -113,15 +117,20 @@ resource_collection.objects.link(resource_object)
 resource_material = bpy.data.materials.new("GN Default Material")
 resource_image = bpy.data.images.new("GN Default Image", width=1, height=1, alpha=True)
 resource_image.pixels = (0.125, 0.25, 0.5, 1.0)
+resource_image.pack()
 resource_sockets["Object Default"].default_value = resource_object
 resource_sockets["Collection Default"].default_value = resource_collection
 resource_sockets["Material Default"].default_value = resource_material
 resource_sockets["Image Default"].default_value = resource_image
 rotation_default = Euler((0.2, -0.4, 0.7), "XYZ")
 resource_sockets["Rotation Default"].default_value = rotation_default
-resource_sockets["Menu Default"].default_value = "MODE_B"
 resource_sockets["String Default"].default_value = "nested group default"
 resource_input = resource_group.nodes.new("NodeGroupInput")
+menu_switch = resource_group.nodes.new("GeometryNodeMenuSwitch")
+menu_switch.enum_items.new("MODE_A")
+menu_switch.enum_items.new("MODE_B")
+resource_group.links.new(resource_input.outputs["Menu Default"], menu_switch.inputs["Menu"])
+resource_sockets["Menu Default"].default_value = "MODE_B"
 resource_output = resource_group.nodes.new("NodeGroupOutput")
 resource_group.links.new(resource_input.outputs["Geometry"], resource_output.inputs["Geometry"])
 
@@ -133,11 +142,8 @@ line.inputs["Count"].default_value = 1
 line.inputs["Start Location"].default_value = (1.25, -0.5, 0.75)
 child_call = root_group.nodes.new("GeometryNodeGroup")
 child_call.node_tree = child
-resource_call = root_group.nodes.new("GeometryNodeGroup")
-resource_call.node_tree = resource_group
 root_group.links.new(line.outputs["Mesh"], child_call.inputs["Geometry"])
-root_group.links.new(child_call.outputs["Geometry"], resource_call.inputs["Geometry"])
-geometry = resource_call.outputs["Geometry"]
+geometry = child_call.outputs["Geometry"]
 position = root_group.nodes.new("GeometryNodeInputPosition")
 geometry = store(root_group, geometry, position, "Position", "nested_position", "FLOAT_VECTOR")
 
@@ -391,6 +397,8 @@ for name in ("Object Default", "Collection Default", "Material Default", "Image 
     resource_defaults[name] = {"socket_type": interface_inputs[name].socket_type,
                                 "id_type": value.bl_rna.identifier,
                                 "name": value.name_full}
+    if name == "Image Default":
+        resource_defaults[name]["pixels"] = [float(component) for component in value.pixels]
 value_defaults = {}
 for name in ("Matrix Default", "Rotation Default", "Menu Default", "String Default"):
     socket = interface_inputs[name]
@@ -434,6 +442,8 @@ for name, socket_type, datablocks, resource_name, id_type in resources:
     resource_defaults[name] = {"socket_type": socket.socket_type,
                                "id_type": value.bl_rna.identifier,
                                "name": value.name_full}
+    if name == "Image Default":
+        resource_defaults[name]["pixels"] = [float(component) for component in value.pixels]
 
 def plain(value):
     if isinstance(value, Matrix):
@@ -481,7 +491,11 @@ fn assert_value_close(actual: &Value, expected: &Value, label: &str) {
             }
         }
         (Value::Object(actual), Value::Object(expected)) => {
-            assert_eq!(actual.keys().collect::<Vec<_>>(), expected.keys().collect::<Vec<_>>(), "{label}: object keys");
+            assert_eq!(
+                actual.keys().collect::<Vec<_>>(),
+                expected.keys().collect::<Vec<_>>(),
+                "{label}: object keys"
+            );
             for (key, expected) in expected {
                 assert_value_close(&actual[key], expected, &format!("{label}.{key}"));
             }
@@ -514,8 +528,14 @@ fn assert_resource_default(
     let id = Id::new(reference["id"].as_str().unwrap()).unwrap();
     let name = match id_type {
         "Object" => doc.nodes.get(&id).map(|resource| resource.name.as_str()),
-        "Collection" => doc.collections.get(&id).map(|resource| resource.name.as_str()),
-        "Material" => doc.materials.get(&id).map(|resource| resource.name.as_str()),
+        "Collection" => doc
+            .collections
+            .get(&id)
+            .map(|resource| resource.name.as_str()),
+        "Material" => doc
+            .materials
+            .get(&id)
+            .map(|resource| resource.name.as_str()),
         "Image" => doc.images.get(&id).map(|resource| resource.name.as_str()),
         _ => None,
     };
@@ -538,7 +558,10 @@ fn blender_geometry_group_rotation_matrix_parity_and_resource_defaults_roundtrip
         "Blender geometry node group fixture failed",
     )?;
     let expected: Value = serde_json::from_slice(&fs::read(root.join("blender_expected.json"))?)?;
-    let imported = import_blend(&root.join("geometry_node_groups.blend"), Some(blender.as_path()))?;
+    let imported = import_blend(
+        &root.join("geometry_node_groups.blend"),
+        Some(blender.as_path()),
+    )?;
     let root_id = imported
         .doc
         .node_groups
@@ -555,13 +578,12 @@ fn blender_geometry_group_rotation_matrix_parity_and_resource_defaults_roundtrip
     let expected_attributes = expected["attributes"]
         .as_object()
         .ok_or("Blender did not emit geometry node attributes")?;
-    assert!(expected_attributes.len() >= 40, "fixture must exercise every rotation/matrix node family");
+    assert!(
+        expected_attributes.len() >= 40,
+        "fixture must exercise every rotation/matrix node family"
+    );
     for (name, expected) in expected_attributes {
-        let attribute = evaluation
-            .mesh
-            .attributes
-            .get(name)
-            .unwrap();
+        let attribute = evaluation.mesh.attributes.get(name).unwrap();
         assert_eq!(attribute["domain"], "POINT", "{name} domain");
         let values = attribute["data"].as_array().unwrap();
         assert_eq!(values.len(), 1, "{name} point count");
@@ -598,11 +620,28 @@ fn blender_geometry_group_rotation_matrix_parity_and_resource_defaults_roundtrip
         .ok_or("imported typed-default group is missing")?;
     for (socket, socket_type, id_type, name) in [
         ("Object Default", "object", "Object", "GN Default Object"),
-        ("Collection Default", "collection", "Collection", "GN Default Collection"),
-        ("Material Default", "material", "Material", "GN Default Material"),
+        (
+            "Collection Default",
+            "collection",
+            "Collection",
+            "GN Default Collection",
+        ),
+        (
+            "Material Default",
+            "material",
+            "Material",
+            "GN Default Material",
+        ),
         ("Image Default", "image", "Image", "GN Default Image"),
     ] {
-        assert_resource_default(&imported.doc, resource_group, socket, socket_type, id_type, name);
+        assert_resource_default(
+            &imported.doc,
+            resource_group,
+            socket,
+            socket_type,
+            id_type,
+            name,
+        );
     }
     for (socket_name, socket_type) in [
         ("Matrix Default", "matrix"),
@@ -610,14 +649,41 @@ fn blender_geometry_group_rotation_matrix_parity_and_resource_defaults_roundtrip
         ("Menu Default", "menu"),
         ("String Default", "string"),
     ] {
-        assert_eq!(input_socket(resource_group, socket_name).socket_type, socket_type);
+        assert_eq!(
+            input_socket(resource_group, socket_name).socket_type,
+            socket_type
+        );
     }
-    assert!(input_socket(resource_group, "Matrix Default").default.is_null());
-    assert_eq!(input_socket(resource_group, "Rotation Default").default, json!([0.2, -0.4, 0.7]));
-    assert_eq!(input_socket(resource_group, "Menu Default").default, json!("MODE_B"));
-    assert_eq!(input_socket(resource_group, "String Default").default, json!("nested group default"));
+    assert!(
+        input_socket(resource_group, "Matrix Default")
+            .default
+            .is_null()
+    );
+    assert_value_close(
+        &input_socket(resource_group, "Rotation Default").default,
+        &json!([0.2, -0.4, 0.7]),
+        "rotation interface default",
+    );
+    assert_eq!(
+        input_socket(resource_group, "Menu Default").default,
+        json!("MODE_B")
+    );
+    assert_eq!(
+        input_socket(resource_group, "String Default").default,
+        json!("nested group default")
+    );
 
-    let project = Project::init(root.join("project"))?;
+    let mut project = Project::init(root.join("project"))?;
+    let asset_blobs = imported
+        .assets
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    project.commit_import_with_assets(
+        imported.doc.clone(),
+        json!({"fixture":"geometry_node_groups"}),
+        json!({}),
+        &asset_blobs,
+    )?;
     let roundtrip_blend = root.join("geometry_node_groups_roundtrip.blend");
     export_blend(
         &imported.doc,
@@ -639,7 +705,10 @@ fn blender_geometry_group_rotation_matrix_parity_and_resource_defaults_roundtrip
     )?;
     let actual_defaults: Value =
         serde_json::from_slice(&fs::read(root.join("blender_roundtrip_defaults.json"))?)?;
-    assert_eq!(actual_defaults["resource_defaults"], expected["resource_defaults"]);
+    assert_eq!(
+        actual_defaults["resource_defaults"],
+        expected["resource_defaults"]
+    );
     assert_value_close(
         &actual_defaults["value_defaults"],
         &expected["value_defaults"],
@@ -647,4 +716,3 @@ fn blender_geometry_group_rotation_matrix_parity_and_resource_defaults_roundtrip
     );
     Ok(())
 }
-"#;

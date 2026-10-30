@@ -3,7 +3,7 @@ use crate::{
     model::{Id, Registry},
 };
 
-use super::{GraphLink, NodeGroup};
+use super::{GraphLink, GraphSocket, NodeGroup};
 
 type Socket = (&'static str, &'static str);
 
@@ -139,6 +139,36 @@ pub fn is_known_node_type(node_type: &str) -> bool {
 
 type SocketList = Vec<(String, String)>;
 type SocketPair = (SocketList, SocketList);
+fn interface_sockets(sockets: &[GraphSocket]) -> SocketList {
+    sockets
+        .iter()
+        .flat_map(|socket| {
+            std::iter::once((socket.id.clone(), socket.socket_type.clone())).chain(
+                (socket.name != socket.id)
+                    .then(|| (socket.name.clone(), socket.socket_type.clone())),
+            )
+        })
+        .collect()
+}
+fn geometry_interface_sockets(sockets: &[GraphSocket]) -> SocketList {
+    sockets
+        .iter()
+        .map(|socket| (socket.id.clone(), socket.socket_type.clone()))
+        .chain(
+            sockets
+                .iter()
+                .filter(|socket| socket.name != socket.id)
+                .map(|socket| (socket.name.clone(), socket.socket_type.clone())),
+        )
+        .collect()
+}
+fn group_interface_sockets(kind: super::GraphKind, sockets: &[GraphSocket]) -> SocketList {
+    if kind == super::GraphKind::Geometry {
+        geometry_interface_sockets(sockets)
+    } else {
+        interface_sockets(sockets)
+    }
+}
 
 pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair> {
     let node = group.nodes.get(node_id)?;
@@ -158,20 +188,10 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
     let sockets = match node.node_type.as_str() {
         "NodeGroupInput" => (
             Vec::new(),
-            group
-                .interface
-                .inputs
-                .iter()
-                .map(|socket| (socket.name.clone(), socket.socket_type.clone()))
-                .collect(),
+            group_interface_sockets(group.kind, &group.interface.inputs),
         ),
         "NodeGroupOutput" => {
-            let inputs: Vec<_> = group
-                .interface
-                .outputs
-                .iter()
-                .map(|socket| (socket.name.clone(), socket.socket_type.clone()))
-                .collect();
+            let inputs = group_interface_sockets(group.kind, &group.interface.outputs);
             if inputs.is_empty() && group.kind == super::GraphKind::Geometry {
                 (sockets(&[("Geometry", "geometry")]), Vec::new())
             } else {
@@ -320,7 +340,7 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
             sockets(&[("Matrix", "matrix")]),
             sockets(&[("U", "matrix"), ("S", "vector"), ("V", "matrix")]),
         ),
-        "FunctionNodeProjectPoint" => (
+        "FunctionNodeProjectPoint" | "FunctionNodeTransformPoint" => (
             sockets(&[("Vector", "vector"), ("Transform", "matrix")]),
             sockets(&[("Vector", "vector")]),
         ),
@@ -395,10 +415,6 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
         "FunctionNodeTransformDirection" => (
             sockets(&[("Direction", "vector"), ("Transform", "matrix")]),
             sockets(&[("Direction", "vector")]),
-        ),
-        "FunctionNodeTransformPoint" => (
-            sockets(&[("Vector", "vector"), ("Transform", "matrix")]),
-            sockets(&[("Vector", "vector")]),
         ),
         "FunctionNodeTransposeMatrix" => (
             sockets(&[("Matrix", "matrix")]),
@@ -1032,9 +1048,17 @@ fn socket_type(
         } else {
             &child_group.interface.inputs
         };
-        let socket = sockets
-            .iter()
-            .find(|socket| socket.id == socket_name || socket.name == socket_name)?;
+        let socket = if child_group.kind == super::GraphKind::Geometry {
+            sockets
+                .iter()
+                .find(|socket| socket.id == socket_name)
+                .or_else(|| sockets.iter().find(|socket| socket.name == socket_name))
+        } else {
+            sockets
+                .iter()
+                .find(|socket| socket.name == socket_name)
+                .or_else(|| sockets.iter().find(|socket| socket.id == socket_name))
+        }?;
         return graph_socket_type(&socket.socket_type).map(str::to_owned);
     }
     if node.node_type == "ShaderNodeVectorMath" && output {
@@ -1051,23 +1075,40 @@ fn socket_type(
         };
     }
     if node.node_type == "NodeGroupInput" && output {
-        return group
-            .interface
-            .inputs
-            .iter()
-            .find(|socket| socket.name == socket_name || socket.id == socket_name)
-            .and_then(|socket| graph_socket_type(&socket.socket_type).map(str::to_owned));
+        let sockets = &group.interface.inputs;
+        let socket = if group.kind == super::GraphKind::Geometry {
+            sockets
+                .iter()
+                .find(|socket| socket.id == socket_name)
+                .or_else(|| sockets.iter().find(|socket| socket.name == socket_name))
+        } else {
+            sockets
+                .iter()
+                .find(|socket| socket.name == socket_name)
+                .or_else(|| sockets.iter().find(|socket| socket.id == socket_name))
+        };
+        return socket.and_then(|socket| graph_socket_type(&socket.socket_type).map(str::to_owned));
     }
     if node.node_type == "NodeGroupOutput" && !output {
-        if group.interface.outputs.is_empty() && socket_name == "Geometry" {
+        let sockets = &group.interface.outputs;
+        if group.kind == super::GraphKind::Geometry
+            && sockets.is_empty()
+            && socket_name == "Geometry"
+        {
             return Some("geometry".to_owned());
         }
-        return group
-            .interface
-            .outputs
-            .iter()
-            .find(|socket| socket.name == socket_name || socket.id == socket_name)
-            .and_then(|socket| graph_socket_type(&socket.socket_type).map(str::to_owned));
+        let socket = if group.kind == super::GraphKind::Geometry {
+            sockets
+                .iter()
+                .find(|socket| socket.id == socket_name)
+                .or_else(|| sockets.iter().find(|socket| socket.name == socket_name))
+        } else {
+            sockets
+                .iter()
+                .find(|socket| socket.name == socket_name)
+                .or_else(|| sockets.iter().find(|socket| socket.id == socket_name))
+        };
+        return socket.and_then(|socket| graph_socket_type(&socket.socket_type).map(str::to_owned));
     }
     if let Some((inputs, outputs)) = node_sockets(group, node_id) {
         let sockets = if output { outputs } else { inputs };
@@ -1107,6 +1148,9 @@ fn graph_socket_type(socket_type: &str) -> Option<&'static str> {
         "collection" | "NodeSocketCollection" => Some("collection"),
         "material" | "NodeSocketMaterial" => Some("material"),
         "image" | "NodeSocketImage" => Some("image"),
+        "geometry" | "NodeSocketGeometry" => Some("geometry"),
+        "shader" | "NodeSocketShader" => Some("shader"),
+        "string" | "NodeSocketString" => Some("string"),
         _ => None,
     }
 }
@@ -1169,28 +1213,6 @@ fn validate_link_with_registry(
     Ok(())
 }
 
-pub(super) fn validate_group_links(group: &NodeGroup) -> Result<()> {
-    for (index, link) in group.links.iter().enumerate() {
-        validate_link_structure(group, None, link)?;
-        if group.links[..index].contains(link) {
-            return Err(PotError::new(
-                ErrorCode::InvalidOperation,
-                "graph link already exists",
-            ));
-        }
-        if has_single_link_input(group, link)
-            && group.links[..index].iter().any(|existing| {
-                existing.to_node == link.to_node && existing.to_socket == link.to_socket
-            })
-        {
-            return Err(PotError::new(
-                ErrorCode::InvalidOperation,
-                "input socket already has a link",
-            ));
-        }
-    }
-    Ok(())
-}
 pub(super) fn node_sockets_with_groups(
     group: &NodeGroup,
     node_id: &Id,
@@ -1202,33 +1224,13 @@ pub(super) fn node_sockets_with_groups(
     }
     let group_id = node.properties.get("node_tree")?.as_str()?;
     let child_group = node_groups.get(group_id)?;
-    let input_sockets = child_group
-        .interface
-        .inputs
-        .iter()
-        .flat_map(|socket| {
-            std::iter::once((socket.id.clone(), socket.socket_type.clone())).chain(
-                (socket.name != socket.id)
-                    .then(|| (socket.name.clone(), socket.socket_type.clone())),
-            )
-        })
-        .collect();
+    let input_sockets = group_interface_sockets(child_group.kind, &child_group.interface.inputs);
     let output_sockets = if child_group.kind == super::GraphKind::Geometry
         && child_group.interface.outputs.is_empty()
     {
         sockets(GEOMETRY_OUT)
     } else {
-        child_group
-            .interface
-            .outputs
-            .iter()
-            .flat_map(|socket| {
-                std::iter::once((socket.id.clone(), socket.socket_type.clone())).chain(
-                    (socket.name != socket.id)
-                        .then(|| (socket.name.clone(), socket.socket_type.clone())),
-                )
-            })
-            .collect()
+        group_interface_sockets(child_group.kind, &child_group.interface.outputs)
     };
     Some((input_sockets, output_sockets))
 }
