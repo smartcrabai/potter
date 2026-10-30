@@ -1,0 +1,63 @@
+{
+  "resolution": [
+    65,
+    65
+  ],
+  "samples": 1,
+  "renderer": "Blender 5.2.2 EEVEE Next; 1 TAA sample; Raw",
+  "source": "Blender 5.2.2 EEVEE EQUIRECTANGULAR near-axis rays, 0.001 rad camera shift",
+  "cases": [
+    {
+      "name": "x_near_zero_positive_y",
+      "near_zero_component": "x",
+      "probe": [
+        32,
+        20
+      ],
+      "rgb": [
+        0.52978515625,
+        0.08001708984375,
+        0.1800537109375
+      ]
+    },
+    {
+      "name": "x_near_zero_negative_y",
+      "near_zero_component": "x",
+      "probe": [
+        32,
+        44
+      ],
+      "rgb": [
+        1.3701171875,
+        0.08001708984375,
+        0.1800537109375
+      ]
+    },
+    {
+      "name": "y_near_zero_positive_x",
+      "near_zero_component": "y",
+      "probe": [
+        44,
+        32
+      ],
+      "rgb": [
+        0.89013671875,
+        0.08001708984375,
+        0.1800537109375
+      ]
+    },
+    {
+      "name": "y_near_zero_negative_x",
+      "near_zero_component": "y",
+      "probe": [
+        20,
+        32
+      ],
+      "rgb": [
+        0.04998779296875,
+        0.08001708984375,
+        0.89990234375
+      ]
+    }
+  ]
+}

@@ -1442,6 +1442,96 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
             "{feature_id} must report captured operations and guarded imports"
         );
     }
+
+    let shader_advanced = features
+        .iter()
+        .find(|feature| feature["feature_id"] == "shader.advanced")
+        .expect("the partially implemented shader graph scope is catalogued");
+    assert_eq!(shader_advanced["status"], "partial");
+    assert_eq!(
+        shader_advanced["pot_ops"],
+        json!([
+            "graph.create",
+            "graph.node_add",
+            "graph.link",
+            "graph.unlink",
+            "material.create",
+            "material.update"
+        ])
+    );
+    assert_eq!(
+        shader_advanced["capabilities"],
+        json!({
+            "create": true,
+            "edit": true,
+            "inspect": true,
+            "evaluate": true,
+            "render": true,
+            "import": true,
+            "export": true
+        })
+    );
+
+    let spatial_volume = features
+        .iter()
+        .find(|feature| feature["feature_id"] == "shader.volume.spatially_varying_graph")
+        .expect("spatially varying Volume Output graphs are catalogued");
+    assert_eq!(spatial_volume["status"], "partial");
+    assert_eq!(
+        spatial_volume["pot_ops"],
+        json!([
+            "graph.create",
+            "graph.node_add",
+            "graph.link",
+            "material.create",
+            "material.update"
+        ])
+    );
+
+    let world_probe_volume = features
+        .iter()
+        .find(|feature| feature["feature_id"] == "shader.volume.world_probe_l1.realtime_scattering")
+        .expect("realtime world-probe anisotropy refusal is catalogued");
+    assert_eq!(world_probe_volume["status"], "not_supported");
+    assert_eq!(
+        world_probe_volume["pot_ops"],
+        json!([
+            "graph.create",
+            "graph.node_add",
+            "graph.link",
+            "material.create",
+            "material.update"
+        ])
+    );
+
+    let eevee_cubemap_resolution = features
+        .iter()
+        .find(|feature| feature["feature_id"] == "blender.scene.eevee.gi_cubemap_resolution")
+        .expect("non-default EEVEE cubemap resolution loss is catalogued");
+    assert_eq!(eevee_cubemap_resolution["status"], "not_supported");
+    assert_eq!(
+        eevee_cubemap_resolution["pot_ops"],
+        json!(["render.update"])
+    );
+
+    let geometry_attribute = features
+        .iter()
+        .find(|feature| {
+            feature["feature_id"]
+                == "shader.node.ShaderNodeAttribute.geometry_attribute.unsupported"
+        })
+        .expect("unsupported GEOMETRY Attribute data is catalogued");
+    assert_eq!(geometry_attribute["status"], "partial");
+    assert_eq!(
+        geometry_attribute["pot_ops"],
+        json!([
+            "graph.create",
+            "graph.node_add",
+            "graph.link",
+            "material.create",
+            "material.update"
+        ])
+    );
     assert!(
         !features
             .iter()
@@ -1486,7 +1576,12 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "curve.convert.production_settings",
         "blender.curve.bevel_object",
         "modifier.uv_project.animated_camera_lens",
+        "shader.node.ShaderNodeTexImage.linear_mip_filtering",
+        "shader.node.ShaderNodeTexEnvironment.linear_mip_filtering",
+        "shader.material_texture.linear_mip_filtering",
+        "blender.scene.eevee.gi_cubemap_resolution",
         "shader.volume.spectral_extinction.realtime_scattering",
+        "shader.volume.world_probe_l1.realtime_scattering",
         "shader.node.Bump.realtime_transparent_shadow_height",
         "text.font.external.format",
         "text.font.external.resource",
@@ -1559,6 +1654,43 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
                 .iter()
                 .any(|feature| feature["feature_id"] == feature_id),
             "{feature_id} must not remain in the unsupported catalog"
+        );
+    }
+    for (feature_id, expected_ops) in [
+        (
+            "shader.node.ShaderNodeTexImage.linear_mip_filtering",
+            json!([
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+                "material.create",
+                "material.update"
+            ]),
+        ),
+        (
+            "shader.node.ShaderNodeTexEnvironment.linear_mip_filtering",
+            json!([
+                "world.create",
+                "world.update",
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+                "material.create",
+                "material.update"
+            ]),
+        ),
+        (
+            "shader.material_texture.linear_mip_filtering",
+            json!(["material.create", "material.update"]),
+        ),
+    ] {
+        let feature = features
+            .iter()
+            .find(|feature| feature["feature_id"] == feature_id)
+            .expect("realtime mip-filtering limits are catalogued");
+        assert_eq!(
+            feature["pot_ops"], expected_ops,
+            "{feature_id} must report the operations that can use it"
         );
     }
     assert!(

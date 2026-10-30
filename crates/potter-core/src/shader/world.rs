@@ -3,10 +3,12 @@ use std::collections::BTreeSet;
 use glam::DVec3;
 use serde_json::{Value as JsonValue, json};
 
+#[cfg(test)]
+use crate::image::sample_with_extension_alpha;
 use crate::{
     error::{ErrorCode, PotError, Result},
     graph::{GraphKind, GraphNode, NodeGroup},
-    image::{ImageData, ImageExtension, sample_with_extension_alpha},
+    image::{ImageData, ImageExtension},
     model::{Id, Registry, World},
 };
 
@@ -56,11 +58,14 @@ pub(crate) fn world_mix_supported(data_type: Option<&str>, blend_type: Option<&s
 }
 
 /// Evaluates the World node graph for a single outgoing direction.
+///
+/// `path_traced` selects Cycles semantics when true and EEVEE semantics otherwise.
 pub fn evaluate_world(
     world: &World,
     groups: &Registry<NodeGroup>,
     images: &std::collections::BTreeMap<String, ImageData>,
     direction: DVec3,
+    path_traced: bool,
 ) -> Result<DVec3> {
     let Some(graph_id) = &world.node_tree else {
         return Ok(DVec3::from_array(world.color) * world.strength);
@@ -110,6 +115,7 @@ pub fn evaluate_world(
         group,
         images,
         direction: normalize_or(direction, DVec3::Z),
+        path_traced,
         active: BTreeSet::new(),
     };
     let value = evaluator.input(output, "Surface", WorldValue::Color([0.0; 4]))?;
@@ -128,6 +134,7 @@ struct WorldEvaluator<'a> {
     group: &'a NodeGroup,
     images: &'a std::collections::BTreeMap<String, ImageData>,
     direction: DVec3,
+    path_traced: bool,
     active: BTreeSet<(Id, String)>,
 }
 
@@ -179,6 +186,18 @@ impl<'a> WorldEvaluator<'a> {
                 ErrorCode::InvalidOperation,
                 "world output node has no outputs",
             )),
+            "ShaderNodeCombineXYZ" | "CombineXYZ" => {
+                if socket != "Vector" {
+                    return Err(world_error(
+                        id,
+                        &format!("unknown Combine XYZ output `{socket}`"),
+                    ));
+                }
+                let x = as_scalar(self.input(id, "X", WorldValue::Scalar(0.0))?);
+                let y = as_scalar(self.input(id, "Y", WorldValue::Scalar(0.0))?);
+                let z = as_scalar(self.input(id, "Z", WorldValue::Scalar(0.0))?);
+                Ok(WorldValue::Vector(DVec3::new(x, y, z)))
+            }
             "ShaderNodeBackground" => {
                 let color = as_color(self.input(
                     id,
@@ -205,6 +224,53 @@ impl<'a> WorldEvaluator<'a> {
                 ]))
             }
             "ShaderNodeTexSky" => {
+                if node
+                    .properties
+                    .get("sky_type")
+                    .is_none_or(|value| sky_property_is_default("sky_type", value))
+                {
+                    return Err(unsupported_sky_feature(id, "multiple_scattering_model"));
+                }
+                crate::shader::texture::validate_texture_node_mapping(
+                    id,
+                    &node.node_type,
+                    &node.properties,
+                )?;
+                for (property, value) in &node.properties {
+                    if matches!(
+                        property.as_str(),
+                        "sky_type"
+                            | "sun_disc"
+                            | "sun_size"
+                            | "sun_intensity"
+                            | "air_density"
+                            | "aerosol_density"
+                            | "ozone_density"
+                            | "sun_elevation"
+                            | "sun_rotation"
+                            | "altitude"
+                            | "turbidity"
+                            | "ground_albedo"
+                    ) && !sky_property_is_default(property, value)
+                    {
+                        return Err(unsupported_sky_feature(id, property));
+                    }
+                }
+                if let Some(input) = node.inputs.keys().find(|input| {
+                    !socket_matches(input, "Sun Direction") && !socket_matches(input, "Vector")
+                }) {
+                    return Err(unsupported_sky_feature(id, &format!("input.{input}")));
+                }
+                if let Some(link) = self.group.links.iter().find(|link| {
+                    link.to_node == *id
+                        && !socket_matches(&link.to_socket, "Sun Direction")
+                        && !socket_matches(&link.to_socket, "Vector")
+                }) {
+                    return Err(unsupported_sky_feature(
+                        id,
+                        &format!("input.{}", link.to_socket),
+                    ));
+                }
                 let sun = normalize_or(
                     as_vector(self.input(id, "Sun Direction", WorldValue::Vector(DVec3::Z))?),
                     DVec3::Z,
@@ -216,10 +282,19 @@ impl<'a> WorldEvaluator<'a> {
                 Ok(WorldValue::Color(sky_radiance(direction, sun)))
             }
             "ShaderNodeTexEnvironment" => {
-                let direction = normalize_or(
-                    as_vector(self.input(id, "Vector", WorldValue::Vector(self.direction))?),
-                    self.direction,
-                );
+                crate::shader::texture::validate_texture_node_mapping(
+                    id,
+                    &node.node_type,
+                    &node.properties,
+                )?;
+                let direction =
+                    if self.group.links.iter().any(|link| {
+                        link.to_node == *id && socket_matches(&link.to_socket, "Vector")
+                    }) {
+                        as_vector(self.input(id, "Vector", WorldValue::Vector(self.direction))?)
+                    } else {
+                        self.direction
+                    };
                 let image_id = node
                     .properties
                     .get("image")
@@ -233,7 +308,48 @@ impl<'a> WorldEvaluator<'a> {
                         json!({"node_id": id, "image_id": image_id}),
                     )
                 })?;
-                Ok(WorldValue::Color(environment_colour(image, direction)))
+                let interpolation = crate::shader::texture::image_texture_interpolation(
+                    id,
+                    &node.node_type,
+                    &node.properties,
+                    image.interpolation,
+                )?;
+                if !self.path_traced
+                    && interpolation == crate::image::ImageInterpolation::Linear
+                    && node
+                        .properties
+                        .get("projection")
+                        .and_then(JsonValue::as_str)
+                        .is_some_and(|projection| projection.eq_ignore_ascii_case("MIRROR_BALL"))
+                {
+                    return Err(
+                        crate::shader::texture::unsupported_realtime_environment_filtering(
+                            id, image_id,
+                        ),
+                    );
+                }
+                let uv =
+                    environment_texture_uv(id, node, direction, self.direction, self.path_traced)?;
+                let extensions = if self.path_traced {
+                    [ImageExtension::Repeat; 2]
+                } else if node
+                    .properties
+                    .get("projection")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|projection| projection.eq_ignore_ascii_case("MIRROR_BALL"))
+                {
+                    [ImageExtension::Extend; 2]
+                } else {
+                    [ImageExtension::Repeat, ImageExtension::Extend]
+                };
+                let color = crate::shader::texture::sample_environment_texture(
+                    image,
+                    uv,
+                    interpolation,
+                    extensions,
+                    self.path_traced,
+                );
+                Ok(WorldValue::Color(color))
             }
             "ShaderNodeTexCoord" => match socket {
                 "Normal" | "Generated" | "Object" | "Window" | "Camera" | "Incoming" => {
@@ -337,6 +453,51 @@ impl<'a> WorldEvaluator<'a> {
             )),
         }
     }
+}
+fn unsupported_sky_feature(id: &Id, feature: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!("world ShaderNodeTexSky setting `{feature}` is not supported"),
+        json!({
+            "feature_id":format!("world.node.ShaderNodeTexSky.{feature}"),
+            "node_id":id,
+        }),
+    )
+}
+
+pub(crate) fn sky_property_is_default(property: &str, value: &JsonValue) -> bool {
+    match property {
+        "sky_type" => value.as_str() == Some("MULTIPLE_SCATTERING"),
+        "sun_disc" => value.as_bool() == Some(true),
+        "sun_size" => sky_float_is_default(value, 0.545_f32 * (std::f32::consts::PI / 180.0)),
+        "sun_intensity" | "air_density" | "aerosol_density" | "ozone_density" => {
+            sky_float_is_default(value, 1.0)
+        }
+        "sun_elevation" => sky_float_is_default(value, 15.0_f32 * (std::f32::consts::PI / 180.0)),
+        "sun_rotation" => sky_float_is_default(value, 0.0),
+        "altitude" => sky_float_is_default(value, 100.0),
+        "turbidity" => sky_float_is_default(value, 2.2),
+        "ground_albedo" => sky_float_is_default(value, 0.3),
+        "texture_mapping" => sky_rna_marker(value, "TexMapping"),
+        "color_mapping" => sky_rna_marker(value, "ColorMapping"),
+        _ => false,
+    }
+}
+
+fn sky_float_is_default(value: &JsonValue, default: f32) -> bool {
+    let Some(value) = value.as_f64().map(|value| value as f32) else {
+        return false;
+    };
+    let value_bits = value.to_bits();
+    let default_bits = default.to_bits();
+    value_bits == default_bits
+        || (value_bits.trailing_zeros() >= 31 && default_bits.trailing_zeros() >= 31)
+}
+
+fn sky_rna_marker(value: &JsonValue, rna_type: &str) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == 1 && object.get("rna_type").and_then(JsonValue::as_str) == Some(rna_type)
+    })
 }
 
 fn sky_radiance(direction: DVec3, sun: DVec3) -> [f64; 4] {
@@ -444,9 +605,8 @@ pub(crate) fn equirectangular_uv(direction: DVec3) -> [f64; 2] {
     [u, v]
 }
 
-/// The environment colour of a ray direction: Cycles' environment texture (`EnvironmentTextureNode::image_params`), with
-/// the Image Texture rule (REPEAT, no Alpha link).
-pub(crate) fn environment_colour(image: &ImageData, direction: DVec3) -> [f64; 4] {
+#[cfg(test)]
+fn environment_colour(image: &ImageData, direction: DVec3) -> [f64; 4] {
     sample_with_extension_alpha(
         image,
         equirectangular_uv(direction),
@@ -456,12 +616,127 @@ pub(crate) fn environment_colour(image: &ImageData, direction: DVec3) -> [f64; 4
         false,
     )
 }
+fn eevee_equirectangular_uv(direction: DVec3) -> [f64; 2] {
+    let mut direction = direction.as_vec3();
+    let length_squared = direction.length_squared();
+    // Match Blender's safe_normalize, including its exact zero-component UV fallback.
+    if length_squared > 1.0e-35 {
+        direction /= length_squared.sqrt();
+    } else {
+        direction = glam::Vec3::X;
+    }
+    if direction.x == 0.0 || direction.y == 0.0 {
+        return [0.0; 2];
+    }
+    [
+        f64::from(-direction.y.atan2(direction.x) / (2.0 * std::f32::consts::PI) + 0.5),
+        f64::from(direction.z.atan2(direction.x.hypot(direction.y)) / std::f32::consts::PI + 0.5),
+    ]
+}
+
+pub(crate) fn environment_texture_uv(
+    id: &Id,
+    node: &GraphNode,
+    direction: DVec3,
+    fallback: DVec3,
+    path_traced: bool,
+) -> Result<[f64; 2]> {
+    let equirectangular = |direction| {
+        if path_traced {
+            equirectangular_uv(normalize_or(direction, fallback))
+        } else {
+            eevee_equirectangular_uv(direction)
+        }
+    };
+    match node.properties.get("projection") {
+        None => Ok(equirectangular(direction)),
+        Some(JsonValue::String(projection))
+            if projection.eq_ignore_ascii_case("EQUIRECTANGULAR") =>
+        {
+            Ok(equirectangular(direction))
+        }
+        Some(JsonValue::String(projection)) if projection.eq_ignore_ascii_case("MIRROR_BALL") => {
+            if path_traced {
+                let mut direction = direction.normalize_or_zero();
+                direction.y -= 1.0;
+                let divisor = 2.0 * (-0.5 * direction.y).max(0.0).sqrt();
+                if divisor > 0.0 {
+                    direction /= divisor;
+                }
+                Ok([
+                    f64::midpoint(direction.x, 1.0),
+                    f64::midpoint(direction.z, 1.0),
+                ])
+            } else {
+                let vector =
+                    glam::Vec3::new(direction.x as f32, direction.y as f32, direction.z as f32);
+                // EEVEE's vector_math_safe_normalize uses this squared-length cutoff.
+                let mut direction = if vector.dot(vector) > 1.0e-35_f32 {
+                    vector.normalize()
+                } else {
+                    glam::Vec3::ZERO
+                };
+                direction.y -= 1.0;
+                let divisor = 2.0 * (-0.5 * direction.y).max(0.0).sqrt();
+                direction /= divisor.max(1.0e-8);
+                Ok([
+                    f64::from(0.5 * direction.x + 0.5),
+                    f64::from(0.5 * direction.z + 0.5),
+                ])
+            }
+        }
+        Some(projection) => Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            format!("Environment Texture projection `{projection}` is not supported"),
+            json!({
+                "feature_id": "shader.node.ShaderNodeTexEnvironment.projection",
+                "node_id": id,
+                "projection": projection,
+            }),
+        )),
+    }
+}
 
 #[cfg(test)]
 mod tests {
 
     use super::*;
     use crate::graph::{GraphKind, GraphLink};
+
+    #[test]
+    fn eevee_environment_uv_uses_only_exact_zero_fallback() {
+        assert_eq!(
+            eevee_equirectangular_uv(DVec3::new(0.0, 1.0, 0.0)),
+            [0.0; 2]
+        );
+        assert_eq!(
+            eevee_equirectangular_uv(DVec3::new(1.0, 0.0, 0.0)),
+            [0.0; 2]
+        );
+
+        let tiny = f64::from(f32::MIN_POSITIVE);
+        assert_ne!(
+            eevee_equirectangular_uv(DVec3::new(tiny, 1.0, 0.0)),
+            [0.0; 2]
+        );
+    }
+    #[test]
+    fn mirror_ball_uses_eevee_safe_normalize_cutoff() -> Result<()> {
+        let mut node = GraphNode::new("ShaderNodeTexEnvironment");
+        node.properties
+            .insert("projection".to_owned(), json!("MIRROR_BALL"));
+        let id = Id::new("mirror_ball")?;
+        let below =
+            environment_texture_uv(&id, &node, DVec3::new(1.0e-18, 0.0, 0.0), DVec3::Z, false)?;
+        let above =
+            environment_texture_uv(&id, &node, DVec3::new(1.0e-17, 0.0, 0.0), DVec3::Z, false)?;
+
+        assert!((below[0] - 0.5).abs() <= f64::EPSILON);
+        assert!((below[1] - 0.5).abs() <= f64::EPSILON);
+        assert!((above[0] - 0.853_553_390_593_273_7).abs() <= 1.0e-7);
+        assert!((above[1] - 0.5).abs() <= f64::EPSILON);
+        Ok(())
+    }
 
     /// Blender 5.2.2's environment colours (`tests/fixtures/repeat_edge/generate_world_env_oracle.py`): 256 ray directions
     /// around the u = 0 seam and up to the zenith, each with the colour of a 4 x 2 equirectangular texture, Closest and
@@ -570,6 +845,7 @@ mod tests {
             &groups,
             &std::collections::BTreeMap::new(),
             DVec3::Z,
+            true,
         )
     }
 

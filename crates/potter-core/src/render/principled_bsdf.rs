@@ -40,7 +40,9 @@ use super::principled_thin_film::{
 };
 use super::subsurface::{channel_mask, raw_radius, subsurface_evaluated};
 use crate::model::RayKind;
-use crate::shader::{AnisotropyModel, BsdfParams, dielectric_f0, make_orthonormals};
+use crate::shader::{
+    AnisotropyModel, BsdfParams, GlassDistribution, dielectric_f0, make_orthonormals,
+};
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
 const MIN_ROUGHNESS: f64 = 0.02;
@@ -1484,6 +1486,8 @@ struct GlassLobe {
     transmission_tint: DVec3,
     /// Multiscatter gain `1 + Fms · (1 - E) / E` per channel, from the view.
     gain: DVec3,
+    /// Cycles' closure sample weight after its Fresnel albedo estimate and `MULTI_GGX` darkening.
+    selection_weight: f64,
     singular: bool,
     straight: bool,
     thin: Option<ThinGlass>,
@@ -1543,39 +1547,59 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLo
             reflection_tint,
             transmission_tint,
             gain: thin.reflection_gain,
+            selection_weight: 1.0,
             singular,
             straight: false,
             thin: Some(thin),
         });
     }
 
-    // `microfacet_ggx_preserve_energy`: the GGX_GLASS tables at the view, the inverse ones below an IOR of 1.
-    let inverse = ior < 1.0;
-    let table_ior = if inverse { 1.0 / ior } else { ior };
-    let z = ((table_ior - 1.0) / (table_ior + 1.0)).abs().sqrt();
-    let (energy, energy_average) = if inverse {
-        (
-            ggx_glass_inverse_energy(roughness, cos_ni, z),
-            ggx_glass_inverse_energy_average(roughness, z),
-        )
+    // `bsdf_microfacet_setup_fresnel_generalized_schlick` first weights sampling by
+    // `bsdf_microfacet_estimate_albedo`; MULTI_GGX then applies its preservation darkening.
+    let (gain, energy, fss) = if params.glass_distribution == GlassDistribution::MultiGgx {
+        let fss = if transmission_tint.max_element() <= 0.0 {
+            // The reflective Fss: the dielectric's average single-scattering Fresnel, on the reflection tint.
+            dielectric_fss(&SpecularLayer {
+                eta: ior,
+                f0_tinted: f0,
+            }) * reflection_tint
+        } else {
+            transmission_tint
+        };
+        let inverse = ior < 1.0;
+        let table_ior = if inverse { 1.0 / ior } else { ior };
+        let z = ((table_ior - 1.0) / (table_ior + 1.0)).abs().sqrt();
+        let (energy, energy_average) = if inverse {
+            (
+                ggx_glass_inverse_energy(roughness, cos_ni, z),
+                ggx_glass_inverse_energy_average(roughness, z),
+            )
+        } else {
+            (
+                ggx_glass_energy(roughness, cos_ni, z),
+                ggx_glass_energy_average(roughness, z),
+            )
+        };
+        let energy = energy.max(1.0e-6);
+        let missing = (1.0 - energy) / energy;
+        (multiscatter_gain(fss, energy_average, missing), energy, fss)
     } else {
-        (
-            ggx_glass_energy(roughness, cos_ni, z),
-            ggx_glass_energy_average(roughness, z),
-        )
+        (DVec3::ONE, 1.0, DVec3::ONE)
     };
-    let energy = energy.max(1.0e-6);
-    let missing = (1.0 - energy) / energy;
-    let fss = if transmission_tint.max_element() <= 0.0 {
-        // The reflective Fss: the dielectric's average single-scattering Fresnel, on the reflection tint.
-        dielectric_fss(&SpecularLayer {
-            eta: ior,
-            f0_tinted: f0,
-        }) * reflection_tint
-    } else {
-        transmission_tint
-    };
-    let gain = multiscatter_gain(fss, energy_average, missing);
+    let mut selection_weight = glass_estimated_albedo(
+        roughness,
+        cos_ni,
+        ior,
+        thin_film_thickness,
+        thin_film_ior,
+        f0,
+        reflection_tint,
+        transmission_tint,
+    );
+    if params.glass_distribution == GlassDistribution::MultiGgx && fss != DVec3::ONE {
+        // Cycles' darkening is `gain / energy_scale`, and `energy_scale` is `1 / E`.
+        selection_weight *= (gain * energy).element_sum() / 3.0;
+    }
     Some(GlassLobe {
         thin_film_thickness,
         thin_film_ior,
@@ -1585,10 +1609,31 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLo
         reflection_tint,
         transmission_tint,
         gain,
+        selection_weight,
         singular,
         straight,
         thin: None,
     })
+}
+
+fn glass_estimated_albedo(
+    roughness: f64,
+    cosine_incident: f64,
+    ior: f64,
+    thin_film_thickness: f64,
+    thin_film_ior: f64,
+    f0: DVec3,
+    reflection_tint: DVec3,
+    transmission_tint: DVec3,
+) -> f64 {
+    let fresnel = if thin_film_thickness > THICKNESS_CUTOFF {
+        thin_film_dielectric_fresnel(cosine_incident, thin_film_thickness, thin_film_ior, ior, f0).0
+    } else {
+        let z = ((ior - 1.0) / (ior + 1.0)).abs().sqrt();
+        let remap = ggx_gen_schlick_ior_s(roughness, cosine_incident, z);
+        f0.lerp(DVec3::ONE, remap)
+    };
+    (fresnel * reflection_tint + (DVec3::ONE - fresnel) * transmission_tint).element_sum() / 3.0
 }
 
 fn thin_glass_setup(
@@ -1673,7 +1718,8 @@ fn thin_glass_setup(
 
 impl GlassLobe {
     fn selection_weight(self) -> f64 {
-        self.thin.map_or(1.0, ThinGlass::selection_weight)
+        self.thin
+            .map_or(self.selection_weight, ThinGlass::selection_weight)
     }
 }
 
@@ -1914,8 +1960,8 @@ pub(crate) fn thin_glass_shadow_transparency(params: &BsdfParams, layers: &Layer
     thin.transmittance * (amount * params.reflectance.clamp(0.0, 1.0)) * layers.lower
 }
 
-/// The glass lobe along `light`, times reflectance and the layers above it: its reflection above the
-/// surface and its transmission below. A delta lobe is zero here, since `sample_glass` draws it.
+/// The glass lobe along `light`, times its Principled transmission share, reflectance and the layers above it: reflection
+/// above the surface and transmission below. A delta lobe is zero here, since `sample_glass` draws it.
 pub(crate) fn glass_coefficient(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
     let Some(lobe) = layers.glass.as_ref() else {
         return DVec3::ZERO;
@@ -1925,12 +1971,12 @@ pub(crate) fn glass_coefficient(params: &BsdfParams, layers: &Layers, light: DVe
         return DVec3::ZERO;
     }
     let value = if lobe.thin.is_some() {
-        let (value, _) = thin_glass_eval(lobe, layers.specular, layers.view, light);
-        value * ((1.0 - params.metallic.clamp(0.0, 1.0)) * params.transmission.clamp(0.0, 1.0))
+        thin_glass_eval(lobe, layers.specular, layers.view, light).0
     } else {
         glass_eval(lobe, layers.specular, layers.view, light).0
     };
-    value / cosine * (params.reflectance.clamp(0.0, 1.0) * layers.lower)
+    value * ((1.0 - params.metallic.clamp(0.0, 1.0)) * params.transmission.clamp(0.0, 1.0)) / cosine
+        * (params.reflectance.clamp(0.0, 1.0) * layers.lower)
 }
 
 /// Cycles' `1e6` for a singular draw's pdf (`bsdf_microfacet_sample`: `*pdf *= 1e6f` when `m_singular`).
@@ -2001,7 +2047,9 @@ pub(crate) fn sample_glass(
     } else {
         (reflectance, pdf_reflect)
     };
-    let scale = params.reflectance.clamp(0.0, 1.0) * layers.lower;
+    let glass_weight =
+        (1.0 - params.metallic.clamp(0.0, 1.0)) * params.transmission.clamp(0.0, 1.0);
+    let scale = glass_weight * params.reflectance.clamp(0.0, 1.0) * layers.lower;
     GlassSample::Singular {
         direction,
         weight: value * lobe.gain * scale / (branch * share),
@@ -2532,6 +2580,7 @@ mod glass_tests {
             reflection_tint: DVec3::ONE,
             transmission_tint: DVec3::ONE,
             gain: DVec3::ONE,
+            selection_weight: 1.0,
             singular: false,
             straight: false,
             thin: None,

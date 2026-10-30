@@ -438,6 +438,26 @@ impl VdbGrid {
         self.sample_value(IVec3::from_array(ijk))
             .component(component)
     }
+    /// Whether the grid stores a scalar rather than a vector.
+    #[must_use]
+    pub(crate) fn is_scalar(&self) -> bool {
+        matches!(
+            self.value_type.split('_').nth(1),
+            Some("bool" | "float" | "double" | "int32" | "int64")
+        )
+    }
+
+    /// Trilinearly sample a scalar value in fractional index space.
+    pub(crate) fn sample_index_scalar_linear(&self, index: DVec3) -> Option<f64> {
+        if !self.is_scalar() || !index.is_finite() {
+            return None;
+        }
+        Some(Self::trilinear_index(
+            index,
+            self.tree.background_value.scalar(),
+            |point| self.sample_value(IVec3::from_array(point)).scalar(),
+        ))
+    }
 
     /// Box-sample one component of the grid at a fractional index position, with the background
     /// outside active data, as Blender's `BoxSampler::sample` does on a float grid.
@@ -472,24 +492,75 @@ impl VdbGrid {
         })
     }
 
-    /// Whether the grid stores scalar rather than three-component values.
-    #[must_use]
-    pub(crate) fn is_scalar(&self) -> bool {
-        !matches!(
-            self.tree.background_value,
-            VdbValue::Vec3(_) | VdbValue::Vec3d(_) | VdbValue::Vec3i(_)
-        )
+    /// Sample a three-component grid with the renderer's linear or cubic interpolation.
+    pub(crate) fn sample_world_color(&self, position: DVec3, cubic: bool) -> Option<[f64; 3]> {
+        if self.is_scalar() {
+            return None;
+        }
+        let index = self.transform.world_to_index.transform_point3(position);
+        Some(std::array::from_fn(|component| {
+            if cubic {
+                self.sample_world_component_cubic(index, component)
+            } else {
+                Self::trilinear_index(
+                    index,
+                    self.tree
+                        .background_value
+                        .component(component)
+                        .unwrap_or(0.0),
+                    |point| {
+                        self.sample_value(IVec3::from_array(point))
+                            .component(component)
+                            .unwrap_or(0.0)
+                    },
+                )
+            }
+        }))
     }
 
-    /// Trilinearly sample a scalar grid at an index-space position at full precision. Returns
-    /// `None` for three-component grids, which have no scalar field.
-    #[must_use]
-    pub(crate) fn sample_index_scalar_linear(&self, index: DVec3) -> Option<f64> {
-        self.is_scalar().then(|| {
-            Self::trilinear_index(index, self.tree.background, |point| {
-                self.sample_value(IVec3::from_array(point)).scalar()
-            })
-        })
+    fn sample_world_component_cubic(&self, index: DVec3, component: usize) -> f64 {
+        if !index.is_finite() {
+            return self
+                .tree
+                .background_value
+                .component(component)
+                .unwrap_or(0.0);
+        }
+        let lower = index.floor();
+        if lower
+            .to_array()
+            .iter()
+            .any(|value| *value < f64::from(i32::MIN) + 1.0 || *value >= f64::from(i32::MAX) - 2.0)
+        {
+            return self
+                .tree
+                .background_value
+                .component(component)
+                .unwrap_or(0.0);
+        }
+        let base = lower.as_ivec3();
+        let fraction = index - lower;
+        let weight_x = super::volume::cubic_weights(fraction.x);
+        let weight_y = super::volume::cubic_weights(fraction.y);
+        let weight_z = super::volume::cubic_weights(fraction.z);
+        let mut result = 0.0;
+        for (k, wz) in weight_z.iter().enumerate() {
+            for (j, wy) in weight_y.iter().enumerate() {
+                for (i, wx) in weight_x.iter().enumerate() {
+                    let point = [
+                        base.x + i as i32 - 1,
+                        base.y + j as i32 - 1,
+                        base.z + k as i32 - 1,
+                    ];
+                    let value = self
+                        .sample_value(IVec3::from_array(point))
+                        .component(component)
+                        .unwrap_or(0.0);
+                    result += value * wx * wy * wz;
+                }
+            }
+        }
+        result
     }
 
     fn trilinear_index(index: DVec3, background: f64, sample: impl Fn([i32; 3]) -> f64) -> f64 {

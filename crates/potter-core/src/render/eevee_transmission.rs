@@ -29,10 +29,10 @@
 use glam::DVec3;
 
 use super::{
-    eevee_ltc::{PackedMatrix, sample_matrix},
-    eevee_transmission_tables::{brdf, bsdf, btdf},
+    eevee_ltc::PackedMatrix,
+    eevee_transmission_tables::{brdf, bsdf, btdf, ltc_matrix},
 };
-use crate::shader::BsdfParams;
+use crate::shader::{BsdfParams, GlassDistribution};
 
 /// The last texel index of EEVEE's utility-texture LUTs, which are 64 texels across.
 const LAST_TEXEL: usize = 63;
@@ -42,6 +42,11 @@ const ROUGHNESS_LAYERS: usize = 16;
 /// Linear blend of `a` and `b` at `t`.
 pub(super) fn blend(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
+}
+
+/// Blender uploads the utility LUTs as `SFLOAT_16_16_16_16` before shader filtering.
+fn utility_texel(value: f64) -> f64 {
+    f64::from(exr::prelude::f16::from_f32(value as f32).to_f32())
 }
 
 /// EEVEE's `sample_lut` addressing for a coordinate in `[0, 1]`: the two texels around it and the blend weight of the
@@ -72,8 +77,16 @@ fn brdf_channel(channel: usize, roughness: f64, n_dot_v: f64) -> f64 {
     let (x0, x1, fx) = texel_weights(roughness);
     let (y0, y1, fy) = texel_weights(sqrt_one_minus(n_dot_v));
     blend(
-        blend(brdf(x0, y0, channel), brdf(x1, y0, channel), fx),
-        blend(brdf(x0, y1, channel), brdf(x1, y1, channel), fx),
+        blend(
+            utility_texel(brdf(x0, y0, channel)),
+            utility_texel(brdf(x1, y0, channel)),
+            fx,
+        ),
+        blend(
+            utility_texel(brdf(x0, y1, channel)),
+            utility_texel(brdf(x1, y1, channel)),
+            fx,
+        ),
         fy,
     )
 }
@@ -87,8 +100,16 @@ fn transmission_factor(roughness: f64, n_dot_v: f64, amplitude: f64) -> f64 {
     let (y0, y1, fy) = texel_weights(sqrt_one_minus(n_dot_v));
     let layer_value = |layer: usize| {
         blend(
-            blend(btdf(layer, x0, y0), btdf(layer, x1, y0), fx),
-            blend(btdf(layer, x0, y1), btdf(layer, x1, y1), fx),
+            blend(
+                utility_texel(btdf(layer, x0, y0)),
+                utility_texel(btdf(layer, x1, y0)),
+                fx,
+            ),
+            blend(
+                utility_texel(btdf(layer, x0, y1)),
+                utility_texel(btdf(layer, x1, y1)),
+                fx,
+            ),
             fy,
         )
     };
@@ -115,13 +136,13 @@ fn bsdf_channels(ior: f64, roughness: f64, n_dot_v: f64) -> [f64; 3] {
     let channel = |layer: usize, channel: usize| {
         blend(
             blend(
-                bsdf(layer, x0, y0, channel),
-                bsdf(layer, x1, y0, channel),
+                utility_texel(bsdf(layer, x0, y0, channel)),
+                utility_texel(bsdf(layer, x1, y0, channel)),
                 fx,
             ),
             blend(
-                bsdf(layer, x0, y1, channel),
-                bsdf(layer, x1, y1, channel),
+                utility_texel(bsdf(layer, x0, y1, channel)),
+                utility_texel(bsdf(layer, x1, y1, channel)),
                 fx,
             ),
             fy,
@@ -138,14 +159,24 @@ pub(crate) struct GlassSplit {
     pub(crate) transmittance: DVec3,
 }
 
-/// EEVEE's `bsdf_lut` for a glass closure. `f0` is the normal-incidence reflectance (EEVEE's `F0`, tinted by the
-/// specular tint) and `transmission_tint` multiplies the transmittance.
-pub(crate) fn glass_split(
+#[cfg(test)]
+fn glass_split(
     ior: f64,
     roughness: f64,
     n_dot_v: f64,
     f0: DVec3,
     transmission_tint: DVec3,
+) -> GlassSplit {
+    glass_split_with_multiscatter(ior, roughness, n_dot_v, f0, transmission_tint, true)
+}
+
+fn glass_split_with_multiscatter(
+    ior: f64,
+    roughness: f64,
+    n_dot_v: f64,
+    f0: DVec3,
+    transmission_tint: DVec3,
+    do_multiscatter: bool,
 ) -> GlassSplit {
     // EEVEE's `ior == 1`: no reflection, and the tint passes.
     if (ior - 1.0).abs() < 1.0e-9 {
@@ -173,15 +204,19 @@ pub(crate) fn glass_split(
     let reflectance = f0 * scale + DVec3::splat(f90 * bias);
     let transmittance = (DVec3::ONE - f0) * transmission * transmission_tint;
 
-    // `F_brdf_multi_scatter`'s normalisation: `Ess` is the energy the single-scatter terms keep, `Ems` the energy missing.
-    let energy = real_f0 * scale + bias + (1.0 - real_f0) * transmission;
-    let missing = 1.0 - energy;
-    let average = if transmission_tint.max_element() <= 0.0 {
-        f0 + (DVec3::splat(f90) - f0) / 21.0
+    let normalisation = if do_multiscatter {
+        // `F_brdf_multi_scatter`'s normalisation: `Ess` is the energy the single-scatter terms keep, `Ems` the missing energy.
+        let energy = real_f0 * scale + bias + (1.0 - real_f0) * transmission;
+        let missing = 1.0 - energy;
+        let average = if transmission_tint.max_element() <= 0.0 {
+            f0 + (DVec3::splat(f90) - f0) / 21.0
+        } else {
+            transmission_tint
+        };
+        DVec3::ONE / (DVec3::ONE - average * missing).max(DVec3::splat(1.0e-6))
     } else {
-        transmission_tint
+        DVec3::ONE
     };
-    let normalisation = DVec3::ONE / (DVec3::ONE - average * missing).max(DVec3::splat(1.0e-6));
     GlassSplit {
         reflectance: reflectance * normalisation,
         transmittance: transmittance * normalisation,
@@ -207,7 +242,19 @@ fn thin_glass_split(
     f0: DVec3,
     base_color: DVec3,
 ) -> GlassSplit {
-    let split = glass_split(ior, roughness, n_dot_v, f0, DVec3::ONE);
+    thin_glass_split_with_multiscatter(ior, roughness, n_dot_v, f0, base_color, true)
+}
+
+fn thin_glass_split_with_multiscatter(
+    ior: f64,
+    roughness: f64,
+    n_dot_v: f64,
+    f0: DVec3,
+    base_color: DVec3,
+    do_multiscatter: bool,
+) -> GlassSplit {
+    let split =
+        glass_split_with_multiscatter(ior, roughness, n_dot_v, f0, DVec3::ONE, do_multiscatter);
     let c = slab_transmittance_at_angle(base_color, n_dot_v, ior);
     let round_trip = split.reflectance * c;
     let denominator = DVec3::ONE - round_trip * round_trip;
@@ -234,7 +281,6 @@ fn thin_glass_split(
         transmittance,
     }
 }
-
 /// EEVEE's thin-glass closure roughness.
 fn thin_glass_transmission_roughness(roughness: f64, ior: f64) -> f64 {
     let ior_delta = ior - 0.5;
@@ -423,7 +469,7 @@ pub(crate) struct GlassLight {
     pub(crate) reflection: DVec3,
     /// The reflection's inverse LTC matrix, sampled at `N · V` and the roughness (`bxdf_ggx_light_reflection`).
     pub(crate) reflection_matrix: PackedMatrix,
-    /// The transmission closure's colour, squared only for thick refraction with object thickness.
+    /// Combined Beauty transmission color after the thick-refraction two-event factor.
     pub(crate) transmission: DVec3,
     /// The normal the transmission lobe integrates around (`light.N`): `-N`, or the exit normal of a thickness.
     pub(crate) transmission_normal: DVec3,
@@ -440,6 +486,8 @@ struct GlassLobe {
     thin_wall: bool,
     split: GlassSplit,
     reflection_tint: DVec3,
+    /// Post-split tint; Principled transmission keeps its tint inside `split`.
+    transmission_tint: DVec3,
     lobe_weight: DVec3,
 }
 
@@ -458,33 +506,66 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -> 
     let ior = params.ior.max(1.0e-5);
     let roughness = params.roughness.clamp(0.0, 1.0);
     let amplitude = (ior - 1.0) / (ior + 1.0);
-    // EEVEE's `F0 = F0_from_ior(ior) * reflection_tint` for a Principled, where the Glass node's Color is the tint.
-    let f0 = (DVec3::from_array(params.specular_tint).max(DVec3::ZERO) * amplitude * amplitude)
-        .clamp(DVec3::ZERO, DVec3::ONE);
+    let standalone_glass = params.standalone_glass;
+    // Principled's LUT keeps its material tint; standalone Glass uses a white split-sum response
+    // and applies its color to both lobes afterward.
+    let f0 = if standalone_glass {
+        DVec3::splat(amplitude * amplitude)
+    } else {
+        (DVec3::from_array(params.specular_tint).max(DVec3::ZERO) * amplitude * amplitude)
+            .clamp(DVec3::ZERO, DVec3::ONE)
+    };
     let reflection_tint = DVec3::from_array(params.glass_reflection_tint).max(DVec3::ZERO);
+    let transmission_tint = if standalone_glass {
+        reflection_tint
+    } else {
+        DVec3::ONE
+    };
+    let base_color = DVec3::new(
+        params.base_color[0],
+        params.base_color[1],
+        params.base_color[2],
+    );
+    let lut_base_color = if standalone_glass {
+        DVec3::ONE
+    } else {
+        base_color
+    };
+    let lut_transmission_tint = if standalone_glass {
+        DVec3::ONE
+    } else {
+        DVec3::from_array(params.glass_transmission_tint).max(DVec3::ZERO)
+    };
     Some(GlassLobe {
         normal,
         ior,
         roughness,
         thin_wall: params.thin_wall,
         split: if params.thin_wall {
-            thin_glass_split(
+            if params.glass_distribution == GlassDistribution::MultiGgx {
+                thin_glass_split(ior, roughness, normal.dot(view), f0, lut_base_color)
+            } else {
+                thin_glass_split_with_multiscatter(
+                    ior,
+                    roughness,
+                    normal.dot(view),
+                    f0,
+                    lut_base_color,
+                    false,
+                )
+            }
+        } else {
+            glass_split_with_multiscatter(
                 ior,
                 roughness,
                 normal.dot(view),
                 f0,
-                DVec3::new(
-                    params.base_color[0],
-                    params.base_color[1],
-                    params.base_color[2],
-                ),
+                lut_transmission_tint,
+                params.glass_distribution == GlassDistribution::MultiGgx,
             )
-        } else {
-            let transmission_tint =
-                DVec3::from_array(params.glass_transmission_tint).max(DVec3::ZERO);
-            glass_split(ior, roughness, normal.dot(view), f0, transmission_tint)
         },
         reflection_tint,
+        transmission_tint,
         lobe_weight: lower * weight,
     })
 }
@@ -502,7 +583,7 @@ pub(crate) fn glass_closures(
 ) -> Option<GlassClosures> {
     let lobe = glass_lobe(params, normal, view, lower)?;
     let reflection = lobe.split.reflectance * lobe.reflection_tint * lobe.lobe_weight;
-    let mut transmission = lobe.split.transmittance * lobe.lobe_weight;
+    let mut transmission = lobe.split.transmittance * lobe.transmission_tint * lobe.lobe_weight;
     if !lobe.thin_wall && thickness != Thickness::None {
         transmission *= transmission;
     }
@@ -528,6 +609,26 @@ pub(crate) fn glass_closures(
     })
 }
 
+fn sample_glass_matrix(cos_theta: f64, roughness: f64) -> PackedMatrix {
+    let (x0, x1, fx) = texel_weights(roughness);
+    let (y0, y1, fy) = texel_weights(sqrt_one_minus(cos_theta));
+    std::array::from_fn(|channel| {
+        blend(
+            blend(
+                utility_texel(ltc_matrix(x0, y0, channel)),
+                utility_texel(ltc_matrix(x1, y0, channel)),
+                fx,
+            ),
+            blend(
+                utility_texel(ltc_matrix(x0, y1, channel)),
+                utility_texel(ltc_matrix(x1, y1, channel)),
+                fx,
+            ),
+            fy,
+        )
+    })
+}
+
 /// The direct light of the glass closures at a shading point: `glass_closures`' colours with the LTC inputs of
 /// `bxdf_ggx_light_reflection` and `bxdf_ggx_light_transmission`. `None` where `glass_closures` is `None`.
 pub(crate) fn glass_light(
@@ -538,7 +639,7 @@ pub(crate) fn glass_light(
     thickness: Thickness,
 ) -> Option<GlassLight> {
     let lobe = glass_lobe(params, normal, view, lower)?;
-    let mut transmission = lobe.split.transmittance * lobe.lobe_weight;
+    let mut transmission = lobe.split.transmittance * lobe.transmission_tint * lobe.lobe_weight;
     if !lobe.thin_wall && thickness != Thickness::None {
         transmission *= transmission;
     }
@@ -555,10 +656,10 @@ pub(crate) fn glass_light(
     Some(GlassLight {
         oriented_normal: lobe.normal,
         reflection: lobe.split.reflectance * lobe.reflection_tint * lobe.lobe_weight,
-        reflection_matrix: sample_matrix(lobe.normal.dot(view), lobe.roughness),
+        reflection_matrix: sample_glass_matrix(lobe.normal.dot(view), lobe.roughness),
         transmission,
         transmission_normal,
-        transmission_matrix: sample_matrix(cos_theta, transmission_roughness),
+        transmission_matrix: sample_glass_matrix(cos_theta, transmission_roughness),
     })
 }
 
@@ -653,6 +754,77 @@ mod tests {
             return Err(
                 "the tinted thick transmission is not the square of the single event".to_owned(),
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_glass_applies_color_after_the_white_multiscatter_lut() -> Result<(), String> {
+        let tint = DVec3::new(0.82, 0.18, 0.07);
+        for distribution in [GlassDistribution::Ggx, GlassDistribution::MultiGgx] {
+            let mut colored = glass(0.9);
+            colored.standalone_glass = true;
+            colored.glass_distribution = distribution;
+            colored.glass_reflection_tint = tint.to_array();
+            colored.glass_transmission_tint = tint.to_array();
+            let mut white = colored;
+            white.glass_reflection_tint = [1.0; 3];
+            white.glass_transmission_tint = [1.0; 3];
+
+            let colored_lobe = glass_lobe(&colored, DVec3::Z, DVec3::Z, DVec3::ONE)
+                .ok_or_else(|| "colored standalone Glass lobe is missing".to_owned())?;
+            let white_lobe = glass_lobe(&white, DVec3::Z, DVec3::Z, DVec3::ONE)
+                .ok_or_else(|| "white standalone Glass lobe is missing".to_owned())?;
+            assert!(
+                colored_lobe
+                    .split
+                    .reflectance
+                    .abs_diff_eq(white_lobe.split.reflectance, 1.0e-12)
+            );
+            assert!(
+                colored_lobe
+                    .split
+                    .transmittance
+                    .abs_diff_eq(white_lobe.split.transmittance, 1.0e-12)
+            );
+
+            for thickness in [Thickness::None, Thickness::Sphere(2.0)] {
+                let transmission_tint = match thickness {
+                    Thickness::None => tint,
+                    Thickness::Sphere(_) | Thickness::Slab(_) => tint * tint,
+                };
+                let colored_closures =
+                    glass_closures(&colored, DVec3::Z, DVec3::Z, DVec3::ONE, thickness)
+                        .ok_or_else(|| {
+                            "colored standalone Glass closures are missing".to_owned()
+                        })?;
+                let white_closures =
+                    glass_closures(&white, DVec3::Z, DVec3::Z, DVec3::ONE, thickness)
+                        .ok_or_else(|| "white standalone Glass closures are missing".to_owned())?;
+                assert!(
+                    (colored_closures.reflection - white_closures.reflection * tint)
+                        .abs_diff_eq(DVec3::ZERO, 1.0e-12)
+                );
+                assert!(
+                    (colored_closures.transmission
+                        - white_closures.transmission * transmission_tint)
+                        .abs_diff_eq(DVec3::ZERO, 1.0e-12)
+                );
+
+                let colored_light =
+                    glass_light(&colored, DVec3::Z, DVec3::Z, DVec3::ONE, thickness)
+                        .ok_or_else(|| "colored standalone Glass light is missing".to_owned())?;
+                let white_light = glass_light(&white, DVec3::Z, DVec3::Z, DVec3::ONE, thickness)
+                    .ok_or_else(|| "white standalone Glass light is missing".to_owned())?;
+                assert!(
+                    (colored_light.reflection - white_light.reflection * tint)
+                        .abs_diff_eq(DVec3::ZERO, 1.0e-12)
+                );
+                assert!(
+                    (colored_light.transmission - white_light.transmission * transmission_tint)
+                        .abs_diff_eq(DVec3::ZERO, 1.0e-12)
+                );
+            }
         }
         Ok(())
     }

@@ -1,0 +1,63 @@
+{
+  "resolution": [
+    64,
+    64
+  ],
+  "samples": {
+    "eevee": 1,
+    "cycles": 1
+  },
+  "seed": 0,
+  "density": 0.0,
+  "temperature_socket": 1000.0,
+  "blackbody_intensity": 0.2,
+  "renderer": {
+    "eevee": "Blender 5.2.2 EEVEE Next; 1 TAA sample; Raw",
+    "cycles": "Blender 5.2.2 Cycles CPU; 1 sample; Raw"
+  },
+  "source": "Blender 5.2.2 VolumePrincipled blackbody emission from a temperature VDB; Density=0 isolates blackbody from scattering",
+  "cases": [
+    {
+      "name": "volume_blackbody_1800k",
+      "region": [
+        13,
+        29,
+        6,
+        6
+      ],
+      "temperature_attribute": 1.8,
+      "volume_grid": "volume_blackbody_1800k.vdb",
+      "eevee_mean": [
+        0.09765625,
+        0.01953125,
+        0.0
+      ],
+      "cycles_mean": [
+        0.1388888888888889,
+        0.02887114675508605,
+        -0.000953776373838385
+      ]
+    },
+    {
+      "name": "volume_blackbody_10200k",
+      "region": [
+        45,
+        29,
+        6,
+        6
+      ],
+      "temperature_attribute": 10.2,
+      "volume_grid": "volume_blackbody_10200k.vdb",
+      "eevee_mean": [
+        31.0,
+        35.5,
+        51.0
+      ],
+      "cycles_mean": [
+        33.873393535614014,
+        38.919290701548256,
+        56.555551528930664
+      ]
+    }
+  ]
+}

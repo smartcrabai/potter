@@ -1,0 +1,40 @@
+{
+  "cases": [
+    {
+      "name": "texture_mapping",
+      "blend": "mapped_texture_mapping.blend",
+      "loss_feature_id": "shader.node.ShaderNodeTexNoise.texture_mapping",
+      "error_code": "UNSUPPORTED_FEATURE",
+      "feature_id": "shader.node.ShaderNodeTexNoise.texture_mapping",
+      "texture_mapping": {
+        "vector_type": "POINT",
+        "translation": [
+          0.25,
+          -0.125,
+          0.0
+        ]
+      },
+      "color_mapping": {
+        "brightness": 1.0
+      }
+    },
+    {
+      "name": "color_mapping",
+      "blend": "mapped_color_mapping.blend",
+      "loss_feature_id": "shader.node.ShaderNodeTexNoise.color_mapping",
+      "error_code": "UNSUPPORTED_FEATURE",
+      "feature_id": "shader.node.ShaderNodeTexNoise.color_mapping",
+      "texture_mapping": {
+        "vector_type": "POINT",
+        "translation": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "color_mapping": {
+        "brightness": 1.25
+      }
+    }
+  ]
+}

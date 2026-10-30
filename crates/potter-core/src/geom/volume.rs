@@ -281,6 +281,23 @@ pub fn sample_density_checked_with(
     volume: &VolumeData,
     interpolation: VolumeInterpolation,
 ) -> Result<f64> {
+    sample_density_checked_with_precision(position, volume, interpolation, false)
+}
+
+pub(crate) fn sample_density_realtime_checked_with(
+    position: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> Result<f64> {
+    sample_density_checked_with_precision(position, volume, interpolation, true)
+}
+
+fn sample_density_checked_with_precision(
+    position: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+    round_to_f16: bool,
+) -> Result<f64> {
     ensure_evaluable_source(volume)?;
     if !position.is_finite() {
         return Err(invalid_volume("sample position must be finite"));
@@ -293,9 +310,13 @@ pub fn sample_density_checked_with(
         let grid = decoded
             .density_grid()
             .ok_or_else(|| invalid_volume("VDB archive contains no density grid"))?;
-        return Ok(match interpolation {
-            VolumeInterpolation::Linear => grid.sample_world_affine(position),
-            VolumeInterpolation::Cubic => grid.sample_world_cubic(position),
+        return Ok(if round_to_f16 {
+            sample_vdb_scalar_realtime(grid, position, interpolation)
+        } else {
+            match interpolation {
+                VolumeInterpolation::Linear => grid.sample_world_affine(position),
+                VolumeInterpolation::Cubic => grid.sample_world_cubic(position),
+            }
         });
     }
     let grid = first_grid(volume)?;
@@ -304,7 +325,434 @@ pub fn sample_density_checked_with(
         .checked_index_to_local_matrix()?
         .inverse()
         .transform_point3(position);
-    sample_index_checked(coordinate, grid, &values, interpolation)
+    sample_index_checked(coordinate, grid, &values, interpolation, round_to_f16)
+}
+/// Sample an exact named scalar grid attribute. Inline data has no grid names: only its primary
+/// density grid is represented as `density`.
+pub(crate) fn sample_scalar_attribute_checked(
+    name: &str,
+    position: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> Result<Option<f64>> {
+    match &volume.source {
+        VolumeSource::File(source) if source.format == "vdb" => {
+            let decoded = volume
+                .decoded_vdb
+                .as_ref()
+                .ok_or_else(vdb_resource_unavailable)?;
+            let Some(grid) = decoded.grids.iter().find(|grid| grid.name == name) else {
+                return Ok(None);
+            };
+            if !grid.is_scalar() {
+                return Err(unsupported_volume_attribute("scalar", name));
+            }
+            Ok(Some(match interpolation {
+                VolumeInterpolation::Linear => grid.sample_world_affine(position),
+                VolumeInterpolation::Cubic => grid.sample_world_cubic(position),
+            }))
+        }
+        VolumeSource::File(source) => Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            format!(
+                "volume attribute `{name}` cannot be sampled from `{}` data",
+                source.format
+            ),
+            serde_json::json!({"feature_id":"shader.volume.attribute.file_format","attribute":name,"format":source.format}),
+        )),
+        VolumeSource::Generated(_) if name == "density" => {
+            sample_density_checked_with(position, volume, interpolation).map(Some)
+        }
+        VolumeSource::Generated(_) if name == "temperature" && volume.grids.is_empty() => Ok(None),
+        VolumeSource::Generated(_) => Err(unsupported_volume_attribute("scalar", name)),
+    }
+}
+/// EEVEE scalar-grid sampling: each texture tap is rounded to its half-float storage before interpolation.
+pub(crate) fn sample_scalar_attribute_realtime_checked(
+    name: &str,
+    position: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> Result<Option<f64>> {
+    match &volume.source {
+        VolumeSource::File(source) if source.format == "vdb" => {
+            let decoded = volume
+                .decoded_vdb
+                .as_ref()
+                .ok_or_else(vdb_resource_unavailable)?;
+            let Some(grid) = decoded.grids.iter().find(|grid| grid.name == name) else {
+                return Ok(None);
+            };
+            if !grid.is_scalar() {
+                return Err(unsupported_volume_attribute("scalar", name));
+            }
+            Ok(Some(sample_vdb_scalar_realtime(
+                grid,
+                position,
+                interpolation,
+            )))
+        }
+        VolumeSource::File(_) => {
+            sample_scalar_attribute_checked(name, position, volume, interpolation)
+        }
+        VolumeSource::Generated(_) if name == "density" => {
+            sample_density_checked_with_precision(position, volume, interpolation, true).map(Some)
+        }
+        VolumeSource::Generated(_) if name == "temperature" && volume.grids.is_empty() => Ok(None),
+        VolumeSource::Generated(_) => Err(unsupported_volume_attribute("scalar", name)),
+    }
+}
+
+/// Blender's `draw_cache_impl_volume.cc` uploads one-channel grids as `SFLOAT_16` and three-channel grids as
+/// `SFLOAT_16_16_16`.
+fn round_scalar_to_f16(value: f64) -> f64 {
+    f64::from(exr::prelude::f16::from_f32(value as f32).to_f32())
+}
+
+/// Blender's `draw_cache_impl_volume.cc` packs only the active bounding box and samples a zero border.
+fn vdb_texture_tap(grid: &crate::geom::vdb::VdbGrid, point: [i32; 3], component: usize) -> f64 {
+    let Some((minimum, maximum)) = grid.active_bbox else {
+        return 0.0;
+    };
+    if (0..3).any(|axis| point[axis] < minimum[axis] || point[axis] > maximum[axis]) {
+        return 0.0;
+    }
+    grid.sample_index_component(point, component).unwrap_or(0.0)
+}
+
+fn sample_vdb_scalar_realtime(
+    grid: &crate::geom::vdb::VdbGrid,
+    position: DVec3,
+    interpolation: VolumeInterpolation,
+) -> f64 {
+    let index = grid.transform.world_to_index.transform_point3(position);
+    let cubic = interpolation == VolumeInterpolation::Cubic;
+    let lower = index.floor();
+    let minimum = f64::from(i32::MIN) + if cubic { 1.0 } else { 0.0 };
+    let maximum = f64::from(i32::MAX) - if cubic { 2.0 } else { 0.0 };
+    if !index.is_finite()
+        || lower
+            .to_array()
+            .iter()
+            .any(|value| *value < minimum || *value >= maximum)
+    {
+        return 0.0;
+    }
+    let index = index.as_vec3();
+    let lower = index.floor();
+    let base = lower.as_ivec3();
+    let tap = |point| round_scalar_to_f16(vdb_texture_tap(grid, point, 0)) as f32;
+    match interpolation {
+        VolumeInterpolation::Linear => {
+            let fraction = index - lower;
+            let mut result = 0.0_f32;
+            for z in 0..=1 {
+                for y in 0..=1 {
+                    for x in 0..=1 {
+                        let weight = (if x == 0 { 1.0 - fraction.x } else { fraction.x })
+                            * (if y == 0 { 1.0 - fraction.y } else { fraction.y })
+                            * (if z == 0 { 1.0 - fraction.z } else { fraction.z });
+                        result += tap([base.x + x, base.y + y, base.z + z]) * weight;
+                    }
+                }
+            }
+            f64::from(result)
+        }
+        VolumeInterpolation::Cubic => {
+            let fraction = index - lower;
+            let weight_x = cubic_weights(f64::from(fraction.x)).map(|weight| weight as f32);
+            let weight_y = cubic_weights(f64::from(fraction.y)).map(|weight| weight as f32);
+            let weight_z = cubic_weights(f64::from(fraction.z)).map(|weight| weight as f32);
+            let mut result = 0.0_f32;
+            for (z, wz) in weight_z.iter().enumerate() {
+                for (y, wy) in weight_y.iter().enumerate() {
+                    for (x, wx) in weight_x.iter().enumerate() {
+                        result += tap([
+                            base.x + x as i32 - 1,
+                            base.y + y as i32 - 1,
+                            base.z + z as i32 - 1,
+                        ]) * (*wx * *wy * *wz);
+                    }
+                }
+            }
+            f64::from(result)
+        }
+    }
+}
+
+fn sample_vdb_color_realtime(
+    grid: &crate::geom::vdb::VdbGrid,
+    position: DVec3,
+    interpolation: VolumeInterpolation,
+) -> [f64; 3] {
+    let index = grid.transform.world_to_index.transform_point3(position);
+    let cubic = interpolation == VolumeInterpolation::Cubic;
+    let lower = index.floor();
+    let minimum = f64::from(i32::MIN) + if cubic { 1.0 } else { 0.0 };
+    let maximum = f64::from(i32::MAX) - if cubic { 2.0 } else { 0.0 };
+    if !index.is_finite()
+        || lower
+            .to_array()
+            .iter()
+            .any(|value| *value < minimum || *value >= maximum)
+    {
+        return [0.0; 3];
+    }
+    let index = index.as_vec3();
+    let lower = index.floor();
+    let base = lower.as_ivec3();
+    let tap =
+        |point, component| round_scalar_to_f16(vdb_texture_tap(grid, point, component)) as f32;
+    let mut result = [0.0_f32; 3];
+    match interpolation {
+        VolumeInterpolation::Linear => {
+            let fraction = (index - lower).to_array();
+            for z in 0..=1 {
+                for y in 0..=1 {
+                    for x in 0..=1 {
+                        let weight = (if x == 0 {
+                            1.0 - fraction[0]
+                        } else {
+                            fraction[0]
+                        }) * (if y == 0 {
+                            1.0 - fraction[1]
+                        } else {
+                            fraction[1]
+                        }) * (if z == 0 {
+                            1.0 - fraction[2]
+                        } else {
+                            fraction[2]
+                        });
+                        let point = [base.x + x, base.y + y, base.z + z];
+                        for (component, channel) in result.iter_mut().enumerate() {
+                            *channel += tap(point, component) * weight;
+                        }
+                    }
+                }
+            }
+        }
+        VolumeInterpolation::Cubic => {
+            let fraction = index - lower;
+            let weight_x = cubic_weights(f64::from(fraction.x)).map(|weight| weight as f32);
+            let weight_y = cubic_weights(f64::from(fraction.y)).map(|weight| weight as f32);
+            let weight_z = cubic_weights(f64::from(fraction.z)).map(|weight| weight as f32);
+            for (z, wz) in weight_z.iter().enumerate() {
+                for (y, wy) in weight_y.iter().enumerate() {
+                    for (x, wx) in weight_x.iter().enumerate() {
+                        let point = [
+                            base.x + x as i32 - 1,
+                            base.y + y as i32 - 1,
+                            base.z + z as i32 - 1,
+                        ];
+                        for (component, channel) in result.iter_mut().enumerate() {
+                            *channel += tap(point, component) * (*wx * *wy * *wz);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result.map(f64::from)
+}
+
+/// Map all possible Cycles VDB taps before averaging their shader outputs, the stochastic-filtering
+/// expectation.
+pub(crate) fn sample_scalar_attribute_mapped_checked(
+    name: &str,
+    position: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+    mut map: impl FnMut(f64) -> DVec3,
+) -> Result<Option<DVec3>> {
+    if let VolumeSource::File(source) = &volume.source
+        && source.format == "vdb"
+    {
+        let decoded = volume
+            .decoded_vdb
+            .as_ref()
+            .ok_or_else(vdb_resource_unavailable)?;
+        let Some(grid) = decoded.grids.iter().find(|grid| grid.name == name) else {
+            return Ok(None);
+        };
+        if !grid.is_scalar() {
+            return Err(unsupported_volume_attribute("scalar", name));
+        }
+        return Ok(Some(map_vdb_scalar_samples(
+            grid,
+            position,
+            interpolation,
+            map,
+        )));
+    }
+
+    sample_scalar_attribute_checked(name, position, volume, interpolation)
+        .map(|value| value.map(&mut map))
+}
+
+fn map_vdb_scalar_samples(
+    grid: &crate::geom::vdb::VdbGrid,
+    position: DVec3,
+    interpolation: VolumeInterpolation,
+    mut map: impl FnMut(f64) -> DVec3,
+) -> DVec3 {
+    let index = grid.transform.world_to_index.transform_point3(position);
+    let lower = index.floor();
+    let cubic = interpolation == VolumeInterpolation::Cubic;
+    let min_index = f64::from(i32::MIN) + if cubic { 1.0 } else { 0.0 };
+    let max_index = f64::from(i32::MAX) - if cubic { 2.0 } else { 0.0 };
+    if !index.is_finite()
+        || lower
+            .to_array()
+            .iter()
+            .any(|value| *value < min_index || *value >= max_index)
+    {
+        return map(grid.tree.background);
+    }
+
+    let base = lower.as_ivec3();
+    let fraction = index - lower;
+    let mut mapped = DVec3::ZERO;
+    match interpolation {
+        VolumeInterpolation::Linear => {
+            for z in 0..=1 {
+                for y in 0..=1 {
+                    for x in 0..=1 {
+                        let weight = (if x == 0 { 1.0 - fraction.x } else { fraction.x })
+                            * (if y == 0 { 1.0 - fraction.y } else { fraction.y })
+                            * (if z == 0 { 1.0 - fraction.z } else { fraction.z });
+                        let sample = grid.sample_index_component_box(
+                            DVec3::new(
+                                f64::from(base.x + x),
+                                f64::from(base.y + y),
+                                f64::from(base.z + z),
+                            ),
+                            0,
+                        );
+                        mapped += map(f64::from(sample)) * weight;
+                    }
+                }
+            }
+        }
+        VolumeInterpolation::Cubic => {
+            let weight_x = cubic_weights(fraction.x);
+            let weight_y = cubic_weights(fraction.y);
+            let weight_z = cubic_weights(fraction.z);
+            for (z, wz) in weight_z.iter().enumerate() {
+                for (y, wy) in weight_y.iter().enumerate() {
+                    for (x, wx) in weight_x.iter().enumerate() {
+                        let sample = grid.sample_index_component_box(
+                            DVec3::new(
+                                f64::from(base.x + x as i32 - 1),
+                                f64::from(base.y + y as i32 - 1),
+                                f64::from(base.z + z as i32 - 1),
+                            ),
+                            0,
+                        );
+                        mapped += map(f64::from(sample)) * (*wx * *wy * *wz);
+                    }
+                }
+            }
+        }
+    }
+    mapped
+}
+
+/// Sample an exact named three-component VDB grid attribute.
+pub(crate) fn sample_color_attribute_checked(
+    name: &str,
+    position: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> Result<Option<[f64; 3]>> {
+    match &volume.source {
+        VolumeSource::File(source) if source.format == "vdb" => {
+            let decoded = volume
+                .decoded_vdb
+                .as_ref()
+                .ok_or_else(vdb_resource_unavailable)?;
+            let Some(grid) = decoded.grids.iter().find(|grid| grid.name == name) else {
+                return Ok(None);
+            };
+            let Some(color) =
+                grid.sample_world_color(position, interpolation == VolumeInterpolation::Cubic)
+            else {
+                return Err(unsupported_volume_attribute("color", name));
+            };
+            Ok(Some(color))
+        }
+        VolumeSource::File(source) => Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            format!(
+                "volume color attribute `{name}` cannot be sampled from `{}` data",
+                source.format
+            ),
+            serde_json::json!({"feature_id":"shader.volume.attribute.file_format","attribute":name,"format":source.format}),
+        )),
+        VolumeSource::Generated(_) => Err(unsupported_volume_attribute("color", name)),
+    }
+}
+/// EEVEE vector-grid sampling: each three-channel GPU texture tap is rounded to half before interpolation.
+pub(crate) fn sample_color_attribute_realtime_checked(
+    name: &str,
+    position: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> Result<Option<[f64; 3]>> {
+    match &volume.source {
+        VolumeSource::File(source) if source.format == "vdb" => {
+            let decoded = volume
+                .decoded_vdb
+                .as_ref()
+                .ok_or_else(vdb_resource_unavailable)?;
+            let Some(grid) = decoded.grids.iter().find(|grid| grid.name == name) else {
+                return Ok(None);
+            };
+            if grid.is_scalar() {
+                return Err(unsupported_volume_attribute("color", name));
+            }
+            Ok(Some(sample_vdb_color_realtime(
+                grid,
+                position,
+                interpolation,
+            )))
+        }
+        VolumeSource::File(_) => {
+            sample_color_attribute_checked(name, position, volume, interpolation)
+        }
+        VolumeSource::Generated(_) => Err(unsupported_volume_attribute("color", name)),
+    }
+}
+
+/// Whether the exact named grid is present. Inline data exposes only its primary scalar `density` grid.
+pub(crate) fn volume_attribute_is_present(name: &str, volume: &VolumeData) -> Result<bool> {
+    match &volume.source {
+        VolumeSource::File(source) if source.format == "vdb" => {
+            let decoded = volume
+                .decoded_vdb
+                .as_ref()
+                .ok_or_else(vdb_resource_unavailable)?;
+            Ok(decoded.grids.iter().any(|grid| grid.name == name))
+        }
+        VolumeSource::File(source) => Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            format!(
+                "volume attribute `{name}` cannot be located in `{}` data",
+                source.format
+            ),
+            serde_json::json!({"feature_id":"shader.volume.attribute.file_format","attribute":name,"format":source.format}),
+        )),
+        VolumeSource::Generated(_) if name == "density" => Ok(!volume.grids.is_empty()),
+        VolumeSource::Generated(_) if name == "temperature" && volume.grids.is_empty() => Ok(false),
+        VolumeSource::Generated(_) => Err(unsupported_volume_attribute("named", name)),
+    }
+}
+
+fn unsupported_volume_attribute(kind: &str, name: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!("volume {kind} attribute `{name}` is not represented by the available grid data"),
+        serde_json::json!({"feature_id":format!("shader.volume.attribute.{kind}"),"attribute":name}),
+    )
 }
 
 /// The inverse of the first inline grid's index-to-local matrix: volume-local positions to index coordinates. The renderer
@@ -322,9 +770,26 @@ pub fn sample_index_density_checked_with(
     volume: &VolumeData,
     interpolation: VolumeInterpolation,
 ) -> Result<f64> {
+    sample_index_density_checked_with_precision(coordinate, volume, interpolation, false)
+}
+
+pub(crate) fn sample_index_density_realtime_checked_with(
+    coordinate: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> Result<f64> {
+    sample_index_density_checked_with_precision(coordinate, volume, interpolation, true)
+}
+
+fn sample_index_density_checked_with_precision(
+    coordinate: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+    round_to_f16: bool,
+) -> Result<f64> {
     let grid = first_grid(volume)?;
     let values = validate_grid(grid)?;
-    sample_index_checked(coordinate, grid, &values, interpolation)
+    sample_index_checked(coordinate, grid, &values, interpolation, round_to_f16)
 }
 
 /// `sample_index_density_checked_with` as a NaN where it errors.
@@ -343,6 +808,7 @@ fn sample_index_checked(
     grid: &VolumeGrid,
     values: &GridSamples<'_>,
     interpolation: VolumeInterpolation,
+    round_to_f16: bool,
 ) -> Result<f64> {
     if !coordinate.is_finite() {
         return Ok(0.0);
@@ -361,6 +827,7 @@ fn sample_index_checked(
                 [1.0 - fraction.z, fraction.z],
             ],
             0,
+            round_to_f16,
         )?,
         VolumeInterpolation::Cubic => sample_inline_nodes(
             coordinate,
@@ -372,6 +839,7 @@ fn sample_index_checked(
                 cubic_weights(fraction.z),
             ],
             -1,
+            round_to_f16,
         )?,
     })
 }
@@ -397,6 +865,7 @@ fn sample_inline_nodes<const N: usize>(
     values: &GridSamples<'_>,
     weights: [[f64; N]; 3],
     first: i64,
+    round_to_f16: bool,
 ) -> Result<f64> {
     let lower = coordinate.floor();
     let base = [lower.x as i64, lower.y as i64, lower.z as i64];
@@ -409,7 +878,7 @@ fn sample_inline_nodes<const N: usize>(
                     base[1] + first + j as i64,
                     base[2] + first + k as i64,
                 ];
-                result += inline_node(grid, values, node)? * wx * wy * wz;
+                result += inline_node(grid, values, node, round_to_f16)? * wx * wy * wz;
             }
         }
     }
@@ -417,7 +886,12 @@ fn sample_inline_nodes<const N: usize>(
 }
 
 /// One node's value, zero outside the grid: the background beyond a volume's active voxels.
-fn inline_node(grid: &VolumeGrid, values: &GridSamples<'_>, node: [i64; 3]) -> Result<f64> {
+fn inline_node(
+    grid: &VolumeGrid,
+    values: &GridSamples<'_>,
+    node: [i64; 3],
+    round_to_f16: bool,
+) -> Result<f64> {
     if node
         .iter()
         .zip(grid.dims)
@@ -431,7 +905,11 @@ fn inline_node(grid: &VolumeGrid, values: &GridSamples<'_>, node: [i64; 3]) -> R
     let sample = values
         .get(index)
         .ok_or_else(|| invalid_volume("volume sample index is out of range"))?;
-    Ok(sample)
+    Ok(if round_to_f16 {
+        round_scalar_to_f16(sample)
+    } else {
+        sample
+    })
 }
 
 /// The density with the material's interpolation, as a `NaN` where [`sample_density_checked_with`] errors.
@@ -3158,13 +3636,13 @@ mod tests {
     use crate::{
         error::ErrorCode,
         geom::{BoxParams, Mesh},
+        model::VolumeInterpolation,
     };
 
     use super::{
         VolumeData, VolumeGrid, cubic_weights, mesh_to_fog_volume, sample_density,
         sample_density_checked, sample_density_with,
     };
-    use crate::model::VolumeInterpolation;
 
     #[test]
     fn density_sampling_is_trilinear_and_zero_outside() {

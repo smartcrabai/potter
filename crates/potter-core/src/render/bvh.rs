@@ -785,6 +785,12 @@ mod tests {
                             center + DVec3::new(0.0, *size, 0.0),
                         ],
                         generated: crate::geom::GeneratedCorners::default(),
+                        geometry_vertex_slots: [0; 3],
+                        geometry_vertex_weights: [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
                         object_index: index as u32,
                         element_index: index as u32,
                         color: [1.0; 4],

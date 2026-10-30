@@ -1198,6 +1198,75 @@ def _set_falloff_curve_mapping(mapping, values, owner, settings=None):
 
 
 
+def _texture_node_mapping(node):
+    result = {}
+    mapping = getattr(node, "texture_mapping", None)
+    if mapping is not None:
+        result["texture_mapping"] = {
+            "vector_type": str(mapping.vector_type),
+            "translation": plain(mapping.translation),
+            "rotation": plain(mapping.rotation),
+            "scale": plain(mapping.scale),
+            "min": plain(mapping.min),
+            "max": plain(mapping.max),
+            "use_min": bool(mapping.use_min),
+            "use_max": bool(mapping.use_max),
+            "mapping_x": str(mapping.mapping_x),
+            "mapping_y": str(mapping.mapping_y),
+            "mapping_z": str(mapping.mapping_z),
+            "mapping": str(mapping.mapping),
+        }
+    color = getattr(node, "color_mapping", None)
+    if color is not None:
+        ramp = getattr(color, "color_ramp", None)
+        ramp_state = None
+        if ramp is not None:
+            ramp_state = {
+                "elements": [
+                    {"position": float(element.position),
+                     "color": [float(component) for component in element.color]}
+                    for element in ramp.elements
+                ],
+                "interpolation": str(ramp.interpolation),
+                "hue_interpolation": str(ramp.hue_interpolation),
+                "color_mode": str(ramp.color_mode),
+            }
+        result["color_mapping"] = {
+            "use_color_ramp": bool(color.use_color_ramp),
+            "color_ramp": ramp_state,
+            "brightness": float(color.brightness),
+            "contrast": float(color.contrast),
+            "saturation": float(color.saturation),
+            "blend_type": str(color.blend_type),
+            "blend_color": plain(color.blend_color),
+            "blend_factor": float(color.blend_factor),
+        }
+    return result
+
+
+def _restore_texture_node_mapping(node, texture_mapping, color_mapping, owner):
+    if texture_mapping is not None:
+        target = getattr(node, "texture_mapping", None)
+        if target is None or not isinstance(texture_mapping, dict):
+            raise ValueError("%s cannot restore texture mapping" % owner)
+        for key in ("vector_type", "translation", "rotation", "scale", "min", "max",
+                    "use_min", "use_max", "mapping_x", "mapping_y", "mapping_z", "mapping"):
+            if key in texture_mapping:
+                _set_required(target, key, texture_mapping[key], owner)
+    if color_mapping is not None:
+        target = getattr(node, "color_mapping", None)
+        if target is None or not isinstance(color_mapping, dict):
+            raise ValueError("%s cannot restore color mapping" % owner)
+        for key in ("use_color_ramp", "brightness", "contrast", "saturation",
+                    "blend_type", "blend_color", "blend_factor"):
+            if key in color_mapping:
+                _set_required(target, key, color_mapping[key], owner)
+        ramp_state = color_mapping.get("color_ramp")
+        if ramp_state is not None:
+            _restore_color_ramp(target.color_ramp, ramp_state, owner)
+
+
+
 def tree_dump(tree):
     if tree is None:
         return None
@@ -1261,6 +1330,7 @@ def tree_dump(tree):
             properties["bake_items"] = bake_items
         if node.bl_idname == "GeometryNodeMeshCube":
             properties = {}
+        properties.update(_texture_node_mapping(node))
         if simple_material is True and not _matches_blender_defaults(node):
             simple_material = False
         if simple_material:
@@ -3354,6 +3424,11 @@ def _eevee_volumetric_end(scene):
     eevee = getattr(scene, "eevee", None)
     return float(getattr(eevee, "volumetric_end", 100.0)) if eevee is not None else 100.0
 
+def _eevee_gi_cubemap_resolution(scene):
+    eevee = getattr(scene, "eevee", None)
+    return int(getattr(eevee, "gi_cubemap_resolution", 512)) if eevee is not None else 512
+
+
 def _cryptomatte_accurate(scene):
     return any(bool(getattr(layer, CRYPTOMATTE_ACCURATE_PROP, False)) for layer in scene.view_layers)
 
@@ -3682,6 +3757,7 @@ def dump_scene(scene):
                 "passes": _render_passes(scene),
                 "cryptomatte_accurate": _cryptomatte_accurate(scene),
                 "eevee_light_threshold": _eevee_light_threshold(scene),
+                "eevee_gi_cubemap_resolution": _eevee_gi_cubemap_resolution(scene),
                 "eevee_use_volumetric_shadows": _eevee_use_volumetric_shadows(scene),
                 "eevee_volumetric_tile_size": _eevee_volumetric_tile_size(scene),
                 "eevee_volumetric_samples": _eevee_volumetric_samples(scene),
@@ -6190,6 +6266,8 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
             node.bl_idname == "ShaderNodeValToRGB" and "color_ramp" in node_properties)
         color_ramp_settings = (node_properties.pop("color_ramp")
                                if restore_color_ramp else None)
+        texture_mapping = node_properties.pop("texture_mapping", None)
+        color_mapping = node_properties.pop("color_mapping", None)
         if node.bl_idname == "GeometryNodeBake" and "bake_items" in node_properties:
             identifier_remaps[node.name] = _restore_bake_items(
                 node, node_properties.pop("bake_items") or [], owner)
@@ -6224,6 +6302,8 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
             _restore_color_ramp(
                 node.color_ramp, color_ramp_settings, "%s node %s ColorRamp" %
                 (owner, node.name))
+        _restore_texture_node_mapping(
+            node, texture_mapping, color_mapping, "%s node %s" % (owner, node.name))
         set_id(node, source.get("potter_id"))
         custom_properties = dict(source.get("custom_properties", {}))
         if simple_material:

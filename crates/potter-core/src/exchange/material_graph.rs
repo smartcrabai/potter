@@ -505,6 +505,7 @@ fn texture_node(graph: &mut NodeGroup, name: &str, slot: &SlotTexture) -> Result
     let interpolation = match slot.texture.interpolation {
         ImageInterpolation::Closest => "Closest",
         ImageInterpolation::Linear => "Linear",
+        ImageInterpolation::Cubic => "Cubic",
     };
     image
         .properties

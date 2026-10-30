@@ -9,6 +9,7 @@ pub enum ImageInterpolation {
     #[default]
     Linear,
     Closest,
+    Cubic,
 }
 
 /// How an image lookup past its edge is resolved, as Blender's Image Texture `extension`.
@@ -52,8 +53,8 @@ pub struct ImageData {
     pub pixels: Vec<[f64; 4]>,
     pub tiles: BTreeMap<u32, ImageTileData>,
     pub interpolation: ImageInterpolation,
-    /// Whether `pixels` were decoded from sRGB-encoded storage. Linear sampling then interpolates the encoded values
-    /// and decodes the result, as Cycles does for images it compresses as sRGB (`svm_image_texture` with
+    /// Whether `pixels` were decoded from sRGB-encoded storage. Linear and cubic sampling then interpolate the encoded
+    /// values and decode the result, as Cycles does for images it compresses as sRGB (`svm_image_texture` with
     /// `NODE_IMAGE_COMPRESS_AS_SRGB`, set from `ImageMetaData::is_compressible_as_srgb`).
     pub srgb: bool,
     /// How Blender stores the image's values for Image Texture colour reads.
@@ -230,11 +231,11 @@ impl Texels {
     }
 }
 
-/// Samples an image at a normalized UV coordinate, with the colour rule of Blender's texture modifiers: an sRGB
-/// image's encoded texels are mixed, and the result is decoded to linear light. Blender's `BKE_texture_get_value`
-/// reads the straight encoded bytes (`ibuf_get_color`), mixes them in `boxsample` (a one-texel box, which is the
-/// bilinear weighting), and then converts the colour channels with `IMB_colormanagement_colorspace_to_scene_linear_v3`.
-/// The modifier reader does not premultiply.
+/// Samples an image at a normalized UV coordinate, with the colour rule of Blender's texture modifiers: for linear
+/// interpolation, an sRGB image's encoded texels are mixed and the result is decoded to linear light. Blender's
+/// `BKE_texture_get_value` reads the straight encoded bytes (`ibuf_get_color`), mixes them in `boxsample` (a one-texel
+/// box, which is bilinear weighting), and then converts the colour channels with
+/// `IMB_colormanagement_colorspace_to_scene_linear_v3`. The modifier reader does not premultiply.
 ///
 /// With `udim` set, the tile is the one the UV's floored offsets select from tile 1001; a missing tile reads transparent
 /// black.
@@ -279,6 +280,15 @@ fn sample_image(
     match interpolation {
         ImageInterpolation::Linear => sample_linear(values, width, height, u, v, texels),
         ImageInterpolation::Closest => sample_closest(values, width, height, u, v, texels),
+        ImageInterpolation::Cubic => sample_cubic_with_extension(
+            values,
+            width,
+            height,
+            [u, v],
+            [ImageExtension::Extend; 2],
+            false,
+            texels,
+        ),
     }
 }
 
@@ -300,6 +310,19 @@ pub fn sample_with_extension_alpha(
     extension: ImageExtension,
     alpha_linked: bool,
 ) -> [f64; 4] {
+    sample_with_extension_alpha_axes(data, uv, udim, interpolation, [extension; 2], alpha_linked)
+}
+
+/// Samples with independent U/V extensions, as EEVEE environment textures configure their sampler.
+#[must_use]
+pub(crate) fn sample_with_extension_alpha_axes(
+    data: &ImageData,
+    uv: [f64; 2],
+    udim: bool,
+    interpolation: ImageInterpolation,
+    extensions: [ImageExtension; 2],
+    alpha_linked: bool,
+) -> [f64; 4] {
     if !uv[0].is_finite() || !uv[1].is_finite() {
         return TRANSPARENT_BLACK;
     }
@@ -314,6 +337,44 @@ pub fn sample_with_extension_alpha(
     } else {
         (base_tile(data), uv)
     };
+    sample_tile_with_extension_axes(image, local, interpolation, extensions, alpha_linked)
+}
+
+/// Samples one image without routing UVs, as EEVEE does for non-flat Image Texture projections.
+/// A UDIM image uses its first tile.
+#[must_use]
+pub(crate) fn sample_with_extension_alpha_first_tile_axes(
+    data: &ImageData,
+    uv: [f64; 2],
+    interpolation: ImageInterpolation,
+    extensions: [ImageExtension; 2],
+    alpha_linked: bool,
+) -> [f64; 4] {
+    if !uv[0].is_finite() || !uv[1].is_finite() {
+        return TRANSPARENT_BLACK;
+    }
+    let image = if data.udim {
+        stored_tile(data, 1001)
+            .or_else(|| {
+                data.tiles
+                    .keys()
+                    .next()
+                    .and_then(|number| stored_tile(data, *number))
+            })
+            .unwrap_or_else(|| base_tile(data))
+    } else {
+        base_tile(data)
+    };
+    sample_tile_with_extension_axes(image, uv, interpolation, extensions, alpha_linked)
+}
+
+fn sample_tile_with_extension_axes(
+    image: ImageTileDataRef<'_>,
+    local: [f64; 2],
+    interpolation: ImageInterpolation,
+    extensions: [ImageExtension; 2],
+    alpha_linked: bool,
+) -> [f64; 4] {
     let Some((width, height)) = image.valid_dimensions() else {
         return TRANSPARENT_BLACK;
     };
@@ -326,11 +387,14 @@ pub fn sample_with_extension_alpha(
             height,
             local[0],
             1.0 - local[1],
-            extension,
+            extensions,
             texels,
         ),
         ImageInterpolation::Closest => {
-            sample_closest_cycles(values, width, height, local, extension, texels)
+            sample_closest_cycles(values, width, height, local, extensions, texels)
+        }
+        ImageInterpolation::Cubic => {
+            sample_cubic_with_extension(values, width, height, local, extensions, true, texels)
         }
     }
 }
@@ -397,6 +461,7 @@ fn image_for_uv(data: &ImageData, uv: [f64; 2], udim: bool) -> Option<ImageTileD
     stored_tile(data, udim_tile(uv)?)
 }
 
+#[derive(Clone, Copy)]
 struct ImageTileDataRef<'a> {
     width: u32,
     height: u32,
@@ -542,7 +607,7 @@ fn sample_closest_cycles(
     width: usize,
     height: usize,
     uv: [f64; 2],
-    extension: ImageExtension,
+    extensions: [ImageExtension; 2],
     texels: Texels,
 ) -> [f64; 4] {
     let (Some(column), Some(row)) = (
@@ -552,8 +617,8 @@ fn sample_closest_cycles(
         return TRANSPARENT_BLACK;
     };
     let (Some(x), Some(y)) = (
-        extension_index(column, width, extension),
-        extension_index(row, height, extension),
+        extension_index(column, width, extensions[0]),
+        extension_index(row, height, extensions[1]),
     ) else {
         return TRANSPARENT_BLACK;
     };
@@ -573,7 +638,7 @@ fn sample_linear_with_extension(
     height: usize,
     u: f64,
     v: f64,
-    extension: ImageExtension,
+    extensions: [ImageExtension; 2],
     texels: Texels,
 ) -> [f64; 4] {
     let x = u * width as f64 - 0.5;
@@ -591,13 +656,109 @@ fn sample_linear_with_extension(
 
     let texel = |x: i64, y: i64| {
         stored_texel(
-            pixel_with_extension(pixels, width, height, x, y, extension),
+            pixel_with_extension(pixels, width, height, x, y, extensions),
             texels,
         )
     };
     let top = mix(texel(x0, y0), texel(x1, y0), tx);
     let bottom = mix(texel(x0, y1), texel(x1, y1), tx);
     finish(mix(top, bottom, ty), texels)
+}
+
+/// Cycles' 4×4 cubic spline lookup (`ImageInterpolator::interp_cubic`), including its f32 weights and texel arithmetic.
+/// `uv` is normalized; Cycles scales it by the image dimensions before applying the center offset. `flip_y` converts its
+/// V-up rows to Potter's V-down storage without changing the extension's coordinate-space mapping.
+fn sample_cubic_with_extension(
+    pixels: &[[f64; 4]],
+    width: usize,
+    height: usize,
+    uv: [f64; 2],
+    extensions: [ImageExtension; 2],
+    flip_y: bool,
+    texels: Texels,
+) -> [f64; 4] {
+    let x = uv[0] as f32 * width as f32 - 0.5;
+    let y = uv[1] as f32 * height as f32 - 0.5;
+    let (Some((ix, tx)), Some((iy, ty))) = (cycles_frac_f32(x), cycles_frac_f32(y)) else {
+        return TRANSPARENT_BLACK;
+    };
+    let (Ok(width_i), Ok(height_i)) = (i64::try_from(width), i64::try_from(height)) else {
+        return TRANSPARENT_BLACK;
+    };
+    if (extensions[0] == ImageExtension::Clip && (ix < -2 || ix > width_i))
+        || (extensions[1] == ImageExtension::Clip && (iy < -2 || iy > height_i))
+    {
+        return TRANSPARENT_BLACK;
+    }
+    let (Some(prev_x), Some(next_x), Some(next_next_x)) =
+        (ix.checked_sub(1), ix.checked_add(1), ix.checked_add(2))
+    else {
+        return TRANSPARENT_BLACK;
+    };
+    let (Some(prev_y), Some(next_y), Some(next_next_y)) =
+        (iy.checked_sub(1), iy.checked_add(1), iy.checked_add(2))
+    else {
+        return TRANSPARENT_BLACK;
+    };
+    let x_indices =
+        [prev_x, ix, next_x, next_next_x].map(|index| extension_index(index, width, extensions[0]));
+    let y_indices = [prev_y, iy, next_y, next_next_y]
+        .map(|index| extension_index(index, height, extensions[1]));
+    let u = cubic_spline_weights(tx);
+    let v = cubic_spline_weights(ty);
+    let texel = |column: usize, row: usize| {
+        let (Some(x), Some(y)) = (x_indices[column], y_indices[row]) else {
+            return [0.0_f32; 4];
+        };
+        let y = if flip_y { height - 1 - y } else { y };
+        stored_texel(pixel(pixels, width, x, y), texels).map(|value| value as f32)
+    };
+    let row = |index: usize| {
+        let samples = [
+            texel(0, index),
+            texel(1, index),
+            texel(2, index),
+            texel(3, index),
+        ];
+        std::array::from_fn::<_, 4, _>(|channel| {
+            u[0] * samples[0][channel]
+                + u[1] * samples[1][channel]
+                + u[2] * samples[2][channel]
+                + u[3] * samples[3][channel]
+        })
+    };
+    let rows = [row(0), row(1), row(2), row(3)];
+    let mixed = std::array::from_fn::<_, 4, _>(|channel| {
+        v[0] * rows[0][channel]
+            + v[1] * rows[1][channel]
+            + v[2] * rows[2][channel]
+            + v[3] * rows[3][channel]
+    });
+    finish(mixed.map(f64::from), texels)
+}
+
+fn cycles_frac_f32(value: f32) -> Option<(i64, f32)> {
+    let truncated = f64::from(value.trunc());
+    if !(I64_LOWER_INCLUSIVE..I64_UPPER_EXCLUSIVE).contains(&truncated) {
+        return None;
+    }
+    let index = value.trunc() as i64;
+    let index = if value < 0.0 {
+        index.checked_sub(1)?
+    } else {
+        index
+    };
+    Some((index, value - index as f32))
+}
+
+/// `SET_CUBIC_SPLINE_WEIGHTS` from Cycles' `intern/cycles/kernel/device/cpu/image.h`.
+fn cubic_spline_weights(t: f32) -> [f32; 4] {
+    [
+        (((-1.0_f32 / 6.0) * t + 0.5) * t - 0.5) * t + (1.0 / 6.0),
+        ((0.5 * t - 1.0) * t) * t + (2.0 / 3.0),
+        ((-0.5 * t + 0.5) * t + 0.5) * t + (1.0 / 6.0),
+        (1.0 / 6.0) * t * t * t,
+    ]
 }
 
 /// One texel as Blender's stored buffer holds it, before mixing. An sRGB image's texel is encoded, which is the value
@@ -642,7 +803,7 @@ fn integer_premultiply(value: f64, alpha: f64, max: f64) -> f64 {
 /// Rounds to the nearest IEEE half-precision value, ties to even, as Cycles' `float_to_half` does. Normal halves keep
 /// 11 significant bits (a step of 2^(e - 10) at exponent e), and values below 2^-14 share the subnormal step 2^-24.
 /// Magnitudes above the largest finite half clamp to 65504, as `float_to_half_image` does (`intern/cycles/util/half.h`).
-fn round_to_half(value: f64) -> f64 {
+pub(crate) fn round_to_half(value: f64) -> f64 {
     if value.is_nan() || value.abs() < f64::MIN_POSITIVE {
         return value;
     }
@@ -685,12 +846,12 @@ fn pixel_with_extension(
     height: usize,
     x: i64,
     y: i64,
-    extension: ImageExtension,
+    extensions: [ImageExtension; 2],
 ) -> [f64; 4] {
-    let Some(x) = extension_index(x, width, extension) else {
+    let Some(x) = extension_index(x, width, extensions[0]) else {
         return TRANSPARENT_BLACK;
     };
-    let Some(y) = extension_index(y, height, extension) else {
+    let Some(y) = extension_index(y, height, extensions[1]) else {
         return TRANSPARENT_BLACK;
     };
     pixel(pixels, width, x, y)

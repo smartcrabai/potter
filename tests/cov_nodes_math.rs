@@ -1725,7 +1725,33 @@ fn shader_surface_with_node(
     target: &str,
 ) -> potter_core::error::Result<potter_core::shader::BsdfParams> {
     let mut group = NodeGroup::new("Shader node", GraphKind::Shader);
+    let mut inputs = inputs;
+    let vector_input = if node_type == "ShaderNodeTexVoronoi" {
+        inputs
+            .as_object_mut()
+            .and_then(|inputs| inputs.remove("Vector"))
+    } else {
+        None
+    };
     add_node(&mut group, "node", node_type, inputs, properties);
+    if let Some(vector_input) = vector_input {
+        let vector = vector_input
+            .as_array()
+            .expect("Voronoi test Vector input must be an array");
+        assert_eq!(vector.len(), 3);
+        add_node(
+            &mut group,
+            "vector",
+            "ShaderNodeCombineXYZ",
+            json!({
+                "X": vector[0].clone(),
+                "Y": vector[1].clone(),
+                "Z": vector[2].clone()
+            }),
+            json!({}),
+        );
+        link(&mut group, "vector", "Vector", "node", "Vector");
+    }
     add_node(
         &mut group,
         "principled",
@@ -1925,7 +1951,7 @@ fn shader_map_range_defaults_to_blenders_enabled_clamp() {
 
 #[test]
 fn voronoi_distance_is_bounded_deterministic_and_matches_its_feature_position() {
-    for vector in [[0.3, 0.7, 1.2], [-4.2, 9.9, 0.0], [100.5, -0.25, 7.75]] {
+    for vector in [[0.3_f64, 0.7, 1.2], [-4.2, 9.9, 0.0], [100.5, -0.25, 7.75]] {
         let inputs = json!({"Vector": vector, "Scale": 1.0});
         let distance = shader_surface_with_node(
             "ShaderNodeTexVoronoi",
@@ -1965,13 +1991,23 @@ fn voronoi_distance_is_bounded_deterministic_and_matches_its_feature_position() 
         )
         .unwrap()
         .emission_color;
-        let offset = [
-            vector[0] - position[0],
-            vector[1] - position[1],
-            vector[2] - position[2],
-        ];
-        let measured = offset.iter().map(|axis| axis * axis).sum::<f64>().sqrt();
-        assert!((measured - distance).abs() < 1.0e-12, "{vector:?}");
+        let measured = (0..3)
+            .map(|axis| {
+                let offset = vector[axis] as f32 - position[axis] as f32;
+                offset * offset
+            })
+            .sum::<f32>()
+            .sqrt();
+        let position_magnitude = vector
+            .iter()
+            .map(|coordinate| coordinate.abs() + 2.0)
+            .fold(1.0, f64::max);
+        let position_ulp = 2.0_f64.powf(position_magnitude.log2().floor() - 23.0);
+        let quantization_bound = 4.0 * position_ulp;
+        assert!(
+            (f64::from(measured) - distance).abs() <= quantization_bound,
+            "{vector:?}: measured {measured}, distance {distance}, f32 quantization bound {quantization_bound}"
+        );
         for axis in 0..3 {
             assert!(
                 (position[axis] - vector[axis].floor()).abs() < 2.0,
@@ -2003,8 +2039,11 @@ fn voronoi_scale_multiplies_the_sampled_coordinate_and_color_is_a_unit_rgb() {
     )
     .unwrap()
     .emission_color;
-    // The same scaled coordinate (1, 2, 3) must select the same feature point.
-    assert_eq!(scaled.map(f64::to_bits), unit.map(f64::to_bits));
+    // The same scaled coordinate selects the same feature point, which the output maps back by 1/Scale.
+    assert_eq!(
+        scaled.map(|value| (value as f32 * 2.0).to_bits()),
+        unit.map(|value| (value as f32).to_bits())
+    );
     let color = sample(2.0, "Color", "Emission Color").emission_color;
     assert!(color.iter().all(|channel| (0.0..=1.0).contains(channel)));
     let error = shader_surface_with_node(

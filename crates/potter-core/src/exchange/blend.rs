@@ -11213,6 +11213,840 @@ fn canonicalize_point_cache_locator(
         json!({"kind": system, "frames": frames}),
     );
 }
+fn shader_graph_nodes_reaching_output<'a>(tree: &'a Value, output_type: &str) -> BTreeSet<&'a str> {
+    shader_graph_nodes_reaching_output_socket(tree, output_type, None)
+}
+
+fn shader_graph_nodes_reaching_output_socket<'a>(
+    tree: &'a Value,
+    output_type: &str,
+    output_socket: Option<&str>,
+) -> BTreeSet<&'a str> {
+    let Some(nodes) = tree.get("nodes").and_then(Value::as_array) else {
+        return BTreeSet::new();
+    };
+    let Some(links) = tree.get("links").and_then(Value::as_array) else {
+        return BTreeSet::new();
+    };
+    let is_output = |node: &Value| {
+        let node_type = node.get("type").and_then(Value::as_str);
+        node_type == Some(output_type)
+            || (output_type == "ShaderNodeOutputMaterial" && node_type == Some("OutputMaterial"))
+            || (output_type == "ShaderNodeOutputWorld" && node_type == Some("OutputWorld"))
+    };
+    let has_active_output = nodes.iter().any(|node| {
+        is_output(node)
+            && node
+                .get("properties")
+                .and_then(|properties| properties.get("is_active_output"))
+                .and_then(Value::as_bool)
+                == Some(true)
+    });
+    let outputs = nodes
+        .iter()
+        .filter(|node| {
+            is_output(node)
+                && (!has_active_output
+                    || node
+                        .get("properties")
+                        .and_then(|properties| properties.get("is_active_output"))
+                        .and_then(Value::as_bool)
+                        == Some(true))
+        })
+        .filter_map(|node| node.get("name").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    let mut pending = match output_socket {
+        Some(socket) => links
+            .iter()
+            .filter(|link| {
+                link.get("to_node")
+                    .and_then(Value::as_str)
+                    .is_some_and(|target| outputs.contains(target))
+                    && link.get("to_socket").and_then(Value::as_str) == Some(socket)
+            })
+            .filter_map(|link| link.get("from_node").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        None => outputs.iter().copied().collect(),
+    };
+    let mut reachable = BTreeSet::new();
+    while let Some(target) = pending.pop() {
+        if !reachable.insert(target) {
+            continue;
+        }
+        for link in links {
+            if link.get("to_node").and_then(Value::as_str) == Some(target)
+                && let Some(source) = link.get("from_node").and_then(Value::as_str)
+            {
+                pending.push(source);
+            }
+        }
+    }
+    reachable
+}
+
+fn legacy_mapping_marker_requires_reimport(value: &Value, rna_type: &str) -> bool {
+    value.as_object().is_some_and(|mapping| {
+        mapping.len() == 1 && mapping.get("rna_type").and_then(Value::as_str) == Some(rna_type)
+    })
+}
+
+fn push_shader_node_mapping_import_losses(
+    node_name: &str,
+    node_type: &str,
+    properties: &Value,
+    data_id: Option<&str>,
+    losses: &mut Vec<Loss>,
+) {
+    if !matches!(
+        node_type,
+        "ShaderNodeTexImage"
+            | "ShaderNodeTexChecker"
+            | "ShaderNodeTexNoise"
+            | "ShaderNodeTexVoronoi"
+            | "ShaderNodeTexGradient"
+            | "ShaderNodeTexEnvironment"
+            | "ShaderNodeTexBrick"
+            | "ShaderNodeTexGabor"
+            | "ShaderNodeTexMagic"
+            | "ShaderNodeTexSky"
+            | "ShaderNodeTexWave"
+    ) {
+        return;
+    }
+    for (property, rna_type) in [
+        ("texture_mapping", "TexMapping"),
+        ("color_mapping", "ColorMapping"),
+    ] {
+        let Some(value) = properties.get(property) else {
+            continue;
+        };
+        let legacy_marker = legacy_mapping_marker_requires_reimport(value, rna_type);
+        if !legacy_marker
+            && crate::shader::texture::texture_node_mapping_property_is_default(property, value)
+                != Some(false)
+        {
+            continue;
+        }
+        let reason = if legacy_marker {
+            format!(
+                "Shader node `{node_name}` retains the legacy `{property}` RNA marker `{rna_type}` without mapping values; they are unknown, not Blender defaults, and Potter requires re-import before evaluation"
+            )
+        } else {
+            format!(
+                "Shader node `{node_name}` has unsupported `{property}` settings; Potter preserves them but refuses evaluation"
+            )
+        };
+        losses.push(loss(
+            format!("shader.node.{node_type}.{property}"),
+            data_id,
+            &reason,
+        ));
+    }
+}
+fn typed_shader_graph_nodes_reaching_output(group: &NodeGroup) -> BTreeSet<&Id> {
+    let is_output = |node: &GraphNode| {
+        matches!(
+            node.node_type.as_str(),
+            "ShaderNodeOutputMaterial" | "OutputMaterial" | "ShaderNodeOutputWorld" | "OutputWorld"
+        )
+    };
+    let has_active_output = group.nodes.values().any(|node| {
+        is_output(node)
+            && node
+                .properties
+                .get("is_active_output")
+                .and_then(Value::as_bool)
+                == Some(true)
+    });
+    let mut pending = group
+        .nodes
+        .iter()
+        .filter(|(_, node)| {
+            is_output(node)
+                && (!has_active_output
+                    || node
+                        .properties
+                        .get("is_active_output")
+                        .and_then(Value::as_bool)
+                        == Some(true))
+        })
+        .map(|(node_id, _)| node_id)
+        .collect::<Vec<_>>();
+    let mut reachable = BTreeSet::new();
+    while let Some(target) = pending.pop() {
+        if !reachable.insert(target) {
+            continue;
+        }
+        pending.extend(
+            group
+                .links
+                .iter()
+                .filter(|link| &link.to_node == target)
+                .map(|link| &link.from_node),
+        );
+    }
+    reachable
+}
+
+fn legacy_shader_mapping_export_losses(doc: &SceneDoc) -> Vec<Loss> {
+    let mut losses = Vec::new();
+    for group in doc.node_groups.values() {
+        if group.kind != GraphKind::Shader {
+            continue;
+        }
+        let reachable = typed_shader_graph_nodes_reaching_output(group);
+        for (node_id, node) in &group.nodes {
+            if !reachable.contains(node_id)
+                || !matches!(
+                    node.node_type.as_str(),
+                    "ShaderNodeTexImage"
+                        | "ShaderNodeTexChecker"
+                        | "ShaderNodeTexNoise"
+                        | "ShaderNodeTexVoronoi"
+                        | "ShaderNodeTexGradient"
+                        | "ShaderNodeTexEnvironment"
+                        | "ShaderNodeTexBrick"
+                        | "ShaderNodeTexGabor"
+                        | "ShaderNodeTexMagic"
+                        | "ShaderNodeTexSky"
+                        | "ShaderNodeTexWave"
+                )
+            {
+                continue;
+            }
+            for (property, rna_type) in [
+                ("texture_mapping", "TexMapping"),
+                ("color_mapping", "ColorMapping"),
+            ] {
+                if !node
+                    .properties
+                    .get(property)
+                    .is_some_and(|value| legacy_mapping_marker_requires_reimport(value, rna_type))
+                {
+                    continue;
+                }
+                losses.push(loss(
+                    format!("shader.node.{}.{}", node.node_type, property),
+                    Some(node_id.as_str()),
+                    &format!(
+                        "Shader node `{}` retains an unknown legacy `{property}` mapping with no Blender values; export cannot reconstruct it and re-import is required",
+                        node.name
+                    ),
+                ));
+            }
+        }
+    }
+    losses
+}
+
+fn texture_enum_is_supported(properties: &Value, property: &str, values: &[&str]) -> bool {
+    properties.get(property).is_none_or(|value| {
+        value.as_str().is_some_and(|value| {
+            values
+                .iter()
+                .any(|supported| value.eq_ignore_ascii_case(supported))
+        })
+    })
+}
+
+fn image_texture_settings_supported(properties: &Value) -> bool {
+    texture_enum_is_supported(properties, "projection", &["FLAT", "BOX", "SPHERE", "TUBE"])
+        && texture_enum_is_supported(
+            properties,
+            "interpolation",
+            &["LINEAR", "CLOSEST", "CUBIC", "SMART"],
+        )
+        && texture_enum_is_supported(
+            properties,
+            "extension",
+            &["REPEAT", "EXTEND", "CLIP", "MIRROR"],
+        )
+        && properties.get("projection_blend").is_none_or(|value| {
+            value
+                .as_f64()
+                .is_some_and(|blend| blend.is_finite() && (0.0..=1.0).contains(&blend))
+        })
+}
+
+fn environment_texture_settings_supported(properties: &Value) -> bool {
+    texture_enum_is_supported(
+        properties,
+        "projection",
+        &["EQUIRECTANGULAR", "MIRROR_BALL"],
+    ) && texture_enum_is_supported(
+        properties,
+        "interpolation",
+        &["LINEAR", "CLOSEST", "CUBIC", "SMART"],
+    )
+}
+
+fn sky_node_uses_default_multiple_scattering_model(node: &Value) -> bool {
+    node.get("properties")
+        .and_then(|properties| properties.get("sky_type"))
+        .is_none_or(|value| crate::shader::sky_property_is_default("sky_type", value))
+}
+
+fn sky_node_import_supported(node: &Value, tree: &Value) -> bool {
+    let properties = node.get("properties").and_then(Value::as_object);
+    if !properties.is_none_or(crate::shader::texture::texture_node_mapping_is_default) {
+        return false;
+    }
+    if properties.is_some_and(|properties| {
+        properties.iter().any(|(property, value)| {
+            matches!(
+                property.as_str(),
+                "sky_type"
+                    | "sun_disc"
+                    | "sun_size"
+                    | "sun_intensity"
+                    | "air_density"
+                    | "aerosol_density"
+                    | "ozone_density"
+                    | "sun_elevation"
+                    | "sun_rotation"
+                    | "altitude"
+                    | "turbidity"
+                    | "ground_albedo"
+            ) && !crate::shader::sky_property_is_default(property, value)
+        })
+    }) {
+        return false;
+    }
+    if node
+        .get("inputs")
+        .and_then(Value::as_array)
+        .is_some_and(|inputs| {
+            inputs.iter().any(|input| {
+                !matches!(
+                    input.get("name").and_then(Value::as_str),
+                    Some("Vector" | "Sun Direction")
+                )
+            })
+        })
+    {
+        return false;
+    }
+    let Some(name) = node.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    !tree
+        .get("links")
+        .and_then(Value::as_array)
+        .is_some_and(|links| {
+            links.iter().any(|link| {
+                link.get("to_node").and_then(Value::as_str) == Some(name)
+                    && !matches!(
+                        link.get("to_socket").and_then(Value::as_str),
+                        Some("Vector" | "Sun Direction")
+                    )
+            })
+        })
+}
+
+fn shader_graph_input_linked(tree: &Value, node: &Value, input_name: &str) -> bool {
+    let Some(node_name) = node.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    let socket_id = node
+        .get("inputs")
+        .and_then(Value::as_array)
+        .and_then(|inputs| {
+            inputs
+                .iter()
+                .find(|input| input.get("name").and_then(Value::as_str) == Some(input_name))
+        })
+        .and_then(|input| input.get("identifier"))
+        .and_then(Value::as_str);
+    tree.get("links")
+        .and_then(Value::as_array)
+        .is_some_and(|links| {
+            links.iter().any(|link| {
+                link.get("to_node").and_then(Value::as_str) == Some(node_name)
+                    && link
+                        .get("to_socket")
+                        .and_then(Value::as_str)
+                        .is_some_and(|socket| socket == input_name || Some(socket) == socket_id)
+            })
+        })
+}
+
+fn volume_is_associated_with_material(raw: &Value, volume: &Value, material_name: &str) -> bool {
+    let Some(volume_name) = volume.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    let data_material = volume
+        .get("materials")
+        .and_then(Value::as_array)
+        .is_some_and(|materials| {
+            materials
+                .iter()
+                .any(|material| material.as_str() == Some(material_name))
+        });
+    let object_material = raw
+        .get("objects")
+        .and_then(Value::as_array)
+        .is_some_and(|objects| {
+            objects.iter().any(|object| {
+                object.get("type").and_then(Value::as_str) == Some("VOLUME")
+                    && object.get("data_name").and_then(Value::as_str) == Some(volume_name)
+                    && object
+                        .get("materials")
+                        .and_then(Value::as_array)
+                        .is_some_and(|materials| {
+                            materials
+                                .iter()
+                                .any(|material| material.as_str() == Some(material_name))
+                        })
+            })
+        });
+    data_material || object_material
+}
+
+fn material_volume_grid_is_present(
+    raw: &Value,
+    material_name: &str,
+    grid_name: &str,
+    vdb_only: bool,
+) -> bool {
+    raw.get("volumes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|volume| {
+            let is_vdb = volume
+                .get("filepath")
+                .and_then(Value::as_str)
+                .is_some_and(|filepath| {
+                    !filepath.is_empty()
+                        && Path::new(filepath)
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .is_none_or(|extension| {
+                                extension.is_empty() || extension.eq_ignore_ascii_case("vdb")
+                            })
+                });
+            volume_is_associated_with_material(raw, volume, material_name)
+                && (!vdb_only || is_vdb)
+                && volume
+                    .get("grids")
+                    .and_then(Value::as_array)
+                    .is_some_and(|grids| grids.iter().any(|grid| grid.as_str() == Some(grid_name)))
+        })
+}
+
+fn material_volume_has_source(raw: &Value, material_name: &str) -> bool {
+    raw.get("volumes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|volume| {
+            volume_is_associated_with_material(raw, volume, material_name)
+                && (volume
+                    .get("filepath")
+                    .and_then(Value::as_str)
+                    .is_some_and(|filepath| !filepath.is_empty())
+                    || volume
+                        .get("grids")
+                        .and_then(Value::as_array)
+                        .is_some_and(|grids| !grids.is_empty()))
+        })
+}
+
+fn volume_node_is_spatial_source(node: &Value, tree: &Value) -> bool {
+    let Some(node_type) = node.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    if node_type.starts_with("ShaderNodeTex") {
+        return !shader_graph_input_linked(tree, node, "Vector");
+    }
+    matches!(
+        node_type,
+        "ShaderNodeUVMap"
+            | "ShaderNodeGeometry"
+            | "ShaderNodeNewGeometry"
+            | "ShaderNodeAttribute"
+            | "ShaderNodeVertexColor"
+            | "ShaderNodeTangent"
+            | "ShaderNodeNormalMap"
+            | "ShaderNodeFresnel"
+            | "ShaderNodeLayerWeight"
+    )
+}
+
+fn principled_volume_has_spatial_attribute(
+    raw: &Value,
+    material_name: Option<&str>,
+    tree: &Value,
+    node: &Value,
+    volume_closure_count: usize,
+) -> bool {
+    let Some(material_name) = material_name else {
+        return false;
+    };
+    let input_default = |input_name: &str| {
+        node.get("inputs")
+            .and_then(Value::as_array)
+            .and_then(|inputs| {
+                inputs
+                    .iter()
+                    .find(|input| input.get("name").and_then(Value::as_str) == Some(input_name))
+            })
+            .and_then(|input| input.get("default"))
+    };
+    let density_active = input_default("Density")
+        .and_then(Value::as_f64)
+        .is_none_or(|density| density > 0.0)
+        || shader_graph_input_linked(tree, node, "Density");
+    if density_active {
+        let density_attribute = input_default("Density Attribute")
+            .and_then(Value::as_str)
+            .unwrap_or("density");
+        if density_attribute != "density" && material_volume_has_source(raw, material_name) {
+            return true;
+        }
+        let color_attribute = input_default("Color Attribute")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !color_attribute.is_empty()
+            && material_volume_grid_is_present(raw, material_name, color_attribute, true)
+        {
+            return true;
+        }
+    }
+    if volume_closure_count > 1 {
+        let blackbody_active = input_default("Blackbody Intensity")
+            .and_then(Value::as_f64)
+            .is_some_and(|intensity| intensity > 0.0)
+            || shader_graph_input_linked(tree, node, "Blackbody Intensity");
+        if blackbody_active && !shader_graph_input_linked(tree, node, "Temperature Attribute") {
+            let attribute = input_default("Temperature Attribute")
+                .and_then(Value::as_str)
+                .unwrap_or("temperature");
+            if !attribute.is_empty()
+                && material_volume_grid_is_present(raw, material_name, attribute, true)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn material_volume_graph_has_spatial_dependency(
+    raw: &Value,
+    material: &Value,
+    tree: &Value,
+    nodes: &[Value],
+    reachable: &BTreeSet<&str>,
+) -> bool {
+    let material_name = material.get("name").and_then(Value::as_str);
+    let volume_closure_count = nodes
+        .iter()
+        .filter(|node| {
+            node.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| reachable.contains(name))
+                && matches!(
+                    node.get("type").and_then(Value::as_str),
+                    Some(
+                        "ShaderNodeVolumePrincipled"
+                            | "VolumePrincipled"
+                            | "PrincipledVolume"
+                            | "ShaderNodeVolumeAbsorption"
+                            | "VolumeAbsorption"
+                            | "ShaderNodeVolumeScatter"
+                            | "VolumeScatter"
+                    )
+                )
+        })
+        .count();
+    nodes.iter().any(|node| {
+        let Some(name) = node.get("name").and_then(Value::as_str) else {
+            return false;
+        };
+        if !reachable.contains(name) {
+            return false;
+        }
+        volume_node_is_spatial_source(node, tree)
+            || (node.get("type").and_then(Value::as_str) == Some("ShaderNodeVolumePrincipled")
+                && principled_volume_has_spatial_attribute(
+                    raw,
+                    material_name,
+                    tree,
+                    node,
+                    volume_closure_count,
+                ))
+    })
+}
+
+fn mesh_uses_material(mesh: &Value, object: &Value, material_name: &str) -> bool {
+    let data_materials = mesh.get("materials").and_then(Value::as_array);
+    let object_materials = object.get("materials").and_then(Value::as_array);
+    let material_links = object.get("material_links").and_then(Value::as_array);
+    mesh.get("polygons")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|polygon| {
+            let Some(slot) = polygon
+                .get("material_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+            else {
+                return false;
+            };
+            let object_linked = material_links
+                .and_then(|links| links.get(slot))
+                .and_then(Value::as_str)
+                .is_some_and(|link| link.eq_ignore_ascii_case("object"));
+            let material = if object_linked {
+                object_materials
+            } else {
+                data_materials
+            }
+            .and_then(|materials| materials.get(slot))
+            .and_then(Value::as_str);
+            material == Some(material_name)
+        })
+}
+
+fn shader_graph_output_sockets_reaching_output<'a>(
+    tree: &'a Value,
+    node_name: &str,
+    reachable: &BTreeSet<&'a str>,
+) -> BTreeSet<&'a str> {
+    tree.get("links")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|link| {
+            link.get("from_node").and_then(Value::as_str) == Some(node_name)
+                && link
+                    .get("to_node")
+                    .and_then(Value::as_str)
+                    .is_some_and(|target| reachable.contains(target))
+        })
+        .filter_map(|link| link.get("from_socket").and_then(Value::as_str))
+        .collect()
+}
+
+fn unsupported_geometry_attribute<'a>(
+    raw: &'a Value,
+    material_name: Option<&str>,
+    attribute_name: &str,
+    output_socket: Option<&'a str>,
+) -> Option<(&'a str, &'a str, Option<&'a str>)> {
+    let material_name = material_name?;
+    let meshes = raw.get("meshes").and_then(Value::as_array)?;
+    let objects = raw.get("objects").and_then(Value::as_array)?;
+    for mesh in meshes {
+        let Some(mesh_name) = mesh.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !objects.iter().any(|object| {
+            object.get("type").and_then(Value::as_str) == Some("MESH")
+                && object.get("data_name").and_then(Value::as_str) == Some(mesh_name)
+                && mesh_uses_material(mesh, object, material_name)
+        }) {
+            continue;
+        }
+        for attribute in mesh
+            .get("attributes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|attribute| {
+                attribute.get("name").and_then(Value::as_str) == Some(attribute_name)
+            })
+        {
+            let (Some(domain), Some(data_type)) = (
+                attribute.get("domain").and_then(Value::as_str),
+                attribute.get("data_type").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let supported = matches!(
+                (domain, data_type),
+                ("POINT", "FLOAT" | "INT" | "FLOAT_VECTOR")
+                    | ("POINT" | "CORNER", "FLOAT_COLOR" | "BYTE_COLOR")
+            );
+            let mismatched_output = output_socket.filter(|socket| {
+                domain == "POINT"
+                    && match data_type {
+                        "FLOAT" | "INT" => matches!(*socket, "Color" | "Vector" | "Alpha"),
+                        "FLOAT_VECTOR" => {
+                            matches!(*socket, "Color" | "Fac" | "Factor" | "Alpha")
+                        }
+                        _ => false,
+                    }
+            });
+            if (!supported || mismatched_output.is_some())
+                && !attribute_name.starts_with('.')
+                && !is_blender_managed_attribute(attribute_name, domain, data_type)
+            {
+                return Some((domain, data_type, mismatched_output));
+            }
+        }
+    }
+    None
+}
+
+fn material_shader_graph_import_losses(raw: &Value, material: &Value, losses: &mut Vec<Loss>) {
+    let Some(tree) = material.get("nodes") else {
+        return;
+    };
+    let Some(nodes) = tree.get("nodes").and_then(Value::as_array) else {
+        return;
+    };
+    let reachable = shader_graph_nodes_reaching_output(tree, "ShaderNodeOutputMaterial");
+    let volume_reachable =
+        shader_graph_nodes_reaching_output_socket(tree, "ShaderNodeOutputMaterial", Some("Volume"));
+    let material_name = material.get("name").and_then(Value::as_str);
+    if material_volume_graph_has_spatial_dependency(raw, material, tree, nodes, &volume_reachable) {
+        losses.push(loss(
+            "shader.volume.spatially_varying_graph",
+            material_name,
+            "the active Material Output Volume input depends on spatially varying data or conflicting volume attributes that the Cycles path tracer refuses to evaluate per step; EEVEE realtime may evaluate supported VolumeAbsorption density fields at froxel samples",
+        ));
+    }
+    for node in nodes {
+        let Some(name) = node.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !reachable.contains(name) {
+            continue;
+        }
+        let Some(node_type) = node.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if !crate::shader::shader_node_type_supported(node_type) {
+            losses.push(loss(
+                "blender.material.shader_node.unsupported",
+                material_name,
+                &format!(
+                    "Shader node `{name}` of type `{node_type}` is unsupported by Potter's shader evaluator; the node is preserved"
+                ),
+            ));
+        }
+        let properties = node.get("properties").unwrap_or(&Value::Null);
+
+        if node_type == "ShaderNodeTexImage" && !image_texture_settings_supported(properties) {
+            losses.push(loss(
+                "blender.material.shader_node.image_texture_settings",
+                material_name,
+                &format!(
+                    "Image Texture `{name}` has a projection, interpolation, extension, or BOX blend setting Potter refuses during shading; the settings are preserved"
+                ),
+            ));
+        }
+        push_shader_node_mapping_import_losses(name, node_type, properties, material_name, losses);
+        if node_type == "ShaderNodeTexEnvironment"
+            && !environment_texture_settings_supported(properties)
+        {
+            losses.push(loss(
+                "blender.material.shader_node.environment_texture_settings",
+                material_name,
+                &format!(
+                    "Environment Texture `{name}` has an unsupported projection or interpolation setting; the setting is preserved"
+                ),
+            ));
+        }
+
+        if node_type == "ShaderNodeVolumePrincipled" && volume_reachable.contains(name) {
+            let input_default = |input_name: &str| {
+                node.get("inputs")
+                    .and_then(Value::as_array)
+                    .and_then(|inputs| {
+                        inputs.iter().find(|input| {
+                            input.get("name").and_then(Value::as_str) == Some(input_name)
+                        })
+                    })
+                    .and_then(|input| input.get("default"))
+            };
+            let blackbody_active = input_default("Blackbody Intensity")
+                .and_then(Value::as_f64)
+                .is_some_and(|intensity| intensity > 0.0)
+                || shader_graph_input_linked(tree, node, "Blackbody Intensity");
+            let temperature_attribute_linked =
+                shader_graph_input_linked(tree, node, "Temperature Attribute");
+            if blackbody_active && temperature_attribute_linked {
+                losses.push(loss(
+                    "blender.material.shader_node.volume_temperature_attribute",
+                    material_name,
+                    &format!(
+                        "Principled Volume `{name}` uses an unsupported Temperature Attribute; Potter evaluates only the Temperature input and preserves the attribute setting"
+                    ),
+                ));
+            }
+        }
+        if node_type == "ShaderNodeBsdfGlass"
+            && !properties.get("distribution").is_none_or(|value| {
+                value.as_str().is_some_and(|distribution| {
+                    distribution.eq_ignore_ascii_case("GGX")
+                        || distribution.eq_ignore_ascii_case("MULTI_GGX")
+                })
+            })
+        {
+            losses.push(loss(
+                "blender.material.shader_node.glass_distribution",
+                material_name,
+                &format!(
+                    "Glass BSDF `{name}` uses a distribution Potter refuses; the setting is preserved"
+                ),
+            ));
+        }
+        if node_type == "ShaderNodeAttribute" {
+            let attribute_type = properties
+                .get("attribute_type")
+                .and_then(Value::as_str)
+                .unwrap_or("GEOMETRY");
+            if attribute_type != "GEOMETRY" {
+                losses.push(loss(
+                    "blender.material.shader_node.attribute_type",
+                    material_name,
+                    &format!(
+                        "Attribute node `{name}` uses `{attribute_type}`, which Potter cannot evaluate; the setting is preserved and rendering refuses it"
+                    ),
+                ));
+            } else if let Some(attribute_name) =
+                properties.get("attribute_name").and_then(Value::as_str)
+            {
+                let output_sockets =
+                    shader_graph_output_sockets_reaching_output(tree, name, &reachable);
+                let refusal =
+                    unsupported_geometry_attribute(raw, material_name, attribute_name, None)
+                        .or_else(|| {
+                            output_sockets.iter().copied().find_map(|output_socket| {
+                                unsupported_geometry_attribute(
+                                    raw,
+                                    material_name,
+                                    attribute_name,
+                                    Some(output_socket),
+                                )
+                            })
+                        });
+                if let Some((domain, data_type, Some(output_socket))) = refusal {
+                    losses.push(loss(
+                        "shader.node.ShaderNodeAttribute.geometry_attribute.unsupported",
+                        material_name,
+                        &format!(
+                            "Attribute node `{name}` cannot feed output socket `{output_socket}` from mesh attribute `{attribute_name}` with domain `{domain}` and type `{data_type}`; Potter refuses this output/type mismatch and rendering fails"
+                        ),
+                    ));
+                } else if let Some((domain, data_type, None)) = refusal {
+                    losses.push(loss(
+                        "shader.node.ShaderNodeAttribute.geometry_attribute.unsupported",
+                        material_name,
+                        &format!(
+                            "Attribute node `{name}` references mesh attribute `{attribute_name}` with domain `{domain}` and type `{data_type}`, which Potter cannot evaluate; the graph is preserved and rendering refuses it"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+}
+
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
     // Blender's USD CacheFiles are not read: their Mesh Cache and Mesh Sequence Cache modifiers would fail at
@@ -11663,6 +12497,24 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 losses.push(loss(feature, name, reason));
             }
         }
+        let render = scene.get("render");
+        if render
+            .and_then(|render| render.get("engine"))
+            .and_then(Value::as_str)
+            == Some("realtime")
+            && let Some(resolution) = render
+                .and_then(|render| render.get("eevee_gi_cubemap_resolution"))
+                .and_then(Value::as_u64)
+                .filter(|resolution| *resolution != 512)
+        {
+            losses.push(loss(
+                "blender.scene.eevee.gi_cubemap_resolution",
+                name,
+                &format!(
+                    "Blender SceneEEVEE.gi_cubemap_resolution is {resolution}; Potter preserves only the default 512, which EEVEE captures at 256 texels (512 / 2), so this non-default setting is not restored"
+                ),
+            ));
+        }
     }
     for material in raw
         .get("materials")
@@ -11690,6 +12542,7 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 "Blender's EEVEE shadow backface culling is not imported; the material casts shadows from both sides",
             ));
         }
+        material_shader_graph_import_losses(raw, material, &mut losses);
     }
     for object in raw
         .get("objects")
@@ -12170,35 +13023,136 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
         .flatten()
     {
         if let Some(world) = scene.get("world").filter(|world| !world.is_null()) {
-            let has_unmapped_nodes = world
-                .get("nodes")
+            let tree = world.get("nodes");
+            let reachable = tree
+                .map(|tree| {
+                    shader_graph_nodes_reaching_output_socket(
+                        tree,
+                        "ShaderNodeOutputWorld",
+                        Some("Surface"),
+                    )
+                })
+                .unwrap_or_default();
+            let is_reachable = |node: &Value| {
+                node.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| reachable.contains(name))
+            };
+            let has_approximate_sky_model = tree.is_some_and(|tree| {
+                tree.get("nodes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|nodes| {
+                        nodes.iter().any(|node| {
+                            is_reachable(node)
+                                && node.get("type").and_then(Value::as_str)
+                                    == Some("ShaderNodeTexSky")
+                                && sky_node_uses_default_multiple_scattering_model(node)
+                        })
+                    })
+            });
+            if has_approximate_sky_model {
+                losses.push(loss(
+                    "blender.world.sky_model",
+                    scene.get("name").and_then(Value::as_str),
+                    "a Sky Texture requires the MULTIPLE_SCATTERING model, which Potter does not implement; the model is preserved and rendering refuses it",
+                ));
+            }
+
+            let has_unsupported_sky = tree.is_some_and(|tree| {
+                tree.get("nodes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|nodes| {
+                        nodes.iter().any(|node| {
+                            is_reachable(node)
+                                && node.get("type").and_then(Value::as_str)
+                                    == Some("ShaderNodeTexSky")
+                                && !sky_node_import_supported(node, tree)
+                        })
+                    })
+            });
+            if has_unsupported_sky {
+                losses.push(loss(
+                    "blender.world.sky_settings",
+                    scene.get("name").and_then(Value::as_str),
+                    "a Sky Texture has non-default settings other than Sun Direction or an unsupported input; Potter preserves them but refuses to render the graph",
+                ));
+            }
+            let has_unsupported_environment_settings = tree.is_some_and(|tree| {
+                tree.get("nodes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|nodes| {
+                        nodes.iter().any(|node| {
+                            is_reachable(node)
+                                && node.get("type").and_then(Value::as_str)
+                                    == Some("ShaderNodeTexEnvironment")
+                                && !environment_texture_settings_supported(
+                                    node.get("properties").unwrap_or(&Value::Null),
+                                )
+                        })
+                    })
+            });
+            if has_unsupported_environment_settings {
+                losses.push(loss(
+                    "blender.world.environment_texture_settings",
+                    scene.get("name").and_then(Value::as_str),
+                    "an Environment Texture has a projection or interpolation setting Potter refuses during world shading; the setting is preserved",
+                ));
+            }
+            if let Some(nodes) = tree
+                .and_then(|tree| tree.get("nodes"))
+                .and_then(Value::as_array)
+            {
+                for node in nodes {
+                    if !is_reachable(node)
+                        || node.get("type").and_then(Value::as_str)
+                            != Some("ShaderNodeTexEnvironment")
+                    {
+                        continue;
+                    }
+                    let Some(node_name) = node.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    push_shader_node_mapping_import_losses(
+                        node_name,
+                        "ShaderNodeTexEnvironment",
+                        node.get("properties").unwrap_or(&Value::Null),
+                        scene.get("name").and_then(Value::as_str),
+                        &mut losses,
+                    );
+                }
+            }
+            let has_unmapped_nodes = tree
                 .and_then(|tree| tree.get("nodes"))
                 .and_then(Value::as_array)
                 .is_some_and(|nodes| {
                     // The node kinds `shader/world.rs` evaluates, so a world built from them renders natively.
                     nodes.iter().any(|node| {
-                        let properties = node.get("properties");
-                        match node.get("type").and_then(Value::as_str) {
-                            Some("ShaderNodeMix") => !crate::shader::world_mix_supported(
-                                properties
-                                    .and_then(|properties| properties.get("data_type"))
-                                    .and_then(Value::as_str),
-                                properties
-                                    .and_then(|properties| properties.get("blend_type"))
-                                    .and_then(Value::as_str),
-                            ),
-                            Some(
-                                "ShaderNodeBackground"
-                                | "ShaderNodeOutputWorld"
-                                | "ShaderNodeEmission"
-                                | "ShaderNodeTexSky"
-                                | "ShaderNodeTexEnvironment"
-                                | "ShaderNodeTexCoord"
-                                | "ShaderNodeMixRGB"
-                                | "ShaderNodeMixShader"
-                                | "ShaderNodeAddShader",
-                            ) => false,
-                            _ => true,
+                        is_reachable(node) && {
+                            let properties = node.get("properties");
+                            match node.get("type").and_then(Value::as_str) {
+                                Some("ShaderNodeMix") => !crate::shader::world_mix_supported(
+                                    properties
+                                        .and_then(|properties| properties.get("data_type"))
+                                        .and_then(Value::as_str),
+                                    properties
+                                        .and_then(|properties| properties.get("blend_type"))
+                                        .and_then(Value::as_str),
+                                ),
+                                Some(
+                                    "ShaderNodeTexSky"
+                                    | "ShaderNodeTexEnvironment"
+                                    | "ShaderNodeBackground"
+                                    | "OutputWorld"
+                                    | "ShaderNodeOutputWorld"
+                                    | "ShaderNodeEmission"
+                                    | "ShaderNodeCombineXYZ"
+                                    | "ShaderNodeTexCoord"
+                                    | "ShaderNodeMixRGB"
+                                    | "ShaderNodeMixShader"
+                                    | "ShaderNodeAddShader",
+                                ) => false,
+                                _ => true,
+                            }
                         }
                     })
                 });
@@ -12206,7 +13160,7 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 losses.push(loss(
                     "blender.world.node_graph",
                     scene.get("name").and_then(Value::as_str),
-                    "world nodes beyond background color/strength are retained only in compatibility data",
+                    "the world shader graph contains nodes Potter cannot evaluate; it is preserved in compatibility data",
                 ));
             }
         }
@@ -13138,6 +14092,7 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             ));
         }
     }
+    losses.extend(legacy_shader_mapping_export_losses(doc));
     // A USD cache resource has no Blender CacheFile to become: the exporter does not create an Alembic CacheFile
     // on a USD path, so its modifiers are written without a cache file (a no-op in Blender).
     for (resource_id, resource) in &doc.resources {
@@ -14112,6 +15067,19 @@ fn shader_node_import_losses(doc: &SceneDoc) -> Vec<Loss> {
             .and_then(|data| data.camera.as_ref())
             .is_some()
     });
+    let has_realtime_world_graph = doc.scenes.values().any(|scene| {
+        scene.render.engine == "realtime"
+            && scene
+                .world
+                .as_ref()
+                .and_then(|world_id| doc.worlds.get(world_id))
+                .and_then(|world| world.node_tree.as_ref())
+                .and_then(|group_id| doc.node_groups.get(group_id))
+                .is_some_and(|group| {
+                    group.kind == GraphKind::Shader
+                        && shader_output_node(group, "ShaderNodeOutputWorld").is_some()
+                })
+    });
     let path_traced = doc
         .scenes
         .get(&doc.active_scene)
@@ -14155,6 +15123,8 @@ fn shader_node_import_losses(doc: &SceneDoc) -> Vec<Loss> {
             None,
             has_camera,
             path_traced,
+            has_realtime_world_graph,
+            Some("Volume"),
             &mut group_stack,
             &mut call_sites,
             &mut recorded,
@@ -14173,12 +15143,17 @@ fn collect_shader_node_import_losses(
     sink_socket: Option<&str>,
     has_camera: bool,
     path_traced: bool,
+    has_realtime_world_graph: bool,
+    volume_output_socket: Option<&str>,
     group_stack: &mut BTreeSet<Id>,
     call_sites: &mut Vec<(Id, Id)>,
     recorded: &mut BTreeSet<(String, String)>,
     losses: &mut Vec<Loss>,
 ) {
     let reachable = shader_nodes_reaching(group, sink, sink_socket);
+    let volume_reachable = volume_output_socket
+        .map(|socket| shader_nodes_reaching(group, sink, Some(socket)))
+        .unwrap_or_default();
     for node_id in &reachable {
         let Some(node) = group.nodes.get(node_id) else {
             continue;
@@ -14196,6 +15171,47 @@ fn collect_shader_node_import_losses(
             .collect();
         if outputs.is_empty() {
             continue;
+        }
+        if has_realtime_world_graph
+            && volume_reachable.contains(node_id)
+            && node.node_type == "ShaderNodeVolumePrincipled"
+        {
+            let input_linked = |socket: &str| {
+                group
+                    .links
+                    .iter()
+                    .any(|link| link.to_node == *node_id && link.to_socket == socket)
+            };
+            let density_may_scatter = input_linked("Density")
+                || node
+                    .inputs
+                    .get("Density")
+                    .is_none_or(|density| density.as_f64().is_some_and(|density| density > 0.0));
+            let color_may_scatter = input_linked("Color")
+                || node.inputs.get("Color").is_none_or(|color| {
+                    color.as_array().is_some_and(|components| {
+                        components
+                            .iter()
+                            .take(3)
+                            .filter_map(Value::as_f64)
+                            .any(|component| component > 0.0)
+                    })
+                });
+            let anisotropy_nonzero = input_linked("Anisotropy")
+                || node
+                    .inputs
+                    .get("Anisotropy")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|anisotropy| anisotropy != 0.0);
+            if density_may_scatter && color_may_scatter && anisotropy_nonzero {
+                record_shader_loss(
+                    recorded,
+                    losses,
+                    "shader.volume.world_probe_l1.realtime_scattering",
+                    node_id,
+                    "A reachable Principled Volume has active scatter (positive or linked Density and a positive RGB Color component or linked Color) with nonzero or linked Anisotropy in a realtime scene with a shader World graph; world uniformity is unknown at import, and rendering refuses this case when the world-probe L0 is nonuniform.",
+                );
+            }
         }
         if node.node_type == "ShaderNodeBump" {
             let mut visited_inputs = BTreeSet::new();
@@ -14275,6 +15291,15 @@ fn collect_shader_node_import_losses(
                 else {
                     continue;
                 };
+                let child_volume_output = group
+                    .links
+                    .iter()
+                    .any(|link| {
+                        link.from_node == *node_id
+                            && link.from_socket == *output
+                            && volume_reachable.contains(&link.to_node)
+                    })
+                    .then_some(interface_output.name.as_str());
                 group_stack.insert(child_id.clone());
                 call_sites.push((group_id.clone(), node_id.clone()));
                 collect_shader_node_import_losses(
@@ -14286,6 +15311,8 @@ fn collect_shader_node_import_losses(
                     Some(&interface_output.name),
                     has_camera,
                     path_traced,
+                    has_realtime_world_graph,
+                    child_volume_output,
                     group_stack,
                     call_sites,
                     recorded,
@@ -18679,7 +19706,8 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             source_material,
             &crate::shader::HitContext::new(&doc.node_groups)
                 .with_images(&image_data)
-                .with_uv_layers(hit_layers),
+                .with_uv_layers(hit_layers)
+                .with_path_traced(true),
         )?;
         let source_normal = source_shading
             .dominant()
@@ -18832,7 +19860,8 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             imported_material,
             &crate::shader::HitContext::new(&imported.doc.node_groups)
                 .with_images(&image_data)
-                .with_uv_layers(hit_layers),
+                .with_uv_layers(hit_layers)
+                .with_path_traced(true),
         )?;
         let roundtrip_normal = roundtrip_shading
             .dominant()
@@ -19347,7 +20376,8 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     source_material,
                     &crate::shader::HitContext::new(&doc.node_groups)
                         .with_images(&image_data)
-                        .with_uv_layers(layers),
+                        .with_uv_layers(layers)
+                        .with_path_traced(true),
                 )?;
                 let source = source_shading
                     .dominant()
@@ -19356,7 +20386,8 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     reopened_material,
                     &crate::shader::HitContext::new(&imported.doc.node_groups)
                         .with_images(&reopened_image_data)
-                        .with_uv_layers(layers),
+                        .with_uv_layers(layers)
+                        .with_path_traced(true),
                 )?;
                 let reopened = reopened_shading
                     .dominant()
@@ -23626,6 +24657,64 @@ print("UNSUPPORTED_POSE " + json.dumps({
     }
 
     #[test]
+    fn export_losses_report_unknown_shader_mappings_with_node_ids() -> Result<()> {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let graph_id = Id::new("shader_graph")?;
+        let noise_id = Id::new("noise")?;
+        let unused_id = Id::new("unused")?;
+        let output_id = Id::new("output")?;
+        let mut graph = NodeGroup::new("Material", GraphKind::Shader);
+        let mut noise = GraphNode::new("ShaderNodeTexNoise");
+        noise.name = "Noise".to_owned();
+        noise.properties.insert(
+            "texture_mapping".to_owned(),
+            json!({"rna_type":"TexMapping"}),
+        );
+        noise.properties.insert(
+            "color_mapping".to_owned(),
+            json!({"rna_type":"ColorMapping"}),
+        );
+        graph.nodes.insert(noise_id.clone(), noise);
+        let mut unused = GraphNode::new("ShaderNodeTexNoise");
+        unused.properties.insert(
+            "color_mapping".to_owned(),
+            json!({"rna_type":"ColorMapping"}),
+        );
+        graph.nodes.insert(unused_id.clone(), unused);
+        let mut output = GraphNode::new("ShaderNodeOutputMaterial");
+        output
+            .properties
+            .insert("is_active_output".to_owned(), Value::Bool(true));
+        graph.nodes.insert(output_id.clone(), output);
+        graph.links.push(GraphLink {
+            from_node: noise_id.clone(),
+            from_socket: "Color".to_owned(),
+            to_node: output_id,
+            to_socket: "Surface".to_owned(),
+        });
+        doc.node_groups.insert(graph_id, graph);
+
+        let losses = export_losses(&doc);
+        let mapping_losses: Vec<_> = losses
+            .iter()
+            .filter(|loss| {
+                loss.feature_id
+                    .starts_with("shader.node.ShaderNodeTexNoise.")
+            })
+            .collect();
+        assert_eq!(mapping_losses.len(), 2);
+        assert!(mapping_losses.iter().any(|loss| {
+            loss.feature_id == "shader.node.ShaderNodeTexNoise.texture_mapping"
+                && loss.data_id.as_deref() == Some(noise_id.as_str())
+        }));
+        assert!(mapping_losses.iter().any(|loss| {
+            loss.feature_id == "shader.node.ShaderNodeTexNoise.color_mapping"
+                && loss.data_id.as_deref() == Some(noise_id.as_str())
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn export_losses_report_material_fields_a_custom_graph_does_not_carry() -> Result<()> {
         let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
         doc.node_groups
@@ -23820,8 +24909,9 @@ print("UNSUPPORTED_POSE " + json.dumps({
             .materials
             .get(&material_id)
             .ok_or_else(|| invalid_intermediate("roundtrip material is missing"))?;
-        let source_hit = crate::shader::HitContext::new(&doc.node_groups);
-        let reopened_hit = crate::shader::HitContext::new(&imported.doc.node_groups);
+        let source_hit = crate::shader::HitContext::new(&doc.node_groups).with_path_traced(true);
+        let reopened_hit =
+            crate::shader::HitContext::new(&imported.doc.node_groups).with_path_traced(true);
         let source_shading = crate::shader::evaluate_surface(source, &source_hit)?;
         let reopened_shading = crate::shader::evaluate_surface(reopened, &reopened_hit)?;
         let source_params = source_shading
@@ -24192,6 +25282,144 @@ mod camera_import_tests {
     }
 
     #[test]
+    fn geometry_attribute_import_losses_require_a_referenced_used_mesh_attribute() {
+        let raw = json!({
+            "meshes": [{
+                "name": "Mesh",
+                "materials": ["Material"],
+                "polygons": [{"material_index": 0}],
+                "attributes": [{"name": "Probe", "domain": "EDGE", "data_type": "FLOAT"}]
+            }],
+            "objects": [{
+                "name": "Object",
+                "type": "MESH",
+                "data_name": "Mesh",
+                "materials": [null],
+                "material_links": ["data"]
+            }],
+            "materials": [{
+                "name": "Material",
+                "nodes": {
+                    "nodes": [
+                        {
+                            "name": "Attribute",
+                            "type": "ShaderNodeAttribute",
+                            "properties": {
+                                "attribute_type": "GEOMETRY",
+                                "attribute_name": "Probe"
+                            }
+                        },
+                        {"name": "Emission", "type": "ShaderNodeEmission", "properties": {}},
+                        {
+                            "name": "Output",
+                            "type": "ShaderNodeOutputMaterial",
+                            "properties": {}
+                        }
+                    ],
+                    "links": [
+                        {"from_node": "Attribute", "to_node": "Emission"},
+                        {"from_node": "Emission", "to_node": "Output"}
+                    ]
+                }
+            }]
+        });
+        let feature = "shader.node.ShaderNodeAttribute.geometry_attribute.unsupported";
+        let losses = import_losses(&raw);
+        let refusal = losses.iter().find(|loss| loss.feature_id == feature);
+        assert!(refusal.is_some(), "a used EDGE attribute is an import loss");
+        let Some(refusal) = refusal else { return };
+        assert_eq!(refusal.data_id.as_deref(), Some("Material"));
+
+        for data_type in ["FLOAT", "INT", "FLOAT_VECTOR"] {
+            let mut supported_point = raw.clone();
+            supported_point["meshes"][0]["attributes"][0]["domain"] = json!("POINT");
+            supported_point["meshes"][0]["attributes"][0]["data_type"] = json!(data_type);
+            assert!(
+                !import_losses(&supported_point)
+                    .iter()
+                    .any(|loss| loss.feature_id == feature)
+            );
+        }
+
+        let mut unsupported_type = raw.clone();
+        unsupported_type["meshes"][0]["attributes"][0]["domain"] = json!("POINT");
+        unsupported_type["meshes"][0]["attributes"][0]["data_type"] = json!("FLOAT2");
+        assert!(
+            import_losses(&unsupported_type)
+                .iter()
+                .any(|loss| loss.feature_id == feature)
+        );
+
+        let mut unreachable_attribute = raw.clone();
+        unreachable_attribute["materials"][0]["nodes"]["links"] =
+            json!([{"from_node": "Emission", "to_node": "Output"}]);
+        assert!(
+            !import_losses(&unreachable_attribute)
+                .iter()
+                .any(|loss| loss.feature_id == feature)
+        );
+
+        let mut supported_color = raw.clone();
+        supported_color["meshes"][0]["attributes"][0]["domain"] = json!("CORNER");
+        supported_color["meshes"][0]["attributes"][0]["data_type"] = json!("BYTE_COLOR");
+        assert!(
+            !import_losses(&supported_color)
+                .iter()
+                .any(|loss| loss.feature_id == feature)
+        );
+
+        let mut missing_attribute = raw.clone();
+        missing_attribute["materials"][0]["nodes"]["nodes"][0]["properties"]["attribute_name"] =
+            json!("Missing");
+        assert!(
+            !import_losses(&missing_attribute)
+                .iter()
+                .any(|loss| loss.feature_id == feature)
+        );
+        let mut ignored_builtin = raw.clone();
+        ignored_builtin["meshes"][0]["attributes"][0] =
+            json!({"name": "material_index", "domain": "FACE", "data_type": "INT"});
+        ignored_builtin["materials"][0]["nodes"]["nodes"][0]["properties"]["attribute_name"] =
+            json!("material_index");
+        assert!(
+            !import_losses(&ignored_builtin)
+                .iter()
+                .any(|loss| loss.feature_id == feature)
+        );
+
+        let mut unrelated_mesh = raw.clone();
+        unrelated_mesh["objects"][0]["data_name"] = json!("OtherMesh");
+        assert!(
+            !import_losses(&unrelated_mesh)
+                .iter()
+                .any(|loss| loss.feature_id == feature)
+        );
+
+        let mut unused_material = raw.clone();
+        unused_material["meshes"][0]["materials"][0] = json!("OtherMaterial");
+        assert!(
+            !import_losses(&unused_material)
+                .iter()
+                .any(|loss| loss.feature_id == feature)
+        );
+
+        let mut non_geometry = raw;
+        non_geometry["materials"][0]["nodes"]["nodes"][0]["properties"]["attribute_type"] =
+            json!("OBJECT");
+        let non_geometry_losses = import_losses(&non_geometry);
+        assert!(
+            non_geometry_losses
+                .iter()
+                .any(|loss| loss.feature_id == "blender.material.shader_node.attribute_type")
+        );
+        assert!(
+            !non_geometry_losses
+                .iter()
+                .any(|loss| loss.feature_id == feature)
+        );
+    }
+
+    #[test]
     fn full_sphere_equirectangular_imports_at_blenders_defaults() -> Result<(), serde_json::Error> {
         let full = f64::from(std::f32::consts::PI);
         let camera = panorama("EQUIRECTANGULAR", (-full, full), (-0.5 * full, 0.5 * full));
@@ -24364,6 +25592,38 @@ mod workbench_display_loss_tests {
             ["blender.scene.display_background"]
         );
     }
+    #[test]
+    fn eevee_cubemap_resolution_reports_only_nondefault_values() {
+        let raw = |resolution| {
+            json!({
+                "scenes": [{
+                    "name": "Scene",
+                    "render": {
+                        "engine": "realtime",
+                        "eevee_gi_cubemap_resolution": resolution
+                    },
+                    "display_shading": factory_shading()
+                }]
+            })
+        };
+        let feature_id = "blender.scene.eevee.gi_cubemap_resolution";
+        assert!(
+            !import_losses(&raw(512))
+                .iter()
+                .any(|loss| loss.feature_id == feature_id)
+        );
+        let losses = import_losses(&raw(1024));
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == feature_id && loss.data_id.as_deref() == Some("Scene")
+        }));
+        let mut path_scene = raw(1024);
+        path_scene["scenes"][0]["render"]["engine"] = json!("path");
+        assert!(
+            !import_losses(&path_scene)
+                .iter()
+                .any(|loss| loss.feature_id == feature_id)
+        );
+    }
 }
 
 #[test]
@@ -24527,6 +25787,164 @@ fn shader_import_losses_only_report_unavailable_outputs() -> Result<()> {
     assert!(!shader_node_import_losses(&doc).iter().any(|loss| {
         loss.feature_id == "shader.node.VectorTransform:WORLD_to_CAMERA:camera_matrices"
     }));
+    Ok(())
+}
+
+#[test]
+fn realtime_world_probe_import_loss_requires_a_world_and_anisotropic_volume() -> Result<()> {
+    let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+    let scene_id = doc.active_scene.clone();
+    doc.scenes
+        .get_mut(&scene_id)
+        .ok_or_else(|| invalid_intermediate("volume test scene is missing"))?
+        .render
+        .engine = "realtime".to_owned();
+
+    let world_graph_id = Id::new("world_graph")?;
+    let world_id = Id::new("world")?;
+    let mut world_graph = NodeGroup::new("World", GraphKind::Shader);
+    let mut world_output = GraphNode::new("ShaderNodeOutputWorld");
+    world_output
+        .properties
+        .insert("is_active_output".to_owned(), Value::Bool(true));
+    world_graph
+        .nodes
+        .insert(Id::new("world_output")?, world_output);
+    doc.node_groups.insert(world_graph_id.clone(), world_graph);
+    doc.worlds.insert(
+        world_id.clone(),
+        World {
+            node_tree: Some(world_graph_id),
+            ..World::default()
+        },
+    );
+    doc.scenes
+        .get_mut(&scene_id)
+        .ok_or_else(|| invalid_intermediate("volume test scene is missing"))?
+        .world = Some(world_id.clone());
+
+    let graph_id = Id::new("volume_graph")?;
+    let volume_id = Id::new("volume")?;
+    let mut group = NodeGroup::new("Material", GraphKind::Shader);
+    let mut volume = GraphNode::new("ShaderNodeVolumePrincipled");
+    volume.inputs.insert("Anisotropy".to_owned(), json!(0.35));
+    group.nodes.insert(volume_id.clone(), volume);
+    let mut output = GraphNode::new("ShaderNodeOutputMaterial");
+    output
+        .properties
+        .insert("is_active_output".to_owned(), Value::Bool(true));
+    let output_id = Id::new("output")?;
+    group.nodes.insert(output_id.clone(), output);
+    group.links.push(GraphLink {
+        from_node: volume_id.clone(),
+        from_socket: "Volume".to_owned(),
+        to_node: output_id,
+        to_socket: "Volume".to_owned(),
+    });
+    doc.node_groups.insert(graph_id.clone(), group);
+    doc.materials.insert(
+        Id::new("material")?,
+        Material {
+            node_tree: Some(graph_id.clone()),
+            ..Material::default()
+        },
+    );
+
+    let feature_id = "shader.volume.world_probe_l1.realtime_scattering";
+    let losses = shader_node_import_losses(&doc);
+    assert!(losses.iter().any(|loss| {
+        loss.feature_id == feature_id
+            && loss.data_id.as_deref() == Some(volume_id.as_str())
+            && loss.reason.contains("world uniformity")
+    }));
+
+    doc.scenes
+        .get_mut(&scene_id)
+        .ok_or_else(|| invalid_intermediate("volume test scene is missing"))?
+        .render
+        .engine = "path".to_owned();
+    assert!(
+        !shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
+    doc.scenes
+        .get_mut(&scene_id)
+        .ok_or_else(|| invalid_intermediate("volume test scene is missing"))?
+        .render
+        .engine = "realtime".to_owned();
+    {
+        let volume = doc
+            .node_groups
+            .get_mut(&graph_id)
+            .and_then(|group| group.nodes.get_mut(&volume_id))
+            .ok_or_else(|| invalid_intermediate("volume test node is missing"))?;
+        volume.inputs.insert("Anisotropy".to_owned(), json!(0.35));
+        volume.inputs.insert("Density".to_owned(), json!(1.0));
+        volume
+            .inputs
+            .insert("Color".to_owned(), json!([0.0, 0.0, 0.0, 1.0]));
+    }
+    assert!(
+        !shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
+    {
+        let volume = doc
+            .node_groups
+            .get_mut(&graph_id)
+            .and_then(|group| group.nodes.get_mut(&volume_id))
+            .ok_or_else(|| invalid_intermediate("volume test node is missing"))?;
+        volume
+            .inputs
+            .insert("Color".to_owned(), json!([0.5, 0.5, 0.5, 1.0]));
+        volume.inputs.insert("Density".to_owned(), json!(0.0));
+    }
+    assert!(
+        !shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
+    doc.node_groups
+        .get_mut(&graph_id)
+        .and_then(|group| group.nodes.get_mut(&volume_id))
+        .ok_or_else(|| invalid_intermediate("volume test node is missing"))?
+        .inputs
+        .insert("Density".to_owned(), json!(1.0));
+    assert!(
+        shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
+
+    doc.node_groups
+        .get_mut(&graph_id)
+        .and_then(|group| group.nodes.get_mut(&volume_id))
+        .ok_or_else(|| invalid_intermediate("volume test node is missing"))?
+        .inputs
+        .insert("Anisotropy".to_owned(), json!(0.0));
+    assert!(
+        !shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
+
+    doc.node_groups
+        .get_mut(&graph_id)
+        .and_then(|group| group.nodes.get_mut(&volume_id))
+        .ok_or_else(|| invalid_intermediate("volume test node is missing"))?
+        .inputs
+        .insert("Anisotropy".to_owned(), json!(0.35));
+    doc.worlds
+        .get_mut(&world_id)
+        .ok_or_else(|| invalid_intermediate("volume test world is missing"))?
+        .node_tree = None;
+    assert!(
+        !shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
     Ok(())
 }
 

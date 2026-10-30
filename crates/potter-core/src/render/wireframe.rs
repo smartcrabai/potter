@@ -911,6 +911,8 @@ mod oracle_tests {
         Triangle {
             positions,
             generated: crate::geom::GeneratedCorners::default(),
+            geometry_vertex_slots: [0; 3],
+            geometry_vertex_weights: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             object_index,
             element_index: 1,
             color: [0.8, 0.8, 0.8, 1.0],

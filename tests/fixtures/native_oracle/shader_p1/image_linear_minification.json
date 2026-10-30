@@ -1,0 +1,17 @@
+{
+  "resolution": [
+    16,
+    16
+  ],
+  "samples": 1,
+  "renderer": "Blender 5.2.2 EEVEE Next source fixture; LINEAR Image Texture minified 2:1",
+  "cases": [
+    {
+      "name": "image_linear_minification",
+      "blend": "image_linear_minification.blend",
+      "engine": "realtime",
+      "error_code": "UNSUPPORTED_FEATURE",
+      "feature_id": "shader.node.ShaderNodeTexImage.linear_mip_filtering"
+    }
+  ]
+}

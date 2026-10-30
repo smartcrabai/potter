@@ -1,0 +1,55 @@
+{
+  "resolution": [
+    64,
+    64
+  ],
+  "samples": 4096,
+  "seed": 0,
+  "max_bounces": 4,
+  "renderer": "Blender 5.2.2 Cycles CPU; Raw; box filter 0.001",
+  "source": "Blender 5.2.2 intern/cycles/kernel/closure/bsdf_microfacet.h",
+  "cases": [
+    {
+      "name": "glass_ggx",
+      "region": [
+        12,
+        14,
+        8,
+        8
+      ],
+      "mean": [
+        0.9318794785067439,
+        0.9318794785067439,
+        0.9318794785067439
+      ]
+    },
+    {
+      "name": "glass_multi_ggx",
+      "region": [
+        44,
+        14,
+        8,
+        8
+      ],
+      "mean": [
+        0.9986202791333199,
+        0.9986202791333199,
+        0.9986202791333199
+      ]
+    },
+    {
+      "name": "glass_default",
+      "region": [
+        28,
+        14,
+        8,
+        8
+      ],
+      "mean": [
+        1.003694262355566,
+        1.003694262355566,
+        1.003694262355566
+      ]
+    }
+  ]
+}

@@ -262,7 +262,7 @@ fn simple_pbr_material_evaluates_through_its_principled_graph() {
 }
 
 #[test]
-fn checker_texture_alternates_colors_across_uv_tiles() {
+fn checker_texture_defaults_to_generated_coordinates_and_alternates() {
     let mut graph = NodeGroup::new("Checker", GraphKind::Shader);
     add_node(&mut graph, "out", "OutputMaterial", &[]);
     add_node(&mut graph, "principled", "ShaderNodeBsdfPrincipled", &[]);
@@ -280,18 +280,18 @@ fn checker_texture_alternates_colors_across_uv_tiles() {
     link(&mut graph, "principled", "BSDF", "out", "Surface");
     let (material, groups) = material_with_graph(graph);
     let mut context = HitContext::new(&groups);
-    context.uv = [0.1, 0.1];
+    context.generated = DVec3::new(0.1, 0.1, 0.0);
     let first = *evaluate_surface(&material, &context)
         .unwrap()
         .dominant()
         .unwrap();
-    context.uv = [0.6, 0.1];
+    context.generated = DVec3::new(0.6, 0.1, 0.0);
     let second = *evaluate_surface(&material, &context)
         .unwrap()
         .dominant()
         .unwrap();
-    assert_eq!(first.base_color, [1.0, 0.0, 0.0, 1.0]);
-    assert_eq!(second.base_color, [0.0, 0.0, 1.0, 1.0]);
+    assert_eq!(first.base_color, [0.0, 0.0, 1.0, 1.0]);
+    assert_eq!(second.base_color, [1.0, 0.0, 0.0, 1.0]);
 }
 
 #[test]
@@ -472,7 +472,9 @@ fn image_texture_samples_resolved_pixels_using_hit_uvs() {
             udim: true,
         },
     )]);
-    let mut context = HitContext::new(&groups).with_images(&image_data);
+    let mut context = HitContext::new(&groups)
+        .with_images(&image_data)
+        .with_path_traced(true);
     context.uv = [0.25, 0.5];
     let first = *evaluate_surface(&material, &context)
         .unwrap()
@@ -535,22 +537,24 @@ fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
         let mut graph = NodeGroup::new("UDIM Image", GraphKind::Shader);
         add_node(&mut graph, "out", "OutputMaterial", &[]);
         add_node(&mut graph, "principled", "ShaderNodeBsdfPrincipled", &[]);
+        add_node(
+            &mut graph,
+            "coords",
+            "ShaderNodeCombineXYZ",
+            &[
+                ("X", json!(vector[0])),
+                ("Y", json!(vector[1])),
+                ("Z", json!(vector[2])),
+            ],
+        );
         if mapped {
-            add_node(
-                &mut graph,
-                "mapping",
-                "ShaderNodeMapping",
-                &[("Vector", json!(vector))],
-            );
+            add_node(&mut graph, "mapping", "ShaderNodeMapping", &[]);
             add_node(&mut graph, "image", "ShaderNodeTexImage", &[]);
+            link(&mut graph, "coords", "Vector", "mapping", "Vector");
             link(&mut graph, "mapping", "Vector", "image", "Vector");
         } else {
-            add_node(
-                &mut graph,
-                "image",
-                "ShaderNodeTexImage",
-                &[("Vector", json!(vector))],
-            );
+            add_node(&mut graph, "image", "ShaderNodeTexImage", &[]);
+            link(&mut graph, "coords", "Vector", "image", "Vector");
         }
         let image = graph.nodes.get_mut(&Id::new("image").unwrap()).unwrap();
         image
@@ -573,7 +577,9 @@ fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
     for mapped in [false, true] {
         for (vector, expected) in cases {
             let (material, groups) = make_material(mapped, vector);
-            let context = HitContext::new(&groups).with_images(&images);
+            let context = HitContext::new(&groups)
+                .with_images(&images)
+                .with_path_traced(true);
             assert_eq!(
                 evaluate_surface(&material, &context)
                     .unwrap()
@@ -672,7 +678,8 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     };
     let mut context = HitContext::new(&groups)
         .with_images(&image_data)
-        .with_uv_layers(layers);
+        .with_uv_layers(layers)
+        .with_path_traced(true);
     context.uv = [0.25, 0.5];
     let simple = *evaluate_surface(&material, &context)
         .unwrap()
@@ -763,7 +770,8 @@ fn uv_map_node_samples_its_named_layer_and_falls_back_with_a_warning() {
     let mut context = HitContext::new(&named_groups)
         .with_images(&images)
         .with_uv_layers(layers)
-        .with_warnings(&warnings);
+        .with_warnings(&warnings)
+        .with_path_traced(true);
     context.uv = [0.25, 0.5];
     let named = *evaluate_surface(&named_material, &context)
         .unwrap()
@@ -776,7 +784,8 @@ fn uv_map_node_samples_its_named_layer_and_falls_back_with_a_warning() {
     let context = HitContext::new(&missing_groups)
         .with_images(&images)
         .with_uv_layers(layers)
-        .with_warnings(&warnings);
+        .with_warnings(&warnings)
+        .with_path_traced(true);
     let fallback = *evaluate_surface(&missing_material, &context)
         .unwrap()
         .dominant()

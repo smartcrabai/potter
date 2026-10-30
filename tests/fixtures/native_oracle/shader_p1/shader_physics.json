@@ -1,0 +1,41 @@
+{
+  "resolution": [
+    64,
+    64
+  ],
+  "samples": 1024,
+  "seed": 0,
+  "max_bounces": 4,
+  "renderer": "Blender 5.2.2 Cycles CPU; Raw; box filter 0.001",
+  "source": "Blender 5.2.2 source/blender/nodes/shader/nodes/node_shader_volume_principled.cc",
+  "cases": [
+    {
+      "name": "volume_blackbody_1800k",
+      "region": [
+        12,
+        42,
+        8,
+        8
+      ],
+      "mean": [
+        0.14547923544887453,
+        0.08023931458592415,
+        0.08267698809504509
+      ]
+    },
+    {
+      "name": "volume_blackbody_9000k",
+      "region": [
+        44,
+        42,
+        8,
+        8
+      ],
+      "mean": [
+        18.180199563503265,
+        19.983255743980408,
+        26.9941865503788
+      ]
+    }
+  ]
+}

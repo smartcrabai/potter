@@ -516,7 +516,12 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
         ),
         "ShaderNodeAttribute" => (
             sockets(&[("Name", "string")]),
-            sockets(&[("Color", "color"), ("Alpha", "float")]),
+            sockets(&[
+                ("Color", "color"),
+                ("Vector", "vector"),
+                ("Fac", "float"),
+                ("Alpha", "float"),
+            ]),
         ),
         "ShaderNodeMixShader" => (
             sockets(&[

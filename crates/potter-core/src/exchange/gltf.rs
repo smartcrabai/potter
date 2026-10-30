@@ -123,7 +123,7 @@ impl TextureExport {
             )?,
             None => self.packed_image_index(texture, doc, root_path, binary, views)?,
         };
-        let sampler_index = self.sampler_index(texture.interpolation, texture.wrap);
+        let sampler_index = self.sampler_index(texture.interpolation, texture.wrap)?;
         if let Some(index) = self.texture_indices.get(&(image_index, sampler_index)) {
             return Ok(*index);
         }
@@ -135,17 +135,25 @@ impl TextureExport {
         Ok(index)
     }
 
-    /// Sampler for one interpolation and wrap pair. Linear uses LINEAR(_`MIPMAP_LINEAR`) and Closest
-    /// NEAREST(_`MIPMAP_NEAREST`), as Blender's exporter does.
+    /// Sampler for one interpolation and wrap pair. glTF represents linear and closest filtering only.
     fn sampler_index(
         &mut self,
         interpolation: ImageInterpolation,
         wrap: [TextureWrap; 2],
-    ) -> usize {
-        let nearest = interpolation == ImageInterpolation::Closest;
+    ) -> Result<usize> {
+        let nearest = match interpolation {
+            ImageInterpolation::Closest => true,
+            ImageInterpolation::Linear => false,
+            ImageInterpolation::Cubic => {
+                return Err(unsupported_export(
+                    feature_id::SAMPLER,
+                    "glTF cannot represent cubic image-texture interpolation",
+                ));
+            }
+        };
         let key = (nearest, wrap_code(wrap[0]), wrap_code(wrap[1]));
         if let Some(index) = self.sampler_indices.get(&key) {
-            return *index;
+            return Ok(*index);
         }
         let (mag, min) = if nearest { (9728, 9984) } else { (9729, 9987) };
         let index = self.samplers.len();
@@ -156,7 +164,7 @@ impl TextureExport {
             "wrapT": key.2
         }));
         self.sampler_indices.insert(key, index);
-        index
+        Ok(index)
     }
 
     /// Image index of a derived (packed) texture, encoded once per channel list.
@@ -15089,7 +15097,8 @@ mod tests {
             };
             let mut context = crate::shader::HitContext::new(&imported.doc.node_groups)
                 .with_images(&images)
-                .with_uv_layers(layers);
+                .with_uv_layers(layers)
+                .with_path_traced(true);
             // A texture on the render layer reads `TexCoord.UV`, which is the hit's render `uv`. The renderer
             // sets it; without it the texture samples the (0, 0) default across the REPEAT seam.
             context.uv = [u, 0.25];
@@ -15312,7 +15321,8 @@ mod tests {
             };
             let mut context = crate::shader::HitContext::new(groups)
                 .with_images(images)
-                .with_uv_layers(layers);
+                .with_uv_layers(layers)
+                .with_path_traced(true);
             // A graph texture on the render layer reads `TexCoord.UV`, the hit's render `uv`, as the renderer sets it.
             context.uv = [u, v];
             let shading = crate::shader::evaluate_surface(material, &context)?;
@@ -15521,7 +15531,8 @@ mod tests {
                 };
                 let mut context = crate::shader::HitContext::new(&imported.doc.node_groups)
                     .with_images(&images)
-                    .with_uv_layers(layers);
+                    .with_uv_layers(layers)
+                    .with_path_traced(true);
                 context.uv = [s_u, s_v];
                 let shading = crate::shader::evaluate_surface(material, &context)?;
                 Ok(shading
@@ -15626,7 +15637,8 @@ mod tests {
             };
             let mut context = crate::shader::HitContext::new(&imported.doc.node_groups)
                 .with_images(&images)
-                .with_uv_layers(layers);
+                .with_uv_layers(layers)
+                .with_path_traced(true);
             context.uv = storage;
             let shading = crate::shader::evaluate_surface(material, &context)?;
             let actual = shading
