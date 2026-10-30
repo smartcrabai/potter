@@ -4861,6 +4861,7 @@ fn world_radiance(
     direction: DVec3,
     fallback: DVec3,
     path_traced: bool,
+    evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
     let Some(world) = doc
         .scenes
@@ -4870,7 +4871,14 @@ fn world_radiance(
     else {
         return Ok(fallback);
     };
-    crate::shader::evaluate_world(world, &doc.node_groups, images, direction, path_traced)
+    crate::shader::evaluate_world_with_workspace(
+        world,
+        &doc.node_groups,
+        images,
+        direction,
+        path_traced,
+        evaluator_workspace,
+    )
 }
 
 /// The scene a path reads, bundled so the volume and shadow code take one argument for it.
@@ -5388,6 +5396,7 @@ fn trace_path_with_temperatures(
                                 direction,
                                 environment,
                                 true,
+                                evaluator_workspace,
                             )?,
                         },
                         budget,
@@ -5458,6 +5467,7 @@ fn trace_path_with_temperatures(
                                 direction,
                                 environment,
                                 true,
+                                evaluator_workspace,
                             )?,
                         },
                         budget,
@@ -5537,6 +5547,7 @@ fn trace_path_with_temperatures(
                                 direction,
                                 environment,
                                 true,
+                                evaluator_workspace,
                             )?,
                         },
                         budget,
@@ -5598,6 +5609,7 @@ fn trace_path_with_temperatures(
                                     direction,
                                     environment,
                                     true,
+                                    evaluator_workspace,
                                 )?,
                             },
                             budget,
@@ -5664,6 +5676,7 @@ fn trace_path_with_temperatures(
                     direction,
                     environment,
                     true,
+                    evaluator_workspace,
                 )?;
                 radiance += throughput * environment * environment_weight;
             }
@@ -7104,6 +7117,7 @@ fn direct_lighting(
             direction,
             environment,
             true,
+            evaluator_workspace,
         )?;
         let visibility = shadow_transmittance(
             scene,
@@ -7175,6 +7189,7 @@ fn direct_volume_lighting(
             direction,
             site.environment,
             true,
+            evaluator_workspace,
         )?;
         let visibility = shadow_transmittance(
             scene,

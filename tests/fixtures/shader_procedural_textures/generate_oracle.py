@@ -555,19 +555,118 @@ def build_world_fixture():
     wave.bands_direction = "X"
     wave.wave_profile = "SIN"
     for name, value in {
-        "Scale": 0.01,
+        "Scale": 0.04,
         "Distortion": 0.0,
         "Detail": 0.0,
         "Phase Offset": 0.17,
     }.items():
         wave.inputs[name].default_value = value
+
+    magic = tree.nodes.new("ShaderNodeTexMagic")
+    magic.turbulence_depth = 2
+    magic.inputs["Scale"].default_value = 0.01
+    magic.inputs["Distortion"].default_value = 0.0
+
+    brick = tree.nodes.new("ShaderNodeTexBrick")
+    brick.offset = 0.37
+    brick.offset_frequency = 3
+    brick.squash = 0.73
+    brick.squash_frequency = 4
+    for name, value in {
+        "Color1": (0.72, 0.19, 0.07, 1.0),
+        "Color2": (0.21, 0.39, 0.68, 1.0),
+        "Mortar": (0.08, 0.11, 0.16, 1.0),
+        "Scale": 4.7,
+        "Mortar Size": 0.12,
+        "Mortar Smooth": 0.08,
+        "Bias": 0.27,
+        "Brick Width": 0.43,
+        "Row Height": 0.31,
+    }.items():
+        brick.inputs[name].default_value = value
+
+    constant_vector = tree.nodes.new("ShaderNodeCombineXYZ")
+    for axis, component in zip(("X", "Y", "Z"), CONSTANT_VECTOR):
+        constant_vector.inputs[axis].default_value = component
+    white_noise = tree.nodes.new("ShaderNodeTexWhiteNoise")
+    white_noise.noise_dimensions = "1D"
+    white_noise.inputs["W"].default_value = CONSTANT_W
+
+    gabor = tree.nodes.new("ShaderNodeTexGabor")
+    gabor.gabor_type = "2D"
+    gabor.inputs["Scale"].default_value = 0.01
+    gabor.inputs["Frequency"].default_value = 2.4
+    gabor.inputs["Anisotropy"].default_value = 0.63
+    gabor.inputs["Orientation"].default_value = 0.73
+
+    magic_constant_vector = tree.nodes.new("ShaderNodeCombineXYZ")
+    for axis, component in zip(("X", "Y", "Z"), (-0.17, 0.31, 0.53)):
+        magic_constant_vector.inputs[axis].default_value = component
+    magic_constant = tree.nodes.new("ShaderNodeTexMagic")
+    magic_constant.turbulence_depth = 6
+    magic_constant.inputs["Scale"].default_value = 5.1
+    magic_constant.inputs["Distortion"].default_value = 2.3
+
+    gabor_constant_orientation = tree.nodes.new("ShaderNodeCombineXYZ")
+    for axis, component in zip(("X", "Y", "Z"), (-1.0, 0.0, 0.0)):
+        gabor_constant_orientation.inputs[axis].default_value = component
+    gabor_constant = tree.nodes.new("ShaderNodeTexGabor")
+    gabor_constant.gabor_type = "3D"
+    gabor_constant.inputs["Scale"].default_value = 3.7
+    gabor_constant.inputs["Frequency"].default_value = 2.4
+    gabor_constant.inputs["Anisotropy"].default_value = 0.5
+
+    mix_wave_magic = tree.nodes.new("ShaderNodeMixRGB")
+    mix_brick_noise = tree.nodes.new("ShaderNodeMixRGB")
+    mix_left_right = tree.nodes.new("ShaderNodeMixRGB")
+    mix_with_gabor = tree.nodes.new("ShaderNodeMixRGB")
+    mix_with_magic_constant = tree.nodes.new("ShaderNodeMixRGB")
+    mix_with_gabor_constant = tree.nodes.new("ShaderNodeMixRGB")
+    for mix, factor in zip(
+        (
+            mix_wave_magic,
+            mix_brick_noise,
+            mix_left_right,
+            mix_with_gabor,
+            mix_with_magic_constant,
+            mix_with_gabor_constant,
+        ),
+        (0.10, 0.13, 0.16, 0.19, 0.22, 0.25),
+    ):
+        mix.inputs["Fac"].default_value = factor
     background = tree.nodes.new("ShaderNodeBackground")
     background.inputs["Strength"].default_value = 1.0
     output = tree.nodes.new("ShaderNodeOutputWorld")
     output.is_active_output = True
-    tree.links.new(coordinates.outputs["Generated"], wave.inputs["Vector"])
-    tree.links.new(wave.outputs["Color"], background.inputs["Color"])
-    tree.links.new(background.outputs["Background"], output.inputs["Surface"])
+
+    links = tree.links
+    links.new(coordinates.outputs["Generated"], wave.inputs["Vector"])
+    links.new(coordinates.outputs["Generated"], magic.inputs["Vector"])
+    links.new(coordinates.outputs["Generated"], gabor.inputs["Vector"])
+    links.new(constant_vector.outputs["Vector"], brick.inputs["Vector"])
+    links.new(magic_constant_vector.outputs["Vector"], magic_constant.inputs["Vector"])
+    links.new(constant_vector.outputs["Vector"], gabor_constant.inputs["Vector"])
+    links.new(
+        gabor_constant_orientation.outputs["Vector"],
+        gabor_constant.inputs["Orientation 3D"],
+    )
+    links.new(wave.outputs["Color"], mix_wave_magic.inputs["Color1"])
+    links.new(magic.outputs["Color"], mix_wave_magic.inputs["Color2"])
+    links.new(mix_wave_magic.outputs["Color"], mix_brick_noise.inputs["Color1"])
+    links.new(brick.outputs["Color"], mix_brick_noise.inputs["Color2"])
+    links.new(mix_brick_noise.outputs["Color"], mix_left_right.inputs["Color1"])
+    links.new(white_noise.outputs["Color"], mix_left_right.inputs["Color2"])
+    links.new(mix_left_right.outputs["Color"], mix_with_gabor.inputs["Color1"])
+    links.new(gabor.outputs["Value"], mix_with_gabor.inputs["Color2"])
+    links.new(mix_with_gabor.outputs["Color"], mix_with_magic_constant.inputs["Color1"])
+    links.new(magic_constant.outputs["Color"], mix_with_magic_constant.inputs["Color2"])
+    links.new(
+        mix_with_magic_constant.outputs["Color"],
+        mix_with_gabor_constant.inputs["Color1"],
+    )
+    links.new(gabor_constant.outputs["Value"], mix_with_gabor_constant.inputs["Color2"])
+    links.new(mix_with_gabor_constant.outputs["Color"], background.inputs["Color"])
+    links.new(background.outputs["Background"], output.inputs["Surface"])
 
     camera_data = bpy.data.cameras.new("procedural_world_camera")
     camera_data.type = "PERSP"

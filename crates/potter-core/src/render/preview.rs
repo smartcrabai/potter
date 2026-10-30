@@ -418,14 +418,19 @@ pub(crate) fn render_camera_frame(
         None => background_color(doc, &snapshot, mode, film_transparent),
     };
     let images_ref = &images;
+    let prepared_world = beauty_world
+        .map(|world| crate::shader::prepare_world(world, &doc.node_groups))
+        .transpose()?
+        .flatten();
     let world_radiance = beauty_world.map(|world| {
         move |direction: DVec3| {
-            crate::shader::evaluate_world(
+            crate::shader::evaluate_world_with_prepared(
                 world,
                 &doc.node_groups,
                 images_ref,
                 direction,
                 engine == "path",
+                prepared_world.as_ref(),
             )
         }
     });

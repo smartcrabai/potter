@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use super::EvaluatorWorkspace;
 use glam::DVec3;
 use serde_json::{Value as JsonValue, json};
 
@@ -60,6 +61,33 @@ pub(crate) fn world_mix_supported(data_type: Option<&str>, blend_type: Option<&s
     world_mix_mode(data_type, blend_type).is_ok()
 }
 
+pub(crate) struct PreparedWorld {
+    graph_id: Id,
+    fold_index: super::inline_fold::FoldIndex,
+}
+
+impl PreparedWorld {
+    pub(super) fn new(graph_id: &Id, group: &NodeGroup, node_groups: &Registry<NodeGroup>) -> Self {
+        Self {
+            graph_id: graph_id.clone(),
+            fold_index: super::inline_fold::FoldIndex::new(graph_id, group, node_groups),
+        }
+    }
+    pub(super) fn graph_id(&self) -> &Id {
+        &self.graph_id
+    }
+}
+
+pub(crate) fn prepare_world(
+    world: &World,
+    groups: &Registry<NodeGroup>,
+) -> Result<Option<PreparedWorld>> {
+    let Some((graph_id, group)) = world_graph(world, groups)? else {
+        return Ok(None);
+    };
+    Ok(Some(PreparedWorld::new(graph_id, group, groups)))
+}
+
 /// Evaluates the World node graph for a single outgoing direction.
 ///
 /// `path_traced` selects Cycles semantics when true and EEVEE semantics otherwise.
@@ -70,8 +98,60 @@ pub fn evaluate_world(
     direction: DVec3,
     path_traced: bool,
 ) -> Result<DVec3> {
+    let mut workspace = EvaluatorWorkspace::default();
+    evaluate_world_with_workspace(
+        world,
+        groups,
+        images,
+        direction,
+        path_traced,
+        &mut workspace,
+    )
+}
+
+pub(crate) fn evaluate_world_with_workspace(
+    world: &World,
+    groups: &Registry<NodeGroup>,
+    images: &std::collections::BTreeMap<String, ImageData>,
+    direction: DVec3,
+    path_traced: bool,
+    workspace: &mut EvaluatorWorkspace,
+) -> Result<DVec3> {
+    let Some((graph_id, group)) = world_graph(world, groups)? else {
+        return Ok(world_color(world));
+    };
+    let prepared = workspace.prepared_world(graph_id, group, groups);
+    evaluate_world_graph(group, &prepared.fold_index, images, direction, path_traced)
+}
+
+pub(crate) fn evaluate_world_with_prepared(
+    world: &World,
+    groups: &Registry<NodeGroup>,
+    images: &std::collections::BTreeMap<String, ImageData>,
+    direction: DVec3,
+    path_traced: bool,
+    prepared: Option<&PreparedWorld>,
+) -> Result<DVec3> {
+    let Some((graph_id, group)) = world_graph(world, groups)? else {
+        return Ok(world_color(world));
+    };
+    let prepared = prepared
+        .filter(|prepared| prepared.graph_id == *graph_id)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "prepared World shader graph does not match the active world",
+            )
+        })?;
+    evaluate_world_graph(group, &prepared.fold_index, images, direction, path_traced)
+}
+
+fn world_graph<'world, 'groups>(
+    world: &'world World,
+    groups: &'groups Registry<NodeGroup>,
+) -> Result<Option<(&'world Id, &'groups NodeGroup)>> {
     let Some(graph_id) = &world.node_tree else {
-        return Ok(DVec3::from_array(world.color) * world.strength);
+        return Ok(None);
     };
     let group = groups.get(graph_id).ok_or_else(|| {
         PotError::with_details(
@@ -86,6 +166,20 @@ pub fn evaluate_world(
             format!("world graph `{graph_id}` is not a shader graph"),
         ));
     }
+    Ok(Some((graph_id, group)))
+}
+
+fn world_color(world: &World) -> DVec3 {
+    DVec3::from_array(world.color) * world.strength
+}
+
+fn evaluate_world_graph(
+    group: &NodeGroup,
+    fold_index: &super::inline_fold::FoldIndex,
+    images: &std::collections::BTreeMap<String, ImageData>,
+    direction: DVec3,
+    path_traced: bool,
+) -> Result<DVec3> {
     let output = group
         .nodes
         .iter()
@@ -116,6 +210,7 @@ pub fn evaluate_world(
         })?;
     let mut evaluator = WorldEvaluator {
         group,
+        fold_index,
         images,
         direction: normalize_or(direction, DVec3::Z),
         path_traced,
@@ -135,6 +230,7 @@ pub fn evaluate_world(
 
 struct WorldEvaluator<'a> {
     group: &'a NodeGroup,
+    fold_index: &'a super::inline_fold::FoldIndex,
     images: &'a std::collections::BTreeMap<String, ImageData>,
     direction: DVec3,
     path_traced: bool,
@@ -298,14 +394,20 @@ impl<'a> WorldEvaluator<'a> {
                 }
                 let depth =
                     world_texture_integer(id, node, "turbulence_depth", 2)?.clamp(0, 10) as u8;
-                let path_traced = self.path_traced;
-                let (color, factor) = procedural_texture::magic_shader(
-                    self.procedural_texture_vector(id, self.direction)?,
-                    self.procedural_texture_scalar(id, "Scale", 5.0)?,
-                    self.procedural_texture_scalar(id, "Distortion", 1.0)?,
-                    depth,
-                    path_traced,
-                );
+                let vector = self.procedural_texture_vector(id, self.direction)?;
+                let scale = self.procedural_texture_scalar(id, "Scale", 5.0)?;
+                let distortion = self.procedural_texture_scalar(id, "Distortion", 1.0)?;
+                let (color, factor) = if self.fold_index.primitive_nodes.contains(id) {
+                    procedural_texture::magic(vector, scale, distortion, depth)
+                } else {
+                    procedural_texture::magic_shader(
+                        vector,
+                        scale,
+                        distortion,
+                        depth,
+                        self.path_traced,
+                    )
+                };
                 match socket {
                     "Color" => Ok(WorldValue::Color(color.map(f64::from))),
                     "Fac" => Ok(WorldValue::Scalar(f64::from(factor))),
@@ -442,18 +544,29 @@ impl<'a> WorldEvaluator<'a> {
                         )?,
                     )
                 } else {
-                    procedural_texture::gabor_3d_shader(
-                        vector,
-                        scale,
-                        frequency,
-                        anisotropy,
-                        self.procedural_texture_vector_input(
-                            id,
-                            "Orientation 3D",
-                            [std::f32::consts::SQRT_2, std::f32::consts::SQRT_2, 0.0],
-                        )?,
-                        self.path_traced,
-                    )
+                    let orientation = self.procedural_texture_vector_input(
+                        id,
+                        "Orientation 3D",
+                        [std::f32::consts::SQRT_2, std::f32::consts::SQRT_2, 0.0],
+                    )?;
+                    if self.fold_index.primitive_nodes.contains(id) {
+                        procedural_texture::gabor_3d(
+                            vector,
+                            scale,
+                            frequency,
+                            anisotropy,
+                            orientation,
+                        )
+                    } else {
+                        procedural_texture::gabor_3d_shader(
+                            vector,
+                            scale,
+                            frequency,
+                            anisotropy,
+                            orientation,
+                            self.path_traced,
+                        )
+                    }
                 };
                 let value = match socket {
                     "Value" => values[0],

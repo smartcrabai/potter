@@ -98,18 +98,31 @@ fn procedural_world_texture_matches_cycles_and_eevee() -> TestResult {
     let (project, import_report) = import_blend(&blender, root.path(), "procedural_world", &blend)?;
     assert_lossless(&import_report, "procedural world texture import");
 
+    let exported = root.path().join("world-roundtrip.blend");
+    let export_report = export(&blender, &project, "blend", &exported)?;
+    assert_lossless(&export_report, "procedural world texture export");
+    let (roundtrip, roundtrip_report) = import_blend(
+        &blender,
+        root.path(),
+        "procedural_world_roundtrip",
+        &exported,
+    )?;
+    assert_lossless(&roundtrip_report, "procedural world texture re-import");
+
     for (engine, oracle_engine) in [("path", "cycles"), ("realtime", "eevee")] {
         let resolution: [u32; 2] = serde_json::from_value(
             oracle["world_render"]["renders"][oracle_engine]["resolution"].clone(),
         )?;
-        let image = render_project(
-            &project,
-            root.path(),
-            &format!("world_{oracle_engine}"),
-            engine,
-            resolution,
-        )?;
-        compare_world_pixels(&image, &oracle, oracle_engine)?;
+        for (name, target_project) in [("imported", &project), ("roundtrip", &roundtrip)] {
+            let image = render_project(
+                target_project,
+                root.path(),
+                &format!("world_{name}_{oracle_engine}"),
+                engine,
+                resolution,
+            )?;
+            compare_world_pixels(&image, &oracle, oracle_engine)?;
+        }
     }
     Ok(())
 }

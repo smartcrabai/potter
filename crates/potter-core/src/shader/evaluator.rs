@@ -1553,6 +1553,7 @@ pub struct EvaluatorWorkspace {
     curve_mappings: Vec<PreparedNodeCurve>,
     /// Prepared ramp elements and their lookup tables survive hit resets; source-property equality invalidates edits.
     ramps: Vec<PreparedNodeRamp>,
+    world_folds: Vec<super::world::PreparedWorld>,
 }
 struct PreparedNodeRamp {
     graph: usize,
@@ -1579,6 +1580,30 @@ struct ClosureSpan {
 }
 
 impl EvaluatorWorkspace {
+    /// Reuses the canonical primitive-fold analysis across repeated world directions.
+    pub(crate) fn prepared_world(
+        &mut self,
+        graph_id: &Id,
+        graph: &NodeGroup,
+        node_groups: &Registry<NodeGroup>,
+    ) -> &super::world::PreparedWorld {
+        let index = if let Some(index) = self
+            .world_folds
+            .iter()
+            .position(|prepared| prepared.graph_id() == graph_id)
+        {
+            index
+        } else {
+            let index = self.world_folds.len();
+            self.world_folds.push(super::world::PreparedWorld::new(
+                graph_id,
+                graph,
+                node_groups,
+            ));
+            index
+        };
+        &self.world_folds[index]
+    }
     /// Clears the scratch for a new evaluation. Spans from an earlier evaluation are invalid after this.
     fn reset(&mut self) {
         self.active.clear();
