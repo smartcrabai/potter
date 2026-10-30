@@ -3635,9 +3635,17 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         let vector = texture_vector(self.texture_vector_input(id, self.hit_ctx.generated)?)?;
         let scale = texture_f32(self.scalar_input(id, &["Scale"], 5.0)?)?;
         let distortion = texture_f32(self.scalar_input(id, &["Distortion"], 1.0)?)?;
-        let path_traced = self.hit_ctx.path_traced;
-        let (color, factor) =
-            procedural_texture::magic_shader(vector, scale, distortion, depth, path_traced);
+        let (color, factor) = if self.inputs_fold_to_primitives(id) {
+            procedural_texture::magic(vector, scale, distortion, depth)
+        } else {
+            procedural_texture::magic_shader(
+                vector,
+                scale,
+                distortion,
+                depth,
+                self.hit_ctx.path_traced,
+            )
+        };
         match socket {
             "Color" => Ok(Value::Color(color.map(f64::from))),
             "Fac" => Ok(Value::Scalar(f64::from(factor))),
@@ -3763,6 +3771,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         let scale = texture_f32(self.scalar_input(id, &["Scale"], 5.0)?)?;
         let frequency = texture_f32(self.scalar_input(id, &["Frequency"], 2.0)?)?;
         let anisotropy = texture_f32(self.scalar_input(id, &["Anisotropy"], 1.0)?)?;
+        let primitive_inputs = self.inputs_fold_to_primitives(id);
         let outputs = if dimensions == 2 {
             let orientation = texture_f32(self.scalar_input(
                 id,
@@ -3776,14 +3785,18 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                 &["Orientation 3D"],
                 DVec3::new(std::f64::consts::SQRT_2, std::f64::consts::SQRT_2, 0.0),
             )?)?;
-            procedural_texture::gabor_3d_shader(
-                vector,
-                scale,
-                frequency,
-                anisotropy,
-                orientation,
-                self.hit_ctx.path_traced,
-            )
+            if primitive_inputs {
+                procedural_texture::gabor_3d(vector, scale, frequency, anisotropy, orientation)
+            } else {
+                procedural_texture::gabor_3d_shader(
+                    vector,
+                    scale,
+                    frequency,
+                    anisotropy,
+                    orientation,
+                    self.hit_ctx.path_traced,
+                )
+            }
         };
         let value = match socket {
             "Value" => outputs[0],

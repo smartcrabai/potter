@@ -226,6 +226,10 @@ def add_probe(scene, node_key, properties, coordinate_source, output_name, index
     texture.label = probe_id
     set_node_properties(texture, properties)
     set_input_defaults(texture, node_key, properties)
+    # Keep the Generated-coordinate probe smooth within a 4-pixel tile; constant probes exercise full detail/distortion.
+    if node_key == "wave" and coordinate_source == "generated":
+        texture.inputs["Scale"].default_value = 0.01
+        texture.inputs["Distortion"].default_value = 0.0
     if node_key == "gabor" and coordinate_source == "constant_edge":
         texture.inputs["Anisotropy"].default_value = 0.5
         orientation = next(socket for socket in texture.inputs if socket.identifier == "Orientation 3D")
@@ -479,20 +483,32 @@ def add_camera(scene):
 def render_probe_pixels(scene, probes):
     scene.render.resolution_x = COLUMNS * PIXELS_PER_TILE
     scene.render.resolution_y = ROWS * PIXELS_PER_TILE
-    bpy.ops.render.render(write_still=False)
-    image = bpy.data.images.get("Render Result")
-    width, height = image.size
-    channels = image.channels
-    pixels = list(image.pixels[:])
+    previous_filepath = scene.render.filepath
     result = []
-    for probe in probes:
-        x = probe["column"] * PIXELS_PER_TILE + PIXELS_PER_TILE // 2
-        y = probe["row"] * PIXELS_PER_TILE + PIXELS_PER_TILE // 2
-        offset = (y * width + x) * channels
-        rgba = pixels[offset : offset + channels]
-        if channels == 3:
-            rgba.append(1.0)
-        result.append([float(component) for component in rgba[:4]])
+    try:
+        with tempfile.TemporaryDirectory(prefix="procedural_shader_probes_") as render_directory:
+            render_path = os.path.join(render_directory, "probes.exr")
+            scene.render.filepath = render_path
+            bpy.ops.render.render(write_still=True)
+            image = bpy.data.images.load(render_path, check_existing=False)
+            try:
+                width, height = image.size
+                channels = image.channels
+                pixels = list(image.pixels[:])
+                if channels not in (3, 4) or len(pixels) != width * height * channels:
+                    raise RuntimeError("Blender procedural render did not return full RGBA pixels")
+                for probe in probes:
+                    x = probe["column"] * PIXELS_PER_TILE + PIXELS_PER_TILE // 2
+                    y = probe["row"] * PIXELS_PER_TILE + PIXELS_PER_TILE // 2
+                    offset = (y * width + x) * channels
+                    rgba = pixels[offset : offset + channels]
+                    if channels == 3:
+                        rgba.append(1.0)
+                    result.append([float(component) for component in rgba[:4]])
+            finally:
+                bpy.data.images.remove(image)
+    finally:
+        scene.render.filepath = previous_filepath
     return result
 
 
@@ -618,22 +634,33 @@ bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
 modes = make_modes()
 probes = []
-ROWS = math.ceil(
-    (
-        sum(
-            len(node_modes) * (3 if node_key == "brick" else 2) * len(OUTPUTS[node_key])
-            for node_key, node_modes in modes.items()
-        )
-        + 3
-    )
-    / COLUMNS
+probe_count = sum(
+    len(node_modes) * len(OUTPUTS[node_key])
+    for node_key, node_modes in modes.items()
 )
+probe_count += len(modes["brick"]) * len(OUTPUTS["brick"]) + 4
+ROWS = math.ceil(probe_count / COLUMNS)
 index = 0
 for node_key, node_modes in modes.items():
-    for mode in node_modes:
-        for coordinate_source in ("constant", "generated"):
-            for output_name in OUTPUTS[node_key]:
-                probes.append(add_probe(scene, node_key, mode, coordinate_source, output_name, index))
+    for mode_index, mode in enumerate(node_modes):
+        coordinate_sources = ("constant",)
+        if node_key == "wave" and mode_index == 0:
+            coordinate_sources = ("constant", "generated")
+        for coordinate_source in coordinate_sources:
+            output_names = OUTPUTS[node_key]
+            if node_key == "wave" and coordinate_source == "generated":
+                output_names = ("Color",)
+            for output_name in output_names:
+                probes.append(
+                    add_probe(
+                        scene,
+                        node_key,
+                        mode,
+                        coordinate_source,
+                        output_name,
+                        index,
+                    )
+                )
                 index += 1
         if node_key == "brick":
             for output_name in OUTPUTS[node_key]:

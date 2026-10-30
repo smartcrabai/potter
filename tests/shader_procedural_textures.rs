@@ -48,12 +48,15 @@ fn procedural_shader_textures_match_blender_and_roundtrip_without_losses() -> Te
         json!({"view_transform":"Raw", "look":"None", "exposure":0.0, "gamma":1.0})
     );
     assert_probe_coverage(&oracle)?;
+    assert_generated_wave_matches_constant_oracle(&oracle)?;
 
     let (project, import_report) = import_blend(&blender, root.path(), "procedural", &blend)?;
     assert_lossless(&import_report, "procedural texture fixture import");
     let imported_scene = read_scene(&project)?;
     assert_imported_probes(&imported_scene, &oracle)?;
-    assert_imported_gn_field(&imported_scene, &oracle)?;
+    assert_gabor_shader_matches_oracle(&imported_scene, &oracle)?;
+    assert_imported_gn_field(&imported_scene, &oracle)
+        .map_err(|error| format!("imported GN scene: {error}"))?;
 
     let exported = root.path().join("procedural-roundtrip.blend");
     let export_report = export(&blender, &project, "blend", &exported)?;
@@ -62,7 +65,8 @@ fn procedural_shader_textures_match_blender_and_roundtrip_without_losses() -> Te
         import_blend(&blender, root.path(), "procedural_roundtrip", &exported)?;
     assert_lossless(&roundtrip_report, "procedural texture fixture re-import");
     assert_imported_probes(&read_scene(&roundtrip)?, &oracle)?;
-    assert_imported_gn_field(&read_scene(&roundtrip)?, &oracle)?;
+    assert_imported_gn_field(&read_scene(&roundtrip)?, &oracle)
+        .map_err(|error| format!("roundtrip GN scene: {error}"))?;
 
     for (engine, oracle_engine) in [("path", "cycles"), ("realtime", "eevee")] {
         let expected_resolution: [u32; 2] =
@@ -434,9 +438,13 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
         }
         match node {
             "ShaderNodeTexWave" => {
+                let generated = coordinate == "generated";
                 for (name, expected) in [
-                    ("Scale", json!(4.3)),
-                    ("Distortion", json!(2.1)),
+                    ("Scale", if generated { json!(0.01) } else { json!(4.3) }),
+                    (
+                        "Distortion",
+                        if generated { json!(0.0) } else { json!(2.1) },
+                    ),
                     ("Detail", json!(3.0)),
                     ("Detail Scale", json!(2.2)),
                     ("Detail Roughness", json!(0.37)),
@@ -548,12 +556,11 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
     assert_eq!(node_types, expected_nodes);
     assert_eq!(outputs, expected_outputs);
     for node in expected_nodes {
-        let expected_sources = if node == "ShaderNodeTexBrick" {
-            BTreeSet::from(["constant", "constant_row9", "generated"])
-        } else if node == "ShaderNodeTexGabor" {
-            BTreeSet::from(["constant", "constant_edge", "generated"])
-        } else {
-            BTreeSet::from(["constant", "generated"])
+        let expected_sources = match node {
+            "ShaderNodeTexWave" => BTreeSet::from(["constant", "generated"]),
+            "ShaderNodeTexBrick" => BTreeSet::from(["constant", "constant_row9"]),
+            "ShaderNodeTexGabor" => BTreeSet::from(["constant", "constant_edge"]),
+            _ => BTreeSet::from(["constant"]),
         };
         assert_eq!(coordinates[node], expected_sources);
     }
@@ -765,8 +772,157 @@ fn assert_imported_probes(scene: &Value, oracle: &Value) -> TestResult {
     Ok(())
 }
 
-fn assert_imported_gn_field(scene: &Value, oracle: &Value) -> TestResult {
+fn assert_generated_wave_matches_constant_oracle(oracle: &Value) -> TestResult {
+    let probe = oracle["probes"]
+        .as_array()
+        .and_then(|probes| {
+            probes
+                .iter()
+                .find(|probe| probe["id"] == "wave_000_constant_color")
+        })
+        .ok_or("constant Wave oracle probe is missing")?;
+    let vector = probe["inputs"]
+        .as_array()
+        .and_then(|inputs| inputs.iter().find(|input| input["name"] == "Vector"))
+        .ok_or("constant Wave oracle vector is missing")?;
+    let vector: [f64; 3] = serde_json::from_value(vector["default"].clone())?;
+    let mut wave = GraphNode::new("ShaderNodeTexWave");
+    wave.properties = probe["properties"]
+        .as_object()
+        .cloned()
+        .ok_or("constant Wave properties are missing")?;
+    for property in ["texture_mapping", "color_mapping"] {
+        if !probe[property].is_null() {
+            wave.properties
+                .insert(property.to_owned(), probe[property].clone());
+        }
+    }
+    for input in probe["inputs"]
+        .as_array()
+        .ok_or("constant Wave inputs are missing")?
+    {
+        let name = input["name"]
+            .as_str()
+            .ok_or("constant Wave input name is missing")?;
+        wave.inputs
+            .insert(name.to_owned(), input["default"].clone());
+    }
+
+    let coordinates = Id::new("coordinates")?;
+    let wave_id = Id::new("wave")?;
+    let emission = Id::new("emission")?;
+    let output = Id::new("output")?;
+    let mut group = NodeGroup::new("Generated Wave Direct Oracle", GraphKind::Shader);
+    group
+        .nodes
+        .insert(coordinates.clone(), GraphNode::new("ShaderNodeTexCoord"));
+    group.nodes.insert(wave_id.clone(), wave);
+    group
+        .nodes
+        .insert(emission.clone(), GraphNode::new("ShaderNodeEmission"));
+    group
+        .nodes
+        .insert(output.clone(), GraphNode::new("ShaderNodeOutputMaterial"));
+    group.links = vec![
+        GraphLink {
+            from_node: coordinates,
+            from_socket: "Generated".to_owned(),
+            to_node: wave_id.clone(),
+            to_socket: "Vector".to_owned(),
+        },
+        GraphLink {
+            from_node: wave_id,
+            from_socket: "Color".to_owned(),
+            to_node: emission.clone(),
+            to_socket: "Color".to_owned(),
+        },
+        GraphLink {
+            from_node: emission,
+            from_socket: "Emission".to_owned(),
+            to_node: output,
+            to_socket: "Surface".to_owned(),
+        },
+    ];
+    let graph_id = Id::new("generated_wave_direct_oracle")?;
+    let mut groups = Registry::default();
+    groups.insert(graph_id.clone(), group);
+    let material = Material {
+        node_tree: Some(graph_id),
+        ..Material::default()
+    };
+
+    for (engine, path_traced) in [("cycles", true), ("eevee", false)] {
+        let mut context = HitContext::new(&groups);
+        context.path_traced = path_traced;
+        context.generated = vector.into();
+        let actual = evaluate_surface(&material, &context)?;
+        let actual = actual
+            .dominant()
+            .ok_or("Generated Wave direct surface has no closure")?
+            .emission_color;
+        let expected: [f64; 4] =
+            serde_json::from_value(oracle["renders"][engine]["pixels"][0].clone())?;
+        for channel in 0..3 {
+            assert_close(
+                actual[channel],
+                expected[channel],
+                PROBE_PIXEL_TOLERANCE,
+                &format!("{engine} full-settings Generated Wave direct evaluation"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn assert_gabor_shader_matches_oracle(scene: &Value, oracle: &Value) -> TestResult {
+    let probes = oracle["probes"]
+        .as_array()
+        .ok_or("oracle probes are missing")?;
+    let probe_index = probes
+        .iter()
+        .position(|probe| {
+            probe["node_type"] == "ShaderNodeTexGabor"
+                && probe["coordinate_source"] == "constant_edge"
+        })
+        .ok_or("Gabor orientation edge probe is missing")?;
+    let probe = &probes[probe_index];
+    let node_name = probe["node_name"]
+        .as_str()
+        .ok_or("Gabor orientation edge node is missing")?;
+    let material_name = format!("oracle_{node_name}");
     let document: SceneDoc = serde_json::from_value(scene.clone())?;
+    let material = document
+        .materials
+        .values()
+        .find(|material| material.name == material_name)
+        .ok_or("Gabor orientation edge material is missing")?;
+    for (engine, path_traced) in [("eevee", false), ("cycles", true)] {
+        let mut context = HitContext::new(&document.node_groups);
+        context.path_traced = path_traced;
+        let shading = evaluate_surface(material, &context)?;
+        let closure = shading
+            .dominant()
+            .ok_or("Gabor direct surface has no closure")?;
+        let actual = closure
+            .emission_color
+            .map(|channel| channel * closure.emission_strength);
+        let expected: [f64; 4] =
+            serde_json::from_value(oracle["renders"][engine]["pixels"][probe_index].clone())?;
+        for channel in 0..3 {
+            assert_close(
+                actual[channel],
+                expected[channel],
+                PROBE_PIXEL_TOLERANCE,
+                &format!("{engine} direct Gabor orientation edge"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn assert_imported_gn_field(scene: &Value, oracle: &Value) -> TestResult {
+    let document: SceneDoc =
+        serde_json::from_value(scene.clone()).map_err(|error| format!("scene decode: {error}"))?;
     let gn_oracle = &oracle["gn_field"];
     let group_name = gn_oracle["group_name"]
         .as_str()
@@ -776,7 +932,8 @@ fn assert_imported_gn_field(scene: &Value, oracle: &Value) -> TestResult {
         .values()
         .find(|group| group.name == group_name)
         .ok_or_else(|| format!("imported GN field graph {group_name} is missing"))?;
-    let evaluation = graph::evaluate(group, None, &Map::new(), "Geometry")?;
+    let evaluation = graph::evaluate(group, None, &Map::new(), "Geometry")
+        .map_err(|error| format!("graph evaluation: {error}"))?;
     let expected_attributes = gn_oracle["attributes"]
         .as_array()
         .ok_or("Blender GN texture field oracle attributes are missing")?;
@@ -919,7 +1076,8 @@ fn render_project(
     assert_eq!(loaded["ok"], true, "{loaded}");
     let scene = read_scene(project)?;
     let image_id = format!("{name}_image");
-    let image: Image = serde_json::from_value(scene["images"][&image_id].clone())?;
+    let image: Image = serde_json::from_value(scene["images"][&image_id].clone())
+        .map_err(|error| format!("decoding rendered image {name}: {error}"))?;
     let image = load_image_data(&image, project, ImageInterpolation::Closest)?;
     assert_eq!(
         [image.width, image.height],
@@ -949,7 +1107,7 @@ fn compare_probe_pixels(image: &ImageData, oracle: &Value, engine: &str) -> Test
         let id = probe["id"].as_str().ok_or("probe id is missing")?;
         let uv = [
             (probe["column"].as_u64().ok_or("probe column is missing")? as f64 + 0.5) / columns,
-            (probe["row"].as_u64().ok_or("probe row is missing")? as f64 + 0.5) / rows,
+            1.0 - (probe["row"].as_u64().ok_or("probe row is missing")? as f64 + 0.5) / rows,
         ];
         let expected: [f64; 4] = serde_json::from_value(expected.clone())?;
         let actual = sample(image, uv, false);
@@ -980,7 +1138,10 @@ fn compare_world_pixels(image: &ImageData, oracle: &Value, engine: &str) -> Test
     let mut varied = false;
     for probe in probes {
         let [x, y]: [u32; 2] = serde_json::from_value(probe["pixel"].clone())?;
-        let uv = [(f64::from(x) + 0.5) / width, (f64::from(y) + 0.5) / height];
+        let uv = [
+            (f64::from(x) + 0.5) / width,
+            1.0 - (f64::from(y) + 0.5) / height,
+        ];
         let expected: [f64; 4] = serde_json::from_value(probe["rgba"].clone())?;
         let actual = sample(image, uv, false);
         for channel in 0..4 {

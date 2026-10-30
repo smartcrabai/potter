@@ -2397,10 +2397,7 @@ impl Evaluator<'_> {
         let offset = self.vector_input(id, node, "Offset", offset_default, &Mesh::new())?;
 
         let points = (0..count)
-            .map(|index| {
-                let t = interpolation_factor(index, count);
-                start + offset * t
-            })
+            .map(|index| start + offset * index as f64)
             .collect::<Vec<_>>();
         let mut mesh = Mesh::new();
         let mut ids = Vec::with_capacity(points.len());

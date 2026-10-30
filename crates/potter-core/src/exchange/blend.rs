@@ -11953,7 +11953,6 @@ fn material_volume_graph_has_spatial_dependency(
     })
 }
 
-
 fn mesh_uses_material(mesh: &Value, object: &Value, material_name: &str) -> bool {
     let data_materials = mesh.get("materials").and_then(Value::as_array);
     let object_materials = object.get("materials").and_then(Value::as_array);
