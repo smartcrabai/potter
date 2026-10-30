@@ -504,19 +504,30 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
                     "geometry node group has no geometry output socket",
                 )
             })?;
-        group
+        let output_link = group
             .links
             .iter()
-            .find(|link| {
-                link.to_node == output_node
-                    && (link.to_socket == socket.id || link.to_socket == socket.name)
-            })
+            .find(|link| link.to_node == output_node && link.to_socket == socket.id)
+            .or_else(|| {
+                group_socket_name_is_unambiguous(&group.interface.outputs, &socket.name)
+                    .then(|| {
+                        group.links.iter().find(|link| {
+                            link.to_node == output_node && link.to_socket == socket.name
+                        })
+                    })
+                    .flatten()
+            });
+        output_link
             .map(|link| link.to_socket.clone())
             .or_else(|| {
                 group.nodes.get(&output_node).and_then(|node| {
                     if node.inputs.contains_key(&socket.id) {
                         Some(socket.id.clone())
-                    } else if node.inputs.contains_key(&socket.name) {
+                    } else if group_socket_name_is_unambiguous(
+                        &group.interface.outputs,
+                        &socket.name,
+                    ) && node.inputs.contains_key(&socket.name)
+                    {
                         Some(socket.name.clone())
                     } else {
                         None
@@ -866,6 +877,26 @@ fn typed_socket_value(socket_type: &str, value: &Value) -> Result<Value> {
     }
 }
 
+fn group_socket_name_is_unambiguous(sockets: &[super::GraphSocket], name: &str) -> bool {
+    sockets
+        .iter()
+        .filter(|candidate| candidate.name == name)
+        .count()
+        == 1
+        && !sockets.iter().any(|candidate| candidate.id == name)
+}
+
+pub(super) fn group_interface_socket<'a>(
+    sockets: &'a [super::GraphSocket],
+    key: &str,
+) -> Option<&'a super::GraphSocket> {
+    sockets.iter().find(|socket| socket.id == key).or_else(|| {
+        group_socket_name_is_unambiguous(sockets, key)
+            .then(|| sockets.iter().find(|socket| socket.name == key))
+            .flatten()
+    })
+}
+
 fn reachable_group_inputs(
     group: &NodeGroup,
     node_groups: &Registry<NodeGroup>,
@@ -901,18 +932,7 @@ fn reachable_group_inputs(
             )
         })?;
         if node.node_type == "NodeGroupInput" {
-            let input_socket = group
-                .interface
-                .inputs
-                .iter()
-                .find(|candidate| candidate.id == socket)
-                .or_else(|| {
-                    group
-                        .interface
-                        .inputs
-                        .iter()
-                        .find(|candidate| candidate.name == socket)
-                })
+            let input_socket = group_interface_socket(&group.interface.inputs, socket)
                 .ok_or_else(|| evaluation(format!("unknown group input socket `{socket}`")))?;
             required.insert(input_socket.id.clone());
         } else if node.node_type == "GeometryNodeGroup" {
@@ -943,21 +963,9 @@ fn reachable_group_inputs(
                 None
             } else {
                 Some(
-                    child
-                        .interface
-                        .outputs
-                        .iter()
-                        .find(|candidate| candidate.id == socket)
-                        .or_else(|| {
-                            child
-                                .interface
-                                .outputs
-                                .iter()
-                                .find(|candidate| candidate.name == socket)
-                        })
-                        .ok_or_else(|| {
-                            evaluation(format!("unknown output socket `{socket}` on node group"))
-                        })?,
+                    group_interface_socket(&child.interface.outputs, socket).ok_or_else(|| {
+                        evaluation(format!("unknown output socket `{socket}` on node group"))
+                    })?,
                 )
             };
             let child_output_node = select_group_output_node(child)?;
@@ -980,9 +988,17 @@ fn reachable_group_inputs(
                     .iter()
                     .any(|link| link.to_node == *node_id && link.to_socket == child_input.id)
                 {
-                    &child_input.id
+                    Some(child_input.id.as_str())
+                } else if group_socket_name_is_unambiguous(
+                    &child.interface.inputs,
+                    &child_input.name,
+                ) {
+                    Some(child_input.name.as_str())
                 } else {
-                    &child_input.name
+                    None
+                };
+                let Some(input_link_socket) = input_link_socket else {
+                    continue;
                 };
                 for link in group
                     .links
@@ -1023,14 +1039,17 @@ fn reachable_group_inputs(
     let mut required = BTreeSet::new();
     let mut visited = BTreeSet::new();
     let mut active = BTreeSet::new();
+    let output_socket_name = group
+        .interface
+        .outputs
+        .iter()
+        .find(|socket| socket.id == output_socket)
+        .filter(|socket| group_socket_name_is_unambiguous(&group.interface.outputs, &socket.name))
+        .map(|socket| socket.name.as_str());
     for link in group.links.iter().filter(|link| {
         link.to_node == *output_node
             && (link.to_socket == output_socket
-                || group
-                    .interface
-                    .outputs
-                    .iter()
-                    .any(|socket| socket.id == output_socket && link.to_socket == socket.name))
+                || output_socket_name.is_some_and(|name| link.to_socket == name))
     }) {
         visit_output(
             group,
@@ -1591,25 +1610,22 @@ impl Evaluator<'_> {
     }
 
     fn group_input_value(&self, socket: &str) -> Result<EvalValue> {
-        let Some((socket_index, interface_socket)) = self
-            .group
-            .interface
-            .inputs
-            .iter()
-            .enumerate()
-            .find(|(_, candidate)| candidate.id == socket)
-            .or_else(|| {
-                self.group
-                    .interface
-                    .inputs
-                    .iter()
-                    .enumerate()
-                    .find(|(_, candidate)| candidate.name == socket)
-            })
+        let Some(interface_socket) = group_interface_socket(&self.group.interface.inputs, socket)
         else {
             return Err(PotError::new(
                 ErrorCode::InvalidOperation,
                 format!("unknown group input socket `{socket}`"),
+            ));
+        };
+        let Some(socket_index) = self
+            .group
+            .interface
+            .inputs
+            .iter()
+            .position(|candidate| candidate.id == interface_socket.id)
+        else {
+            return Err(evaluation(
+                "group input socket is missing from its interface",
             ));
         };
         if let Some(value) = self.group_inputs.get(&interface_socket.id) {
@@ -1638,7 +1654,14 @@ impl Evaluator<'_> {
         let value = if self.top_level {
             self.overrides
                 .get(&interface_socket.id)
-                .or_else(|| self.overrides.get(&interface_socket.name))
+                .or_else(|| {
+                    group_socket_name_is_unambiguous(
+                        &self.group.interface.inputs,
+                        &interface_socket.name,
+                    )
+                    .then(|| self.overrides.get(&interface_socket.name))
+                    .flatten()
+                })
                 .unwrap_or(&interface_socket.default)
         } else {
             &interface_socket.default
@@ -1687,18 +1710,7 @@ impl Evaluator<'_> {
                 None
             } else {
                 Some(
-                    child_group
-                        .interface
-                        .outputs
-                        .iter()
-                        .find(|candidate| candidate.id == output_socket)
-                        .or_else(|| {
-                            child_group
-                                .interface
-                                .outputs
-                                .iter()
-                                .find(|candidate| candidate.name == output_socket)
-                        })
+                    group_interface_socket(&child_group.interface.outputs, output_socket)
                         .cloned()
                         .ok_or_else(|| {
                             PotError::with_details(
@@ -1730,7 +1742,8 @@ impl Evaluator<'_> {
             if !required_inputs.contains(&interface_socket.id) {
                 continue;
             }
-            let value = self.group_call_input(node_id, node, interface_socket)?;
+            let value =
+                self.group_call_input(node_id, node, interface_socket, &child_input_sockets)?;
             group_inputs.insert(interface_socket.id.clone(), value);
         }
         let output_value = match child_output_socket.as_ref() {
@@ -1764,6 +1777,9 @@ impl Evaluator<'_> {
         })?;
         let output_link_socket_name = child_output_socket
             .as_ref()
+            .filter(|socket| {
+                group_socket_name_is_unambiguous(&child_group.interface.outputs, &socket.name)
+            })
             .map(|socket| socket.name.as_str());
         let output_link = child_group
             .links
@@ -1830,25 +1846,33 @@ impl Evaluator<'_> {
         node_id: &Id,
         node: &GraphNode,
         interface_socket: &super::GraphSocket,
+        interface_sockets: &[super::GraphSocket],
     ) -> Result<EvalValue> {
+        let name_is_unambiguous =
+            group_socket_name_is_unambiguous(interface_sockets, &interface_socket.name);
         let linked = self
             .group
             .links
             .iter()
             .find(|link| link.to_node == *node_id && link.to_socket == interface_socket.id)
             .or_else(|| {
-                self.group.links.iter().find(|link| {
-                    link.to_node == *node_id && link.to_socket == interface_socket.name
-                })
+                name_is_unambiguous
+                    .then(|| {
+                        self.group.links.iter().find(|link| {
+                            link.to_node == *node_id && link.to_socket == interface_socket.name
+                        })
+                    })
+                    .flatten()
             });
         if let Some(link) = linked {
             return self.output_value(&link.from_node, &link.from_socket);
         }
-        if let Some(value) = node
-            .inputs
-            .get(&interface_socket.id)
-            .or_else(|| node.inputs.get(&interface_socket.name))
-        {
+        let value = node.inputs.get(&interface_socket.id).or_else(|| {
+            name_is_unambiguous
+                .then(|| node.inputs.get(&interface_socket.name))
+                .flatten()
+        });
+        if let Some(value) = value {
             if socket_is_geometry(&interface_socket.socket_type) {
                 return Ok(EvalValue::Geometry(GeometryValue {
                     mesh: Mesh::new(),

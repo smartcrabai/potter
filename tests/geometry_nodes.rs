@@ -233,6 +233,109 @@ fn nested_group_io_is_lazy_and_uses_socket_identifier_defaults() {
 }
 
 #[test]
+fn group_callsite_name_cannot_shadow_another_socket_identifier() {
+    let doc = apply(
+        &SceneDoc::new("c8a8b9d4-2cbf-4bc4-9b17-6297b72e7d22".to_owned()),
+        &[
+            json!({"op":"graph.create","id":"child","kind":"geometry"}),
+            json!({"op":"graph.interface_update","graph":"child","set":{
+                "inputs":[
+                    {"id":"Socket_0","name":"Geometry","socket_type":"geometry"},
+                    {"id":"Socket_1","name":"Amount","socket_type":"vector","default":[0.0,0.0,0.0]},
+                    {"id":"Socket_2","name":"Socket_1","socket_type":"vector","default":[0.0,2.0,0.0]}
+                ],
+                "outputs":[{"id":"Result","name":"Geometry","socket_type":"geometry"}]
+            }}),
+            json!({"op":"graph.node_add","graph":"child","id":"input","type":"NodeGroupInput"}),
+            json!({"op":"graph.node_add","graph":"child","id":"offset","type":"ShaderNodeVectorMath","properties":{"operation":"ADD"}}),
+            json!({"op":"graph.node_add","graph":"child","id":"position","type":"GeometryNodeSetPosition"}),
+            json!({"op":"graph.node_add","graph":"child","id":"output","type":"NodeGroupOutput"}),
+            json!({"op":"graph.link","graph":"child","from_node":"input","from_socket":"Socket_1","to_node":"offset","to_socket":"Vector"}),
+            json!({"op":"graph.link","graph":"child","from_node":"input","from_socket":"Socket_2","to_node":"offset","to_socket":"Vector_001"}),
+            json!({"op":"graph.link","graph":"child","from_node":"input","from_socket":"Socket_0","to_node":"position","to_socket":"Geometry"}),
+            json!({"op":"graph.link","graph":"child","from_node":"offset","from_socket":"Vector","to_node":"position","to_socket":"Offset"}),
+            json!({"op":"graph.link","graph":"child","from_node":"position","from_socket":"Geometry","to_node":"output","to_socket":"Result"}),
+            json!({"op":"graph.create","id":"geo","kind":"geometry"}),
+            json!({"op":"graph.node_add","graph":"geo","id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":1}}),
+            json!({"op":"graph.node_add","graph":"geo","id":"nested_override","type":"GeometryNodeGroup","properties":{"node_tree":"child"},"inputs":{"Socket_1":[3.0,0.0,0.0]}}),
+            json!({"op":"graph.node_add","graph":"geo","id":"source","type":"ShaderNodeCombineXYZ","inputs":{"X":1.0}}),
+            json!({"op":"graph.node_add","graph":"geo","id":"nested_link","type":"GeometryNodeGroup","properties":{"node_tree":"child"}}),
+            json!({"op":"graph.node_add","graph":"geo","id":"position","type":"GeometryNodeInputPosition"}),
+            json!({"op":"graph.node_add","graph":"geo","id":"store_override","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"FLOAT_VECTOR"},"inputs":{"Name":"override_value"}}),
+            json!({"op":"graph.node_add","graph":"geo","id":"store_link","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"FLOAT_VECTOR"},"inputs":{"Name":"linked_value"}}),
+            json!({"op":"graph.node_add","graph":"geo","id":"output","type":"NodeGroupOutput"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"line","from_socket":"Mesh","to_node":"nested_override","to_socket":"Socket_0"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"nested_override","from_socket":"Result","to_node":"store_override","to_socket":"Geometry"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"position","from_socket":"Position","to_node":"store_override","to_socket":"Value"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"store_override","from_socket":"Geometry","to_node":"nested_link","to_socket":"Socket_0"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"source","from_socket":"Vector","to_node":"nested_link","to_socket":"Socket_1"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"nested_link","from_socket":"Result","to_node":"store_link","to_socket":"Geometry"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"position","from_socket":"Position","to_node":"store_link","to_socket":"Value"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"store_link","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let result = graph::evaluate_with_node_groups(
+        &Id::new("geo").unwrap(),
+        &doc.node_groups,
+        None,
+        &Map::new(),
+        "GroupSocketIdentifierCollision",
+    )
+    .unwrap();
+    let override_value = &result.mesh.attributes["override_value"]["data"][0];
+    assert_close(override_value[0].as_f64().unwrap(), 3.0);
+    assert_close(override_value[1].as_f64().unwrap(), 2.0);
+    assert_close(override_value[2].as_f64().unwrap(), 0.0);
+    let linked_value = &result.mesh.attributes["linked_value"]["data"][0];
+    assert_close(linked_value[0].as_f64().unwrap(), 4.0);
+    assert_close(linked_value[1].as_f64().unwrap(), 4.0);
+    assert_close(linked_value[2].as_f64().unwrap(), 0.0);
+}
+
+#[test]
+fn group_output_name_alias_cannot_shadow_another_socket_identifier() {
+    let doc = apply(
+        &SceneDoc::new("c8a8b9d4-2cbf-4bc4-9b17-6297b72e7d22".to_owned()),
+        &[
+            json!({"op":"graph.create","id":"child","kind":"geometry"}),
+            json!({"op":"graph.interface_update","graph":"child","set":{
+                "inputs":[{"id":"GeometryInput","name":"Geometry","socket_type":"geometry"}],
+                "outputs":[
+                    {"id":"GeometryOutput","name":"Geometry","socket_type":"geometry"},
+                    {"id":"Out1","name":"Amount","socket_type":"vector","default":[1.0,0.0,0.0]},
+                    {"id":"Amount","name":"Other","socket_type":"vector","default":[0.0,0.0,0.0]}
+                ]
+            }}),
+            json!({"op":"graph.node_add","graph":"child","id":"input","type":"NodeGroupInput"}),
+            json!({"op":"graph.node_add","graph":"child","id":"value","type":"ShaderNodeCombineXYZ","inputs":{"X":9.0}}),
+            json!({"op":"graph.node_add","graph":"child","id":"output","type":"NodeGroupOutput"}),
+            json!({"op":"graph.link","graph":"child","from_node":"input","from_socket":"GeometryInput","to_node":"output","to_socket":"GeometryOutput"}),
+            json!({"op":"graph.link","graph":"child","from_node":"value","from_socket":"Vector","to_node":"output","to_socket":"Amount"}),
+            json!({"op":"graph.create","id":"geo","kind":"geometry"}),
+            json!({"op":"graph.node_add","graph":"geo","id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":1}}),
+            json!({"op":"graph.node_add","graph":"geo","id":"nested","type":"GeometryNodeGroup","properties":{"node_tree":"child"}}),
+            json!({"op":"graph.node_add","graph":"geo","id":"store","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"FLOAT_VECTOR"},"inputs":{"Name":"alias_value"}}),
+            json!({"op":"graph.node_add","graph":"geo","id":"output","type":"NodeGroupOutput"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"line","from_socket":"Mesh","to_node":"nested","to_socket":"GeometryInput"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"nested","from_socket":"GeometryOutput","to_node":"store","to_socket":"Geometry"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"nested","from_socket":"Out1","to_node":"store","to_socket":"Value"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"store","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let result = graph::evaluate_with_node_groups(
+        &Id::new("geo").unwrap(),
+        &doc.node_groups,
+        None,
+        &Map::new(),
+        "GroupOutputSocketIdentifierCollision",
+    )
+    .unwrap();
+    let stored = &result.mesh.attributes["alias_value"]["data"][0];
+    assert_close(stored[0].as_f64().unwrap(), 1.0);
+    assert_close(stored[1].as_f64().unwrap(), 0.0);
+    assert_close(stored[2].as_f64().unwrap(), 0.0);
+}
+#[test]
 fn recursive_geometry_group_calls_return_deterministic_errors() {
     let doc = apply(
         &SceneDoc::new("c8a8b9d4-2cbf-4bc4-9b17-6297b72e7d22".to_owned()),
