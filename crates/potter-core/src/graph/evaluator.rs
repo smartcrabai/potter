@@ -303,6 +303,28 @@ enum MixOutput {
     Value,
     Color,
 }
+enum OutputDependencies {
+    Single(Option<(Id, String)>),
+    Multiple(Vec<(Id, String)>),
+}
+
+impl OutputDependencies {
+    fn get(&self, index: usize) -> Option<&(Id, String)> {
+        match self {
+            Self::Single(Some(dependency)) if index == 0 => Some(dependency),
+            Self::Single(_) => None,
+            Self::Multiple(dependencies) => dependencies.get(index),
+        }
+    }
+}
+
+struct OutputWorkFrame {
+    id: Id,
+    socket: String,
+    node: GraphNode,
+    dependencies: OutputDependencies,
+    next_dependency: usize,
+}
 
 struct Evaluator<'a> {
     group: &'a NodeGroup,
@@ -1110,26 +1132,216 @@ impl Evaluator<'_> {
                 json!({"node_id":id}),
             ));
         }
-        let node = self.group.nodes.get(id).cloned().ok_or_else(|| {
-            PotError::new(
+        let result = if let Some(node) = self.group.nodes.get(id).cloned() {
+            match self.output_geometry_dependencies(id, &node, socket) {
+                Some(dependencies) => self.evaluate_output_worklist(id, socket, node, dependencies),
+                None => self.evaluate_node(id, &node, socket),
+            }
+        } else {
+            Err(PotError::new(
                 ErrorCode::TargetNotFound,
                 format!("graph node `{id}` was not found"),
-            )
-        })?;
-        let result = self.evaluate_node(id, &node, socket);
+            ))
+        };
         self.active.remove(id);
-        let mut value = result?;
-        if let EvalValue::Geometry(geometry) = &mut value
+        Ok(self.finalize_output_value(key, result?))
+    }
+
+    /// Finalizes and caches each completed output for both traversal paths.
+    fn finalize_output_value(&mut self, key: (Id, String), mut value: EvalValue) -> EvalValue {
+        self.apply_output_origindex(&mut value);
+        self.cache.insert(key, value.clone());
+        value
+    }
+
+    fn apply_output_origindex(&self, value: &mut EvalValue) {
+        if let EvalValue::Geometry(geometry) = value
             && origindex_values(&geometry.mesh).is_none()
             && self.input.and_then(origindex_values).is_some()
         {
             let vertex_count = geometry.mesh.vertices.len();
             set_origindex(&mut geometry.mesh, &vec![ORIGINDEX_NONE; vertex_count]);
         }
-        self.cache.insert(key, value.clone());
-        Ok(value)
+    }
+    /// Returns a supported single-input geometry dependency for bottom-up evaluation.
+    /// Group and branching nodes remain on the existing demand-driven path.
+    fn geometry_chain_input_socket(
+        &self,
+        id: &Id,
+        node: &GraphNode,
+        output_socket: &str,
+        geometry_output: bool,
+    ) -> Option<&'static str> {
+        match (node.node_type.as_str(), output_socket, geometry_output) {
+            (
+                "GeometryNodeTransform"
+                | "GeometryNodeSetPosition"
+                | "GeometryNodeStoreNamedAttribute"
+                | "GeometryNodeRealizeInstances"
+                | "GeometryNodeCaptureAttribute",
+                "Geometry",
+                _,
+            ) => Some("Geometry"),
+            ("GeometryNodeCaptureAttribute", _, false) => {
+                let (_, outputs) = node_sockets(self.group, id)?;
+                outputs
+                    .iter()
+                    .any(|(name, _)| name == output_socket)
+                    .then_some("Geometry")
+            }
+            ("GeometryNodeDistributePointsOnFaces" | "GeometryNodeMeshToPoints", "Points", _) => {
+                Some("Mesh")
+            }
+            ("GeometryNodeSubdivisionSurface", "Mesh", _) => Some("Mesh"),
+            _ => None,
+        }
     }
 
+    fn output_geometry_dependencies(
+        &self,
+        id: &Id,
+        node: &GraphNode,
+        output_socket: &str,
+    ) -> Option<OutputDependencies> {
+        // Join consumes all connected inputs; Instance on Points reads its linked sockets in node order.
+        if matches!(
+            node.node_type.as_str(),
+            "GeometryNodeJoinGeometry" | "GeometryNodeInstanceOnPoints"
+        ) {
+            let (_, outputs) = node_sockets(self.group, id)?;
+            if !outputs
+                .iter()
+                .any(|(name, socket_type)| name == output_socket && socket_type == "geometry")
+            {
+                return None;
+            }
+            if node.node_type == "GeometryNodeJoinGeometry" {
+                // Join requires every connected input; unconnected sockets are not dependencies.
+                let dependencies = self
+                    .group
+                    .links
+                    .iter()
+                    .filter(|link| &link.to_node == id && link.to_socket == "Geometry")
+                    .map(|link| (link.from_node.clone(), link.from_socket.clone()))
+                    .collect();
+                return Some(OutputDependencies::Multiple(dependencies));
+            }
+            let dependencies = ["Points", "Instance"]
+                .into_iter()
+                .filter_map(|input_socket| {
+                    self.group
+                        .links
+                        .iter()
+                        .find(|link| &link.to_node == id && link.to_socket == input_socket)
+                        .map(|link| (link.from_node.clone(), link.from_socket.clone()))
+                })
+                .collect();
+            return Some(OutputDependencies::Multiple(dependencies));
+        }
+        let input_socket = self.geometry_chain_input_socket(id, node, output_socket, false)?;
+        let mut links = self
+            .group
+            .links
+            .iter()
+            .filter(|link| &link.to_node == id && link.to_socket == input_socket);
+        let dependency = links
+            .next()
+            .map(|link| (link.from_node.clone(), link.from_socket.clone()));
+        if links.next().is_some() {
+            return None;
+        }
+        Some(OutputDependencies::Single(dependency))
+    }
+
+    fn evaluate_output_worklist(
+        &mut self,
+        root_id: &Id,
+        root_socket: &str,
+        root_node: GraphNode,
+        dependencies: OutputDependencies,
+    ) -> Result<EvalValue> {
+        let mut active_dependencies = Vec::new();
+        let result = (|| {
+            let mut frames = vec![OutputWorkFrame {
+                id: root_id.clone(),
+                socket: root_socket.to_owned(),
+                node: root_node,
+                dependencies,
+                next_dependency: 0,
+            }];
+            loop {
+                let dependency = {
+                    let Some(frame) = frames.last_mut() else {
+                        return Err(PotError::new(
+                            ErrorCode::InternalError,
+                            "geometry output worklist lost its root frame",
+                        ));
+                    };
+                    let dependency = frame.dependencies.get(frame.next_dependency).cloned();
+                    if dependency.is_some() {
+                        frame.next_dependency += 1;
+                    }
+                    dependency
+                };
+                if let Some((dependency_id, dependency_socket)) = dependency {
+                    if self.cache.keys().any(|(cached_id, cached_socket)| {
+                        cached_id == &dependency_id && cached_socket == &dependency_socket
+                    }) {
+                        continue;
+                    }
+                    let Some(dependency_node) = self.group.nodes.get(&dependency_id).cloned()
+                    else {
+                        let _ = self.output_value(&dependency_id, &dependency_socket)?;
+                        continue;
+                    };
+                    if let Some(dependencies) = self.output_geometry_dependencies(
+                        &dependency_id,
+                        &dependency_node,
+                        &dependency_socket,
+                    ) {
+                        if !self.active.insert(dependency_id.clone()) {
+                            return Err(PotError::with_details(
+                                ErrorCode::EvaluationFailed,
+                                "geometry node graph contains an evaluation cycle",
+                                json!({"node_id":dependency_id}),
+                            ));
+                        }
+                        active_dependencies.push(dependency_id.clone());
+                        frames.push(OutputWorkFrame {
+                            id: dependency_id,
+                            socket: dependency_socket,
+                            node: dependency_node,
+                            dependencies,
+                            next_dependency: 0,
+                        });
+                    } else {
+                        let _ = self.output_value(&dependency_id, &dependency_socket)?;
+                    }
+                    continue;
+                }
+                let Some(frame) = frames.pop() else {
+                    return Err(PotError::new(
+                        ErrorCode::InternalError,
+                        "geometry output worklist completed without its root frame",
+                    ));
+                };
+                let is_root = &frame.id == root_id;
+                let value = self.evaluate_node(&frame.id, &frame.node, &frame.socket);
+                if !is_root {
+                    self.active.remove(&frame.id);
+                }
+                let value = value?;
+                if is_root {
+                    return Ok(value);
+                }
+                let _ = self.finalize_output_value((frame.id, frame.socket), value);
+            }
+        })();
+        for dependency_id in active_dependencies {
+            self.active.remove(&dependency_id);
+        }
+        result
+    }
     fn evaluate_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
         match node.node_type.as_str() {
             "NodeGroupInput" => self.group_input_value(socket),
@@ -2041,7 +2253,8 @@ impl Evaluator<'_> {
     }
 
     fn geometry_input(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
-        match self.input_geometry(id, node, socket)? {
+        let input = self.input_geometry(id, node, socket)?;
+        match input {
             EvalValue::Geometry(geometry) => {
                 let instance_aware = matches!(
                     node.node_type.as_str(),
