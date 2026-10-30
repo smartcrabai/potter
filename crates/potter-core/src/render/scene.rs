@@ -19,13 +19,19 @@ use crate::{
     image::ImageData,
     model::{Id, Material, Node, RayKind, RayVisibility, SceneDoc},
     shader::{
-        BsdfParams, EvaluatorWorkspace, GeometryAttribute, GeometryAttributeValues, HitContext,
-        HitUvLayers, PreparedMaterial, ShaderClosure, SurfaceShading, dielectric_f0,
+        BsdfModel, BsdfParams, EvaluatorWorkspace, GeometryAttribute, GeometryAttributeValues,
+        HitContext, HitUvLayers, PreparedMaterial, ShaderClosure, SurfaceShading, dielectric_f0,
         evaluate_displacement_with_workspace_semantics, evaluate_surface_with_workspace_semantics,
         fill_color_layers, heaviest, make_orthonormals,
     },
 };
 
+use super::eevee_advanced_bsdf::{
+    EeveeSubsurfaceClosure, EeveeSubsurfaceSample, MAX_EEVEE_SUBSURFACE_CLOSURES,
+    eevee_gbuffer_normal, eevee_holdout_weight, eevee_metallic_brdf,
+    eevee_subsurface_gbuffer_profile, eevee_subsurface_radius,
+};
+use super::hair_intersect::{CurveKey, HairBvh};
 use super::world_probe::WorldProbe;
 use super::{
     bvh::{Bvh, BvhHit, WalkRay},
@@ -157,10 +163,37 @@ pub(super) struct ElementRecord {
     pub uv_available_mask: Option<u8>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HairSegment {
+    pub material_index: usize,
+    pub object_index: u32,
+    pub element_index: u32,
+    pub curve_random: Option<f64>,
+    pub curve_type: u8,
+    pub curve_normal_start: DVec3,
+    pub curve_normal_end: DVec3,
+}
+
+pub(super) struct HairCurveInstance {
+    pub curve: super::hair_intersect::HairCurveGeometry,
+    pub normals: super::hair_geometry::HairCurveNormalSamples,
+    pub material_index: usize,
+    pub object_index: u32,
+    pub element_index: u32,
+    pub curve_random: Option<f64>,
+    pub ray_mask: u8,
+}
+
 pub(super) struct Geometry {
+    pub hair_keys: Vec<[CurveKey; 4]>,
+    pub hair_curve_types: Vec<u8>,
+    pub hair_masks: Vec<u8>,
+    pub hair_segments: Vec<HairSegment>,
+    pub hair_bvh: HairBvh,
+    pub hair_curve_instances: Vec<HairCurveInstance>,
+    pub hair_curve_bvh: HairBvh,
     pub triangles: Vec<Triangle>,
     pub lines: Vec<Line>,
-    /// Mesh edges for the wireframe preview, each once; empty outside Wire.
     pub wire_edges: Vec<WireEdge>,
     /// Loose vertices of a mesh with no edges or faces, and point-cloud points, for the wireframe preview.
     pub wire_points: Vec<WirePoint>,
@@ -422,6 +455,100 @@ fn shadow_origin(point: DVec3, normal: DVec3, direction: DVec3) -> DVec3 {
     point + normal * (side * SHADOW_EPSILON)
 }
 
+fn cycles_hash_uint2(kx: u32, ky: u32) -> u32 {
+    let mut a = 0xdead_beef_u32.wrapping_add((2 << 2) + 13);
+    let mut b = a;
+    let mut c = a;
+    a = a.wrapping_add(kx);
+    b = b.wrapping_add(ky);
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(14));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(11));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(25));
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(16));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(4));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(14));
+    c ^= b;
+    c.wrapping_sub(b.rotate_left(24))
+}
+
+fn cycles_curve_random(curve_index: usize) -> Option<f64> {
+    let index = u32::try_from(curve_index).ok()?;
+    let random = cycles_hash_uint2(index, 0);
+    Some(f64::from((random as f32) * (1.0_f32 / u32::MAX as f32)))
+}
+fn hair_uniform_scale(matrix: DMat4) -> Option<f64> {
+    let axes = [
+        matrix.transform_vector3(DVec3::X),
+        matrix.transform_vector3(DVec3::Y),
+        matrix.transform_vector3(DVec3::Z),
+    ];
+    let scale = axes[0].length();
+    let tolerance = scale * 1.0e-10;
+    (scale.is_finite()
+        && scale > 0.0
+        && axes
+            .iter()
+            .all(|axis| (axis.length() - scale).abs() <= tolerance)
+        && axes[0].dot(axes[1]).abs() <= tolerance * scale
+        && axes[0].dot(axes[2]).abs() <= tolerance * scale
+        && axes[1].dot(axes[2]).abs() <= tolerance * scale)
+        .then_some(scale)
+}
+
+fn hair_curve_geometry_error(
+    node_id: &Id,
+    error: &super::hair_geometry::HairCurveGeometryError,
+) -> PotError {
+    use super::hair_geometry::HairCurveGeometryError;
+
+    match error {
+        HairCurveGeometryError::InvalidAttribute(attribute) => PotError::new(
+            ErrorCode::SceneInvalid,
+            format!("hair curve attribute {attribute} is invalid"),
+        ),
+        HairCurveGeometryError::InvalidCurve(curve_index) => PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "hair curve spline data is invalid",
+            serde_json::json!({
+                "feature_id":"render.hair.curve_data",
+                "node_id":node_id.as_str(),
+                "curve_index":curve_index,
+            }),
+        ),
+        HairCurveGeometryError::MissingCustomKnots { curve_index } => PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "custom NURBS knots are unavailable in the serialized hair curve data",
+            serde_json::json!({
+                "feature_id":"render.hair.nurbs_custom_knots",
+                "node_id":node_id.as_str(),
+                "curve_index":curve_index,
+            }),
+        ),
+        HairCurveGeometryError::InvalidTransform => PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "path-traced hair requires an invertible affine object transform",
+            serde_json::json!({
+                "feature_id":"render.hair.object_transform",
+                "node_id":node_id.as_str(),
+            }),
+        ),
+    }
+}
+fn hair_vector3_attribute(value: &serde_json::Value) -> Option<DVec3> {
+    let values = value.as_array()?;
+    Some(DVec3::new(
+        values.first()?.as_f64()?,
+        values.get(1)?.as_f64()?,
+        values.get(2)?.as_f64()?,
+    ))
+}
+
 pub(super) fn extract_geometry(
     doc: &SceneDoc,
     snapshot: &Snapshot,
@@ -484,6 +611,11 @@ pub(super) fn extract_geometry_with_semantics(
     let mut prepared = vec![PreparedMaterial::default()];
     let mut material_indices =
         std::collections::BTreeMap::<(Id, Option<usize>, Option<Arc<[u64]>>), usize>::new();
+    let mut hair_keys = Vec::new();
+    let mut hair_curve_types = Vec::new();
+    let mut hair_masks = Vec::new();
+    let mut hair_segments = Vec::new();
+    let mut hair_curve_instances = Vec::new();
     let mut triangles = Vec::new();
     let mut lines = Vec::new();
     let mut wire_edges = Vec::new();
@@ -1361,10 +1493,152 @@ pub(super) fn extract_geometry_with_semantics(
             ]
             .into_iter()
             .fold(0.0_f64, f64::max);
-            let color = snapshot
-                .slot_material(node_id, node, data_block, 0)
-                .and_then(|material_id| doc.materials.get(material_id))
+            let path_curves_enabled = path_traced && matches!(mode, Mode::Beauty);
+            let path_curve_scale = if path_curves_enabled {
+                hair_uniform_scale(matrix)
+            } else {
+                None
+            };
+            let material_id = snapshot.slot_material(node_id, node, data_block, 0);
+            let material_index = if let Some(id) = material_id {
+                let key = (id.clone(), None, None);
+                if let Some(index) = material_indices.get(&key).copied() {
+                    index
+                } else if let Some(material) = doc.materials.get(id) {
+                    let index = materials.len();
+                    materials.push(material.clone());
+                    prepared.push(PreparedMaterial::new(material, &doc.node_groups));
+                    material_indices.insert(key, index);
+                    index
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            if let Some(object) = objects.last_mut() {
+                object.material_colors.insert(
+                    material_index,
+                    materials
+                        .get(material_index)
+                        .and_then(|material| material.pass_index.map(f64::from)),
+                    None,
+                    None,
+                );
+            }
+            let color = materials
+                .get(material_index)
                 .map_or([0.6, 0.6, 0.6, 1.0], |material| material.base_color);
+            let point_count = hair
+                .curves
+                .iter()
+                .try_fold(0usize, |count, curve| count.checked_add(curve.points.len()));
+            let point_count = point_count.ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "hair point count exceeds platform limits",
+                )
+            })?;
+            let curve_types = hair.attributes.get("curve_type");
+            if curve_types.is_some_and(|attribute| {
+                attribute.domain != "CURVE"
+                    || attribute.data_type != "INT8"
+                    || attribute.values.len() != hair.curves.len()
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair curve_type attribute has an invalid domain, type, or length",
+                ));
+            }
+            let radius_values = hair.attributes.get("radius");
+            if radius_values.is_some_and(|attribute| {
+                attribute.domain != "POINT"
+                    || attribute.data_type != "FLOAT"
+                    || attribute.values.len() != point_count
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair radius attribute has an invalid domain, type, or length",
+                ));
+            }
+            let cyclic_values = hair.attributes.get("cyclic");
+            if cyclic_values.is_some_and(|attribute| {
+                attribute.domain != "CURVE"
+                    || attribute.data_type != "BOOLEAN"
+                    || attribute.values.len() != hair.curves.len()
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair cyclic attribute has an invalid domain, type, or length",
+                ));
+            }
+            let normal_modes = hair.attributes.get("normal_mode");
+            if normal_modes.is_some_and(|attribute| {
+                attribute.domain != "CURVE"
+                    || attribute.data_type != "INT8"
+                    || attribute.values.len() != hair.curves.len()
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair normal_mode attribute has an invalid domain, type, or length",
+                ));
+            }
+            let resolutions = hair.attributes.get("resolution");
+            if resolutions.is_some_and(|attribute| {
+                attribute.domain != "CURVE"
+                    || attribute.data_type != "INT"
+                    || attribute.values.len() != hair.curves.len()
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair resolution attribute has an invalid domain, type, or length",
+                ));
+            }
+            let tilt_values = hair.attributes.get("tilt");
+            if tilt_values.is_some_and(|attribute| {
+                attribute.domain != "POINT"
+                    || attribute.data_type != "FLOAT"
+                    || attribute.values.len() != point_count
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair tilt attribute has an invalid domain, type, or length",
+                ));
+            }
+            let custom_normal_values = hair.attributes.get("custom_normal");
+            if custom_normal_values.is_some_and(|attribute| {
+                attribute.domain != "POINT"
+                    || attribute.data_type != "FLOAT_VECTOR"
+                    || attribute.values.len() != point_count
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair custom_normal attribute has an invalid domain, type, or length",
+                ));
+            }
+            let needs_analytic_hair = path_curves_enabled
+                && (path_curve_scale.is_none()
+                    || curve_types.is_some_and(|attribute| {
+                        attribute
+                            .values
+                            .iter()
+                            .any(|value| !matches!(value.as_i64(), Some(0 | 1)))
+                    }));
+            let mut prepared_curves = if needs_analytic_hair {
+                Some(
+                    super::hair_geometry::prepare_hair_curve_geometry(hair, matrix)
+                        .map_err(|error| hair_curve_geometry_error(node_id, &error))?
+                        .into_iter(),
+                )
+            } else {
+                None
+            };
+            let mut point_offset = 0usize;
+            let mut normal_scratch = super::hair_geometry::CurveNormalsScratch::default();
+            let mut normal_positions = Vec::new();
+            let mut normal_tilts = Vec::new();
+            let mut custom_normals = Vec::new();
+            let mut point_normals = Vec::new();
             for (curve_index, curve) in hair.curves.iter().enumerate() {
                 if !curve.radius.is_finite()
                     || curve.radius < 0.0
@@ -1379,9 +1653,116 @@ pub(super) fn extract_geometry_with_semantics(
                         "hair curve contains invalid position or radius data",
                     ));
                 }
+                let prepared_curve = prepared_curves.as_mut().and_then(Iterator::next);
                 if curve.points.is_empty() {
                     continue;
                 }
+                let curve_type = curve_types
+                    .and_then(|attribute| attribute.values.get(curve_index))
+                    .map_or(Some(0), serde_json::Value::as_i64)
+                    .and_then(|curve_type| u8::try_from(curve_type).ok())
+                    .ok_or_else(|| {
+                        PotError::new(ErrorCode::SceneInvalid, "hair curve_type is invalid")
+                    })?;
+                let curve_random = Some(cycles_curve_random(curve_index).ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "hair curve index exceeds Cycles' random attribute range",
+                    )
+                })?);
+                let cyclic = cyclic_values
+                    .and_then(|attribute| attribute.values.get(curve_index))
+                    .map_or(Some(false), serde_json::Value::as_bool)
+                    .ok_or_else(|| {
+                        PotError::new(ErrorCode::SceneInvalid, "hair cyclic value is invalid")
+                    })?;
+                let normal_mode = normal_modes
+                    .and_then(|attribute| attribute.values.get(curve_index))
+                    .map_or(Some(0), serde_json::Value::as_i64)
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or_else(|| {
+                        PotError::new(ErrorCode::SceneInvalid, "hair normal_mode is invalid")
+                    })?;
+                let resolution = resolutions
+                    .and_then(|attribute| attribute.values.get(curve_index))
+                    .map_or(Some(12usize), |value| {
+                        value.as_i64().and_then(|value| usize::try_from(value).ok())
+                    })
+                    .ok_or_else(|| {
+                        PotError::new(ErrorCode::SceneInvalid, "hair resolution is invalid")
+                    })?;
+                let radius_at = |point: usize| {
+                    radius_values
+                        .and_then(|attribute| {
+                            attribute.values.get(point_offset.saturating_add(point))
+                        })
+                        .map_or(Some(curve.radius), serde_json::Value::as_f64)
+                };
+                if radius_values.is_some_and(|attribute| {
+                    attribute.values[point_offset..point_offset + curve.points.len()]
+                        .iter()
+                        .any(|value| {
+                            value
+                                .as_f64()
+                                .is_none_or(|radius| !radius.is_finite() || radius < 0.0)
+                        })
+                }) {
+                    return Err(PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        "hair curve contains invalid radius data",
+                    ));
+                }
+                let local_normals = if path_curve_scale.is_some() && matches!(curve_type, 0 | 1) {
+                    normal_positions.clear();
+                    normal_positions
+                        .extend(curve.points.iter().map(|point| DVec3::from_array(*point)));
+                    normal_tilts.clear();
+                    custom_normals.clear();
+                    for point_index in 0..curve.points.len() {
+                        let global_index = point_offset + point_index;
+                        let tilt = tilt_values
+                            .and_then(|attribute| attribute.values.get(global_index))
+                            .map_or(Some(0.0), serde_json::Value::as_f64)
+                            .filter(|value| value.is_finite())
+                            .ok_or_else(|| {
+                                PotError::new(ErrorCode::SceneInvalid, "hair tilt value is invalid")
+                            })?;
+                        normal_tilts.push(tilt);
+                        if custom_normal_values.is_some() {
+                            let normal = custom_normal_values
+                                .and_then(|attribute| attribute.values.get(global_index))
+                                .and_then(hair_vector3_attribute)
+                                .filter(|normal| normal.is_finite())
+                                .ok_or_else(|| {
+                                    PotError::new(
+                                        ErrorCode::SceneInvalid,
+                                        "hair custom_normal value is invalid",
+                                    )
+                                })?;
+                            custom_normals.push(normal);
+                        }
+                    }
+                    point_normals.resize(curve.points.len(), DVec3::ZERO);
+                    if !super::hair_geometry::curve_normals_into(
+                        &normal_positions,
+                        curve_type,
+                        cyclic,
+                        resolution,
+                        normal_mode,
+                        &normal_tilts,
+                        custom_normal_values.map(|_| custom_normals.as_slice()),
+                        &mut normal_scratch,
+                        &mut point_normals,
+                    ) {
+                        return Err(PotError::new(
+                            ErrorCode::EvaluationFailed,
+                            "Blender hair curve normal evaluation failed",
+                        ));
+                    }
+                    Some(point_normals.as_slice())
+                } else {
+                    None
+                };
                 let element_index = u32::try_from(elements.len() + 1).map_err(|_| {
                     PotError::new(
                         ErrorCode::LimitExceeded,
@@ -1427,10 +1808,119 @@ pub(super) fn extract_geometry_with_semantics(
                         ray_mask: ray_visibility.mask(),
                     });
                 }
+                if let Some(scale) = path_curve_scale
+                    && curve.points.len() > 1
+                    && matches!(curve_type, 0 | 1)
+                {
+                    let path_segment_count = if cyclic {
+                        curve.points.len()
+                    } else {
+                        curve.points.len() - 1
+                    };
+                    let key = |point_index: usize| {
+                        let point_index = point_index % curve.points.len();
+                        let position =
+                            matrix.transform_point3(DVec3::from_array(curve.points[point_index]));
+                        let radius = radius_at(point_index).unwrap_or(curve.radius) * scale;
+                        CurveKey { position, radius }
+                    };
+                    for segment in 0..path_segment_count {
+                        let next = (segment + 1) % curve.points.len();
+                        let previous = if segment == 0 {
+                            if cyclic { curve.points.len() - 1 } else { 0 }
+                        } else {
+                            segment - 1
+                        };
+                        let following = if next + 1 < curve.points.len() {
+                            next + 1
+                        } else if cyclic {
+                            0
+                        } else {
+                            curve.points.len() - 1
+                        };
+                        let keys = [key(previous), key(segment), key(next), key(following)];
+                        let normals = local_normals.ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::InternalError,
+                                "hair curve normals were not prepared for a path hit",
+                            )
+                        })?;
+                        hair_keys.push(keys);
+                        hair_curve_types.push(curve_type);
+                        hair_masks.push(ray_visibility.mask());
+                        hair_segments.push(HairSegment {
+                            material_index,
+                            object_index,
+                            element_index,
+                            curve_random,
+                            curve_type,
+                            curve_normal_start: normals[segment],
+                            curve_normal_end: normals[next],
+                        });
+                    }
+                }
+                if path_curves_enabled
+                    && curve.points.len() > 1
+                    && (path_curve_scale.is_none() || !matches!(curve_type, 0 | 1))
+                {
+                    let curve_geometry = prepared_curve.ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "analytic hair geometry was not prepared for a path hit",
+                        )
+                    })?;
+                    let normals = super::hair_geometry::curve_normals_for_geometry(&curve_geometry)
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::EvaluationFailed,
+                                "Blender hair curve normal evaluation failed",
+                            )
+                        })?;
+                    let (curve_min, curve_max) =
+                        curve_geometry.world_bounds().ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::EvaluationFailed,
+                                "Blender hair curve bounds evaluation failed",
+                            )
+                        })?;
+                    bounds = Some(match bounds {
+                        Some((current_min, current_max)) => {
+                            (current_min.min(curve_min), current_max.max(curve_max))
+                        }
+                        None => (curve_min, curve_max),
+                    });
+                    hair_curve_instances.push(HairCurveInstance {
+                        curve: curve_geometry,
+                        normals,
+                        material_index,
+                        object_index,
+                        element_index,
+                        curve_random,
+                        ray_mask: ray_visibility.mask(),
+                    });
+                }
+                point_offset = point_offset
+                    .checked_add(curve.points.len())
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::LimitExceeded,
+                            "hair point offset exceeds platform limits",
+                        )
+                    })?;
             }
         }
     }
+    let hair_bvh = HairBvh::build(&hair_keys, &hair_curve_types);
+    let hair_curve_bvh =
+        HairBvh::build_splines(hair_curve_instances.iter().map(|curve| &curve.curve));
     let mut geometry = Geometry {
+        hair_keys,
+        hair_curve_types,
+        hair_masks,
+        hair_segments,
+        hair_bvh,
+        hair_curve_instances,
+        hair_curve_bvh,
         triangles,
         lines,
         wire_edges,
@@ -2403,6 +2893,8 @@ impl SceneShaderCore<'_> {
                 color: [0.0; 4],
                 has_surface: false,
                 transparent_tint: [1.0; 3],
+                holdout_weight: 0.0,
+                subsurface: None,
             });
         }
         let graph_shading = if triangle.lit_per_pixel {
@@ -2509,6 +3001,7 @@ impl SceneShaderCore<'_> {
         });
         let thickness = object_for_index(self.geometry.objects, triangle.object_index)
             .map_or(0.0, |object| object.thickness);
+        let world = self.world_probe()?;
         let color = shade(
             self.doc,
             self.snapshot,
@@ -2521,13 +3014,34 @@ impl SceneShaderCore<'_> {
             self.mode,
             shadow,
             thickness,
-            self.world_probe()?,
+            world,
         );
+        let subsurface = if matches!(self.mode, Mode::Beauty) {
+            eevee_subsurface_sample(
+                self.doc,
+                self.snapshot,
+                hit.point,
+                hit.shadow_point,
+                hit.normal,
+                hit.geometric,
+                hit.view,
+                closures,
+                shadow,
+                thickness,
+                world,
+                triangle.object_index,
+                camera_matrices,
+            )?
+        } else {
+            None
+        };
         occluders.finish()?;
         Ok(SurfaceSample {
             color,
             has_surface: true,
             transparent_tint: beauty_tint(material, surface_tint(closures)),
+            holdout_weight: eevee_holdout_weight(closures),
+            subsurface,
         })
     }
 
@@ -3158,6 +3672,173 @@ fn base_albedo(params: &BsdfParams) -> DVec3 {
 
 #[expect(
     clippy::too_many_arguments,
+    reason = "standalone EEVEE closures consume their evaluated surface, probe, and direct-light inputs"
+)]
+fn standalone_eevee_lighting(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    receiver: Receiver,
+    normal: DVec3,
+    params: &BsdfParams,
+    thickness: Thickness,
+    shadow: ShadowContext<'_>,
+    world: Option<&WorldProbe>,
+    ambient: f64,
+) -> Option<DVec3> {
+    let scene = doc.scenes.get(&snapshot.scene_id);
+    let light_threshold = scene.map_or(0.01, |scene| scene.render.eevee_light_threshold);
+    let mut result = DVec3::ZERO;
+    match params.model {
+        BsdfModel::Translucent => {
+            let mut color = base_albedo(params).max(DVec3::ZERO);
+            if thickness != Thickness::None {
+                color *= color;
+            }
+            if let Some(world) = world {
+                let environment = if matches!(thickness, Thickness::Sphere(value) if value != 0.0) {
+                    world.average_irradiance()
+                } else {
+                    prefiltered_world(world, -normal, 1.0, irradiance_probe_radiance)
+                };
+                result += color * environment * ambient;
+            }
+            for (id, light_node) in &doc.nodes {
+                let Some(evaluated) = snapshot.nodes.get(id) else {
+                    continue;
+                };
+                let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+                    light_node
+                        .data
+                        .as_ref()
+                        .and_then(|data_id| doc.data_blocks.get(data_id))
+                        .and_then(|block| block.light.as_ref())
+                }) else {
+                    continue;
+                };
+                let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+                let influence = light_influence_at(light, matrix, receiver.point, light_threshold);
+                if influence <= 0.0 {
+                    continue;
+                }
+                result += translucent_direct_contribution(
+                    light,
+                    matrix,
+                    receiver,
+                    normal,
+                    color,
+                    thickness,
+                    light_node.resolved_ray_visibility(),
+                    shadow,
+                ) * influence;
+            }
+        }
+        BsdfModel::Refraction(_) => {
+            let mut color = base_albedo(params).max(DVec3::ZERO);
+            if thickness != Thickness::None {
+                color *= color;
+            }
+            let roughness = params.roughness.clamp(0.0, 1.0);
+            let ior = params.ior.max(1.0e-5);
+            if let Some(world) = world {
+                let direction = super::eevee_advanced_bsdf::eevee_refraction_probe_direction(
+                    normal,
+                    receiver.view,
+                    ior,
+                    roughness,
+                    thickness,
+                );
+                let perceived = eevee_transmission::transmission_roughness(roughness, ior);
+                result += prefiltered_world(world, direction, perceived, probe_radiance) * color;
+            }
+            let glass =
+                eevee_transmission::refraction_light(params, normal, receiver.view, thickness);
+            let mut direct_radiance = (DVec3::ZERO, DVec3::ZERO);
+            for (id, light_node) in &doc.nodes {
+                let Some(evaluated) = snapshot.nodes.get(id) else {
+                    continue;
+                };
+                let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+                    light_node
+                        .data
+                        .as_ref()
+                        .and_then(|data_id| doc.data_blocks.get(data_id))
+                        .and_then(|block| block.light.as_ref())
+                }) else {
+                    continue;
+                };
+                let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+                let influence = light_influence_at(light, matrix, receiver.point, light_threshold);
+                let visibility = light_node.resolved_ray_visibility();
+                if influence <= 0.0 || !visibility.allows(RayKind::Transmission) {
+                    continue;
+                }
+                let (reflection, transmission) = glass_direct_contribution(
+                    light,
+                    matrix,
+                    receiver,
+                    &glass,
+                    thickness,
+                    visibility,
+                    shadow,
+                    shadow.and_then(|scene| scene.point_maps.get(id)),
+                );
+                direct_radiance.0 += reflection * influence;
+                direct_radiance.1 += transmission * influence;
+            }
+            result += glass.reflection * rgb9e5_roundtrip(direct_radiance.0)
+                + glass.transmission * rgb9e5_roundtrip(direct_radiance.1);
+        }
+        BsdfModel::Metallic(_) => {
+            let reflectance = eevee_metallic_brdf(params, normal, receiver.view)?;
+            let roughness = params.roughness.clamp(0.0, 1.0);
+            if let Some(world) = world {
+                let direction = super::eevee_advanced_bsdf::eevee_metallic_probe_direction(
+                    normal,
+                    receiver.view,
+                    roughness,
+                );
+                result += prefiltered_world(world, direction, roughness, probe_radiance)
+                    * reflectance
+                    * ambient;
+            }
+            for (id, light_node) in &doc.nodes {
+                let Some(evaluated) = snapshot.nodes.get(id) else {
+                    continue;
+                };
+                let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+                    light_node
+                        .data
+                        .as_ref()
+                        .and_then(|data_id| doc.data_blocks.get(data_id))
+                        .and_then(|block| block.light.as_ref())
+                }) else {
+                    continue;
+                };
+                let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+                let influence = light_influence_at(light, matrix, receiver.point, light_threshold);
+                if influence <= 0.0 {
+                    continue;
+                }
+                result += metallic_direct_contribution(
+                    light,
+                    matrix,
+                    receiver,
+                    normal,
+                    roughness,
+                    reflectance,
+                    light_node.resolved_ray_visibility(),
+                    shadow,
+                    shadow.and_then(|scene| scene.point_maps.get(id)),
+                ) * influence;
+            }
+        }
+        _ => return None,
+    }
+    Some(result)
+}
+
+#[expect(
+    clippy::too_many_arguments,
     reason = "flat material shading consumes explicit evaluated surface and light values"
 )]
 fn shade(
@@ -3222,6 +3903,9 @@ fn shade(
     for closure in closures {
         let params = &closure.params;
         let share = closure.weight * params.alpha.clamp(0.0, 1.0);
+        if matches!(params.model, BsdfModel::Holdout | BsdfModel::Subsurface) {
+            continue;
+        }
         // Reflectance weights the whole sum once, below, so the lobes take unit reflectance.
         let lobe = BsdfParams {
             reflectance: 1.0,
@@ -3242,102 +3926,111 @@ fn shade(
             params.thickness.unwrap_or(object_thickness),
             params.thickness_slab,
         );
-        let mut lobes = DVec3::ZERO;
-        // EEVEE packs each glass closure's summed direct radiance before multiplying its closure colour.
-        let mut glass_direct_radiance = (DVec3::ZERO, DVec3::ZERO);
-        if let (Some(world), Some(diffuse_environment)) = (world, diffuse_environment) {
-            let diffuse_albedo = if params.thin_wall {
-                let subsurface = params.subsurface_weight.clamp(0.0, 1.0);
-                let reflection = f64::midpoint(1.0, -params.subsurface_anisotropy).clamp(0.0, 1.0);
-                albedo * (1.0 - subsurface + subsurface * reflection)
-            } else {
-                albedo
-            };
-            let mut environment = diffuse_albedo * diffuse_environment * dielectric * lower;
-            let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
-            let specular_environment =
-                prefiltered_world(world, reflection, roughness, probe_radiance);
-            let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
-            let f0 = albedo * metallic + DVec3::splat(specular_f0 * dielectric);
-            environment += specular_environment * f0 * (1.0_f64 - roughness).powi(2) * lower;
-            lobes += environment * ambient;
-            if params.thin_wall && params.subsurface_weight > 0.0 {
-                let sphere_thickness = matches!(thickness, Thickness::Sphere(value) if value > 0.0);
-                let translucent_environment = if sphere_thickness {
-                    world.average_irradiance()
-                } else {
-                    prefiltered_world(world, -normal, 1.0, irradiance_probe_radiance)
-                };
-                let color = if sphere_thickness {
-                    albedo * albedo
+        let lobes = if let Some(lobes) = standalone_eevee_lighting(
+            doc, snapshot, receiver, normal, params, thickness, shadow, world, ambient,
+        ) {
+            lobes
+        } else {
+            let mut lobes = DVec3::ZERO;
+            // EEVEE packs each glass closure's summed direct radiance before multiplying its closure colour.
+            let mut glass_direct_radiance = (DVec3::ZERO, DVec3::ZERO);
+            if let (Some(world), Some(diffuse_environment)) = (world, diffuse_environment) {
+                let diffuse_albedo = if params.thin_wall {
+                    let subsurface = params.subsurface_weight.clamp(0.0, 1.0);
+                    let reflection =
+                        f64::midpoint(1.0, -params.subsurface_anisotropy).clamp(0.0, 1.0);
+                    albedo * (1.0 - subsurface + subsurface * reflection)
                 } else {
                     albedo
                 };
-                lobes += color
-                    * thin_subsurface_transmission_weight(&lobe, &shading, false)
-                    * translucent_environment
-                    * ambient;
+                let mut environment = diffuse_albedo * diffuse_environment * dielectric * lower;
+                let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
+                let specular_environment =
+                    prefiltered_world(world, reflection, roughness, probe_radiance);
+                let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
+                let f0 = albedo * metallic + DVec3::splat(specular_f0 * dielectric);
+                environment += specular_environment * f0 * (1.0_f64 - roughness).powi(2) * lower;
+                lobes += environment * ambient;
+                if params.thin_wall && params.subsurface_weight > 0.0 {
+                    let sphere_thickness =
+                        matches!(thickness, Thickness::Sphere(value) if value > 0.0);
+                    let translucent_environment = if sphere_thickness {
+                        world.average_irradiance()
+                    } else {
+                        prefiltered_world(world, -normal, 1.0, irradiance_probe_radiance)
+                    };
+                    let color = if sphere_thickness {
+                        albedo * albedo
+                    } else {
+                        albedo
+                    };
+                    lobes += color
+                        * thin_subsurface_transmission_weight(&lobe, &shading, false)
+                        * translucent_environment
+                        * ambient;
+                }
+                // Refraction takes no occlusion: EEVEE's deferred combine multiplies no visibility into the transmission
+                // closure's probe read (`eevee_deferred_combine.bsl.hh`), so the glass environment is not attenuated.
+                if let Some(glass) =
+                    eevee_transmission::glass_closures(params, normal, view, lower, thickness)
+                {
+                    lobes += glass_environment(world, &glass);
+                }
             }
-            // Refraction takes no occlusion: EEVEE's deferred combine multiplies no visibility into the transmission
-            // closure's probe read (`eevee_deferred_combine.bsl.hh`), so the glass environment is not attenuated.
-            if let Some(glass) =
-                eevee_transmission::glass_closures(params, normal, view, lower, thickness)
-            {
-                lobes += glass_environment(world, &glass);
-            }
-        }
-        let glass = eevee_transmission::glass_light(params, normal, view, lower, thickness);
-        for (id, light_node) in &doc.nodes {
-            let Some(evaluated) = snapshot.nodes.get(id) else {
-                continue;
-            };
-            let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
-                light_node
-                    .data
-                    .as_ref()
-                    .and_then(|data_id| doc.data_blocks.get(data_id))
-                    .and_then(|block| block.light.as_ref())
-            }) else {
-                continue;
-            };
-            let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
-            let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
-            let influence = light_influence_at(light, matrix, point, light_threshold);
-            let ray_visibility = light_node.resolved_ray_visibility();
-            lobes += light_contribution(
-                light,
-                matrix,
-                point,
-                shadow_point,
-                normal,
-                geometric,
-                &lobe,
-                &shading,
-                shadow,
-                point_shadow,
-                ray_visibility,
-                thickness,
-            ) * influence;
-            if let Some(glass) = &glass {
-                let (reflection, transmission) = glass_direct_contribution(
+            let glass = eevee_transmission::glass_light(params, normal, view, lower, thickness);
+            for (id, light_node) in &doc.nodes {
+                let Some(evaluated) = snapshot.nodes.get(id) else {
+                    continue;
+                };
+                let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+                    light_node
+                        .data
+                        .as_ref()
+                        .and_then(|data_id| doc.data_blocks.get(data_id))
+                        .and_then(|block| block.light.as_ref())
+                }) else {
+                    continue;
+                };
+                let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+                let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
+                let influence = light_influence_at(light, matrix, point, light_threshold);
+                let ray_visibility = light_node.resolved_ray_visibility();
+                lobes += light_contribution(
                     light,
                     matrix,
-                    receiver,
-                    glass,
-                    thickness,
-                    ray_visibility,
+                    point,
+                    shadow_point,
+                    normal,
+                    geometric,
+                    &lobe,
+                    &shading,
                     shadow,
                     point_shadow,
-                );
-                glass_direct_radiance.0 += reflection * influence;
-                glass_direct_radiance.1 += transmission * influence;
+                    ray_visibility,
+                    thickness,
+                ) * influence;
+                if let Some(glass) = &glass {
+                    let (reflection, transmission) = glass_direct_contribution(
+                        light,
+                        matrix,
+                        receiver,
+                        glass,
+                        thickness,
+                        ray_visibility,
+                        shadow,
+                        point_shadow,
+                    );
+                    glass_direct_radiance.0 += reflection * influence;
+                    glass_direct_radiance.1 += transmission * influence;
+                }
             }
-        }
-        if let Some(glass) = &glass {
-            let reflection = rgb9e5_roundtrip(glass_direct_radiance.0);
-            let transmission = rgb9e5_roundtrip(glass_direct_radiance.1);
-            lobes += glass.reflection * reflection + glass.transmission * transmission;
-        }
+            if let Some(glass) = &glass {
+                let reflection = rgb9e5_roundtrip(glass_direct_radiance.0);
+                let transmission = rgb9e5_roundtrip(glass_direct_radiance.1);
+                lobes += glass.reflection * reflection + glass.transmission * transmission;
+            }
+            lobes
+        };
         // Reflectance weights every reflective closure (ambient, direct, environment); Emission has none.
         reflected += lobes * (share * params.reflectance.clamp(0.0, 1.0));
         // Emission sits outside the reflectance weight and the clamp: Cycles' `EmissionNode` emits
@@ -3356,6 +4049,211 @@ fn shade(
     let reflected = reflected.max(DVec3::ZERO).min(DVec3::splat(1.0));
     let result = reflected + emitted;
     [result.x, result.y, result.z, opaque]
+}
+#[derive(Clone, Copy)]
+struct EeveeSubsurfaceSelection {
+    closure: ShaderClosure,
+    radius: [f64; 3],
+    color: DVec3,
+    color_weight: f64,
+    total_weight: f64,
+}
+
+/// Matches EEVEE's `closure_select_check` weighted reservoir for closures sharing output bin 0.
+fn select_eevee_subsurface_closure(
+    closures: &[ShaderClosure],
+    mut random: f64,
+) -> Option<EeveeSubsurfaceSelection> {
+    let mut selected = None;
+    let mut total_weight = 0.0;
+    for closure in closures
+        .iter()
+        .filter(|closure| matches!(closure.params.model, BsdfModel::Subsurface))
+    {
+        let Some(radius) = eevee_subsurface_radius(&closure.params) else {
+            continue;
+        };
+        let color = base_albedo(&closure.params).max(DVec3::ZERO);
+        let color_weight = color.abs().element_sum() / 3.0;
+        let weight = closure.weight * color_weight;
+        if weight < 1e-5 {
+            continue;
+        }
+        total_weight += weight;
+        let selection_probability = weight / total_weight;
+        let is_selected = random < selection_probability;
+        random = if is_selected {
+            random / selection_probability
+        } else {
+            (random - selection_probability) / (1.0 - selection_probability)
+        };
+        if is_selected {
+            selected = Some((*closure, radius, color, color_weight));
+        }
+    }
+    selected.map(
+        |(closure, radius, color, color_weight)| EeveeSubsurfaceSelection {
+            closure,
+            radius,
+            color,
+            color_weight,
+            total_weight,
+        },
+    )
+}
+
+fn eevee_subsurface_random(point: DVec3, object_index: u32) -> f64 {
+    let [x, y, z] = point.to_array().map(|value| (value as f32).to_bits());
+    let hash = cycles_hash_uint2(x ^ object_index, y ^ z.rotate_left(13));
+    (f64::from(hash) + 0.5) / 4_294_967_296.0
+}
+
+fn eevee_subsurface_shading_normal(evaluated: DVec3, geometric: DVec3) -> DVec3 {
+    let normal = evaluated.normalize_or_zero();
+    if normal == DVec3::ZERO {
+        geometric.normalize_or_zero()
+    } else {
+        normal
+    }
+}
+
+fn eevee_subsurface_sample(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    point: DVec3,
+    shadow_point: DVec3,
+    normal: DVec3,
+    geometric: DVec3,
+    view: DVec3,
+    closures: &[ShaderClosure],
+    shadow: ShadowContext<'_>,
+    object_thickness: f64,
+    world: Option<&WorldProbe>,
+    object_index: u32,
+    camera_matrices: Option<(&DMat4, &DMat4)>,
+) -> Result<Option<EeveeSubsurfaceSample>> {
+    let Some(selection) =
+        select_eevee_subsurface_closure(closures, eevee_subsurface_random(point, object_index))
+    else {
+        return Ok(None);
+    };
+    let params = &selection.closure.params;
+    let Some((_, world_to_camera)) = camera_matrices else {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "EEVEE subsurface requires the per-eye camera transform for view-space depth",
+            serde_json::json!({"feature_id":"render.eevee.subsurface.camera_transform"}),
+        ));
+    };
+    let depth = -world_to_camera.transform_point3(point).z;
+    if !depth.is_finite() || depth <= 0.0 {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "EEVEE subsurface hit has invalid view-space depth",
+        ));
+    }
+
+    let scene = doc.scenes.get(&snapshot.scene_id);
+    let light_threshold = scene.map_or(0.01, |scene| scene.render.eevee_light_threshold);
+    let view = view.try_normalize().unwrap_or(normal);
+    let shading_normal =
+        eevee_gbuffer_normal(eevee_subsurface_shading_normal(params.normal, geometric));
+    let opaque = opaque_share(closures);
+    let profile_weight = if opaque > 0.0 {
+        selection.total_weight / opaque
+    } else {
+        0.0
+    };
+    let profile_color = selection.color / selection.color_weight * profile_weight;
+    let (profile_color, profile_radius) =
+        eevee_subsurface_gbuffer_profile(profile_color.to_array(), selection.radius);
+    let mut profiles = [None; MAX_EEVEE_SUBSURFACE_CLOSURES];
+    profiles[0] = Some(EeveeSubsurfaceClosure {
+        color: profile_color,
+        radius: profile_radius,
+    });
+
+    let mut diffuse = *params;
+    diffuse.model = BsdfModel::Principled;
+    diffuse.base_color = [1.0; 4];
+    diffuse.alpha = 1.0;
+    diffuse.metallic = 0.0;
+    diffuse.roughness = 1.0;
+    diffuse.transmission = 0.0;
+    diffuse.subsurface_weight = 0.0;
+    diffuse.reflectance = 1.0;
+    diffuse.specular_ior_level = 0.0;
+    diffuse.sheen_weight = 0.0;
+    diffuse.coat_weight = 0.0;
+    diffuse.thin_wall = false;
+    let layers = principled_layers(&diffuse, shading_normal, view);
+    let thickness = Thickness::new(
+        params.thickness.unwrap_or(object_thickness),
+        params.thickness_slab,
+    );
+    let mut direct = DVec3::ZERO;
+    for (id, light_node) in &doc.nodes {
+        let Some(evaluated) = snapshot.nodes.get(id) else {
+            continue;
+        };
+        let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+            light_node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id))
+                .and_then(|block| block.light.as_ref())
+        }) else {
+            continue;
+        };
+        let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+        let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
+        let influence = light_influence_at(light, matrix, point, light_threshold);
+        if influence <= 0.0 {
+            continue;
+        }
+        direct += light_contribution(
+            light,
+            matrix,
+            point,
+            shadow_point,
+            shading_normal,
+            geometric,
+            &diffuse,
+            &layers,
+            shadow,
+            point_shadow,
+            light_node.resolved_ray_visibility(),
+            thickness,
+        ) * influence;
+    }
+    let ambient = shadow.map_or(1.0, |scene| {
+        let facing = if geometric.dot(view) < 0.0 {
+            -geometric
+        } else {
+            geometric
+        };
+        ambient_visibility(
+            scene.bvh,
+            scene.triangles,
+            scene.prepared_materials,
+            point,
+            facing,
+            shading_normal,
+            1.0,
+            scene.has_volume_only,
+        )
+    });
+    let indirect = world.map_or(DVec3::ZERO, |world| {
+        prefiltered_world(world, shading_normal, 1.0, irradiance_probe_radiance) * ambient
+    });
+    Ok(Some(EeveeSubsurfaceSample {
+        closures: profiles,
+        direct: direct.to_array().map(|value| value as f32),
+        indirect: indirect.to_array().map(|value| value as f32),
+        object_index,
+        depth,
+        split_radiance: false,
+    }))
 }
 
 /// The environment's share of the glass closures: the reflection at its mirror direction and the transmission at the
@@ -4195,6 +5093,143 @@ fn rgb9e5_roundtrip(radiance: DVec3) -> DVec3 {
         (((color[1] / denominator + 0.5) as u32) as f32 * denominator) as f64,
         (((color[2] / denominator + 0.5) as u32) as f32 * denominator) as f64,
     )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the EEVEE translucent light closure consumes explicit light and receiver values"
+)]
+fn translucent_direct_contribution(
+    light: &crate::model::LightData,
+    matrix: DMat4,
+    receiver: Receiver,
+    normal: DVec3,
+    color: DVec3,
+    thickness: Thickness,
+    ray_visibility: RayVisibility,
+    shadow: ShadowContext<'_>,
+) -> DVec3 {
+    // EEVEE's translucent direct closure uses LIGHT_DIFFUSE power, including the thick-sphere variant.
+    if !ray_visibility.allows(RayKind::Diffuse) {
+        return DVec3::ZERO;
+    }
+    let Some(direct) = direct_emitter(light, matrix, receiver.point) else {
+        return DVec3::ZERO;
+    };
+    let sphere = matches!(thickness, Thickness::Sphere(value) if value != 0.0);
+    let lobe_normal = if sphere { direct.direction } else { -normal };
+    let facing = if sphere {
+        1.0
+    } else {
+        facing_attenuation(
+            direct.emitter.shape_radius(),
+            direct.direction,
+            direct.distance,
+            lobe_normal,
+            true,
+        )
+    };
+    if facing <= 0.0 {
+        return DVec3::ZERO;
+    }
+    let origin = transmission_origin(
+        receiver.point,
+        receiver.geometric,
+        direct.direction,
+        direct.shadow_distance,
+        thickness,
+    );
+    let visibility = match direct.area {
+        Some(shape) => area_transmitted_fraction(
+            shadow,
+            origin,
+            &shape,
+            (direct.centre, -direct.axis),
+            lobe_normal,
+        ),
+        None => transmitted_visibility(shadow, origin, &direct),
+    };
+    let form = direct.emitter.form_factor(
+        lobe_normal,
+        receiver.view,
+        [1.0, 0.0, 0.0, 1.0],
+        direct.to_centre,
+    );
+    let thickness_scale = if sphere {
+        1.0 / std::f64::consts::PI
+    } else {
+        1.0
+    };
+    color
+        * direct.radiance
+        * (direct.attenuation
+            * facing
+            * visibility
+            * form
+            * LightFactors::of(light).diffuse
+            * thickness_scale)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the EEVEE metallic light closure consumes explicit light and receiver values"
+)]
+fn metallic_direct_contribution(
+    light: &crate::model::LightData,
+    matrix: DMat4,
+    receiver: Receiver,
+    normal: DVec3,
+    roughness: f64,
+    color: DVec3,
+    ray_visibility: RayVisibility,
+    shadow: ShadowContext<'_>,
+    point_shadow: Option<&PointShadowMap>,
+) -> DVec3 {
+    if !ray_visibility.allows(RayKind::Glossy) {
+        return DVec3::ZERO;
+    }
+    let Some(direct) = direct_emitter(light, matrix, receiver.point) else {
+        return DVec3::ZERO;
+    };
+    let facing = facing_attenuation(
+        direct.emitter.shape_radius(),
+        direct.direction,
+        direct.distance,
+        normal,
+        false,
+    );
+    if facing <= 0.0 {
+        return DVec3::ZERO;
+    }
+    let visibility = match direct.area {
+        Some(shape) => area_visible_fraction(
+            shadow,
+            point_shadow,
+            receiver.shadow_point,
+            receiver.geometric,
+            &shape,
+            direct.centre,
+            -direct.axis,
+            receiver.point,
+            normal,
+        ),
+        None => visibility_for_light(
+            shadow,
+            point_shadow,
+            receiver.shadow_point,
+            receiver.geometric,
+            direct.direction,
+            direct.shadow_distance,
+            direct.sun_radius,
+        ),
+    };
+    let matrix = super::eevee_ltc::sample_matrix(normal.dot(receiver.view), roughness);
+    let form = direct
+        .emitter
+        .form_factor(normal, receiver.view, matrix, direct.to_centre);
+    color
+        * direct.radiance
+        * (direct.attenuation * facing * visibility * form * LightFactors::of(light).specular)
 }
 
 /// A sun's direct light, integrated over the sun's disc as EEVEE's sun is. The diffuse class is flat over the disc, so its
@@ -5308,5 +6343,53 @@ mod rgb9e5_tests {
 
         assert_eq!(summed.x, 946.0 / 524_288.0);
         assert_ne!(summed, separately_packed);
+    }
+}
+#[cfg(test)]
+mod eevee_subsurface_reservoir_tests {
+    use glam::DVec3;
+
+    use crate::{
+        error::{ErrorCode, PotError},
+        model::Material,
+        shader::{BsdfModel, BsdfParams, ShaderClosure},
+    };
+
+    use super::{eevee_subsurface_shading_normal, select_eevee_subsurface_closure};
+
+    fn subsurface(normal: DVec3) -> ShaderClosure {
+        let mut params = BsdfParams::from_material(&Material::default(), normal);
+        params.model = BsdfModel::Subsurface;
+        params.normal = normal;
+        params.base_color = [0.5; 4];
+        params.subsurface_radius = [1.0, 0.5, 0.25];
+        params.subsurface_scale = 1.0;
+        ShaderClosure {
+            weight: 1.0,
+            params,
+        }
+    }
+
+    #[test]
+    fn weighted_reservoir_selects_fourth_sss_closure_and_its_normal() -> crate::error::Result<()> {
+        let closures = [
+            subsurface(DVec3::new(1.0, 0.0, 0.0)),
+            subsurface(DVec3::new(0.0, 1.0, 0.0)),
+            subsurface(DVec3::new(0.0, 0.0, 1.0)),
+            subsurface(DVec3::new(-1.0, 0.0, 0.0)),
+        ];
+        let selected = select_eevee_subsurface_closure(&closures, 0.5).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "positive-weight SSS closure was not selected",
+            )
+        })?;
+        assert_eq!(selected.total_weight, 2.0);
+        assert_eq!(selected.closure.params.normal, DVec3::new(-1.0, 0.0, 0.0));
+        assert_eq!(
+            eevee_subsurface_shading_normal(selected.closure.params.normal, DVec3::Z),
+            DVec3::new(-1.0, 0.0, 0.0)
+        );
+        Ok(())
     }
 }

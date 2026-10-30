@@ -107,8 +107,124 @@ pub(crate) enum GlassDistribution {
     MultiGgx,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SheenDistribution {
+    Ashikhmin,
+    Microfiber,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MicrofacetDistribution {
+    Beckmann,
+    Ggx,
+    MultiGgx,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToonComponent {
+    Diffuse,
+    Glossy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ToonParameters {
+    pub(crate) component: ToonComponent,
+    pub(crate) size: f64,
+    pub(crate) smooth: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum MetallicFresnel {
+    F82,
+    PhysicalConductor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MetallicParameters {
+    pub(crate) distribution: MicrofacetDistribution,
+    pub(crate) fresnel: MetallicFresnel,
+    pub(crate) edge_tint: [f64; 3],
+    pub(crate) conductor_ior: [f64; 3],
+    pub(crate) extinction: [f64; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HairComponent {
+    Reflection,
+    Transmission,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct HairParameters {
+    pub(crate) component: HairComponent,
+    pub(crate) offset: f64,
+    pub(crate) roughness_u: f64,
+    pub(crate) roughness_v: f64,
+    pub(crate) tangent: DVec3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HairScatteringModel {
+    Chiang,
+    Huang,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HairParametrization {
+    Reflectance,
+    MelaninConcentration,
+    DirectAbsorption,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PrincipledHairParameters {
+    pub(crate) model: HairScatteringModel,
+    pub(crate) parametrization: HairParametrization,
+    pub(crate) melanin: f64,
+    pub(crate) melanin_redness: f64,
+    pub(crate) tint: [f64; 3],
+    pub(crate) absorption_coefficient: [f64; 3],
+    pub(crate) aspect_ratio: f64,
+    pub(crate) roughness: f64,
+    pub(crate) radial_roughness: f64,
+    pub(crate) coat: f64,
+    pub(crate) ior: f64,
+    pub(crate) offset: f64,
+    pub(crate) random_color: f64,
+    pub(crate) random_roughness: f64,
+    pub(crate) random: f64,
+    pub(crate) reflection: f64,
+    pub(crate) transmission: f64,
+    pub(crate) secondary_reflection: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RayPortalParameters {
+    pub(crate) position: DVec3,
+    pub(crate) direction: DVec3,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum BsdfModel {
+    #[default]
+    Principled,
+    Sheen(SheenDistribution),
+    Subsurface,
+    Translucent,
+    Refraction(MicrofacetDistribution),
+    Toon(ToonParameters),
+    Metallic(MetallicParameters),
+    Holdout,
+    Hair(HairParameters),
+    PrincipledHair(PrincipledHairParameters),
+    RayPortal(RayPortalParameters),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BsdfParams {
+    /// Curve normal used as the Principled Hair Huang model's elliptical major axis.
+    pub(crate) hair_normal: Option<DVec3>,
+    pub(crate) model: BsdfModel,
     pub base_color: [f64; 4],
     pub metallic: f64,
     pub roughness: f64,
@@ -235,6 +351,7 @@ impl BsdfParams {
         let volume = principled_volume_weights(material.volume_color, [0.0; 3]);
         let density = material.volume_density.max(0.0);
         Self {
+            model: BsdfModel::Principled,
             base_color: material.base_color,
             metallic: material.metallic,
             roughness: material.roughness,
@@ -270,6 +387,7 @@ impl BsdfParams {
             anisotropy: 0.0,
             anisotropic_rotation: 0.0,
             anisotropic_tangent: None,
+            hair_normal: None,
             thin_film_thickness: 0.0,
             thin_film_ior: 1.33,
             diffuse_roughness: 0.0,
@@ -467,6 +585,14 @@ pub struct HitContext<'a> {
     pub light_falloff_distance: Option<f64>,
     /// Whether this hit is evaluated by Cycles semantics rather than the realtime shader path.
     pub path_traced: bool,
+    /// Whether this path hit came from a curve primitive without mesh UV or generic-attribute interpolation.
+    pub(crate) hair_curve_hit: bool,
+    /// The strand tangent supplied by the curve/particle hit.
+    pub hair_tangent: Option<DVec3>,
+    /// The strand normal used as the Huang model's elliptical major axis.
+    pub hair_normal: Option<DVec3>,
+    /// Cycles' random value for the current hair curve.
+    pub hair_random: Option<f64>,
     /// The render color layer at this hit: the value a Vertex Color node with an empty layer name
     /// reads.
     pub color_render: Option<[f64; 4]>,
@@ -533,6 +659,10 @@ impl<'a> HitContext<'a> {
             view_direction: DVec3::Z,
             light_falloff_distance: None,
             path_traced: false,
+            hair_curve_hit: false,
+            hair_tangent: None,
+            hair_random: None,
+            hair_normal: None,
             color_render: None,
             color_layers: None,
             geometry_attributes: None,
@@ -582,6 +712,20 @@ impl<'a> HitContext<'a> {
     #[must_use]
     pub const fn with_path_traced(mut self, path_traced: bool) -> Self {
         self.path_traced = path_traced;
+        self
+    }
+
+    /// Attach per-curve tangent, normal, and optional Cycles random value for hair closures.
+    #[must_use]
+    pub const fn with_hair_context(
+        mut self,
+        tangent: DVec3,
+        strand_normal: Option<DVec3>,
+        curve_random: Option<f64>,
+    ) -> Self {
+        self.hair_tangent = Some(tangent);
+        self.hair_normal = strand_normal;
+        self.hair_random = curve_random;
         self
     }
 
@@ -1349,6 +1493,16 @@ enum ValueKind {
 enum NodeKind {
     OutputMaterial,
     Principled,
+    Sheen,
+    Subsurface,
+    Translucent,
+    Refraction,
+    Toon,
+    Metallic,
+    Holdout,
+    Hair,
+    PrincipledHair,
+    RayPortal,
     VolumePrincipled,
     VolumeAbsorption,
     VolumeScatter,
@@ -1418,6 +1572,16 @@ impl NodeKind {
         Some(match node_type {
             "OutputMaterial" | "ShaderNodeOutputMaterial" => Self::OutputMaterial,
             "ShaderNodeBsdfPrincipled" => Self::Principled,
+            "ShaderNodeBsdfSheen" => Self::Sheen,
+            "ShaderNodeSubsurfaceScattering" => Self::Subsurface,
+            "ShaderNodeBsdfTranslucent" => Self::Translucent,
+            "ShaderNodeBsdfRefraction" => Self::Refraction,
+            "ShaderNodeBsdfToon" => Self::Toon,
+            "ShaderNodeBsdfMetallic" => Self::Metallic,
+            "ShaderNodeHoldout" => Self::Holdout,
+            "ShaderNodeBsdfHair" => Self::Hair,
+            "ShaderNodeBsdfHairPrincipled" => Self::PrincipledHair,
+            "ShaderNodeBsdfRayPortal" => Self::RayPortal,
             "ShaderNodeVolumePrincipled" => Self::VolumePrincipled,
             "ShaderNodeVolumeAbsorption" => Self::VolumeAbsorption,
             "ShaderNodeVolumeScatter" => Self::VolumeScatter,
@@ -2108,6 +2272,15 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             |links| links.primitive_nodes.contains(node_id),
         )
     }
+    /// The effective shading normal for BSDF nodes: an unlinked SVM Normal socket falls back to `sd->N`.
+    fn bsdf_normal(&mut self, node_id: &Id) -> Result<DVec3> {
+        let normal = if self.is_linked(node_id, "Normal") {
+            self.vector_input(node_id, &["Normal"], self.hit_ctx.normal)?
+        } else {
+            self.hit_ctx.normal
+        };
+        Ok(normalize_or(normal, self.hit_ctx.normal))
+    }
     /// The effective lobe tangent: explicit Tangent link, or Cycles' implicit Geometry Tangent.
     fn anisotropic_tangent(&mut self, id: &Id, active: bool) -> Result<Option<DVec3>> {
         if !active {
@@ -2176,6 +2349,40 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             .nodes
             .get(node_id)
             .ok_or_else(|| invalid(format!("shader graph references absent node `{node_id}`")))
+    }
+
+    fn enum_property<'a>(&'a self, id: &Id, property: &str) -> Result<Option<&'a str>> {
+        let node = self.node(id)?;
+        match node.properties.get(property) {
+            None => Ok(None),
+            Some(JsonValue::String(value)) => Ok(Some(value)),
+            Some(_) => Err(unsupported_node(
+                id,
+                &format!("{}.{}", node.node_type, property),
+            )),
+        }
+    }
+
+    fn require_cycles(&self, id: &Id, node_type: &str) -> Result<()> {
+        if self.hit_ctx.path_traced {
+            Ok(())
+        } else {
+            Err(unsupported_node(id, &format!("{node_type}.cycles_only")))
+        }
+    }
+
+    fn hair_tangent(&mut self, id: &Id, allow_socket: bool, node_type: &str) -> Result<DVec3> {
+        let tangent = if allow_socket && self.is_linked(id, "Tangent") {
+            self.vector_input(id, &["Tangent"], DVec3::ZERO)?
+        } else {
+            self.hit_ctx
+                .hair_tangent
+                .ok_or_else(|| unsupported_node(id, &format!("{node_type}.tangent_context")))?
+        };
+        if !tangent.is_finite() || tangent.length_squared() <= f64::EPSILON {
+            return Err(unsupported_node(id, &format!("{node_type}.tangent")));
+        }
+        Ok(tangent.normalize())
     }
     fn output_default(&self, node_id: &Id, socket: &str) -> Option<&JsonValue> {
         self.node(node_id)
@@ -2403,6 +2610,46 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             NodeKind::GroupInput => self.group_input(node_id, socket),
             NodeKind::Value => self.value(node_id, socket),
             NodeKind::Rgb => self.rgb(node_id, socket),
+            NodeKind::Sheen => {
+                let params = self.sheen(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Subsurface => {
+                let params = self.subsurface(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Translucent => {
+                let params = self.translucent(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Refraction => {
+                let params = self.refraction(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Toon => {
+                let params = self.toon(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Metallic => {
+                let params = self.metallic(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Holdout => {
+                let params = self.holdout();
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Hair => {
+                let params = self.hair(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::PrincipledHair => {
+                let params = self.principled_hair(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::RayPortal => {
+                let params = self.ray_portal(node_id)?;
+                Ok(self.closure_value(&params))
+            }
             NodeKind::CombineColor => self.combine_color(node_id, socket),
             NodeKind::SeparateColor => self.separate_color(node_id, socket),
             NodeKind::RgbToBw => self.rgb_to_bw(node_id, socket),
@@ -2616,10 +2863,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                 .try_into()
                 .map_err(|_| invalid("invalid emission color"))?;
         params.emission_strength = self.scalar_input(id, &["Emission Strength"], 0.0)?;
-        params.normal = normalize_or(
-            self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
-            self.hit_ctx.normal,
-        );
+        params.normal = self.bsdf_normal(id)?;
         // An unlinked socket has no vector (zero or non-finite), so the coat follows the final normal.
         let coat_normal = self.vector_input(id, &["Coat Normal"], DVec3::ZERO)?;
         params.coat_normal =
@@ -2975,10 +3219,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         params.base_color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.0)?;
         params.diffuse_roughness = params.roughness;
-        params.normal = normalize_or(
-            self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
-            self.hit_ctx.normal,
-        );
+        params.normal = self.bsdf_normal(id)?;
         Ok(params)
     }
 
@@ -3037,6 +3278,405 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         params.glass_reflection_tint = color;
         params.glass_transmission_tint = color;
         params.standalone_glass = true;
+        Ok(params)
+    }
+
+    fn sheen(&mut self, id: &Id) -> Result<BsdfParams> {
+        self.require_cycles(id, "ShaderNodeBsdfSheen")?;
+        let distribution = match self.enum_property(id, "distribution")? {
+            None | Some("MICROFIBER") => SheenDistribution::Microfiber,
+            Some("ASHIKHMIN") => SheenDistribution::Ashikhmin,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfSheen.distribution:{value}"),
+                ));
+            }
+        };
+        let color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
+        let mut params = self.closure_params();
+        params.model = BsdfModel::Sheen(distribution);
+        params.base_color = color;
+        params.metallic = 0.0;
+        params.roughness = self.scalar_input(id, &["Roughness"], 0.5)?;
+        params.sheen_roughness = params.roughness;
+        params.sheen_tint = [color[0], color[1], color[2]];
+        params.sheen_weight = 1.0;
+        params.specular_ior_level = 0.0;
+        params.normal = self.bsdf_normal(id)?;
+        Ok(params)
+    }
+
+    fn subsurface(&mut self, id: &Id) -> Result<BsdfParams> {
+        let method = match self.enum_property(id, "falloff")? {
+            None | Some("RANDOM_WALK") => SubsurfaceMethod::RandomWalk,
+            Some("BURLEY") => SubsurfaceMethod::Burley,
+            Some("RANDOM_WALK_SKIN") => SubsurfaceMethod::RandomWalkSkin,
+            Some("RANDOM_WALK_LEGACY") => SubsurfaceMethod::RandomWalkLegacy,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeSubsurfaceScattering.falloff:{value}"),
+                ));
+            }
+        };
+        let color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
+        let radius = self
+            .vector_input(id, &["Radius"], DVec3::new(1.0, 0.2, 0.1))?
+            .to_array();
+        let scale = self.scalar_input(id, &["Scale"], 0.005)?;
+        let roughness = if matches!(
+            method,
+            SubsurfaceMethod::RandomWalk | SubsurfaceMethod::RandomWalkLegacy
+        ) {
+            self.scalar_input(id, &["Roughness"], 1.0)?
+        } else {
+            1.0
+        };
+        let (ior, anisotropy) = if method == SubsurfaceMethod::Burley {
+            (1.4, 0.0)
+        } else {
+            (
+                self.scalar_input(id, &["IOR"], 1.4)?,
+                self.scalar_input(id, &["Anisotropy"], 0.0)?,
+            )
+        };
+        let mut params = self.closure_params();
+        params.model = BsdfModel::Subsurface;
+        params.base_color = color;
+        params.metallic = 0.0;
+        params.roughness = roughness;
+        params.ior = ior;
+        params.subsurface_weight = 1.0;
+        params.subsurface_radius = radius;
+        params.subsurface_scale = scale;
+        params.subsurface_ior = ior;
+        params.subsurface_anisotropy = anisotropy;
+        params.subsurface_method = method;
+        params.normal = self.bsdf_normal(id)?;
+        Ok(params)
+    }
+
+    fn translucent(&mut self, id: &Id) -> Result<BsdfParams> {
+        let mut params = self.closure_params();
+        params.model = BsdfModel::Translucent;
+        params.base_color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
+        params.metallic = 0.0;
+        params.transmission = 1.0;
+        params.normal = self.bsdf_normal(id)?;
+        Ok(params)
+    }
+
+    fn refraction(&mut self, id: &Id) -> Result<BsdfParams> {
+        let distribution = match self.enum_property(id, "distribution")? {
+            None | Some("BECKMANN") => MicrofacetDistribution::Beckmann,
+            Some("GGX") => MicrofacetDistribution::Ggx,
+            Some("MULTI_GGX") => {
+                return Err(unsupported_node(
+                    id,
+                    "ShaderNodeBsdfRefraction.distribution:MULTI_GGX",
+                ));
+            }
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfRefraction.distribution:{value}"),
+                ));
+            }
+        };
+        let color = self.color_input(id, &["Color"], [1.0, 1.0, 1.0, 1.0])?;
+        let mut params = self.closure_params();
+        params.model = BsdfModel::Refraction(distribution);
+        params.base_color = color;
+        params.metallic = 0.0;
+        params.roughness = self.scalar_input(id, &["Roughness"], 0.0)?;
+        params.ior = self.scalar_input(id, &["IOR"], 1.45)?;
+        params.transmission = 1.0;
+        params.glass_reflection_tint = [1.0; 3];
+        params.glass_transmission_tint = [color[0], color[1], color[2]];
+        params.normal = self.bsdf_normal(id)?;
+        Ok(params)
+    }
+
+    fn toon(&mut self, id: &Id) -> Result<BsdfParams> {
+        self.require_cycles(id, "ShaderNodeBsdfToon")?;
+        let component = match self.enum_property(id, "component")? {
+            None | Some("DIFFUSE") => ToonComponent::Diffuse,
+            Some("GLOSSY") => ToonComponent::Glossy,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfToon.component:{value}"),
+                ));
+            }
+        };
+        let mut params = self.closure_params();
+        params.model = BsdfModel::Toon(ToonParameters {
+            component,
+            size: self.scalar_input(id, &["Size"], 0.5)?,
+            smooth: self.scalar_input(id, &["Smooth"], 0.0)?,
+        });
+        params.base_color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
+        params.metallic = 0.0;
+        params.normal = self.bsdf_normal(id)?;
+        Ok(params)
+    }
+
+    fn metallic(&mut self, id: &Id) -> Result<BsdfParams> {
+        let distribution = match self.enum_property(id, "distribution")? {
+            None | Some("MULTI_GGX") => MicrofacetDistribution::MultiGgx,
+            Some("BECKMANN") => MicrofacetDistribution::Beckmann,
+            Some("GGX") => MicrofacetDistribution::Ggx,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfMetallic.distribution:{value}"),
+                ));
+            }
+        };
+        let fresnel = match self.enum_property(id, "fresnel_type")? {
+            None | Some("F82") => MetallicFresnel::F82,
+            Some("PHYSICAL_CONDUCTOR") => MetallicFresnel::PhysicalConductor,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfMetallic.fresnel_type:{value}"),
+                ));
+            }
+        };
+        let (base_color, edge_tint, conductor_ior, extinction) = match fresnel {
+            MetallicFresnel::F82 => {
+                let color = self.color_input(id, &["Base Color"], [0.617, 0.577, 0.540, 1.0])?;
+                let edge = self.color_input(id, &["Edge Tint"], [0.695, 0.726, 0.770, 1.0])?;
+                (
+                    color,
+                    [edge[0], edge[1], edge[2]],
+                    [2.757, 2.513, 2.231],
+                    [3.867, 3.404, 3.009],
+                )
+            }
+            MetallicFresnel::PhysicalConductor => (
+                [1.0; 4],
+                [0.695, 0.726, 0.770],
+                self.vector_input(id, &["IOR"], DVec3::new(2.757, 2.513, 2.231))?
+                    .to_array(),
+                self.vector_input(id, &["Extinction"], DVec3::new(3.867, 3.404, 3.009))?
+                    .to_array(),
+            ),
+        };
+        let anisotropy = self.scalar_input(id, &["Anisotropy"], 0.0)?;
+        let rotation = self.scalar_input(id, &["Rotation"], 0.0)?;
+        let tangent = self.anisotropic_tangent(id, anisotropy > 0.0)?;
+        let thin_film_thickness = self.scalar_input(id, &["Thin Film Thickness"], 0.0)?;
+        let thin_film_ior = self.scalar_input(id, &["Thin Film IOR"], 1.33)?;
+        let mut params = self.closure_params();
+        params.model = BsdfModel::Metallic(MetallicParameters {
+            distribution,
+            fresnel,
+            edge_tint,
+            conductor_ior,
+            extinction,
+        });
+        params.base_color = base_color;
+        params.metallic = 1.0;
+        params.roughness = self.scalar_input(id, &["Roughness"], 0.5)?;
+        params.anisotropy = anisotropy;
+        params.anisotropy_model = AnisotropyModel::Glossy;
+        params.anisotropic_rotation = rotation;
+        params.anisotropic_tangent = tangent;
+        params.thin_film_thickness = thin_film_thickness;
+        params.thin_film_ior = thin_film_ior;
+        params.normal = self.bsdf_normal(id)?;
+        Ok(params)
+    }
+
+    fn holdout(&self) -> BsdfParams {
+        let mut params = self.closure_params();
+        params.model = BsdfModel::Holdout;
+        params.alpha = 0.0;
+        params.reflectance = 0.0;
+        params
+    }
+
+    fn hair(&mut self, id: &Id) -> Result<BsdfParams> {
+        self.require_cycles(id, "ShaderNodeBsdfHair")?;
+        let component = match self.enum_property(id, "component")? {
+            None | Some("Reflection") => HairComponent::Reflection,
+            Some("Transmission") => HairComponent::Transmission,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfHair.component:{value}"),
+                ));
+            }
+        };
+        let tangent = self.hair_tangent(id, true, "ShaderNodeBsdfHair")?;
+        let color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
+        let offset = self.scalar_input(id, &["Offset"], 0.0)?;
+        let roughness_u = self.scalar_input(id, &["RoughnessU"], 0.1)?;
+        let roughness_v = self.scalar_input(id, &["RoughnessV"], 1.0)?;
+        let mut params = self.closure_params();
+        params.model = BsdfModel::Hair(HairParameters {
+            component,
+            offset,
+            roughness_u,
+            roughness_v,
+            tangent,
+        });
+        params.base_color = color;
+        params.metallic = 0.0;
+        params.roughness = roughness_u;
+        params.anisotropic_tangent = Some(tangent);
+        Ok(params)
+    }
+
+    fn principled_hair(&mut self, id: &Id) -> Result<BsdfParams> {
+        self.require_cycles(id, "ShaderNodeBsdfHairPrincipled")?;
+        let model = match self.enum_property(id, "model")? {
+            None | Some("CHIANG") => HairScatteringModel::Chiang,
+            Some("HUANG") => HairScatteringModel::Huang,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfHairPrincipled.model:{value}"),
+                ));
+            }
+        };
+        let parametrization = match self.enum_property(id, "parametrization")? {
+            None | Some("COLOR") => HairParametrization::Reflectance,
+            Some("MELANIN") => HairParametrization::MelaninConcentration,
+            Some("ABSORPTION") => HairParametrization::DirectAbsorption,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfHairPrincipled.parametrization:{value}"),
+                ));
+            }
+        };
+        let tangent = self.hair_tangent(id, false, "ShaderNodeBsdfHairPrincipled")?;
+        let default_color = [0.017_513, 0.005_763, 0.002_059, 1.0];
+        let color = if parametrization == HairParametrization::Reflectance {
+            self.color_input(id, &["Color"], default_color)?
+        } else {
+            default_color
+        };
+        let (melanin, melanin_redness, tint, random_color) =
+            if parametrization == HairParametrization::MelaninConcentration {
+                let tint = self.color_input(id, &["Tint"], [1.0; 4])?;
+                (
+                    self.scalar_input(id, &["Melanin"], 0.8)?,
+                    self.scalar_input(id, &["Melanin Redness"], 1.0)?,
+                    [tint[0], tint[1], tint[2]],
+                    self.scalar_input(id, &["Random Color"], 0.0)?,
+                )
+            } else {
+                (0.8, 1.0, [1.0; 3], 0.0)
+            };
+        let absorption_coefficient = if parametrization == HairParametrization::DirectAbsorption {
+            self.vector_input(
+                id,
+                &["Absorption Coefficient"],
+                DVec3::new(0.245_531, 0.52, 1.365),
+            )?
+            .to_array()
+        } else {
+            [0.245_531, 0.52, 1.365]
+        };
+        let aspect_ratio = if model == HairScatteringModel::Huang {
+            self.scalar_input(id, &["Aspect Ratio"], 0.85)?
+        } else {
+            0.85
+        };
+        let roughness = self.scalar_input(id, &["Roughness"], 0.3)?;
+        let (radial_roughness, coat) = if model == HairScatteringModel::Chiang {
+            (
+                self.scalar_input(id, &["Radial Roughness"], 0.3)?,
+                self.scalar_input(id, &["Coat"], 0.0)?,
+            )
+        } else {
+            (0.3, 0.0)
+        };
+        let ior = self.scalar_input(id, &["IOR"], 1.55)?;
+        let offset = self.scalar_input(
+            id,
+            &["Offset"],
+            f64::from(2.0_f32 * std::f32::consts::PI / 180.0_f32),
+        )?;
+        let random_roughness = self.scalar_input(id, &["Random Roughness"], 0.0)?;
+        let random = if self.is_linked(id, "Random") {
+            self.scalar_input(id, &["Random"], self.hit_ctx.hair_random.unwrap_or(0.0))?
+        } else {
+            self.hit_ctx.hair_random.unwrap_or(0.0)
+        };
+        let (reflection, transmission, secondary_reflection) =
+            if model == HairScatteringModel::Huang {
+                (
+                    self.scalar_input(id, &["Reflection"], 1.0)?,
+                    self.scalar_input(id, &["Transmission"], 1.0)?,
+                    self.scalar_input(id, &["Secondary Reflection"], 1.0)?,
+                )
+            } else {
+                (1.0, 1.0, 1.0)
+            };
+        let hair_normal = if model == HairScatteringModel::Huang {
+            let normal = self.hit_ctx.hair_normal.ok_or_else(|| {
+                unsupported_node(id, "ShaderNodeBsdfHairPrincipled.strand_normal_context")
+            })?;
+            if !normal.is_finite() || normal.length_squared() <= f64::EPSILON {
+                return Err(unsupported_node(
+                    id,
+                    "ShaderNodeBsdfHairPrincipled.strand_normal",
+                ));
+            }
+            Some(normal.normalize())
+        } else {
+            None
+        };
+        let mut params = self.closure_params();
+        params.model = BsdfModel::PrincipledHair(PrincipledHairParameters {
+            model,
+            parametrization,
+            melanin,
+            melanin_redness,
+            tint,
+            absorption_coefficient,
+            aspect_ratio,
+            roughness,
+            radial_roughness,
+            coat,
+            ior,
+            offset,
+            random_color,
+            random_roughness,
+            random,
+            reflection,
+            transmission,
+            secondary_reflection,
+        });
+        params.hair_normal = hair_normal;
+        params.base_color = color;
+        params.metallic = 0.0;
+        params.roughness = roughness;
+        params.ior = ior;
+        params.anisotropic_tangent = Some(tangent);
+        Ok(params)
+    }
+
+    fn ray_portal(&mut self, id: &Id) -> Result<BsdfParams> {
+        self.require_cycles(id, "ShaderNodeBsdfRayPortal")?;
+        let color = self.color_input(id, &["Color"], [1.0, 1.0, 1.0, 1.0])?;
+        let position = if self.is_linked(id, "Position") {
+            self.vector_input(id, &["Position"], self.hit_ctx.position)?
+        } else {
+            self.hit_ctx.position
+        };
+        let direction = self.vector_input(id, &["Direction"], DVec3::ZERO)?;
+        let mut params = self.closure_params();
+        params.model = BsdfModel::RayPortal(RayPortalParameters {
+            position,
+            direction,
+        });
+        params.base_color = color;
         Ok(params)
     }
 
@@ -5468,6 +6108,13 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                 socket,
             ));
         }
+        if self.hit_ctx.hair_curve_hit && matches!(socket, "Generated" | "UV") {
+            let feature = match socket {
+                "Generated" => "ShaderNodeTexCoord.Generated.hair_curve_texture_space",
+                _ => "ShaderNodeTexCoord.UV.hair_curve_uv",
+            };
+            return Err(unsupported_node(id, feature));
+        }
         let value = match socket {
             "Generated" => self.hit_ctx.generated,
             "UV" => {
@@ -5522,6 +6169,9 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     fn uv_map(&self, id: &Id, socket: &str) -> Result<Value> {
         if socket != "UV" {
             return Err(invalid(format!("unknown UV Map output `{socket}`")));
+        }
+        if self.hit_ctx.hair_curve_hit {
+            return Err(unsupported_node(id, "ShaderNodeUVMap.hair_curve_uv"));
         }
         let node = self.node(id)?;
         if node
@@ -6025,6 +6675,12 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                 }),
             ));
         }
+        if self.hit_ctx.hair_curve_hit {
+            return Err(unsupported_node(
+                id,
+                "ShaderNodeAttribute.hair_curve_attribute_interpolation",
+            ));
+        }
         let name = node
             .properties
             .get("attribute_name")
@@ -6060,6 +6716,12 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
 
     /// `ShaderNodeVertexColor`: the named color layer, or the render layer when the name is empty.
     fn vertex_color(&self, id: &Id, socket: &str) -> Result<Value> {
+        if self.hit_ctx.hair_curve_hit {
+            return Err(unsupported_node(
+                id,
+                "ShaderNodeVertexColor.hair_curve_color_layers",
+            ));
+        }
         let node = self.node(id)?;
         let name = node
             .properties
@@ -6342,10 +7004,10 @@ fn collect_linked_alpha_images(
 }
 
 /// Whether EEVEE compiles the graph as transparent, `GPU_MATFLAG_TRANSPARENT`, which is set statically per node:
-/// a Transparent BSDF whose Color is linked or not black (`node_shader_bsdf_transparent.cc:30`), and a Principled
-/// whose Alpha is linked or not one (`node_shader_bsdf_principled.cc:400`). Only the nodes that feed the output count.
-/// Specular and Ray Portal set the same flag in Blender, but Potter's evaluator rejects both node types, so a material
-/// with one never evaluates and needs no rule.
+/// a Transparent BSDF whose Color is linked or not black (`node_shader_bsdf_transparent.cc:30`), a Principled
+/// whose Alpha is linked or not one (`node_shader_bsdf_principled.cc:400`), and a Ray Portal whose Color is linked
+/// or not black (`node_shader_bsdf_ray_portal.cc:29`). Only nodes feeding the output count. Specular also sets the
+/// flag in Blender but remains unsupported by the evaluator.
 fn graph_is_transparent(
     graph_id: &Id,
     group: &NodeGroup,
@@ -6389,6 +7051,13 @@ fn graph_is_transparent_output(
                         .inputs
                         .get("Alpha")
                         .is_some_and(|value| number(value, 1.0).total_cmp(&1.0).is_ne())
+            }
+            "ShaderNodeBsdfRayPortal" => {
+                linked(id, "Color")
+                    || node
+                        .inputs
+                        .get("Color")
+                        .is_none_or(|value| color(value, [1.0; 4])[..3].iter().any(|c| *c != 0.0))
             }
             _ => false,
         }
@@ -7331,10 +8000,12 @@ mod tests {
     };
 
     use super::{
-        BsdfParams, Evaluator, EvaluatorWorkspace, GeometryAttribute, GeometryAttributeValues,
-        HitContext, HitDifferentials, HitUvLayers, PreparedMaterial, SurfaceShading,
-        Value as ShaderValue, color_lerp, evaluate_displacement, evaluate_surface, layer_index,
-        layer_uv,
+        BsdfModel, BsdfParams, Evaluator, EvaluatorWorkspace, GeometryAttribute,
+        GeometryAttributeValues, HairComponent, HairParametrization, HairScatteringModel,
+        HitContext, HitDifferentials, HitUvLayers, MetallicFresnel, MicrofacetDistribution,
+        PreparedMaterial, PrincipledHairParameters, SheenDistribution, SubsurfaceMethod,
+        SurfaceShading, ToonComponent, Value as ShaderValue, color_lerp, evaluate_displacement,
+        evaluate_surface, layer_index, layer_uv,
     };
     fn set_properties(group: &mut NodeGroup, id: &str, properties: Value) {
         let Value::Object(properties) = properties else {
@@ -7790,6 +8461,460 @@ mod tests {
             to_node: Id::new(to.to_owned()).unwrap(),
             to_socket: input.to_owned(),
         });
+    }
+
+    fn evaluate_bsdf_node(
+        node_type: &str,
+        inputs: Value,
+        properties: Value,
+        path_traced: bool,
+        hair_context: Option<(DVec3, Option<DVec3>, Option<f64>)>,
+    ) -> crate::error::Result<BsdfParams> {
+        let mut graph = NodeGroup::new("Standalone BSDF", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(&mut graph, "bsdf", node_type, inputs);
+        set_properties(&mut graph, "bsdf", properties);
+        let output_socket = match node_type {
+            "ShaderNodeSubsurfaceScattering" => "BSSRDF",
+            "ShaderNodeHoldout" => "Holdout",
+            _ => "BSDF",
+        };
+        link(&mut graph, "bsdf", output_socket, "output", "Surface");
+        let graph_id = Id::new("standalone_bsdf_graph".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        let mut context = HitContext::new(&groups);
+        context.path_traced = path_traced;
+        context.position = DVec3::new(3.0, 4.0, 5.0);
+        if let Some((tangent, normal, random)) = hair_context {
+            context = context.with_hair_context(tangent, normal, random);
+        }
+        let shading = evaluate_surface(&material, &context)?;
+        Ok(shading.closures[0].params)
+    }
+
+    #[test]
+    fn standalone_sheen_subsurface_and_toon_read_exact_socket_values() {
+        let sheen = evaluate_bsdf_node(
+            "ShaderNodeBsdfSheen",
+            json!({"Color":[0.2,0.3,0.4,1.0],"Roughness":0.65,"Normal":[0.0,1.0,0.0]}),
+            json!({"distribution":"ASHIKHMIN"}),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(sheen.model, BsdfModel::Sheen(SheenDistribution::Ashikhmin));
+        assert_eq!(sheen.base_color, [0.2, 0.3, 0.4, 1.0]);
+        assert_eq!(sheen.sheen_tint, [0.2, 0.3, 0.4]);
+        assert_eq!(sheen.sheen_weight, 1.0);
+        assert_eq!(sheen.sheen_roughness, 0.65);
+        assert_eq!(sheen.specular_ior_level, 0.0);
+        assert_eq!(sheen.normal, DVec3::Z);
+
+        let toon = evaluate_bsdf_node(
+            "ShaderNodeBsdfToon",
+            json!({"Color":[0.4,0.3,0.2,1.0],"Size":0.7,"Smooth":0.15}),
+            json!({"component":"GLOSSY"}),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            toon.model,
+            BsdfModel::Toon(super::ToonParameters {
+                component: ToonComponent::Glossy,
+                size: 0.7,
+                smooth: 0.15,
+            })
+        );
+        assert_eq!(toon.base_color, [0.4, 0.3, 0.2, 1.0]);
+
+        for (falloff, method) in [
+            ("BURLEY", SubsurfaceMethod::Burley),
+            ("RANDOM_WALK", SubsurfaceMethod::RandomWalk),
+            ("RANDOM_WALK_SKIN", SubsurfaceMethod::RandomWalkSkin),
+            ("RANDOM_WALK_LEGACY", SubsurfaceMethod::RandomWalkLegacy),
+        ] {
+            let params = evaluate_bsdf_node(
+                "ShaderNodeSubsurfaceScattering",
+                json!({
+                    "Color":[0.6,0.5,0.4,1.0],
+                    "Scale":0.025,
+                    "Radius":[0.5,0.3,0.2],
+                    "IOR":1.7,
+                    "Roughness":0.45,
+                    "Anisotropy":0.6,
+                    "Normal":[0.0,0.0,1.0]
+                }),
+                json!({"falloff":falloff}),
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(params.model, BsdfModel::Subsurface);
+            assert_eq!(params.base_color, [0.6, 0.5, 0.4, 1.0]);
+            assert_eq!(params.subsurface_weight, 1.0);
+            assert_eq!(params.subsurface_radius, [0.5, 0.3, 0.2]);
+            assert_eq!(params.subsurface_scale, 0.025);
+            assert_eq!(params.subsurface_method, method);
+            assert_eq!(params.normal, DVec3::Z);
+            assert_eq!(
+                params.ior,
+                if method == SubsurfaceMethod::Burley {
+                    1.4
+                } else {
+                    1.7
+                }
+            );
+            assert_eq!(
+                params.roughness,
+                if matches!(
+                    method,
+                    SubsurfaceMethod::RandomWalk | SubsurfaceMethod::RandomWalkLegacy
+                ) {
+                    0.45
+                } else {
+                    1.0
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_metallic_uses_fresnel_specific_sockets_and_exact_defaults() {
+        let f82 = evaluate_bsdf_node(
+            "ShaderNodeBsdfMetallic",
+            json!({
+                "Base Color":[0.1,0.2,0.3,1.0],
+                "Edge Tint":[0.4,0.5,0.6,1.0],
+                "Roughness":0.3,
+                "Anisotropy":0.0,
+                "Rotation":0.5,
+                "Thin Film Thickness":0.0,
+                "Thin Film IOR":1.4
+            }),
+            json!({"distribution":"GGX","fresnel_type":"F82"}),
+            false,
+            None,
+        )
+        .unwrap();
+        let BsdfModel::Metallic(f82_parameters) = f82.model else {
+            panic!("metallic node must preserve the metallic model")
+        };
+        assert_eq!(f82_parameters.distribution, MicrofacetDistribution::Ggx);
+        assert_eq!(f82_parameters.fresnel, MetallicFresnel::F82);
+        assert_eq!(f82_parameters.edge_tint, [0.4, 0.5, 0.6]);
+        assert_eq!(f82_parameters.conductor_ior, [2.757, 2.513, 2.231]);
+        assert_eq!(f82_parameters.extinction, [3.867, 3.404, 3.009]);
+        assert_eq!(f82.base_color, [0.1, 0.2, 0.3, 1.0]);
+        assert_eq!(f82.metallic, 1.0);
+        assert_eq!(f82.roughness, 0.3);
+        assert_eq!(f82.anisotropy, 0.0);
+        assert_eq!(f82.anisotropic_rotation, 0.5);
+        assert_eq!(f82.thin_film_ior, 1.4);
+
+        let physical = evaluate_bsdf_node(
+            "ShaderNodeBsdfMetallic",
+            json!({
+                "Base Color":[0.0,0.0,0.0,1.0],
+                "Edge Tint":[0.0,0.0,0.0,1.0],
+                "IOR":[1.0,1.2,1.4],
+                "Extinction":[2.0,2.2,2.4]
+            }),
+            json!({"fresnel_type":"PHYSICAL_CONDUCTOR"}),
+            false,
+            None,
+        )
+        .unwrap();
+        let BsdfModel::Metallic(physical_parameters) = physical.model else {
+            panic!("physical conductor node must preserve the metallic model")
+        };
+        assert_eq!(
+            physical_parameters.fresnel,
+            MetallicFresnel::PhysicalConductor
+        );
+        assert_eq!(physical_parameters.conductor_ior, [1.0, 1.2, 1.4]);
+        assert_eq!(physical_parameters.extinction, [2.0, 2.2, 2.4]);
+        assert_eq!(physical_parameters.edge_tint, [0.695, 0.726, 0.770]);
+        assert_eq!(physical.base_color, [1.0; 4]);
+    }
+
+    #[test]
+    fn hair_context_and_engine_refusals_are_explicit() {
+        let cycles_error =
+            evaluate_bsdf_node("ShaderNodeBsdfSheen", json!({}), json!({}), false, None)
+                .unwrap_err();
+        assert_eq!(cycles_error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            cycles_error.details["feature_id"],
+            json!("shader.node.ShaderNodeBsdfSheen.cycles_only")
+        );
+
+        for node_type in [
+            "ShaderNodeBsdfToon",
+            "ShaderNodeBsdfHair",
+            "ShaderNodeBsdfHairPrincipled",
+            "ShaderNodeBsdfRayPortal",
+        ] {
+            let error =
+                evaluate_bsdf_node(node_type, json!({}), json!({}), false, None).unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+            assert_eq!(
+                error.details["feature_id"],
+                json!(format!("shader.node.{node_type}.cycles_only"))
+            );
+        }
+
+        let tangent_error =
+            evaluate_bsdf_node("ShaderNodeBsdfHair", json!({}), json!({}), true, None).unwrap_err();
+        assert_eq!(tangent_error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            tangent_error.details["feature_id"],
+            json!("shader.node.ShaderNodeBsdfHair.tangent_context")
+        );
+
+        let hair = evaluate_bsdf_node(
+            "ShaderNodeBsdfHair",
+            json!({
+                "Color":[0.2,0.3,0.4,1.0],
+                "Offset":0.1,
+                "RoughnessU":0.25,
+                "RoughnessV":0.75
+            }),
+            json!({"component":"Transmission"}),
+            true,
+            Some((DVec3::X, None, None)),
+        )
+        .unwrap();
+        let BsdfModel::Hair(hair_parameters) = hair.model else {
+            panic!("classic hair node must preserve the hair model")
+        };
+        assert_eq!(hair_parameters.component, HairComponent::Transmission);
+        assert_eq!(hair_parameters.tangent, DVec3::X);
+        assert_eq!(hair_parameters.offset, 0.1);
+        assert_eq!(hair_parameters.roughness_u, 0.25);
+        assert_eq!(hair_parameters.roughness_v, 0.75);
+
+        let principled = evaluate_bsdf_node(
+            "ShaderNodeBsdfHairPrincipled",
+            json!({
+                "Melanin":0.7,
+                "Melanin Redness":0.3,
+                "Tint":[0.1,0.2,0.3,1.0],
+                "Aspect Ratio":0.65,
+                "Roughness":0.2,
+                "Radial Roughness":0.4,
+                "Coat":0.1,
+                "IOR":1.6,
+                "Offset":0.05,
+                "Random Color":0.15,
+                "Random Roughness":0.25,
+                "Reflection":0.6,
+                "Transmission":0.7,
+                "Secondary Reflection":0.8
+            }),
+            json!({
+                "model":"HUANG",
+                "parametrization":"MELANIN"
+            }),
+            true,
+            Some((DVec3::X, Some(DVec3::Z), Some(0.35))),
+        )
+        .unwrap();
+        let BsdfModel::PrincipledHair(PrincipledHairParameters {
+            model,
+            parametrization,
+            melanin,
+            melanin_redness,
+            tint,
+            aspect_ratio,
+            random,
+            reflection,
+            transmission,
+            secondary_reflection,
+            ..
+        }) = principled.model
+        else {
+            panic!("principled hair node must preserve its model")
+        };
+        assert_eq!(model, HairScatteringModel::Huang);
+        assert_eq!(parametrization, HairParametrization::MelaninConcentration);
+        assert_eq!(melanin, 0.7);
+        assert_eq!(melanin_redness, 0.3);
+        assert_eq!(tint, [0.1, 0.2, 0.3]);
+        assert_eq!(aspect_ratio, 0.65);
+        assert_eq!(random, 0.35);
+        assert_eq!(reflection, 0.6);
+        assert_eq!(transmission, 0.7);
+        assert_eq!(secondary_reflection, 0.8);
+        assert_eq!(principled.hair_normal, Some(DVec3::Z));
+        assert_eq!(principled.anisotropic_tangent, Some(DVec3::X));
+
+        let missing_normal = evaluate_bsdf_node(
+            "ShaderNodeBsdfHairPrincipled",
+            json!({}),
+            json!({"model":"HUANG"}),
+            true,
+            Some((DVec3::X, None, None)),
+        )
+        .unwrap_err();
+        assert_eq!(missing_normal.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            missing_normal.details["feature_id"],
+            json!("shader.node.ShaderNodeBsdfHairPrincipled.strand_normal_context")
+        );
+    }
+
+    #[test]
+    fn unlinked_bsdf_normal_uses_the_hit_normal_not_saved_socket_default() {
+        let params = evaluate_bsdf_node(
+            "ShaderNodeBsdfSheen",
+            json!({
+                "Color":[0.72,0.31,0.12,1.0],
+                "Roughness":0.43,
+                "Normal":[0.06,0.02,0.998]
+            }),
+            json!({"distribution":"ASHIKHMIN"}),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params.normal, DVec3::Z);
+    }
+
+    #[test]
+    fn standalone_unknown_enums_and_unsupported_distribution_refuse() {
+        for (node_type, properties, feature) in [
+            (
+                "ShaderNodeBsdfSheen",
+                json!({"distribution":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfSheen.distribution:UNKNOWN",
+            ),
+            (
+                "ShaderNodeSubsurfaceScattering",
+                json!({"falloff":"UNKNOWN"}),
+                "shader.node.ShaderNodeSubsurfaceScattering.falloff:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfToon",
+                json!({"component":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfToon.component:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfMetallic",
+                json!({"distribution":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfMetallic.distribution:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfMetallic",
+                json!({"fresnel_type":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfMetallic.fresnel_type:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfHair",
+                json!({"component":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfHair.component:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfHairPrincipled",
+                json!({"model":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfHairPrincipled.model:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfHairPrincipled",
+                json!({"parametrization":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfHairPrincipled.parametrization:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfRefraction",
+                json!({"distribution":"MULTI_GGX"}),
+                "shader.node.ShaderNodeBsdfRefraction.distribution:MULTI_GGX",
+            ),
+        ] {
+            let path_traced = matches!(
+                node_type,
+                "ShaderNodeBsdfSheen"
+                    | "ShaderNodeBsdfToon"
+                    | "ShaderNodeBsdfHair"
+                    | "ShaderNodeBsdfHairPrincipled"
+            );
+            let error = evaluate_bsdf_node(node_type, json!({}), properties, path_traced, None)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+            assert_eq!(error.details["feature_id"], json!(feature));
+        }
+
+        let portal = evaluate_bsdf_node(
+            "ShaderNodeBsdfRayPortal",
+            json!({"Color":[0.3,0.4,0.5,1.0],"Position":[9.0,8.0,7.0]}),
+            json!({}),
+            true,
+            None,
+        )
+        .unwrap();
+        let BsdfModel::RayPortal(portal_parameters) = portal.model else {
+            panic!("ray portal node must preserve the portal model")
+        };
+        assert_eq!(portal_parameters.position, DVec3::new(3.0, 4.0, 5.0));
+        assert_eq!(portal_parameters.direction, DVec3::ZERO);
+        assert_eq!(portal.base_color, [0.3, 0.4, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn standalone_refraction_translucent_and_holdout_keep_distinct_models() {
+        let refraction = evaluate_bsdf_node(
+            "ShaderNodeBsdfRefraction",
+            json!({"Color":[0.7,0.6,0.5,1.0],"IOR":1.6,"Roughness":0.2}),
+            json!({"distribution":"GGX"}),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            refraction.model,
+            BsdfModel::Refraction(MicrofacetDistribution::Ggx)
+        );
+        assert_eq!(refraction.base_color, [0.7, 0.6, 0.5, 1.0]);
+        assert_eq!(refraction.ior, 1.6);
+        assert_eq!(refraction.roughness, 0.2);
+        assert_eq!(refraction.transmission, 1.0);
+        assert_eq!(refraction.glass_transmission_tint, [0.7, 0.6, 0.5]);
+
+        let translucent = evaluate_bsdf_node(
+            "ShaderNodeBsdfTranslucent",
+            json!({"Color":[0.2,0.4,0.6,1.0],"Normal":[1.0,0.0,0.0]}),
+            json!({}),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(translucent.model, BsdfModel::Translucent);
+        assert_eq!(translucent.base_color, [0.2, 0.4, 0.6, 1.0]);
+        assert_eq!(translucent.transmission, 1.0);
+        assert_eq!(translucent.normal, DVec3::Z);
+
+        let holdout =
+            evaluate_bsdf_node("ShaderNodeHoldout", json!({}), json!({}), false, None).unwrap();
+        assert_eq!(holdout.model, BsdfModel::Holdout);
+        assert_eq!(holdout.alpha, 0.0);
+    }
+
+    #[test]
+    fn metallic_active_thin_film_is_preserved() {
+        let params = evaluate_bsdf_node(
+            "ShaderNodeBsdfMetallic",
+            json!({"Thin Film Thickness":0.2,"Thin Film IOR":1.4}),
+            json!({}),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params.thin_film_thickness, 0.2);
+        assert_eq!(params.thin_film_ior, 1.4);
     }
 
     /// A graph whose Principled BSDF feeds the output with the given inputs.
@@ -8256,9 +9381,23 @@ mod tests {
                 "Normal":[0.0,0.0,1.0],"Coat Weight":0.2
             }),
         );
+        insert_node(
+            &mut graph,
+            "first_normal",
+            "ShaderNodeCombineXYZ",
+            json!({"X":1.0,"Y":0.0,"Z":0.0}),
+        );
+        insert_node(
+            &mut graph,
+            "second_normal",
+            "ShaderNodeCombineXYZ",
+            json!({"X":0.0,"Y":0.0,"Z":1.0}),
+        );
         insert_node(&mut graph, "combine", combiner, inputs);
         link(&mut graph, "first", "BSDF", "combine", "Shader");
         link(&mut graph, "second", "BSDF", "combine", "Shader_001");
+        link(&mut graph, "first_normal", "Vector", "first", "Normal");
+        link(&mut graph, "second_normal", "Vector", "second", "Normal");
         link(&mut graph, "combine", "Shader", "output", "Surface");
         let graph_id = Id::new("surface_shader".to_owned()).unwrap();
         let mut groups = Registry::new();
@@ -9278,6 +10417,59 @@ mod tests {
                     .message
                     .contains("shifted normal/view derivatives are unavailable")
             );
+        }
+    }
+
+    #[test]
+    fn hair_curve_hit_refuses_unavailable_mesh_shader_inputs() {
+        let mut graph = NodeGroup::new("Hair hit context", GraphKind::Shader);
+        insert_node(&mut graph, "coordinates", "ShaderNodeTexCoord", json!({}));
+        insert_node(&mut graph, "uv_map", "ShaderNodeUVMap", json!({}));
+        insert_node(&mut graph, "attribute", "ShaderNodeAttribute", json!({}));
+        insert_node(
+            &mut graph,
+            "vertex_color",
+            "ShaderNodeVertexColor",
+            json!({}),
+        );
+        let graph_id = Id::new("hair_hit_context".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let mut context = HitContext::new(&groups);
+        context.hair_curve_hit = true;
+        for (node_id, socket, feature) in [
+            (
+                "coordinates",
+                "Generated",
+                "shader.node.ShaderNodeTexCoord.Generated.hair_curve_texture_space",
+            ),
+            (
+                "coordinates",
+                "UV",
+                "shader.node.ShaderNodeTexCoord.UV.hair_curve_uv",
+            ),
+            ("uv_map", "UV", "shader.node.ShaderNodeUVMap.hair_curve_uv"),
+            (
+                "attribute",
+                "Color",
+                "shader.node.ShaderNodeAttribute.hair_curve_attribute_interpolation",
+            ),
+            (
+                "vertex_color",
+                "Color",
+                "shader.node.ShaderNodeVertexColor.hair_curve_color_layers",
+            ),
+        ] {
+            let error = evaluate_input_node_output(
+                &groups,
+                &graph_id,
+                &Id::new(node_id.to_owned()).unwrap(),
+                socket,
+                &context,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+            assert_eq!(error.details["feature_id"], json!(feature));
         }
     }
 

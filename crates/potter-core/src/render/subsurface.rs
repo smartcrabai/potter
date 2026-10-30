@@ -27,6 +27,7 @@ const TRUNCATE_CDF: f64 = 0.996_379_009_370_832_8;
 /// other closure, emission or transparency. The exit keeps the entry's normal and geometry only.
 pub(crate) fn exit_params(params: &BsdfParams) -> BsdfParams {
     BsdfParams {
+        model: crate::shader::BsdfModel::Principled,
         base_color: [1.0; 4],
         metallic: 0.0,
         transmission: 0.0,
@@ -237,7 +238,21 @@ impl<T: Copy> ProbeHits<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Material;
     use crate::shader::SubsurfaceMethod;
+
+    #[test]
+    fn bssrdf_exit_uses_the_diffuse_closure_model() {
+        let entry = BsdfParams {
+            model: crate::shader::BsdfModel::Subsurface,
+            subsurface_weight: 1.0,
+            ..BsdfParams::from_material(&Material::default(), DVec3::Z)
+        };
+        let exit = exit_params(&entry);
+        assert_eq!(exit.model, crate::shader::BsdfModel::Principled);
+        assert_eq!(exit.base_color, [1.0; 4]);
+        assert_eq!(exit.subsurface_weight, 0.0);
+    }
 
     /// Simpson's rule over `[a, b]`.
     fn simpson(a: f64, b: f64, n: usize, f: impl Fn(f64) -> f64) -> f64 {

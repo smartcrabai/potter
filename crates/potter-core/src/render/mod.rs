@@ -1,10 +1,14 @@
 pub mod raster;
 
 mod bvh;
+mod eevee_advanced_bsdf;
 mod eevee_ltc;
 mod eevee_transmission;
 mod eevee_transmission_tables;
 mod eevee_volume_resolve;
+mod hair_bsdf;
+mod hair_geometry;
+mod hair_intersect;
 mod light_model;
 mod path;
 mod pick;

@@ -287,7 +287,7 @@ fn sample_hg(direction: DVec3, g: f64, u: f64, v: f64) -> (DVec3, f64) {
 fn sample_channel(albedo: DVec3, throughput: DVec3, u: f64) -> (usize, DVec3) {
     let weights = (throughput * albedo).abs();
     let sum = weights.element_sum();
-    let pdf = if sum > 0.0 {
+    let pdf = if (1.0 - sum) < 1.0 {
         weights / sum
     } else {
         DVec3::splat(1.0 / 3.0)

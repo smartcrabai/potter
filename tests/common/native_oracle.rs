@@ -30,6 +30,7 @@ const BUILD_SCRIPT: &str = include_str!("../fixtures/native_oracle/build_oracle.
 const DUMP_SCRIPT: &str = include_str!("../fixtures/native_oracle/dump_blend.py");
 const RENDER_SCRIPT: &str = include_str!("../fixtures/native_oracle/render_texture.py");
 
+#[must_use]
 pub fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
 }
@@ -100,6 +101,7 @@ pub fn losses(report: &Value) -> Vec<&Value> {
 }
 
 /// The feature ids of the losses in `report`.
+#[must_use]
 pub fn loss_features(report: &Value) -> Vec<String> {
     losses(report)
         .into_iter()
@@ -328,6 +330,7 @@ fn stored_corner(value: &Value) -> TestResult<StoredCorner> {
 
 /// Whether `mesh` holds allocated `normal_code` values. A missing `custom_normal` object, or one
 /// that keeps only basis metadata (`domain`, `type`, `corner_order`), means no allocated layer.
+#[must_use]
 pub fn has_normal_code_values(mesh: &Value) -> bool {
     !mesh["attributes"]["custom_normal"]["values"].is_null()
 }
@@ -499,12 +502,14 @@ pub fn assert_floats(actual: &[f64], expected: &[f64], tolerance: f64, label: &s
 /// samples used here decode to f32 values in [0.5, 1) for the upper half of the byte range, where
 /// one ulp is 2^-24 (about 6e-8); the sRGB encode has slope about 0.6 there, so one ulp of linear
 /// storage moves the encoded value by about 0.3 ulp of the encoded value.
+#[must_use]
 pub fn f32_ulp_tolerance(value: f64, ulps: f64) -> f64 {
     let magnitude = value.abs().max(f64::from(f32::MIN_POSITIVE));
     ulps * f64::from(f32::EPSILON) * magnitude.log2().floor().exp2()
 }
 
 /// Whether two unit-length-ish vectors agree within `tolerance` in every component.
+#[must_use]
 pub fn vectors_close(actual: [f64; 3], expected: [f64; 3], tolerance: f64) -> bool {
     (0..3).all(|axis| (actual[axis] - expected[axis]).abs() <= tolerance)
 }
@@ -517,11 +522,13 @@ pub fn assert_rgba(actual: [f64; 4], expected: [f64; 4], tolerance: f64, label: 
 }
 
 /// The expected JSON's `oracle` section.
+#[must_use]
 pub fn oracle_section(expected: &Value) -> &Value {
     &expected["oracle"]
 }
 
 /// Face loop indices (`loop_start + k`) of every face, from the face sizes in order.
+#[must_use]
 pub fn face_loop_starts(face_sizes: &[usize]) -> Vec<usize> {
     let mut starts = Vec::with_capacity(face_sizes.len());
     let mut next = 0;

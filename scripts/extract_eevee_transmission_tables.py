@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract EEVEE's GGX glass lookup tables into a little-endian f32 binary asset.
+"""Extract EEVEE's GGX glass, metallic, and LTC lookup tables into a little-endian f32 binary asset.
 
 Usage:
     python3 scripts/extract_eevee_transmission_tables.py <eevee_lut.cc> <output.f32le>
@@ -8,8 +8,7 @@ The input is `source/blender/draw/engines/eevee/eevee_lut.cc` at Blender v5.2.2:
 https://raw.githubusercontent.com/blender/blender/v5.2.2/source/blender/draw/engines/eevee/eevee_lut.cc
 
 Five arrays are extracted, in this order, as little-endian f32 values:
-- `brdf_ggx[64][64][3]`, indexed `[y][x][channel]`: the split-sum scale and bias (channels 0 and 1; the metal bias
-  channel 2 is dropped).
+- `brdf_ggx[64][64][3]`, indexed `[y][x][channel]`: the split-sum scale, bias, and metallic F82-tint bias.
 - `btdf_ggx[16][64][64][1]`, indexed `[layer][y][x]`: the transmission factor for an IOR above one.
 - `bsdf_ggx[16][64][64][3]`, indexed `[layer][y][x][channel]`: scale, bias and transmission factor for an IOR below one.
 - `ltc_mat_ggx[64][64][4]`, indexed `[y][x][channel]`: the inverse LTC matrix of the GGX lobe, entries
@@ -38,7 +37,7 @@ LITERAL_RE = re.compile(r"-?\d+\.\d+")
 
 # (C array name, declared dimensions, channels kept)
 ARRAYS = [
-    ("brdf_ggx", [TABLE_SIZE, TABLE_SIZE, 3], 2),
+    ("brdf_ggx", [TABLE_SIZE, TABLE_SIZE, 3], 3),
     ("btdf_ggx", [LAYER_COUNT, TABLE_SIZE, TABLE_SIZE, 1], 1),
     ("bsdf_ggx", [LAYER_COUNT, TABLE_SIZE, TABLE_SIZE, 3], 3),
     ("ltc_mat_ggx", [TABLE_SIZE, TABLE_SIZE, 4], 4),
@@ -96,7 +95,7 @@ def main(argv):
     for name, dims, kept in ARRAYS:
         values.extend(extract_values(text, name, dims, kept))
     expected = (
-        (TABLE_SIZE * TABLE_SIZE * 2)
+        (TABLE_SIZE * TABLE_SIZE * 3)
         + (LAYER_COUNT * TABLE_SIZE * TABLE_SIZE)
         + (LAYER_COUNT * TABLE_SIZE * TABLE_SIZE * 3)
         + (TABLE_SIZE * TABLE_SIZE * 4)

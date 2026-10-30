@@ -29,7 +29,7 @@
 use glam::DVec3;
 
 use super::{
-    eevee_ltc::PackedMatrix,
+    eevee_ltc::{PackedMatrix, sample_matrix},
     eevee_transmission_tables::{brdf, bsdf, btdf, ltc_matrix},
 };
 use crate::shader::{BsdfParams, GlassDistribution};
@@ -661,6 +661,41 @@ pub(crate) fn glass_light(
         transmission_normal,
         transmission_matrix: sample_glass_matrix(cos_theta, transmission_roughness),
     })
+}
+/// The EEVEE direct-light payload of a standalone Refraction BSDF closure.
+pub(crate) fn refraction_light(
+    params: &BsdfParams,
+    normal: DVec3,
+    view: DVec3,
+    thickness: Thickness,
+) -> GlassLight {
+    let normal = if normal.dot(view) < 0.0 {
+        -normal
+    } else {
+        normal
+    };
+    let ior = params.ior.max(1.0e-5);
+    let roughness = params.roughness.clamp(0.0, 1.0);
+    let perceived_roughness = transmission_roughness(roughness, ior);
+    let (transmission_normal, cos_theta) =
+        transmission_light_normal(normal, view, ior, roughness, thickness);
+    let mut transmission = DVec3::new(
+        params.base_color[0],
+        params.base_color[1],
+        params.base_color[2],
+    )
+    .max(DVec3::ZERO);
+    if thickness != Thickness::None {
+        transmission *= transmission;
+    }
+    GlassLight {
+        oriented_normal: normal,
+        reflection: DVec3::ZERO,
+        reflection_matrix: sample_matrix(normal.dot(view), roughness),
+        transmission,
+        transmission_normal,
+        transmission_matrix: sample_matrix(cos_theta, perceived_roughness),
+    }
 }
 
 /// `bxdf_ggx_light_transmission`: the normal the transmission lobe integrates around, and the cosine its matrix is

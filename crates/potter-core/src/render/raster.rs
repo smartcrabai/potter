@@ -3,6 +3,11 @@ use std::f64::consts::TAU;
 use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 
+use super::eevee_advanced_bsdf::EeveeSubsurfaceSample;
+use super::eevee_advanced_bsdf::{
+    EeveeSubsurfaceFrame, EeveeSubsurfacePixel, EeveeSubsurfaceProjection,
+    resolve_screen_space_subsurface,
+};
 use super::wireframe::{self, PointSquare, ScreenPoint, WireEdge, WirePoint, WireSegment};
 use crate::error::{ErrorCode, PotError, Result};
 use crate::float::equal_f64;
@@ -361,7 +366,7 @@ pub(crate) struct SurfaceHit<'a> {
 }
 
 /// What the raster hit evaluator returns: its linear RGBA, whether it is a camera surface,
-/// and the tint of the transparent share it passes.
+/// its transparent tint, and any EEVEE closure data that needs a frame resolve.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SurfaceSample {
     pub(crate) color: [f64; 4],
@@ -370,15 +375,21 @@ pub(crate) struct SurfaceSample {
     /// The Transparent closure's colour per channel, as `(1 - alpha) * tint` is its transmittance. White for a
     /// surface that passes nothing, and a Blender DITHERED material's channel mean (`scene.rs` `beauty_tint`).
     pub(crate) transparent_tint: [f64; 3],
+    /// EEVEE matte share, independent of physical transparency. It removes film alpha only when the film is transparent.
+    pub(crate) holdout_weight: f64,
+    /// EEVEE's deferred SSS data; its direct/indirect terms are resolved across this sample's complete screen frame.
+    pub(crate) subsurface: Option<EeveeSubsurfaceSample>,
 }
 
 impl SurfaceSample {
-    /// A sample with no transparent share: its colour, and a white tint.
+    /// A sample with no transparent, holdout, or subsurface share.
     pub(crate) fn opaque(color: [f64; 4]) -> Self {
         Self {
             color,
             has_surface: true,
             transparent_tint: [1.0; 3],
+            holdout_weight: 0.0,
+            subsurface: None,
         }
     }
 }
@@ -1331,6 +1342,8 @@ struct VisibleHit {
     hit: Hit,
     color: [f64; 4],
     transparent_tint: [f64; 3],
+    holdout_weight: f64,
+    subsurface: Option<EeveeSubsurfaceSample>,
 }
 
 /// The world ray through a pixel centre, or `None` when the projection has no ray there (outside a fisheye's circle).
@@ -1629,8 +1642,15 @@ pub(super) fn rasterize_with_samples(
 }
 
 #[derive(Clone, Copy)]
+struct CachedRasterHit {
+    ray: Option<Ray>,
+    hit: Option<VisibleHit>,
+}
+
+type RasterSampleOutput = ([f64; 4], [f64; 4], Option<EeveeSubsurfacePixel>);
+
 struct RasterPixelSample {
-    cached: Option<(Option<Ray>, Option<VisibleHit>)>,
+    cached: Option<CachedRasterHit>,
     index: u32,
     count: u32,
     x: u32,
@@ -1732,7 +1752,7 @@ impl FilmCenterRenderContext<'_> {
                         self.camera,
                         self.width,
                         self.height,
-                        RasterPixelSample {
+                        &RasterPixelSample {
                             cached: None,
                             index: 0,
                             count: 1,
@@ -1939,6 +1959,7 @@ impl FilmSampleRenderContext<'_, '_, '_> {
         &self,
         rows: std::ops::Range<usize>,
         sample_color: &mut [[f32; 4]],
+        sample_subsurface: &mut [Option<EeveeSubsurfacePixel>],
         sample: FilmSampleJitter,
         candidates: &mut Vec<usize>,
         shader: Option<RasterShader<'_>>,
@@ -1967,7 +1988,7 @@ impl FilmSampleRenderContext<'_, '_, '_> {
                             "pixel index exceeds platform limits",
                         )
                     })?;
-                let (_, sample_linear) = RasterSampleContext {
+                let (_, sample_linear, subsurface) = RasterSampleContext {
                     triangles: self.triangles,
                     visibility: self.visibility,
                     candidates,
@@ -1987,7 +2008,7 @@ impl FilmSampleRenderContext<'_, '_, '_> {
                     volume_pass,
                     linear_rgba_associated: self.linear_rgba_associated,
                 }
-                .shade(RasterPixelSample {
+                .shade(&RasterPixelSample {
                     cached: None,
                     index: sample.index,
                     count: self.sample_count,
@@ -1996,7 +2017,8 @@ impl FilmSampleRenderContext<'_, '_, '_> {
                     sample_x: sample.x,
                     sample_y: sample.y,
                 })?;
-                store_film_sample(sample_color, local_pixel, sample_linear);
+                sample_color[local_pixel] = sample_linear.map(|value| value as f32);
+                sample_subsurface[local_pixel] = subsurface;
             }
         }
         Ok(())
@@ -2035,7 +2057,7 @@ struct RasterSampleContext<
 }
 
 impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
-    fn shade(&mut self, sample: RasterPixelSample) -> Result<([f64; 4], [f64; 4])> {
+    fn shade(&mut self, sample: &RasterPixelSample) -> Result<RasterSampleOutput> {
         let hit_context = if self.shader.is_some() {
             Some(raster_hit_context(
                 self.frame,
@@ -2049,8 +2071,8 @@ impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
         } else {
             None
         };
-        let (sample_ray, sample_hit) = if let Some(cached) = sample.cached {
-            cached
+        let (sample_ray, cached_hit, uncached_hit) = if let Some(cached) = sample.cached.as_ref() {
+            (cached.ray, cached.hit.as_ref(), None)
         } else {
             let ray = ray_for_subpixel_in_frame(
                 self.frame,
@@ -2074,8 +2096,9 @@ impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
                 )?,
                 None => None,
             };
-            (ray, hit)
+            (ray, None, hit)
         };
+        let sample_hit = cached_hit.or(uncached_hit.as_ref());
         if matches!(self.mode, Mode::Wire) {
             let color = sample_hit.map_or(self.background, |visible_hit| {
                 let triangle = &self.triangles[visible_hit.triangle_index];
@@ -2091,7 +2114,7 @@ impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
                     self.background
                 }
             });
-            return Ok((color, color));
+            return Ok((color, color, None));
         }
         let Some(sample_ray) = sample_ray else {
             let color = sample_background(self.background, self.world, None)?;
@@ -2102,6 +2125,7 @@ impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
                 } else {
                     color
                 },
+                None,
             ));
         };
         self.shade_surface(sample, sample_ray, sample_hit, hit_context)
@@ -2109,11 +2133,11 @@ impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
 
     fn shade_surface(
         &mut self,
-        sample: RasterPixelSample,
+        sample: &RasterPixelSample,
         sample_ray: Ray,
-        sample_hit: Option<VisibleHit>,
+        sample_hit: Option<&VisibleHit>,
         hit_context: Option<RasterHitContext<'_>>,
-    ) -> Result<([f64; 4], [f64; 4])> {
+    ) -> Result<RasterSampleOutput> {
         let eye_index = camera_light_eye_index(
             self.camera.stereo_mode,
             sample.x,
@@ -2193,14 +2217,12 @@ impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
             camera_light_view,
             volume_sample.as_mut(),
         )?;
-        Ok((
-            color.straight,
-            if self.linear_rgba_associated {
-                color.associated
-            } else {
-                color.straight
-            },
-        ))
+        let linear = if self.linear_rgba_associated {
+            color.associated
+        } else {
+            color.straight
+        };
+        Ok((color.straight, linear, color.subsurface))
     }
 }
 
@@ -2310,6 +2332,9 @@ fn rasterize_with_samples_for_eye(
         )
     })?;
     let frame = camera_frame(camera, width, height)?;
+    let eevee_sss_frame = matches!(mode, Mode::Beauty)
+        .then(|| eevee_subsurface_frame(camera, &frame, width, height))
+        .flatten();
     let camera_matrices = if shader.is_some() || volume_pass.is_some() {
         camera_matrices_for_raster(camera)?
     } else {
@@ -2369,6 +2394,15 @@ fn rasterize_with_samples_for_eye(
             FilmFilter::new(radius, width, height, eye_split, exposure_scale)
         })
         .transpose()?;
+    let mut single_sample_subsurface = if film.is_none() && matches!(mode, Mode::Beauty) {
+        Some(allocate_filled(
+            pixel_count,
+            None,
+            "EEVEE subsurface closure frame",
+        )?)
+    } else {
+        None
+    };
     // Film jitter is shared across pixels; other sample patterns vary per pixel.
     let camera_light_raster_samples = match (film.as_ref(), camera_lights) {
         (Some(film), Some(lights)) => Some(lights.prepare_raster_samples(
@@ -2445,7 +2479,7 @@ fn rasterize_with_samples_for_eye(
                     camera,
                     width,
                     height,
-                    RasterPixelSample {
+                    &RasterPixelSample {
                         cached: None,
                         index: 0,
                         count: 1,
@@ -2514,7 +2548,7 @@ fn rasterize_with_samples_for_eye(
                 let mut average_associated = [0.0_f64; 4];
                 for sample_index in 0..samples {
                     let (sample_x, sample_y) = sample_offset(seed, x, y, sample_index);
-                    let (sample_color, sample_linear) = RasterSampleContext {
+                    let (sample_color, sample_linear, subsurface) = RasterSampleContext {
                         triangles: &prepared,
                         visibility: &visibility,
                         candidates: &mut candidates,
@@ -2534,8 +2568,11 @@ fn rasterize_with_samples_for_eye(
                         volume_pass: &mut volume_pass,
                         linear_rgba_associated,
                     }
-                    .shade(RasterPixelSample {
-                        cached: (sample_index == 0).then_some((center_ray, center_hit)),
+                    .shade(&RasterPixelSample {
+                        cached: (sample_index == 0).then_some(CachedRasterHit {
+                            ray: center_ray,
+                            hit: center_hit,
+                        }),
                         index: sample_index,
                         count: samples,
                         x,
@@ -2543,6 +2580,9 @@ fn rasterize_with_samples_for_eye(
                         sample_x,
                         sample_y,
                     })?;
+                    if let Some(records) = single_sample_subsurface.as_mut() {
+                        records[pixel_index] = subsurface;
+                    }
                     let count = f64::from(sample_index + 1);
                     let previous_weight = 1.0 - 1.0 / count;
                     for channel in 0..4 {
@@ -2590,6 +2630,33 @@ fn rasterize_with_samples_for_eye(
             }
         }
     }
+    if let Some(sample_subsurface) = single_sample_subsurface.as_ref() {
+        let has_subsurface = sample_subsurface.iter().any(Option::is_some);
+        resolve_eevee_subsurface_frame(
+            sample_subsurface,
+            &mut linear_rgba,
+            eevee_sss_frame,
+            0,
+            [0.5, 0.5],
+        )?;
+        if has_subsurface {
+            for (pixel, associated) in linear_rgba.iter().copied().enumerate() {
+                let alpha = associated[3];
+                let display = if alpha > 0.0 {
+                    [
+                        associated[0] / alpha,
+                        associated[1] / alpha,
+                        associated[2] / alpha,
+                        alpha,
+                    ]
+                } else {
+                    associated
+                };
+                rgba[pixel * 4..pixel * 4 + 4]
+                    .copy_from_slice(&color_to_srgba(display.map(f64::from)));
+            }
+        }
+    }
 
     if let Some(film) = film.as_mut() {
         linear_rgba.fill([0.0; 4]);
@@ -2620,16 +2687,21 @@ fn rasterize_with_samples_for_eye(
             None
         };
         for sample_index in 0..samples {
+            film.sample_subsurface.fill(None);
             let (sample_x, sample_y) = film.jitter(film_sample_offset(sample_index));
             if parallel {
                 let worker_outcomes = std::thread::scope(|scope| {
                     let mut handles = Vec::with_capacity(bands.len());
                     let mut sample_rest = film.sample_color.as_mut_slice();
+                    let mut subsurface_rest = film.sample_subsurface.as_mut_slice();
                     for (rows, mut worker) in bands.iter().cloned().zip(band_workers) {
                         let band_len = rows.len() * width_usize;
                         let (sample_rows, sample_tail) =
                             std::mem::take(&mut sample_rest).split_at_mut(band_len);
                         sample_rest = sample_tail;
+                        let (subsurface_rows, subsurface_tail) =
+                            std::mem::take(&mut subsurface_rest).split_at_mut(band_len);
+                        subsurface_rest = subsurface_tail;
                         let render_context = &render_context;
                         handles.push(
                             std::thread::Builder::new()
@@ -2646,6 +2718,7 @@ fn rasterize_with_samples_for_eye(
                                     let result = render_context.render_rows(
                                         rows,
                                         sample_rows,
+                                        subsurface_rows,
                                         FilmSampleJitter {
                                             index: sample_index,
                                             x: sample_x,
@@ -2707,6 +2780,7 @@ fn rasterize_with_samples_for_eye(
                 render_context.render_rows(
                     0..film.height,
                     &mut film.sample_color,
+                    &mut film.sample_subsurface,
                     FilmSampleJitter {
                         index: sample_index,
                         x: sample_x,
@@ -2716,6 +2790,17 @@ fn rasterize_with_samples_for_eye(
                     shader.map(RasterShader::Main),
                     &mut volume_pass,
                 )?;
+            }
+            resolve_eevee_subsurface_frame(
+                &film.sample_subsurface,
+                &mut film.sample_color,
+                eevee_sss_frame,
+                sample_index,
+                [sample_x, sample_y],
+            )?;
+            for pixel in 0..film.sample_color.len() {
+                let color = film.sample_color[pixel].map(f64::from);
+                store_film_sample(&mut film.sample_color, pixel, color);
             }
             film.resolve_sample(sample_index, sample_x, sample_y, &mut linear_rgba);
         }
@@ -3501,6 +3586,46 @@ pub(crate) fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<C
     })
 }
 
+fn eevee_subsurface_frame(
+    camera: &Camera,
+    frame: &CameraFrame,
+    width: u32,
+    height: u32,
+) -> Option<EeveeSubsurfaceFrame> {
+    let projection = match frame.projection {
+        ProjectionFrame::Perspective {
+            horizontal_scale,
+            vertical_scale,
+        } => EeveeSubsurfaceProjection::Perspective {
+            horizontal_scale,
+            vertical_scale,
+        },
+        ProjectionFrame::Orthographic {
+            half_width,
+            half_height,
+        } => EeveeSubsurfaceProjection::Orthographic {
+            half_width,
+            half_height,
+        },
+        ProjectionFrame::Equirectangular { .. }
+        | ProjectionFrame::FisheyeEquidistant { .. }
+        | ProjectionFrame::FisheyeEquisolid { .. } => return None,
+    };
+    Some(EeveeSubsurfaceFrame {
+        camera_position: camera.position,
+        forward: frame.forward,
+        right: frame.right,
+        up: frame.up,
+        near: frame.near,
+        far: frame.far,
+        shift: frame.shift,
+        projection,
+        width,
+        height,
+        eye_split: (frame.stereo_mode == StereoMode::SideBySide).then_some(width / 2),
+    })
+}
+
 /// The camera's geometric frustum for one rendered view; unbounded projections conservatively
 /// return `None`.
 pub(crate) fn camera_frustum(
@@ -3885,8 +4010,10 @@ struct FilmFilter {
     width: usize,
     height: usize,
     exposure_scale: f32,
-    /// One reusable, quantized input frame, as EEVEE's combined render target.
+    /// The current unquantized Combined sample, quantized after the SSS frame pass.
     sample_color: Vec<[f32; 4]>,
+    /// One reusable SSS closure record, including its own depth, for each TAA sample.
+    sample_subsurface: Vec<Option<EeveeSubsurfacePixel>>,
     /// The accumulation-weight image persists between film samples.
     history_weight: Vec<f32>,
     /// The column where the right eye starts; each eye has an independent film.
@@ -3935,6 +4062,11 @@ impl FilmFilter {
             height,
             exposure_scale,
             sample_color: allocate_filled(pixel_count, [0.0_f32; 4], "film input frame")?,
+            sample_subsurface: allocate_filled(
+                pixel_count,
+                None,
+                "EEVEE subsurface closure frame",
+            )?,
             history_weight: allocate_filled(pixel_count, 0.0_f32, "film weight history")?,
             eye_split,
         })
@@ -4254,7 +4386,7 @@ fn raster_hit_context<'a>(
     camera: &Camera,
     width: u32,
     height: u32,
-    sample: RasterPixelSample,
+    sample: &RasterPixelSample,
     camera_matrices: &'a [(DMat4, DMat4); 2],
     view_index: usize,
 ) -> Result<RasterHitContext<'a>> {
@@ -4511,14 +4643,16 @@ fn nearest_visible_hit(
         };
         let triangle = &triangles[triangle_index];
         let sample = hit_color(triangle, hit, ray, shader, hit_context)?;
-        // The nearest surface with opacity is the pixel's data-pass hit (ids, depth, normals, albedo, AO). A transparent
-        // pane that only tints is not, so it cannot change those passes; the Beauty composite finds it separately.
-        if sample.has_surface && hit_opacity(&triangle.source, sample.color) > 0.0 {
+        if sample.has_surface
+            && (hit_opacity(&triangle.source, sample.color) > 0.0 || sample.holdout_weight > 0.0)
+        {
             return Ok(Some(VisibleHit {
                 triangle_index,
                 hit,
                 color: sample.color,
                 transparent_tint: sample.transparent_tint,
+                holdout_weight: sample.holdout_weight,
+                subsurface: sample.subsurface,
             }));
         }
         cursor = Some((hit.depth, triangle_index));
@@ -4542,7 +4676,7 @@ fn composite_sample_with_association(
     world: Option<WorldRadiance<'_>>,
     shader: Option<RasterShader<'_>>,
     hit_context: Option<RasterHitContext<'_>>,
-    cached_hit: Option<VisibleHit>,
+    cached_hit: Option<&VisibleHit>,
     camera_lights: Option<super::path::RealtimeCameraLightSample<'_, '_, '_>>,
     mut volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
 ) -> Result<CompositeColor> {
@@ -4568,12 +4702,15 @@ fn composite_sample_with_association(
                         color: cached.color,
                         has_surface: true,
                         transparent_tint: cached.transparent_tint,
+                        holdout_weight: cached.holdout_weight,
+                        subsurface: cached.subsurface,
                     })
                 },
             )?;
         if !sample.has_surface
             || (hit_opacity(&triangle.source, sample.color) <= 0.0
-                && is_white(sample.transparent_tint))
+                && is_white(sample.transparent_tint)
+                && sample.holdout_weight <= 0.0)
         {
             continue;
         }
@@ -4582,6 +4719,8 @@ fn composite_sample_with_association(
             hit,
             color: sample.color,
             transparent_tint: sample.transparent_tint,
+            holdout_weight: sample.holdout_weight,
+            subsurface: sample.subsurface,
         };
         let mut insert_at = hit_count;
         while insert_at > 0
@@ -4602,21 +4741,39 @@ fn composite_sample_with_association(
     let mut color = if let Some(volume_sample) = volume_sample.as_deref_mut() {
         let mut transmittance = DVec3::ONE;
         let mut alpha_transmittance = 1.0;
+        let mut alpha_coverage = 0.0;
         let mut premultiplied = DVec3::ZERO;
+        let mut subsurface = None;
         let mut start_distance = volume_sample.near_distance;
         for visible_hit in hits.iter().take(hit_count).flatten() {
             let (radiance, segment_transmittance) =
                 volume_sample.integrate_segment(start_distance, visible_hit.hit.distance)?;
             premultiplied += transmittance * radiance;
             transmittance *= segment_transmittance;
-            alpha_transmittance *= segment_transmittance.element_sum() / 3.0;
+            let segment_alpha_pass = segment_transmittance.element_sum() / 3.0;
+            alpha_coverage += alpha_transmittance * (1.0 - segment_alpha_pass);
+            alpha_transmittance *= segment_alpha_pass;
             let triangle = &triangles[visible_hit.triangle_index];
             let color = visible_hit.color;
             let opacity = hit_opacity(&triangle.source, color);
-            premultiplied += DVec3::new(color[0], color[1], color[2]) * (transmittance * opacity);
+            let holdout = visible_hit.holdout_weight.clamp(0.0, 1.0);
+            let holdout_alpha = matte_alpha_weight(holdout, background[3]);
+            let surface_weight = transmittance * (opacity * (1.0 - holdout));
+            premultiplied += DVec3::new(color[0], color[1], color[2]) * surface_weight;
+            if subsurface.is_none()
+                && let Some(sample) = visible_hit.subsurface
+            {
+                subsurface = Some(EeveeSubsurfacePixel {
+                    sample,
+                    weight: surface_weight.to_array(),
+                });
+            }
             let passed = 1.0 - opacity;
             transmittance *= DVec3::from_array(visible_hit.transparent_tint) * passed;
-            alpha_transmittance *= visible_hit.transparent_tint.iter().sum::<f64>() / 3.0 * passed;
+            let alpha_pass = visible_hit.transparent_tint.iter().sum::<f64>() / 3.0 * passed;
+            alpha_coverage +=
+                alpha_transmittance * (1.0 - alpha_pass - holdout_alpha).clamp(0.0, 1.0);
+            alpha_transmittance *= alpha_pass;
             start_distance = visible_hit.hit.distance;
             if transmittance.max_element() <= 1.0e-6 && alpha_transmittance <= 1.0e-6 {
                 break;
@@ -4627,7 +4784,9 @@ fn composite_sample_with_association(
                 volume_sample.integrate_segment(start_distance, volume_sample.far_distance)?;
             premultiplied += transmittance * radiance;
             transmittance *= segment_transmittance;
-            alpha_transmittance *= segment_transmittance.element_sum() / 3.0;
+            let segment_alpha_pass = segment_transmittance.element_sum() / 3.0;
+            alpha_coverage += alpha_transmittance * (1.0 - segment_alpha_pass);
+            alpha_transmittance *= segment_alpha_pass;
         }
         let background_alpha = background[3].clamp(0.0, 1.0);
         let background_rgb = if transmittance == DVec3::ZERO {
@@ -4637,7 +4796,7 @@ fn composite_sample_with_association(
             [color[0], color[1], color[2]]
         };
         premultiplied += DVec3::from_array(background_rgb) * (transmittance * background_alpha);
-        let alpha = 1.0 - alpha_transmittance * (1.0 - background_alpha);
+        let alpha = alpha_coverage + alpha_transmittance * background_alpha;
         let straight = if alpha <= f64::MIN_POSITIVE {
             premultiplied + DVec3::from_array(background_rgb)
         } else {
@@ -4646,6 +4805,7 @@ fn composite_sample_with_association(
         CompositeColor {
             straight: [straight.x, straight.y, straight.z, alpha],
             associated: [premultiplied.x, premultiplied.y, premultiplied.z, alpha],
+            subsurface,
         }
     } else {
         let layers = hits.iter().take(hit_count).flatten().map(|visible_hit| {
@@ -4655,6 +4815,8 @@ fn composite_sample_with_association(
                 rgb: [color[0], color[1], color[2]],
                 opacity: hit_opacity(&triangle.source, color),
                 tint: visible_hit.transparent_tint,
+                holdout_weight: visible_hit.holdout_weight,
+                subsurface: visible_hit.subsurface,
             }
         });
         composite_layers_with_association(layers, background[3], || {
@@ -4751,6 +4913,7 @@ fn camera_light_event_radiance(
 struct CompositeColor {
     straight: [f64; 4],
     associated: [f64; 4],
+    subsurface: Option<EeveeSubsurfacePixel>,
 }
 
 fn associated_rgba(color: [f64; 4]) -> [f64; 4] {
@@ -4770,36 +4933,48 @@ struct Layer {
     opacity: f64,
     /// The colour of the share it passes: `(1 - opacity) * tint` is its transmittance per channel.
     tint: [f64; 3],
+    holdout_weight: f64,
+    subsurface: Option<EeveeSubsurfaceSample>,
 }
 
-/// Composites `layers` (nearest first) over `background`, as a pixel's film does. A layer adds its colour weighted by
-/// the transmittance reaching it and its opacity, then passes `(1 - opacity) * tint` of the light, so a Transparent
-/// BSDF's tint reaches what lies behind it channel by channel (`path.rs`, `throughput *= tint`).
-///
-/// The film's alpha is EEVEE's separate alpha channel, not the colour's transmittance: each layer multiplies one scalar
-/// by the mean of its passed transmittance, `mean(tint) * (1 - opacity)` (`eevee_surf_forward.bsl.hh`, `combined_a` is
-/// `average(transmittance)` per surface). Overlapping coloured layers therefore multiply their means, not the mean of
-/// their products. The film alpha is `1 - alpha_transmittance * (1 - background alpha)`. With white tints this is the
-/// scalar composite of the layers. Returns straight display colour and associated Combined RGB.
+/// Composites `layers` (nearest first) over `background`. RGB transmission follows the physical
+/// closure tint and opacity. EEVEE's film alpha uses the mean transmission per layer, while a
+/// holdout share removes alpha without changing RGB transmission or revealing geometry behind it.
+/// Holdout affects alpha only when the background alpha marks a transparent film.
 fn composite_layers_with_association(
     layers: impl IntoIterator<Item = Layer>,
     background_alpha: f64,
     background_rgb: impl FnOnce() -> Result<[f64; 3]>,
 ) -> Result<CompositeColor> {
+    let background_alpha = background_alpha.clamp(0.0, 1.0);
     let mut transmittance = DVec3::ONE;
     let mut alpha_transmittance = 1.0;
+    let mut alpha_coverage = 0.0;
     let mut premultiplied = DVec3::ZERO;
+    let mut subsurface = None;
     for layer in layers {
-        premultiplied += DVec3::from_array(layer.rgb) * (transmittance * layer.opacity);
-        let passed = 1.0 - layer.opacity;
+        let opacity = layer.opacity.clamp(0.0, 1.0);
+        let holdout = layer.holdout_weight.clamp(0.0, 1.0);
+        let holdout_alpha = matte_alpha_weight(holdout, background_alpha);
+        let surface_weight = transmittance * (opacity * (1.0 - holdout));
+        premultiplied += DVec3::from_array(layer.rgb) * surface_weight;
+        if subsurface.is_none()
+            && let Some(sample) = layer.subsurface
+        {
+            subsurface = Some(EeveeSubsurfacePixel {
+                sample,
+                weight: surface_weight.to_array(),
+            });
+        }
+        let passed = 1.0 - opacity;
         transmittance *= DVec3::from_array(layer.tint) * passed;
-        alpha_transmittance *= layer.tint.iter().sum::<f64>() / 3.0 * passed;
-        // A layer that passes nothing adds nothing to the colour, but the alpha still counts later layers.
+        let alpha_pass = layer.tint.iter().sum::<f64>() / 3.0 * passed;
+        alpha_coverage += alpha_transmittance * (1.0 - alpha_pass - holdout_alpha).clamp(0.0, 1.0);
+        alpha_transmittance *= alpha_pass;
         if transmittance.max_element() <= 1.0e-6 && alpha_transmittance <= 1.0e-6 {
             break;
         }
     }
-    let background_alpha = background_alpha.clamp(0.0, 1.0);
     // Opaque surfaces block the world, so avoid evaluating its graph for these samples.
     let background_rgb = if transmittance == DVec3::ZERO {
         [0.0; 3]
@@ -4807,7 +4982,7 @@ fn composite_layers_with_association(
         background_rgb()?
     };
     premultiplied += DVec3::from_array(background_rgb) * (transmittance * background_alpha);
-    let alpha = 1.0 - alpha_transmittance * (1.0 - background_alpha);
+    let alpha = alpha_coverage + alpha_transmittance * background_alpha;
     let straight = if alpha <= f64::MIN_POSITIVE {
         [
             background_rgb[0],
@@ -4822,7 +4997,37 @@ fn composite_layers_with_association(
     Ok(CompositeColor {
         straight,
         associated: [premultiplied.x, premultiplied.y, premultiplied.z, alpha],
+        subsurface,
     })
+}
+
+/// EEVEE's holdout changes film alpha only when film transparency is enabled.
+fn matte_alpha_weight(holdout: f64, background_alpha: f64) -> f64 {
+    if background_alpha < 1.0 {
+        holdout.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn resolve_eevee_subsurface_frame(
+    samples: &[Option<EeveeSubsurfacePixel>],
+    sample_color: &mut [[f32; 4]],
+    frame: Option<EeveeSubsurfaceFrame>,
+    sample_index: u32,
+    pixel_jitter: [f64; 2],
+) -> Result<()> {
+    if !samples.iter().any(Option::is_some) {
+        return Ok(());
+    }
+    let Some(frame) = frame else {
+        return Err(PotError::new(
+            ErrorCode::UnsupportedFeature,
+            "EEVEE screen-space subsurface requires a perspective or orthographic raster camera",
+        ));
+    };
+    resolve_screen_space_subsurface(samples, sample_color, frame, sample_index, pixel_jitter);
+    Ok(())
 }
 
 /// Primary-ray triangles. Realtime Beauty leaves out objects hidden from camera rays; the other
@@ -6596,7 +6801,7 @@ mod visibility_tests {
             direction: ray.direction,
         };
         let context =
-            raster_hit_context(&frame, &camera, 4, 4, sample, &matrices, 0).expect("hit context");
+            raster_hit_context(&frame, &camera, 4, 4, &sample, &matrices, 0).expect("hit context");
         let differentials = realtime_hit_differentials(&triangle, hit, ray, Some(context));
         assert!(differentials.world_dx.abs_diff_eq(DVec3::X * 0.5, 1.0e-12));
         assert!(
@@ -6667,6 +6872,8 @@ mod visibility_tests {
                     rgb: [color[0], color[1], color[2]],
                     opacity: hit_opacity(&triangle.source, color),
                     tint: [1.0; 3],
+                    holdout_weight: 0.0,
+                    subsurface: None,
                 }
             }),
             background[3],
@@ -6759,6 +6966,9 @@ mod visibility_tests {
 
 #[cfg(test)]
 mod composite_layer_tests {
+    use crate::error::{ErrorCode, PotError};
+
+    use super::super::eevee_advanced_bsdf::{EeveeSubsurfaceClosure, EeveeSubsurfaceSample};
     use super::{Layer, composite_layers_with_association};
 
     fn composite_layers(
@@ -6794,11 +7004,15 @@ mod composite_layer_tests {
                 rgb: [1.0, 0.0, 0.0],
                 opacity: 0.5,
                 tint: [1.0, 0.5, 0.0],
+                holdout_weight: 0.0,
+                subsurface: None,
             },
             Layer {
                 rgb: [0.0, 1.0, 0.0],
                 opacity: 0.0,
                 tint: [0.2, 0.4, 0.8],
+                holdout_weight: 0.0,
+                subsurface: None,
             },
         ];
         let alpha = 1.0 - (0.25 * 1.4 / 3.0) * (1.0 - 0.6);
@@ -6816,11 +7030,15 @@ mod composite_layer_tests {
                 rgb: [0.0; 3],
                 opacity: 0.0,
                 tint: [1.0, 0.0, 0.0],
+                holdout_weight: 0.0,
+                subsurface: None,
             },
             Layer {
                 rgb: [0.0; 3],
                 opacity: 0.0,
                 tint: [0.0, 1.0, 0.0],
+                holdout_weight: 0.0,
+                subsurface: None,
             },
         ];
         let actual = composite_layers(layers, [0.0; 4])?;
@@ -6836,9 +7054,73 @@ mod composite_layer_tests {
             rgb: [0.8, 0.2, 0.4],
             opacity: 0.25,
             tint: [1.0; 3],
+            holdout_weight: 0.0,
+            subsurface: None,
         }];
         let actual = composite_layers(layers, [0.5, 0.5, 0.5, 1.0])?;
         assert_close(actual, [0.575, 0.425, 0.475, 1.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn holdout_hides_the_backplate_without_showing_geometry_behind_it() -> super::Result<()> {
+        let layers = [Layer {
+            rgb: [0.8, 0.4, 0.2],
+            opacity: 1.0,
+            tint: [1.0; 3],
+            holdout_weight: 1.0,
+            subsurface: None,
+        }];
+        let actual = composite_layers(layers, [0.2, 0.4, 0.6, 0.0])?;
+        assert_close(actual, [0.0, 0.0, 0.0, 0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn foreground_pane_preserves_sss_payload_depth_and_transmitted_weight() -> super::Result<()> {
+        let sample = EeveeSubsurfaceSample {
+            closures: [
+                Some(EeveeSubsurfaceClosure {
+                    color: [1.0; 3],
+                    radius: [0.1; 3],
+                }),
+                None,
+                None,
+            ],
+            direct: [0.0; 3],
+            indirect: [0.0; 3],
+            object_index: 3,
+            depth: 5.0,
+            split_radiance: false,
+        };
+        let composite = composite_layers_with_association(
+            [
+                Layer {
+                    rgb: [0.2, 0.4, 0.6],
+                    opacity: 0.25,
+                    tint: [1.0; 3],
+                    holdout_weight: 0.0,
+                    subsurface: None,
+                },
+                Layer {
+                    rgb: [0.0; 3],
+                    opacity: 1.0,
+                    tint: [1.0; 3],
+                    holdout_weight: 0.0,
+                    subsurface: Some(sample),
+                },
+            ],
+            1.0,
+            || Ok([0.0; 3]),
+        )?;
+        let subsurface = composite.subsurface.ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "background SSS payload was not preserved through the pane",
+            )
+        })?;
+        assert_eq!(subsurface.sample.depth, 5.0);
+        assert_eq!(subsurface.weight, [0.75; 3]);
         Ok(())
     }
 

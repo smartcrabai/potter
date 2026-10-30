@@ -18,18 +18,24 @@ use crate::{
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, Material, RayKind, SceneDoc, VolumeSampling},
     shader::{
-        BsdfParams, EvaluatorWorkspace, HitContext, HitFootprint, HitUvLayers, PreparedMaterial,
-        ShaderClosure, SubsurfaceMethod, SurfaceShading, equirectangular_uv,
-        evaluate_displacement_with_workspace_semantics, evaluate_surface_with_workspace,
-        evaluate_surface_with_workspace_into_semantics, evaluate_surface_with_workspace_semantics,
-        heaviest, height_gradient, make_orthonormals,
+        BsdfModel, BsdfParams, EvaluatorWorkspace, HairComponent, HairScatteringModel, HitContext,
+        HitFootprint, HitUvLayers, PreparedMaterial, ShaderClosure, SubsurfaceMethod,
+        SurfaceShading, equirectangular_uv, evaluate_displacement_with_workspace_semantics,
+        evaluate_surface_with_workspace, evaluate_surface_with_workspace_into_semantics,
+        evaluate_surface_with_workspace_semantics, heaviest, height_gradient, make_orthonormals,
     },
 };
 
+use super::hair_bsdf::{
+    HairHitData, HairSample, hair_eval, hair_is_transparent, hair_pdf, hair_sample,
+    hair_sample_weight,
+};
 use super::principled_bsdf::{
-    GlassSample, Layers, base_color, continuous_density, continuous_lobes, diffuse_coefficient,
-    evaluate_masked, layers_at, lobe_probabilities, sample_glass, sample_specular_ggx_half,
-    sheen_coefficient, specular_eta, subsurface_closure_weight, thin_glass_shadow_transparency,
+    GlassSample, Layers, StandaloneSample, base_color, continuous_density, continuous_lobes,
+    diffuse_coefficient, evaluate_masked, layers_at, lobe_probabilities, sample_glass,
+    sample_specular_ggx_half, sheen_coefficient, specular_eta, standalone_density, standalone_eval,
+    standalone_sample, standalone_selection_weight, subsurface_closure_weight,
+    thin_glass_shadow_transparency,
 };
 use super::subsurface::{
     MAX_HITS, ProbeHits, SubsurfaceExit, burley_radius, channel_mask, eval as burley_eval,
@@ -47,6 +53,7 @@ use super::{
         linear_sample_weights, occupancy_boundary_index, resolve_z_with_end_of_slice_bias,
         screen_uv_to_resolve_uv,
     },
+    hair_intersect::{CurveHit, CurveKey, HairBvh, curve_position, curve_radius, curve_tangent},
     light_model::{
         AreaShape, Spread, area_radiance, area_shape, emitter_radiance, influence_fade,
         inside_emitter, local_light_influence_radius_squared, point_intensity, spot_attenuation,
@@ -71,6 +78,7 @@ const CYCLES_VOLUME_MAX_STEPS: usize = 1024;
 /// Cycles' `VOLUME_BOUNDS_MAX` (`intern/cycles/kernel/types.h`): volume-only boundary crossings
 /// have their own counter, and the path ends past this many.
 const VOLUME_BOUNDS_MAX: u32 = 1024;
+const CYCLES_PRNG_BOUNCE_NUM: u32 = 16;
 
 #[derive(Clone, Copy)]
 struct PointLight {
@@ -224,9 +232,13 @@ struct VolumeSegment {
 #[derive(Clone, Copy)]
 struct HitClosure {
     weight: f64,
+    model_selection_weight: f64,
     params: BsdfParams,
     layers: Layers,
     pass_tint: DVec3,
+    hair_tangent: Option<DVec3>,
+    hair_pixel_coverage: f64,
+    hair_transparent: bool,
 }
 
 impl HitClosure {
@@ -238,26 +250,60 @@ impl HitClosure {
         bump_correction: bool,
     ) -> Self {
         let closure_layers = layers_at(params, params.normal, view, geometric, bump_correction);
+        let model_selection_weight = match params.model {
+            BsdfModel::Sheen(_)
+            | BsdfModel::Subsurface
+            | BsdfModel::Translucent
+            | BsdfModel::Refraction(_)
+            | BsdfModel::Toon(_)
+            | BsdfModel::Metallic(_) => standalone_selection_weight(params, &closure_layers),
+            BsdfModel::Hair(_) | BsdfModel::PrincipledHair(_) => hair_sample_weight(params),
+            BsdfModel::RayPortal(_) => {
+                let color = DVec3::new(
+                    params.base_color[0],
+                    params.base_color[1],
+                    params.base_color[2],
+                );
+                (color.element_sum() / 3.0).abs()
+            }
+            BsdfModel::Holdout => 0.0,
+            BsdfModel::Principled => 1.0,
+        };
         Self {
             weight,
+            model_selection_weight,
             params: *params,
             layers: closure_layers,
             pass_tint: transparent_tint(params) * (1.0 - params.alpha),
+            hair_tangent: params.anisotropic_tangent,
+            hair_pixel_coverage: 1.0,
+            hair_transparent: false,
         }
     }
 
     /// Selection weight of the reflective share, `w · α` (Cycles' sample weight of a BSDF closure). A closure without
     /// reflectance, such as Emission, takes no share.
     fn reflect_weight(&self) -> f64 {
+        if matches!(self.params.model, BsdfModel::Holdout) || self.hair_transparent {
+            return 0.0;
+        }
+        if matches!(self.params.model, BsdfModel::RayPortal(_)) {
+            return self.weight * self.model_selection_weight;
+        }
         if self.params.reflectance > 0.0 {
-            self.weight * self.params.alpha
+            self.weight * self.params.alpha * self.model_selection_weight
         } else {
             0.0
         }
     }
 
-    /// Selection weight of the transparent closure(s) on this surface, the weight times mean tint.
     fn pass_weight(&self) -> f64 {
+        if matches!(
+            self.params.model,
+            BsdfModel::Holdout | BsdfModel::RayPortal(_)
+        ) {
+            return 0.0;
+        }
         self.weight * self.pass_tint.element_sum() / 3.0
     }
 }
@@ -265,6 +311,20 @@ impl HitClosure {
 /// A closure's transparent tint, clamped at zero: Cycles' Transparent colour.
 fn transparent_tint(params: &BsdfParams) -> DVec3 {
     DVec3::from_array(params.transparent_tint).max(DVec3::ZERO)
+}
+fn shadow_alpha_tint(params: &BsdfParams) -> (f64, DVec3) {
+    match params.model {
+        BsdfModel::Holdout => (1.0, DVec3::ONE),
+        BsdfModel::RayPortal(_) => (
+            0.0,
+            DVec3::from_array([
+                params.base_color[0],
+                params.base_color[1],
+                params.base_color[2],
+            ]),
+        ),
+        _ => (params.alpha, transparent_tint(params)),
+    }
 }
 
 /// Cycles' shadow transparency `Σ w · (1 − α) · tint` over each closure's `(weight, alpha, tint)`, one when no closure
@@ -347,6 +407,10 @@ struct Closures {
     albedo: [f64; 4],
     /// Camera coverage, one minus the mean shadow transparency of the closures; zero for a hit without closures.
     coverage: f64,
+    /// Alpha multiplier from Holdout closures, independent of physical transparency.
+    holdout_coverage: f64,
+    /// Cycles' additional path LCG, shared by Hair Huang closure eval and sampling.
+    hair_lcg_state: u32,
 }
 
 impl Closures {
@@ -375,16 +439,19 @@ impl Closures {
         if weight_total > 0.0 {
             albedo = albedo.map(|channel| channel / weight_total);
         }
+        let holdout_weight: f64 = items
+            .iter()
+            .filter(|closure| matches!(closure.params.model, BsdfModel::Holdout))
+            .map(|closure| closure.weight)
+            .sum();
         let transparency = shadow_transparency(items.iter().map(|closure| {
-            (
-                closure.weight,
-                closure.params.alpha,
-                transparent_tint(&closure.params),
-            )
+            let (alpha, tint) = shadow_alpha_tint(&closure.params);
+            (closure.weight, alpha, tint)
         }));
-        // Cycles' film alpha is one minus the mean transparent weight (`surface_shader_transparency`), tinted. An Add with a
-        // Transparent arm therefore covers the pixel by its other arms only, and a hit without closures covers nothing.
-        let coverage = (1.0 - transparency.element_sum() / 3.0).clamp(0.0, 1.0);
+        let holdout_coverage = (1.0 - holdout_weight).clamp(0.0, 1.0);
+        // Holdout contributes to film alpha but is opaque to path and shadow rays.
+        let coverage = (1.0 - (transparency + DVec3::splat(holdout_weight)).element_sum() / 3.0)
+            .clamp(0.0, 1.0);
         Self {
             items,
             smooth,
@@ -396,6 +463,8 @@ impl Closures {
             emission_pass,
             albedo,
             coverage,
+            holdout_coverage,
+            hair_lcg_state: 0,
         }
     }
 
@@ -439,70 +508,160 @@ impl Closures {
         tint * (self.selection_total / (tint.element_sum() / 3.0))
     }
 
-    /// The reflective share at `light`: `Σ w·α·f·|cos|` over the closures, each with its own lobes, normal and cosine
-    /// (Cycles' `surface_shader_bsdf_eval`). `sampled` is the closure a draw picked and the ray kind of that draw. Cycles'
-    /// `bsdf_sample` evaluates the picked closure with `is_eval = false`, so only its diffuse draw keeps the shading-side
-    /// test; every other closure takes it (`bump_shadowing_term`, `kernel/closure/bsdf.h`). `ray_mask` keeps the lobes a
-    /// light admits (`evaluate_masked`); a path's own continuation takes every kind.
-    fn bsdf_eval(&self, light: DVec3, sampled: Option<(usize, RayKind)>, ray_mask: u8) -> DVec3 {
-        self.items
-            .iter()
-            .enumerate()
-            .fold(DVec3::ZERO, |sum, (index, closure)| {
-                let is_eval = match sampled {
-                    Some((picked, ray)) if picked == index => ray == RayKind::Diffuse,
-                    _ => true,
-                };
-                sum + self.closure_eval(closure, light, is_eval, ray_mask)
-            })
+    /// The reflective share at `light`: `Σ w·α·f·|cos|` over closures. `sampled` carries both the selected closure and
+    /// its ray label; the label controls ancestry/masks, while Cycles' diffuse-side test uses closure classification.
+    /// The picked closure's `bsdf_sample` uses `is_eval = false`; other closures and light evaluation use `true`.
+    /// `ray_mask` keeps the lobes a light admits (`evaluate_masked`); a path continuation takes every kind.
+    fn bsdf_eval(
+        &mut self,
+        light: DVec3,
+        sampled: Option<(usize, RayKind)>,
+        ray_mask: u8,
+    ) -> DVec3 {
+        let (items, lcg_state) = (&self.items, &mut self.hair_lcg_state);
+        let smooth = self.smooth;
+        let bump_correction = self.bump_correction;
+        let mut sum = DVec3::ZERO;
+        for (index, closure) in items.iter().enumerate() {
+            let sampled_ray = sampled.and_then(|(picked, ray)| (picked == index).then_some(ray));
+            sum += Self::closure_eval(
+                smooth,
+                bump_correction,
+                closure,
+                light,
+                sampled_ray.is_none(),
+                sampled_ray,
+                ray_mask,
+                lcg_state,
+            );
+        }
+        sum
+    }
+    fn diffuse_closure_class(model: BsdfModel) -> bool {
+        matches!(
+            model,
+            BsdfModel::Sheen(crate::shader::SheenDistribution::Microfiber)
+                | BsdfModel::Subsurface
+                | BsdfModel::Translucent
+                | BsdfModel::Toon(crate::shader::ToonParameters {
+                    component: crate::shader::ToonComponent::Diffuse,
+                    ..
+                })
+        )
     }
 
-    /// One closure's reflective term at `light`, `w·α·f·|cos|`, with its diffuse and sheen lobes smoothed at grazing light.
+    fn sampled_side_test(model: BsdfModel, is_eval: bool, sampled_ray: Option<RayKind>) -> bool {
+        is_eval
+            || Self::diffuse_closure_class(model)
+            || (matches!(model, BsdfModel::Principled) && sampled_ray == Some(RayKind::Diffuse))
+    }
+
+    /// One closure's reflective term at `light`, `w·α·f·|cos|`.
     fn closure_eval(
-        &self,
+        smooth: DVec3,
+        bump_correction: bool,
         closure: &HitClosure,
         light: DVec3,
         is_eval: bool,
+        sampled_ray: Option<RayKind>,
         ray_mask: u8,
+        lcg_state: &mut u32,
     ) -> DVec3 {
-        let reflect = closure.reflect_weight();
-        if reflect <= 0.0 {
+        let params = &closure.params;
+        let layers = &closure.layers;
+        let model = params.model;
+        let diffuse_class = Self::diffuse_closure_class(model);
+        if closure.reflect_weight() <= 0.0
+            || (Self::sampled_side_test(model, is_eval, sampled_ray)
+                && !shading_side_passes(smooth, layers.normal, light))
+        {
             return DVec3::ZERO;
         }
-        let (params, layers) = (&closure.params, &closure.layers);
-        if is_eval && !shading_side_passes(self.smooth, layers.normal, light) {
+        let ray_kind = match model {
+            BsdfModel::Sheen(_)
+            | BsdfModel::Subsurface
+            | BsdfModel::Toon(crate::shader::ToonParameters {
+                component: crate::shader::ToonComponent::Diffuse,
+                ..
+            }) => Some(RayKind::Diffuse),
+            BsdfModel::Translucent | BsdfModel::Refraction(_) => Some(RayKind::Transmission),
+            BsdfModel::Toon(_) | BsdfModel::Metallic(_) => Some(RayKind::Glossy),
+            BsdfModel::Hair(hair) => Some(match hair.component {
+                HairComponent::Reflection => RayKind::Glossy,
+                HairComponent::Transmission => RayKind::Transmission,
+            }),
+            BsdfModel::PrincipledHair(hair) => Some(match hair.model {
+                HairScatteringModel::Chiang if layers.normal.dot(light) < 0.0 => {
+                    RayKind::Transmission
+                }
+                _ => RayKind::Glossy,
+            }),
+            BsdfModel::Principled => None,
+            BsdfModel::Holdout | BsdfModel::RayPortal(_) => return DVec3::ZERO,
+        };
+        if ray_kind.is_some_and(|kind| ray_mask & kind.bit() == 0) {
             return DVec3::ZERO;
         }
         let cosine = layers.normal.dot(light).abs();
-        // The diffuse and sheen lobes sit in the above-shading share of `evaluate_masked`, so their smoothing applies to that
-        // share only; the specular and glass lobes take none. A light that excludes the diffuse kind drops both.
-        let above = layers.normal.dot(light) > 0.0;
-        let diffuse_admitted = ray_mask & RayKind::Diffuse.bit() != 0;
-        let diffuse = if above && diffuse_admitted {
-            diffuse_coefficient(params, layers, light)
-        } else {
-            DVec3::ZERO
-        };
-        let sheen = if above && diffuse_admitted {
-            sheen_coefficient(params, layers, light)
-        } else {
-            DVec3::ZERO
-        };
-        // Cycles' `bump_shadowing_term` leaves the diffuse lobe unsmoothed when `SD_USE_BUMP_MAP_CORRECTION` is off
-        // (`kernel/closure/bsdf.h`); the sheen lobe takes the same test, as it is a diffuse closure.
-        let smoothing = |normal: DVec3| {
-            if self.bump_correction {
-                diffuse_smoothing(self.smooth, normal, light)
-            } else {
-                1.0
+        let outer = closure.weight * params.alpha;
+        match model {
+            BsdfModel::Principled => {
+                let above = layers.normal.dot(light) > 0.0;
+                let diffuse_admitted = ray_mask & RayKind::Diffuse.bit() != 0;
+                let diffuse = if above && diffuse_admitted {
+                    diffuse_coefficient(params, layers, light)
+                } else {
+                    DVec3::ZERO
+                };
+                let sheen = if above && diffuse_admitted {
+                    sheen_coefficient(params, layers, light)
+                } else {
+                    DVec3::ZERO
+                };
+                let smoothing = |normal: DVec3| {
+                    if bump_correction {
+                        diffuse_smoothing(smooth, normal, light)
+                    } else {
+                        1.0
+                    }
+                };
+                let diffuse_correction = diffuse * (smoothing(layers.normal) - 1.0);
+                let sheen_correction = sheen * (smoothing(layers.sheen_normal) - 1.0);
+                (evaluate_masked(params, layers, light, ray_mask)
+                    + diffuse_correction
+                    + sheen_correction)
+                    * (outer * cosine)
             }
-        };
-        let diffuse_correction = diffuse * (smoothing(layers.normal) - 1.0);
-        let sheen_correction = sheen * (smoothing(layers.sheen_normal) - 1.0);
-        let shaded = evaluate_masked(params, layers, light, ray_mask)
-            + diffuse_correction
-            + sheen_correction;
-        shaded * (reflect * cosine)
+            BsdfModel::Sheen(_)
+            | BsdfModel::Subsurface
+            | BsdfModel::Translucent
+            | BsdfModel::Refraction(_)
+            | BsdfModel::Toon(_)
+            | BsdfModel::Metallic(_) => {
+                let mut value = standalone_eval(params, layers, light);
+                if diffuse_class && bump_correction {
+                    value *= diffuse_smoothing(smooth, layers.normal, light);
+                }
+                value * (outer * cosine)
+            }
+            BsdfModel::Hair(_) | BsdfModel::PrincipledHair(_) => {
+                let tangent = closure.hair_tangent.unwrap_or(DVec3::ZERO);
+                let hit = HairHitData {
+                    curve_normal: params.hair_normal.unwrap_or(layers.normal),
+                    pixel_coverage: closure.hair_pixel_coverage,
+                };
+                hair_eval(
+                    params,
+                    layers.view,
+                    light,
+                    tangent,
+                    layers.normal,
+                    hit,
+                    lcg_state,
+                ) * (outer * cosine)
+            }
+            BsdfModel::Holdout | BsdfModel::RayPortal(_) => DVec3::ZERO,
+        }
     }
 
     /// Density of the continuous draws at `light`: each closure's lobe mixture weighted by its selection weight, over
@@ -516,11 +675,32 @@ impl Closures {
             .iter()
             .map(|closure| {
                 let reflect = closure.reflect_weight();
-                if reflect > 0.0 {
-                    reflect * continuous_density(&closure.params, &closure.layers, light)
-                } else {
-                    0.0
+                if reflect <= 0.0 {
+                    return 0.0;
                 }
+                let params = &closure.params;
+                let density = match params.model {
+                    BsdfModel::Principled => continuous_density(params, &closure.layers, light),
+                    BsdfModel::Sheen(_)
+                    | BsdfModel::Subsurface
+                    | BsdfModel::Translucent
+                    | BsdfModel::Refraction(_)
+                    | BsdfModel::Toon(_)
+                    | BsdfModel::Metallic(_) => standalone_density(params, &closure.layers, light),
+                    BsdfModel::Hair(_) | BsdfModel::PrincipledHair(_) => hair_pdf(
+                        params,
+                        closure.layers.view,
+                        light,
+                        closure.hair_tangent.unwrap_or(DVec3::ZERO),
+                        closure.layers.normal,
+                        HairHitData {
+                            curve_normal: params.hair_normal.unwrap_or(closure.layers.normal),
+                            pixel_coverage: closure.hair_pixel_coverage,
+                        },
+                    ),
+                    BsdfModel::Holdout | BsdfModel::RayPortal(_) => 0.0,
+                };
+                reflect * density
             })
             .sum();
         mixed / self.selection_total
@@ -529,10 +709,27 @@ impl Closures {
     /// Draws the reflective share of closure `index`, which `pick` chose, and returns the throughput weight of the
     /// closure set. A continuous draw carries `Σ w·α·f·|cos| / p_mix` with `p_mix = Σ w·α·p / S`. A delta or subsurface
     /// draw carries the lobe weight times `S`, since the picked share's `w·α` over its pick probability `w·α / S` is `S`.
-    fn reflect(&self, index: usize, geometric: DVec3, rng: &mut Pcg32) -> Reflection {
-        let closure = &self.items[index];
-        match sample_lobes(&closure.params, &closure.layers, geometric, rng) {
+    fn reflect(&mut self, index: usize, geometric: DVec3, rng: &mut Pcg32) -> Reflection {
+        let closure = self.items[index];
+        match sample_lobes(
+            &closure.params,
+            &closure.layers,
+            geometric,
+            rng,
+            &mut self.hair_lcg_state,
+            closure.model_selection_weight,
+            closure.hair_pixel_coverage,
+        ) {
             LobeDraw::Absorbed => Reflection::Absorbed,
+            LobeDraw::Portal {
+                position,
+                direction,
+                weight,
+            } => Reflection::Portal {
+                position,
+                direction,
+                weight: weight * self.selection_total,
+            },
             LobeDraw::Delta {
                 direction,
                 weight,
@@ -574,9 +771,13 @@ impl Closures {
                 params.coat_roughness = blurred_roughness(params.coat_roughness, blur_alpha);
                 HitClosure {
                     weight: closure.weight,
+                    model_selection_weight: closure.model_selection_weight,
                     params,
                     layers: closure.layers.blurred(blur_alpha),
                     pass_tint: closure.pass_tint,
+                    hair_tangent: closure.hair_tangent,
+                    hair_pixel_coverage: closure.hair_pixel_coverage,
+                    hair_transparent: closure.hair_transparent,
                 }
             })
             .collect();
@@ -632,6 +833,9 @@ impl Closures {
                     self.bump_correction,
                 );
                 item.pass_tint = closure.pass_tint;
+                item.hair_tangent = closure.hair_tangent;
+                item.hair_pixel_coverage = closure.hair_pixel_coverage;
+                item.hair_transparent = closure.hair_transparent;
                 item
             })
             .collect();
@@ -662,6 +866,41 @@ struct Surface {
     /// The hit's camera footprint, Cycles' `sd->dP`: the bump's screen differentials, and the footprint of the
     /// shadow and light rays from this vertex (which carry `dP` unchanged, with no `dD`).
     footprint: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PathHit {
+    Triangle(BvhHit),
+    Hair {
+        segment_index: usize,
+        hit: CurveHit,
+    },
+    SplineHair {
+        curve_index: usize,
+        span_index: usize,
+        hit: CurveHit,
+    },
+}
+
+impl PathHit {
+    fn distance(self) -> f64 {
+        match self {
+            Self::Triangle(hit) => hit.distance,
+            Self::Hair { hit, .. } | Self::SplineHair { hit, .. } => hit.distance,
+        }
+    }
+
+    fn triangle(self) -> Option<BvhHit> {
+        match self {
+            Self::Triangle(hit) => Some(hit),
+            Self::Hair { .. } | Self::SplineHair { .. } => None,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum ShadowHit {
+    Mesh(BvhHit),
+    Hair(PathHit),
 }
 
 /// Cycles' compact camera ray differentials (`kernel/camera/camera.h`): `dP`, the change of the ray origin, and `dD`,
@@ -791,6 +1030,7 @@ fn widen_ray_dd(ray_dd: f64, scale: f64, average_roughness_squared: f64) -> f64 
 /// closure falls back to diffuse after a diffuse one). `Delta` is a sharp glass direction with its ray kind. `Subsurface`
 /// enters the surface through the subsurface lobe of its method; the path leaves at that method's exit. `Absorbed` ends
 /// the path.
+#[derive(Clone, Copy)]
 enum Reflection {
     Continuous {
         direction: DVec3,
@@ -807,6 +1047,11 @@ enum Reflection {
         pdf: f64,
         /// Cycles' singular pdf for the widening average, `1e6 · branch · share`.
         mis_weight: f64,
+    },
+    Portal {
+        position: DVec3,
+        direction: DVec3,
+        weight: DVec3,
     },
     Subsurface {
         weight: DVec3,
@@ -836,10 +1081,41 @@ struct LightHit {
     visible: bool,
 }
 
+fn cycles_hash_iqnt2d(x: u32, y: u32) -> u32 {
+    let qx = 1_103_515_245_u32.wrapping_mul((x >> 1) ^ y);
+    let qy = 1_103_515_245_u32.wrapping_mul((y >> 1) ^ x);
+    1_103_515_245_u32.wrapping_mul(qx ^ (qy >> 3))
+}
+
+fn cycles_hash_uint3(kx: u32, ky: u32, kz: u32) -> u32 {
+    let mut a = 0xdead_beef_u32.wrapping_add((3 << 2) + 13);
+    let mut b = a;
+    let mut c = a;
+    a = a.wrapping_add(kx);
+    b = b.wrapping_add(ky);
+    c = c.wrapping_add(kz);
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(14));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(11));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(25));
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(16));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(4));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(14));
+    c ^= b;
+    c.wrapping_sub(b.rotate_left(24))
+}
+
 #[derive(Clone)]
 struct Pcg32 {
     state: u64,
     increment: u64,
+    lcg_rng_pixel: u32,
+    sample_index: u32,
 }
 
 impl Pcg32 {
@@ -847,6 +1123,8 @@ impl Pcg32 {
         let mut rng = Self {
             state: 0,
             increment: (mix64(u64::from(seed) ^ (u64::from(x) << 32) ^ u64::from(y)) << 1) | 1,
+            lcg_rng_pixel: cycles_hash_iqnt2d(x, y) ^ seed,
+            sample_index: sample,
         };
         let _ = rng.next_u32();
         rng.state = rng.state.wrapping_add(mix64(
@@ -871,6 +1149,28 @@ impl Pcg32 {
 
     fn next_f64(&mut self) -> f64 {
         f64::from(self.next_u32()) / 4_294_967_296.0
+    }
+
+    fn hair_lcg_state(&self, rng_offset: u32) -> u32 {
+        cycles_hash_uint3(
+            self.lcg_rng_pixel ^ 0xb4bc_3953,
+            rng_offset,
+            self.sample_index,
+        )
+    }
+}
+
+#[cfg(test)]
+mod hair_lcg_tests {
+    use super::{CYCLES_PRNG_BOUNCE_NUM, Pcg32};
+
+    #[test]
+    fn hair_lcg_seed_changes_after_a_transparent_path_event() {
+        let rng = Pcg32::for_sample(7, 3, 5, 11);
+        let camera_seed = rng.hair_lcg_state(CYCLES_PRNG_BOUNCE_NUM);
+        let transparent_seed =
+            rng.hair_lcg_state(CYCLES_PRNG_BOUNCE_NUM.wrapping_add(CYCLES_PRNG_BOUNCE_NUM));
+        assert_ne!(camera_seed, transparent_seed);
     }
 }
 
@@ -1045,6 +1345,13 @@ pub(super) const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 /// The read-only geometry a path trace reads. It has no interior mutability, so every worker shares it.
 #[derive(Clone, Copy)]
 pub(super) struct SharedGeometry<'a> {
+    pub(super) hair_keys: &'a [[CurveKey; 4]],
+    pub(super) hair_curve_types: &'a [u8],
+    pub(super) hair_masks: &'a [u8],
+    pub(super) hair_segments: &'a [super::scene::HairSegment],
+    pub(super) hair_bvh: &'a HairBvh,
+    pub(super) hair_curve_bvh: &'a HairBvh,
+    pub(super) hair_curve_instances: &'a [super::scene::HairCurveInstance],
     pub(super) triangles: &'a [Triangle],
     pub(super) materials: &'a [Material],
     pub(super) prepared: &'a [PreparedMaterial],
@@ -1056,6 +1363,13 @@ pub(super) struct SharedGeometry<'a> {
 impl<'a> SharedGeometry<'a> {
     pub(super) fn of(geometry: &'a Geometry) -> Self {
         Self {
+            hair_keys: geometry.hair_keys.as_slice(),
+            hair_curve_types: geometry.hair_curve_types.as_slice(),
+            hair_masks: geometry.hair_masks.as_slice(),
+            hair_segments: geometry.hair_segments.as_slice(),
+            hair_bvh: &geometry.hair_bvh,
+            hair_curve_bvh: &geometry.hair_curve_bvh,
+            hair_curve_instances: geometry.hair_curve_instances.as_slice(),
             triangles: geometry.triangles.as_slice(),
             materials: geometry.materials.as_slice(),
             prepared: geometry.prepared.as_slice(),
@@ -5138,10 +5452,14 @@ fn trace_path_with_temperatures(
     let mut radiance = DVec3::ZERO;
     let mut throughput = DVec3::ONE;
     let mut escaped = false;
+    let mut holdout_transparency = 0.0;
+    let mut transparent_background = film_transparent;
     let mut previous = Scatter::Camera;
     let mut ray = RayKind::Camera;
     let mut bounce = 0u32;
     let mut transparent_bounce = 0u32;
+    // Cycles advances its path RNG dimension after every continuation, including transparent portals and volume bounds.
+    let mut rng_offset = CYCLES_PRNG_BOUNCE_NUM;
     // Cycles' `transparent_max_bounce` is at least one: the first pass-through is always taken
     // (`intern/cycles/kernel/integrator/path_state.h`, the FIXME at `path_state_next`).
     let transparent_cap = transparent_max_bounces.max(1);
@@ -5169,7 +5487,7 @@ fn trace_path_with_temperatures(
     // A subsurface exit replaces the next closest hit: the probe's hit is shaded as the exit (`exit_hit`), a diffuse
     // surface built from the entry closure's parameters (`exit_entry`). `diffuse_ancestor` disables the Burley
     // closure after a diffuse bounce.
-    let mut exit_hit: Option<BvhHit> = None;
+    let mut exit_hit: Option<PathHit> = None;
     let mut exit_entry: Option<BsdfParams> = None;
     // Cycles' `PATH_RAY_SUBSURFACE_BACKFACING`: the entry was on a backfacing side, which flips the exit's normal.
     let mut exit_backfacing = false;
@@ -5206,7 +5524,7 @@ fn trace_path_with_temperatures(
                 ray,
             ),
         };
-        let surface_distance = hit.map_or(f64::INFINITY, |hit| hit.distance);
+        let surface_distance = hit.map_or(f64::INFINITY, PathHit::distance);
         // Camera rays see the lights that are visible to camera, and a volume scatter is light-sampled only. A surface
         // vertex's light hit needs its light sample as MIS partner, which a volume scatter on the way would drop, so a
         // scene with volumes does not count those hits.
@@ -5414,6 +5732,7 @@ fn trace_path_with_temperatures(
                 previous = Scatter::Volume(phase_pdf);
                 ray = RayKind::VolumeScatter;
                 bounce += 1;
+                rng_offset = rng_offset.wrapping_add(CYCLES_PRNG_BOUNCE_NUM);
                 continue;
             }
             // No mesh collision before `limit`: the mesh's chromatic transmittance up to there, then the grid's own event
@@ -5485,6 +5804,7 @@ fn trace_path_with_temperatures(
                 previous = Scatter::Volume(phase_pdf);
                 ray = RayKind::VolumeScatter;
                 bounce += 1;
+                rng_offset = rng_offset.wrapping_add(CYCLES_PRNG_BOUNCE_NUM);
                 continue;
             }
         } else if terminal {
@@ -5565,6 +5885,7 @@ fn trace_path_with_temperatures(
                 previous = Scatter::Volume(phase_pdf);
                 ray = RayKind::VolumeScatter;
                 bounce += 1;
+                rng_offset = rng_offset.wrapping_add(CYCLES_PRNG_BOUNCE_NUM);
                 continue;
             }
         } else if let Some(medium) = stack {
@@ -5574,6 +5895,7 @@ fn trace_path_with_temperatures(
             // carries into it, independent of where it scatters (`volume_integrate_homogeneous`).
             match trace_mesh_medium(&medium, segment_limit, &mut throughput, rng) {
                 MediumOutcome::Scatter(distance) => {
+                    transparent_background = false;
                     let phase = event_phase(&media, None, distance);
                     let Some(anisotropy) = phase.pick(rng) else {
                         break;
@@ -5627,6 +5949,7 @@ fn trace_path_with_temperatures(
                     previous = Scatter::Volume(phase_pdf);
                     ray = RayKind::VolumeScatter;
                     bounce += 1;
+                    rng_offset = rng_offset.wrapping_add(CYCLES_PRNG_BOUNCE_NUM);
                     continue;
                 }
                 MediumOutcome::Survive => {}
@@ -5651,6 +5974,7 @@ fn trace_path_with_temperatures(
             // A light is a transparent pass in Cycles (`integrate_light_forward`): it spends the
             // transparent budget, and the path ends at the cap, after the emission above.
             transparent_bounce += 1;
+            rng_offset = rng_offset.wrapping_add(CYCLES_PRNG_BOUNCE_NUM);
             if transparent_bounce >= transparent_max_bounces {
                 break;
             }
@@ -5683,8 +6007,8 @@ fn trace_path_with_temperatures(
             escaped = true;
             break;
         };
-        let footprint_here = ray_dp + hit.distance * ray_dd;
-        let mut surface = make_surface(
+        let footprint_here = ray_dp + hit.distance() * ray_dd;
+        let mut surface = make_path_surface(
             doc,
             geometry,
             hit,
@@ -5705,7 +6029,9 @@ fn trace_path_with_temperatures(
             // The exit of a subsurface entry is a diffuse surface (`subsurface_shader_data_setup`), not the material it
             // hits. Cycles shades it along the exit hit's own normal: `subsurface_disk` sets the probe ray to `Ng[hit]`,
             // flipped for a backfacing entry, and `subsurface_scatter` reverses that ray, so the exit faces outward.
-            if let Some(outward) = intrinsic_normal(geometry, hit.triangle_index) {
+            if let PathHit::Triangle(hit) = hit
+                && let Some(outward) = intrinsic_normal(geometry, hit.triangle_index)
+            {
                 let outward = if exit_backfacing { -outward } else { outward };
                 if surface.normal.dot(outward) < 0.0 {
                     surface.normal = -surface.normal;
@@ -5736,6 +6062,14 @@ fn trace_path_with_temperatures(
             // `PATH_RAY_DIFFUSE_ANCESTOR`). The random walk keeps its closure.
             surface.closures.disable_burley_subsurface();
         }
+        if transparent_background {
+            let holdout_weight = 1.0 - surface.closures.holdout_coverage;
+            holdout_transparency += throughput.element_sum() / 3.0 * holdout_weight;
+            if surface.closures.holdout_coverage <= 0.0 {
+                break;
+            }
+        }
+        surface.closures.hair_lcg_state = rng.hair_lcg_state(rng_offset);
         if surface.volume_boundary || !surface.media.is_empty() {
             // A medium surface passes the path and changes the volume stack: each of its volume closures enters the
             // medium of its object, or leaves the one it entered.
@@ -5749,6 +6083,7 @@ fn trace_path_with_temperatures(
             // As a transparent pass, the origin moves to the surface, so its footprint is the surface's.
             ray_dp = surface.footprint;
             origin = offset_origin(surface.point, direction, surface.geometric_normal);
+            rng_offset = rng_offset.wrapping_add(CYCLES_PRNG_BOUNCE_NUM);
             continue;
         }
         // Emission is the closures' radiance weighted by their coverage, so a path that ends here still shows it.
@@ -5763,7 +6098,7 @@ fn trace_path_with_temperatures(
                 * direct_lighting(
                     scene,
                     &media,
-                    &surface,
+                    &mut surface,
                     environment,
                     bounce < max_bounces && !terminal,
                     transparent_max_bounces.saturating_sub(transparent_bounce),
@@ -5783,21 +6118,58 @@ fn trace_path_with_temperatures(
                 throughput *= multiplier;
                 transparent_bounce += 1;
                 terminate_on_next_surface |= transparent_bounce >= transparent_cap;
+                rng_offset = rng_offset.wrapping_add(CYCLES_PRNG_BOUNCE_NUM);
                 // Cycles keeps `ray.P` and `dP` through a transparent pass and lets `t` grow: moving the origin to the
                 // surface with `dP` set to the surface's footprint gives the same footprint at every later hit.
                 ray_dp = surface.footprint;
                 origin = offset_origin(surface.point, direction, surface.geometric_normal);
             }
             Some(Pick::Reflect(index)) => {
-                if terminal {
+                // Ray portals use Cycles' transparent continuation label: they keep visibility and regular bounce state.
+                let is_portal = matches!(
+                    surface.closures.items[index].params.model,
+                    BsdfModel::RayPortal(_)
+                );
+                if terminal && !is_portal {
                     break;
                 }
                 let draw = surface
                     .closures
                     .reflect(index, surface.geometric_normal, rng);
+                if let Reflection::Portal {
+                    position,
+                    direction: portal_direction,
+                    weight,
+                } = draw
+                {
+                    if !position.is_finite() || !portal_direction.is_finite() || !weight.is_finite()
+                    {
+                        break;
+                    }
+                    let portal_direction = portal_direction.normalize_or_zero();
+                    if portal_direction == DVec3::ZERO {
+                        break;
+                    }
+                    throughput *= weight;
+                    if !matches!(previous, Scatter::Camera) {
+                        previous = Scatter::Delta(surface.point);
+                    }
+                    transparent_bounce += 1;
+                    terminate_on_next_surface |= transparent_bounce >= transparent_cap;
+                    ray_dp = surface.footprint;
+                    direction = portal_direction;
+                    origin = if (surface.point - position).length_squared() > 1.0e-9 {
+                        position
+                    } else {
+                        offset_origin(position, direction, surface.geometric_normal)
+                    };
+                    rng_offset = rng_offset.wrapping_add(CYCLES_PRNG_BOUNCE_NUM);
+                    continue;
+                }
                 // A subsurface entry takes no bounce, so it is taken at the budget too (`subsurface_bounce`, which
                 // `path_state_next` does not count). The path leaves at the method's exit, keeping this vertex's count.
                 if let Reflection::Subsurface { weight, method } = draw {
+                    transparent_background = false;
                     let entry = surface.closures.items[index];
                     let Some(exit) = subsurface_exit(
                         geometry,
@@ -5814,7 +6186,9 @@ fn trace_path_with_temperatures(
                     // Burley exit is oriented by its probe's entry (`subsurface_disk`), and a random walk exit faces
                     // along the walk's last flight, since Cycles reverses that ray at the exit point.
                     exit_backfacing = match method {
-                        SubsurfaceMethod::Burley => intrinsic_normal(geometry, hit.triangle_index)
+                        SubsurfaceMethod::Burley => hit
+                            .triangle()
+                            .and_then(|hit| intrinsic_normal(geometry, hit.triangle_index))
                             .is_some_and(|normal| normal.dot(direction) > 0.0),
                         _ => intrinsic_normal(geometry, exit.hit.triangle_index)
                             .is_some_and(|normal| normal.dot(exit.direction) < 0.0),
@@ -5826,11 +6200,12 @@ fn trace_path_with_temperatures(
                     throughput = exit.throughput;
                     origin = exit.origin;
                     direction = exit.direction;
-                    exit_hit = Some(exit.hit);
+                    exit_hit = Some(PathHit::Triangle(exit.hit));
                     exit_entry = Some(entry.params);
                     previous = Scatter::Camera;
                     // The exit is a diffuse closure (`subsurface_scatter`), so a light it meets is a diffuse-class hit.
                     ray = RayKind::Diffuse;
+                    rng_offset = rng_offset.wrapping_add(CYCLES_PRNG_BOUNCE_NUM.wrapping_mul(2));
                     continue;
                 }
                 if bounce >= max_bounces {
@@ -5849,7 +6224,12 @@ fn trace_path_with_temperatures(
                         pdf,
                         ray: lobe,
                     } => {
-                        diffuse_ancestor |= lobe == RayKind::Diffuse;
+                        transparent_background = false;
+                        diffuse_ancestor |= lobe == RayKind::Diffuse
+                            || matches!(
+                                surface.closures.items[index].params.model,
+                                BsdfModel::Translucent
+                            );
                         min_ray_pdf = min_ray_pdf.min(pdf);
                         previous = Scatter::Surface(MisVertex {
                             bsdf_pdf: pdf,
@@ -5866,12 +6246,16 @@ fn trace_path_with_temperatures(
                         pdf,
                         ..
                     } => {
+                        transparent_background = false;
                         min_ray_pdf = min_ray_pdf.min(pdf);
                         previous = Scatter::Delta(surface.point);
                         ray = lobe;
                         (direction, weight)
                     }
                     // Cycles' `LABEL_NONE`: a rejected draw ends the path. A subsurface draw was handled above.
+                    Reflection::Portal { .. } => {
+                        unreachable!("ray portals redirect before ordinary continuation")
+                    }
                     Reflection::Absorbed | Reflection::Subsurface { .. } => break,
                 };
                 if !next_direction.is_finite() || !weight.is_finite() {
@@ -5899,6 +6283,7 @@ fn trace_path_with_temperatures(
                 direction = next_direction.normalize_or_zero();
                 origin = offset_origin(surface.point, direction, surface.geometric_normal);
                 bounce += 1;
+                rng_offset = rng_offset.wrapping_add(CYCLES_PRNG_BOUNCE_NUM);
             }
         }
     }
@@ -5911,12 +6296,50 @@ fn trace_path_with_temperatures(
     // Cycles writes film transparency only for a path that escapes to the background, as
     // `average(throughput)` (`intern/cycles/kernel/integrator/shade_background.h`). Every other
     // termination leaves the pixel covered.
-    let alpha = if escaped {
-        1.0 - throughput.element_sum() / 3.0
+    let alpha = if film_transparent {
+        transparent_film_alpha(
+            escaped,
+            transparent_background,
+            throughput,
+            holdout_transparency,
+        )
     } else {
         1.0
     };
     Ok((radiance, alpha.clamp(0.0, 1.0)))
+}
+fn transparent_film_alpha(
+    escaped: bool,
+    transparent_background: bool,
+    throughput: DVec3,
+    holdout_transparency: f64,
+) -> f64 {
+    let background_transparency = if escaped && transparent_background {
+        throughput.element_sum() / 3.0
+    } else {
+        0.0
+    };
+    (1.0 - holdout_transparency - background_transparency).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod film_alpha_tests {
+    use super::transparent_film_alpha;
+    use glam::DVec3;
+
+    #[test]
+    fn holdout_alpha_keeps_the_arriving_volume_transparency() {
+        assert_eq!(
+            transparent_film_alpha(false, true, DVec3::splat(0.5), 0.5),
+            0.5
+        );
+        assert_eq!(transparent_film_alpha(false, true, DVec3::ONE, 1.0), 0.0);
+        assert_eq!(
+            transparent_film_alpha(true, true, DVec3::splat(0.25), 0.0),
+            0.75
+        );
+        assert_eq!(transparent_film_alpha(true, false, DVec3::ONE, 0.0), 1.0);
+    }
 }
 
 #[expect(
@@ -5983,7 +6406,7 @@ fn write_center_passes(
                 f64::INFINITY,
                 RayKind::Camera,
             );
-            let segment_limit = hit.map_or(f64::INFINITY, |hit| hit.distance);
+            let segment_limit = hit.map_or(f64::INFINITY, PathHit::distance);
             let volume_transmittance = march_volumes(
                 volumes,
                 origin,
@@ -6019,14 +6442,14 @@ fn write_center_passes(
             } else {
                 left_camera_matrices.as_ref()
             };
-            let surface = make_surface(
+            let surface = make_path_surface(
                 doc,
                 geometry,
                 hit,
                 origin,
                 direction,
                 images,
-                footprint.at_distance(hit.distance),
+                footprint.at_distance(hit.distance()),
                 camera_matrices,
                 RayKind::Camera,
                 evaluator_workspace,
@@ -6100,7 +6523,7 @@ mod overlay_tests {
 
     use super::{
         AreaShape, Bounces, Camera, CameraFootprint, DMat4, DVec3, EvaluatorWorkspace, Geometry,
-        Pcg32, PointLight, RasterOutput, RayKind, SceneRefs, TraceGeometry,
+        HairBvh, Pcg32, PointLight, RasterOutput, RayKind, SceneRefs, TraceGeometry,
         display_rgb_from_associated, overlay_over_rgba, overlay_rasterized_lines, to_srgb_byte,
         trace_path,
     };
@@ -6163,6 +6586,15 @@ mod overlay_tests {
             interocular_distance: 0.0,
         };
         let geometry = Geometry {
+            hair_keys: Vec::new(),
+            hair_curve_types: Vec::new(),
+            hair_masks: Vec::new(),
+            hair_segments: Vec::new(),
+            hair_bvh: HairBvh::build(&[], &[]),
+            hair_curve_instances: Vec::new(),
+            hair_curve_bvh: HairBvh::build_splines(Vec::<
+                &super::super::hair_intersect::HairCurveGeometry,
+            >::new()),
             triangles: Vec::new(),
             lines: vec![Line {
                 start: DVec3::new(0.0, 0.0, -1.0),
@@ -6468,7 +6900,7 @@ fn overlay_rasterized_lines(
     Ok(())
 }
 
-/// The nearest hit a ray of kind `ray` can see; objects hidden from that kind are passed through.
+/// The nearest mesh or hair hit a ray of kind `ray` can see; hidden objects are passed through.
 fn closest_hit(
     geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
@@ -6477,15 +6909,75 @@ fn closest_hit(
     t_min: f64,
     t_max: f64,
     ray: RayKind,
-) -> Option<BvhHit> {
-    bvh.closest_hit_where(
-        geometry.triangles,
-        origin,
-        direction,
-        t_min,
-        t_max,
-        &|mask| mask & ray.bit() != 0,
-    )
+) -> Option<PathHit> {
+    let triangle = bvh
+        .closest_hit_where(
+            geometry.triangles,
+            origin,
+            direction,
+            t_min,
+            t_max,
+            &|mask| mask & ray.bit() != 0,
+        )
+        .map(PathHit::Triangle);
+    let hair = closest_hair_hit(geometry, origin, direction, t_min, t_max, ray.bit());
+    match (triangle, hair) {
+        (Some(triangle), Some(hair)) if triangle.distance() <= hair.distance() => Some(triangle),
+        (Some(_), Some(hair)) => Some(hair),
+        (Some(hit), None) | (None, Some(hit)) => Some(hit),
+        (None, None) => None,
+    }
+}
+fn closest_hair_hit(
+    geometry: &TraceGeometry<'_>,
+    origin: DVec3,
+    direction: DVec3,
+    t_min: f64,
+    t_max: f64,
+    ray_mask: u8,
+) -> Option<PathHit> {
+    let legacy = geometry
+        .hair_bvh
+        .closest_hit(
+            geometry.hair_keys,
+            geometry.hair_curve_types,
+            geometry.hair_masks,
+            origin,
+            direction,
+            t_min,
+            t_max,
+            ray_mask,
+        )
+        .map(|(segment_index, hit)| PathHit::Hair { segment_index, hit });
+    let spline = geometry
+        .hair_curve_bvh
+        .closest_spline_hit(
+            geometry.hair_curve_instances.len(),
+            origin,
+            direction,
+            t_min,
+            t_max,
+            |curve_index, current_max| {
+                let curve = geometry.hair_curve_instances.get(curve_index)?;
+                if curve.ray_mask & ray_mask == 0 {
+                    return None;
+                }
+                curve
+                    .curve
+                    .closest_hit_world(origin, direction, t_min, current_max)
+            },
+        )
+        .map(|(curve_index, span_index, hit)| PathHit::SplineHair {
+            curve_index,
+            span_index,
+            hit,
+        });
+    match (legacy, spline) {
+        (Some(legacy), Some(spline)) if legacy.distance() <= spline.distance() => Some(legacy),
+        (Some(_), Some(spline)) => Some(spline),
+        (Some(hit), None) | (None, Some(hit)) => Some(hit),
+        (None, None) => None,
+    }
 }
 
 /// The shading of one hit for the transparent pass of a realtime shadow ray (`render/scene.rs`). Each closure carries its
@@ -6899,6 +7391,365 @@ fn make_surface(
 /// The media and shadow transparency of one hit, which is all a shadow ray or the camera's medium probe reads from it.
 /// Displacement gradients are not evaluated here; smooth Thin Wall transmission uses its Principled shading normal.
 /// Consequently a warning or error produced only by gradient samples is still raised on path and camera hits.
+fn make_path_surface(
+    doc: &SceneDoc,
+    geometry: &TraceGeometry<'_>,
+    hit: PathHit,
+    origin: DVec3,
+    direction: DVec3,
+    images: &BTreeMap<String, ImageData>,
+    footprint: f64,
+    camera_matrices: Option<&(DMat4, DMat4)>,
+    ray_kind: RayKind,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<Surface> {
+    match hit {
+        PathHit::Triangle(hit) => make_surface(
+            doc,
+            geometry,
+            hit,
+            origin,
+            direction,
+            images,
+            footprint,
+            camera_matrices,
+            ray_kind,
+            evaluator_workspace,
+        ),
+        PathHit::Hair { .. } | PathHit::SplineHair { .. } => make_hair_surface(
+            doc,
+            geometry,
+            hit,
+            origin,
+            direction,
+            images,
+            footprint,
+            camera_matrices,
+            ray_kind,
+            evaluator_workspace,
+        ),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HairSurfaceHit {
+    material_index: usize,
+    object_index: u32,
+    element_index: u32,
+    curve_random: Option<f64>,
+    tangent: DVec3,
+    /// Radius paired with the path footprint for `HairHitData` pixel coverage.
+    radius: f64,
+    normal: DVec3,
+    strand_normal: DVec3,
+    distance: f64,
+}
+
+fn hair_surface_hit(
+    geometry: &TraceGeometry<'_>,
+    hit: PathHit,
+    origin: DVec3,
+    direction: DVec3,
+) -> Result<HairSurfaceHit> {
+    let point = origin + direction * hit.distance();
+    let invalid_hit = || {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "hair curve hit has invalid geometry",
+        )
+    };
+    match hit {
+        PathHit::Hair { segment_index, hit } => {
+            let segment = *geometry.hair_segments.get(segment_index).ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "hair BVH returned an invalid segment index",
+                )
+            })?;
+            let keys = geometry.hair_keys.get(segment_index).ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "hair BVH returned an invalid curve segment",
+                )
+            })?;
+            let center = curve_position(keys, segment.curve_type, hit.u).ok_or_else(invalid_hit)?;
+            let tangent = curve_tangent(keys, segment.curve_type, hit.u).ok_or_else(invalid_hit)?;
+            let radius = curve_radius(keys, segment.curve_type, hit.u).ok_or_else(invalid_hit)?;
+            let normal = {
+                let radial = (point - center).normalize_or_zero();
+                if radial == DVec3::ZERO {
+                    direction
+                } else {
+                    radial
+                }
+            };
+            let object =
+                object_for_index(geometry.objects, segment.object_index).ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        "hair curve references an unmapped object",
+                    )
+                })?;
+            let Some(world_to_local) = object.world_to_local else {
+                return Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    "hair shader evaluation requires an invertible object transform",
+                    serde_json::json!({
+                        "feature_id":"render.hair.object_transform",
+                        "node_id":object.node_id.as_str(),
+                    }),
+                ));
+            };
+            let local_normal = segment
+                .curve_normal_start
+                .lerp(segment.curve_normal_end, hit.u);
+            let strand_normal = world_to_local
+                .transpose()
+                .transform_vector3(local_normal)
+                .normalize_or_zero();
+            Ok(HairSurfaceHit {
+                material_index: segment.material_index,
+                object_index: segment.object_index,
+                element_index: segment.element_index,
+                curve_random: segment.curve_random,
+                tangent,
+                radius,
+                normal,
+                strand_normal,
+                distance: hit.distance,
+            })
+        }
+        PathHit::SplineHair {
+            curve_index,
+            span_index,
+            hit,
+        } => {
+            let curve = geometry
+                .hair_curve_instances
+                .get(curve_index)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        "hair BVH returned an invalid spline curve index",
+                    )
+                })?;
+            let sample = curve
+                .curve
+                .sample_local(span_index, hit.u)
+                .ok_or_else(invalid_hit)?;
+            let center = curve
+                .curve
+                .object_to_world
+                .transform_point3(sample.position);
+            let tangent = curve
+                .curve
+                .object_to_world
+                .transform_vector3(sample.tangent);
+            let tangent_length_squared = tangent.length_squared();
+            let radius = sample.radius;
+            let local_point = curve.curve.world_to_object.transform_point3(point);
+            let local_radial = (local_point - sample.position).normalize_or_zero();
+            let normal = if local_radial == DVec3::ZERO {
+                direction
+            } else {
+                let normal = curve
+                    .curve
+                    .world_to_object
+                    .transpose()
+                    .transform_vector3(local_radial)
+                    .normalize_or_zero();
+                if normal == DVec3::ZERO {
+                    direction
+                } else {
+                    normal
+                }
+            };
+            let strand_normal = super::hair_geometry::curve_normal_world(
+                &curve.curve,
+                &curve.normals,
+                span_index,
+                hit.u,
+            )
+            .ok_or_else(invalid_hit)?;
+            if !center.is_finite()
+                || !tangent.is_finite()
+                || !tangent_length_squared.is_finite()
+                || tangent_length_squared <= f64::EPSILON
+                || !radius.is_finite()
+                || radius < 0.0
+                || !normal.is_finite()
+                || !strand_normal.is_finite()
+            {
+                return Err(invalid_hit());
+            }
+            Ok(HairSurfaceHit {
+                material_index: curve.material_index,
+                object_index: curve.object_index,
+                element_index: curve.element_index,
+                curve_random: curve.curve_random,
+                tangent,
+                radius,
+                normal,
+                strand_normal,
+                distance: hit.distance,
+            })
+        }
+        PathHit::Triangle(_) => Err(invalid_hit()),
+    }
+}
+
+fn make_hair_surface(
+    doc: &SceneDoc,
+    geometry: &TraceGeometry<'_>,
+    hit: PathHit,
+    origin: DVec3,
+    direction: DVec3,
+    images: &BTreeMap<String, ImageData>,
+    footprint: f64,
+    camera_matrices: Option<&(DMat4, DMat4)>,
+    ray_kind: RayKind,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<Surface> {
+    let hit = hair_surface_hit(geometry, hit, origin, direction)?;
+    let point = origin + direction * hit.distance;
+    let normal = hit.normal;
+    let tangent = hit.tangent;
+    let radius = hit.radius;
+    let back_facing = normal.dot(-direction) < 0.0;
+    let object = object_for_index(geometry.objects, hit.object_index).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "hair curve references an unmapped object",
+        )
+    })?;
+    let material = geometry.materials.get(hit.material_index).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "hair curve references an unmapped material",
+        )
+    })?;
+    let prepared = geometry.prepared.get(hit.material_index).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "hair curve references an unmapped prepared material",
+        )
+    })?;
+    let Some(world_to_local) = object.world_to_local else {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "hair shader evaluation requires an invertible object transform",
+            serde_json::json!({
+                "feature_id":"render.hair.object_transform",
+                "node_id":object.node_id.as_str(),
+            }),
+        ));
+    };
+    let strand_normal = hit.strand_normal;
+    let mut context = HitContext::new(&doc.node_groups)
+        .with_images(images)
+        .with_warnings(geometry.warnings);
+    context.position = point;
+    context.object = object_space(object, point);
+    context.object_to_world = object.object_to_world;
+    context.world_to_object = world_to_local;
+    context.object_color = object.object_color;
+    context.object_pass_index = object.object_pass_index;
+    context.object_random_number = object.object_random_number;
+    context.material_pass_index = material.pass_index.map(f64::from);
+    context.normal = normal;
+    context.geometric_normal = normal;
+    context.back_facing = back_facing;
+    context.view_direction = -direction;
+    context.path_traced = true;
+    context.hair_curve_hit = true;
+    context.light_falloff_distance = Some(hit.distance);
+    if let Some((camera_to_world, world_to_camera)) = camera_matrices {
+        context.set_camera_matrices(*camera_to_world, *world_to_camera);
+    }
+    context = context
+        .with_footprint(HitFootprint {
+            dp: footprint,
+            geometric_normal: normal,
+        })
+        .with_hair_context(tangent, Some(strand_normal), hit.curve_random);
+    let shading =
+        evaluate_surface_with_workspace(material, prepared, &context, evaluator_workspace)?;
+    if shading.displacement_height != 0.0 {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "path-traced hair curves do not support surface displacement",
+            serde_json::json!({
+                "feature_id":"render.hair.displacement",
+                "node_id":object.node_id.as_str(),
+            }),
+        ));
+    }
+    if shading
+        .closures
+        .iter()
+        .any(|closure| !closure.params.thin_wall && closure.params.subsurface_weight > 0.0)
+    {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "hair curves do not provide the mesh boundary required by a BSSRDF",
+            serde_json::json!({"feature_id":"render.hair.bssrdf","node_id":object.node_id.as_str()}),
+        ));
+    }
+    let mut items = Vec::with_capacity(shading.closures.len());
+    for closure in shading
+        .closures
+        .iter()
+        .filter(|closure| closure.weight > 0.0)
+    {
+        let mut params = closure.params;
+        apply_hit_alpha(material, &mut params);
+        params.back_facing = back_facing;
+        params.normal = if params.normal.is_finite() && params.normal.length_squared() > 0.0 {
+            params.normal.normalize()
+        } else {
+            normal
+        };
+        let mut item = HitClosure::new(
+            closure.weight,
+            &params,
+            -direction,
+            normal,
+            material.use_bump_map_correction,
+        );
+        item.hair_tangent = Some(tangent);
+        item.hair_pixel_coverage = if ray_kind == RayKind::Camera && radius > 0.0 {
+            0.5 * footprint / radius
+        } else {
+            1.0
+        };
+        let hair_hit = HairHitData {
+            curve_normal: params.hair_normal.unwrap_or(strand_normal),
+            pixel_coverage: item.hair_pixel_coverage,
+        };
+        if hair_is_transparent(&params, -direction, tangent, normal, hair_hit) {
+            item.hair_transparent = true;
+            item.params.alpha = 0.0;
+            item.params.transparent_tint = [1.0; 3];
+            item.pass_tint = DVec3::ONE;
+        }
+        items.push(item);
+    }
+    let shading_normal =
+        heaviest(&items, |closure| closure.weight).map_or(normal, |closure| closure.params.normal);
+    Ok(Surface {
+        point,
+        normal: shading_normal,
+        geometric_normal: normal,
+        shadow_point: point,
+        closures: Closures::new(items, normal, normal, material.use_bump_map_correction),
+        volume_boundary: prepared.is_volume_only(),
+        media: surface_media(hit.object_index, &shading.volume),
+        object_index: hit.object_index,
+        element_index: hit.element_index,
+        triangle_index: usize::MAX,
+        footprint,
+    })
+}
 fn shadow_hit(
     doc: &SceneDoc,
     geometry: &TraceGeometry<'_>,
@@ -6973,7 +7824,8 @@ fn shadow_hit_into(
                     .map(|closure| {
                         let mut params = closure.params;
                         apply_hit_alpha(frame.material, &mut params);
-                        (closure.weight, params.alpha, transparent_tint(&params))
+                        let (alpha, tint) = shadow_alpha_tint(&params);
+                        (closure.weight, alpha, tint)
                     }),
             );
             if ray_kind == RayKind::Shadow {
@@ -7037,7 +7889,7 @@ pub(super) fn object_for_index(
 fn direct_lighting(
     scene: SceneRefs<'_, '_>,
     media: &[MeshMedium],
-    surface: &Surface,
+    surface: &mut Surface,
     environment: DVec3,
     // Whether the path samples a BSDF continuation here. Only then does a BSDF ray pair with the
     // light sample for MIS; at the last vertex the light sample is unweighted.
@@ -7057,10 +7909,13 @@ fn direct_lighting(
     } = scene;
     let normal = surface.normal;
     let geometric = surface.geometric_normal;
-    let closures = &surface.closures;
+    let point = surface.point;
+    let shadow_point = surface.shadow_point;
+    let footprint = surface.footprint;
+    let closures = &mut surface.closures;
     let mut contribution = DVec3::ZERO;
     for light in lights {
-        let Some(sample) = sample_light(light, surface.point, rng) else {
+        let Some(sample) = sample_light(light, point, rng) else {
             continue;
         };
         // Every closure's own lobes and cosine (`Closures::bsdf_eval`), keeping the lobes this light's ray mask admits, as
@@ -7074,12 +7929,12 @@ fn direct_lighting(
             scene,
             media,
             ShadowRay {
-                point: surface.shadow_point,
+                point: shadow_point,
                 normal: geometric,
                 shading: closures.smooth,
                 direction: sample.direction,
                 distance: sample.distance,
-                footprint: surface.footprint,
+                footprint,
             },
             transparent_budget,
             rng,
@@ -7123,12 +7978,12 @@ fn direct_lighting(
             scene,
             media,
             ShadowRay {
-                point: surface.shadow_point,
+                point: shadow_point,
                 normal: geometric,
                 shading: closures.smooth,
                 direction,
                 distance: f64::INFINITY,
-                footprint: surface.footprint,
+                footprint,
             },
             transparent_budget,
             rng,
@@ -7471,7 +8326,6 @@ fn shadow_transmittance_with_volumetric_shadows(
     } = ray;
     let mut transparent_hits = 0u32;
     let mut blocked = false;
-    let mut failure = None;
     // The shadow ray starts in the receiver's volume stack and crosses each medium by its transmittance.
     let mut shadow_media = if volumetric_shadows {
         media.to_vec()
@@ -7479,84 +8333,122 @@ fn shadow_transmittance_with_volumetric_shadows(
         Vec::new()
     };
     let mut transmittance = DVec3::ONE;
-    let remaining = if distance.is_finite() {
+    let mut remaining = if distance.is_finite() {
         (distance - RAY_EPSILON).max(0.0)
     } else {
         f64::INFINITY
     };
-    let (origin, remaining) = bvh.walk_hits(
-        geometry.triangles,
-        WalkRay {
-            origin: shadow_origin(point, direction, normal, shading),
+    let mut origin = shadow_origin(point, direction, normal, shading);
+    loop {
+        let mesh_hit = bvh.closest_hit_where(
+            geometry.triangles,
+            origin,
             direction,
-            epsilon: RAY_EPSILON,
+            RAY_EPSILON,
             remaining,
-            kind: Some(RayKind::Shadow),
-        },
-        |hit, origin| {
-            let (media, transparency, volume_boundary) = match shadow_hit(
-                doc,
-                geometry,
-                hit,
+            &|mask| mask & RayKind::Shadow.bit() != 0,
+        );
+        let hair_hit = closest_hair_hit(
+            geometry,
+            origin,
+            direction,
+            RAY_EPSILON,
+            remaining,
+            RayKind::Shadow.bit(),
+        );
+        let hit = match (mesh_hit, hair_hit) {
+            (Some(mesh), Some(hair)) if mesh.distance <= hair.distance() => {
+                Some(ShadowHit::Mesh(mesh))
+            }
+            (Some(_) | None, Some(hair)) => Some(ShadowHit::Hair(hair)),
+            (Some(mesh), None) => Some(ShadowHit::Mesh(mesh)),
+            (None, None) => None,
+        };
+        let Some(hit) = hit else {
+            break;
+        };
+        let hit_distance = match hit {
+            ShadowHit::Mesh(hit) => hit.distance,
+            ShadowHit::Hair(hit) => hit.distance(),
+        };
+        if volumetric_shadows && !volumes.is_empty() {
+            transmittance *= march_volumes(
+                volumes,
                 origin,
                 direction,
-                images,
-                Some(footprint),
-                evaluator_workspace,
-            ) {
-                Ok(shadow) => shadow,
-                Err(error) => {
-                    failure = Some(error);
-                    return false;
-                }
-            };
-            if volumetric_shadows && !volumes.is_empty() {
-                match march_volumes(
-                    volumes,
+                hit_distance,
+                Some(rng),
+                RayKind::Shadow,
+            )?;
+        }
+        if volumetric_shadows && let Some(stack) = stack_medium(&shadow_media) {
+            transmittance *= medium_transmittance(&stack, hit_distance);
+        }
+        if transmittance.max_element() <= 1.0e-5 {
+            blocked = true;
+            break;
+        }
+        let (hit_media, transparency, volume_boundary) = match hit {
+            ShadowHit::Mesh(hit) => {
+                let (media, transparency, volume_boundary) = shadow_hit(
+                    doc,
+                    geometry,
+                    hit,
                     origin,
                     direction,
-                    hit.distance,
-                    Some(rng),
+                    images,
+                    Some(footprint),
+                    evaluator_workspace,
+                )?;
+                (media, transparency, volume_boundary)
+            }
+            ShadowHit::Hair(hit) => {
+                let surface = make_hair_surface(
+                    doc,
+                    geometry,
+                    hit,
+                    origin,
+                    direction,
+                    images,
+                    footprint,
+                    None,
                     RayKind::Shadow,
-                ) {
-                    Ok(voxel_transmittance) => transmittance *= voxel_transmittance,
-                    Err(error) => {
-                        failure = Some(error);
-                        return false;
-                    }
-                }
+                    evaluator_workspace,
+                )?;
+                let transparency =
+                    shadow_transparency(surface.closures.items.iter().map(|closure| {
+                        let (alpha, tint) = shadow_alpha_tint(&closure.params);
+                        (closure.weight, alpha, tint)
+                    }));
+                (surface.media, transparency, surface.volume_boundary)
             }
-            if volumetric_shadows && let Some(stack) = stack_medium(&shadow_media) {
-                transmittance *= medium_transmittance(&stack, hit.distance);
+        };
+        if volumetric_shadows {
+            for medium in &hit_media {
+                toggle_mesh_medium(&mut shadow_media, medium);
             }
-            if volumetric_shadows {
-                for medium in &media {
-                    toggle_mesh_medium(&mut shadow_media, medium);
-                }
-            }
-            if volume_boundary {
-                return true;
-            }
-            // Cycles counts each transparent surface a shadow ray crosses against the path's remaining budget and blocks
-            // the ray past it (`intern/cycles/kernel/bvh/intersect_filter.h`).
+        }
+        if !volume_boundary {
+            // Cycles counts each transparent surface a shadow ray crosses against the path's remaining budget.
             transparent_hits += 1;
             if transparent_hits > transparent_budget {
                 blocked = true;
-                return false;
+                break;
             }
-            // Shadow transparency is the closures' transparent share (`surface_shader_transparency`); ordinary glass
-            // blocks, while Cycles' smooth Thin Wall transmission becomes a transparent closure for non-camera rays
-            // (`bsdf_thin_glass_transmission_setup`), which `shadow_hit` adds here.
             transmittance *= transparency;
             if transmittance.max_element() <= 1.0e-5 {
                 blocked = true;
-                return false;
+                break;
             }
-            true
-        },
-    );
-    if let Some(error) = failure {
-        return Err(error);
+        }
+        let advance = hit_distance + RAY_EPSILON;
+        origin += direction * advance;
+        if remaining.is_finite() {
+            remaining = (remaining - advance).max(0.0);
+            if remaining <= RAY_EPSILON {
+                break;
+            }
+        }
     }
     if blocked {
         return Ok(DVec3::ZERO);
@@ -8016,6 +8908,11 @@ enum LobeDraw {
         weight: DVec3,
         method: SubsurfaceMethod,
     },
+    Portal {
+        position: DVec3,
+        direction: DVec3,
+        weight: DVec3,
+    },
     Absorbed,
 }
 
@@ -8026,9 +8923,87 @@ fn sample_lobes(
     layers: &Layers,
     geometric: DVec3,
     rng: &mut Pcg32,
+    lcg_state: &mut u32,
+    model_selection_weight: f64,
+    hair_pixel_coverage: f64,
 ) -> LobeDraw {
     let normal = layers.normal;
     let view = layers.view;
+    match params.model {
+        BsdfModel::Principled => {}
+        BsdfModel::Holdout => return LobeDraw::Absorbed,
+        BsdfModel::RayPortal(portal) => {
+            let color = DVec3::new(
+                params.base_color[0],
+                params.base_color[1],
+                params.base_color[2],
+            );
+            let sample_weight = (color.element_sum() / 3.0).abs();
+            if sample_weight < 1.0e-5 {
+                return LobeDraw::Absorbed;
+            }
+            let direction = if portal.direction.length_squared() == 0.0 {
+                -view
+            } else {
+                portal.direction.normalize_or_zero()
+            };
+            return LobeDraw::Portal {
+                position: portal.position,
+                direction,
+                weight: color / sample_weight,
+            };
+        }
+        BsdfModel::Sheen(_)
+        | BsdfModel::Subsurface
+        | BsdfModel::Translucent
+        | BsdfModel::Refraction(_)
+        | BsdfModel::Toon(_)
+        | BsdfModel::Metallic(_) => {
+            if model_selection_weight <= 0.0 {
+                return LobeDraw::Absorbed;
+            }
+            let random = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
+            return match standalone_sample(params, layers, geometric, random) {
+                StandaloneSample::Continuous { direction, ray } => {
+                    LobeDraw::Continuous { direction, ray }
+                }
+                StandaloneSample::Delta {
+                    direction,
+                    weight,
+                    ray,
+                    branch_pdf,
+                } => {
+                    let mis_weight = 1.0e6 * branch_pdf;
+                    LobeDraw::Delta {
+                        direction,
+                        weight: weight / model_selection_weight,
+                        ray,
+                        pdf: mis_weight + standalone_density(params, layers, direction),
+                        mis_weight,
+                    }
+                }
+                StandaloneSample::Subsurface { weight, method } => LobeDraw::Subsurface {
+                    weight: weight / model_selection_weight,
+                    method,
+                },
+                StandaloneSample::Absorbed => LobeDraw::Absorbed,
+            };
+        }
+        BsdfModel::Hair(_) | BsdfModel::PrincipledHair(_) => {
+            let tangent = params.anisotropic_tangent.unwrap_or(DVec3::ZERO);
+            let hit = HairHitData {
+                curve_normal: params.hair_normal.unwrap_or(normal),
+                pixel_coverage: hair_pixel_coverage,
+            };
+            let random = [rng.next_f64(), rng.next_f64(), rng.next_f64(), 0.0];
+            return match hair_sample(params, view, tangent, normal, hit, random, lcg_state) {
+                HairSample::Continuous { direction, ray } => {
+                    LobeDraw::Continuous { direction, ray }
+                }
+                HairSample::Absorbed => LobeDraw::Absorbed,
+            };
+        }
+    }
     let probabilities = lobe_probabilities(params, layers);
     let choice = rng.next_f64();
     // Thin Wall replaces a BSSRDF with diffuse reflection and cosine-sampled translucent transmission.
@@ -11035,7 +12010,7 @@ mod sampling_tests {
 
         let samples = 400_000_usize;
         let mut rng = Pcg32::for_sample(1, 0, 0, 0);
-        let closures = Closures::new(
+        let mut closures = Closures::new(
             vec![HitClosure::new(1.0, &params, view, normal, true)],
             normal,
             normal,
@@ -11048,6 +12023,7 @@ mod sampling_tests {
                 Reflection::Continuous { weight, .. } | Reflection::Delta { weight, .. } => weight,
                 Reflection::Absorbed => DVec3::ZERO,
                 Reflection::Subsurface { .. } => panic!("the test closure has no subsurface lobe"),
+                Reflection::Portal { .. } => panic!("the test closure has no ray portal lobe"),
             };
             sum += weight;
             sum_squares += weight * weight;
@@ -11064,6 +12040,82 @@ mod sampling_tests {
             delta.cmple(tolerance).all(),
             "sampled mean {mean:?} vs quadrature {reference:?} (tolerance {tolerance:?})"
         );
+    }
+
+    #[test]
+    fn standalone_discrete_samples_apply_model_selection_weight_once() {
+        let mut refraction = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        refraction.model = BsdfModel::Refraction(crate::shader::MicrofacetDistribution::Ggx);
+        refraction.base_color = [0.5, 0.5, 0.5, 1.0];
+        refraction.roughness = 0.0;
+        refraction.ior = 1.5;
+        refraction.normal = DVec3::Z;
+        let mut refraction_closures = Closures::new(
+            vec![HitClosure::new(1.0, &refraction, DVec3::Z, DVec3::Z, false)],
+            DVec3::Z,
+            DVec3::Z,
+            false,
+        );
+        let mut rng = Pcg32::for_sample(1, 0, 0, 0);
+        let Reflection::Delta { weight, .. } = refraction_closures.reflect(0, DVec3::Z, &mut rng)
+        else {
+            panic!("smooth standalone refraction must produce a discrete draw")
+        };
+        assert_eq!(weight, DVec3::splat(0.5));
+
+        let mut subsurface = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        subsurface.model = BsdfModel::Subsurface;
+        subsurface.base_color = [0.5, 0.5, 0.5, 1.0];
+        subsurface.subsurface_radius = [1.0; 3];
+        subsurface.subsurface_scale = 0.2;
+        subsurface.subsurface_method = SubsurfaceMethod::Burley;
+        subsurface.subsurface_weight = 1.0;
+        subsurface.normal = DVec3::Z;
+        let mut subsurface_closures = Closures::new(
+            vec![HitClosure::new(1.0, &subsurface, DVec3::Z, DVec3::Z, false)],
+            DVec3::Z,
+            DVec3::Z,
+            false,
+        );
+        let mut rng = Pcg32::for_sample(1, 0, 0, 0);
+        let Reflection::Subsurface { weight, .. } =
+            subsurface_closures.reflect(0, DVec3::Z, &mut rng)
+        else {
+            panic!("standalone subsurface must sample its active BSSRDF")
+        };
+        assert_eq!(weight, DVec3::splat(0.5));
+    }
+
+    #[test]
+    fn translucent_evaluation_uses_transmission_visibility() {
+        let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        params.model = BsdfModel::Translucent;
+        params.base_color = [0.7, 0.4, 0.2, 1.0];
+        params.normal = DVec3::Z;
+        let closure = HitClosure::new(1.0, &params, DVec3::Z, DVec3::Z, false);
+        let mut lcg_state = 0;
+        let transmitted = Closures::closure_eval(
+            DVec3::Z,
+            false,
+            &closure,
+            -DVec3::Z,
+            false,
+            Some(RayKind::Transmission),
+            RayKind::Transmission.bit(),
+            &mut lcg_state,
+        );
+        assert!(transmitted.max_element() > 0.0);
+        let diffuse_only = Closures::closure_eval(
+            DVec3::Z,
+            false,
+            &closure,
+            -DVec3::Z,
+            false,
+            Some(RayKind::Diffuse),
+            RayKind::Diffuse.bit(),
+            &mut lcg_state,
+        );
+        assert_eq!(diffuse_only, DVec3::ZERO);
     }
 
     /// A BSDF ray that reaches a light must see the crossing, emitter radiance, and density that
@@ -11581,5 +12633,223 @@ mod band_tests {
             }
             assert_eq!(sink.into_inner(), single, "band count {band_count}");
         }
+    }
+}
+#[cfg(test)]
+mod analytic_hair_path_tests {
+    #![expect(clippy::unwrap_used, reason = "small analytic hair path fixture")]
+
+    use std::{cell::RefCell, collections::BTreeMap};
+
+    use glam::{DMat4, DVec3};
+    use serde_json::json;
+
+    use super::{PathHit, SharedGeometry, TraceGeometry, closest_hair_hit, hair_surface_hit};
+    use crate::{
+        model::{HairCurve, HairCurveAttribute, HairCurvesData, RayKind},
+        render::{
+            hair_geometry::{curve_normals_for_geometry, prepare_hair_curve_geometry},
+            hair_intersect::HairBvh,
+            scene::HairCurveInstance,
+        },
+    };
+
+    #[test]
+    fn affine_poly_curve_reaches_path_hit_with_curve_frame() {
+        let curves = HairCurvesData {
+            curves: vec![HairCurve {
+                points: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                radius: 0.1,
+            }],
+            attributes: BTreeMap::from([(
+                "curve_type".to_owned(),
+                HairCurveAttribute {
+                    domain: "CURVE".to_owned(),
+                    data_type: "INT8".to_owned(),
+                    values: vec![json!(1)],
+                },
+            )]),
+            ..HairCurvesData::default()
+        };
+        let object_to_world = DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0));
+        let curve = prepare_hair_curve_geometry(&curves, object_to_world)
+            .unwrap()
+            .remove(0);
+        let normals = curve_normals_for_geometry(&curve).unwrap();
+        let curves = vec![HairCurveInstance {
+            curve,
+            normals,
+            material_index: 0,
+            object_index: 1,
+            element_index: 1,
+            curve_random: Some(0.25),
+            ray_mask: RayKind::Camera.bit(),
+        }];
+        let hair_bvh = HairBvh::build(&[], &[]);
+        let hair_curve_bvh = HairBvh::build_splines(curves.iter().map(|curve| &curve.curve));
+        let warnings = RefCell::new(Vec::new());
+        let geometry = TraceGeometry::with_warnings(
+            SharedGeometry {
+                hair_keys: &[],
+                hair_curve_types: &[],
+                hair_masks: &[],
+                hair_segments: &[],
+                hair_bvh: &hair_bvh,
+                hair_curve_bvh: &hair_curve_bvh,
+                hair_curve_instances: &curves,
+                triangles: &[],
+                materials: &[],
+                prepared: &[],
+                objects: &[],
+                elements: &[],
+                shadows: None,
+            },
+            &warnings,
+        );
+        let origin = DVec3::new(1.0, 0.0, 0.5);
+        let direction = -DVec3::X;
+        let hit = closest_hair_hit(
+            &geometry,
+            origin,
+            direction,
+            0.0,
+            f64::INFINITY,
+            RayKind::Camera.bit(),
+        )
+        .unwrap();
+        assert!(matches!(hit, PathHit::SplineHair { .. }));
+        let surface = hair_surface_hit(&geometry, hit, origin, direction).unwrap();
+        assert!((surface.distance - 0.8).abs() < 1.0e-10);
+        assert!((surface.radius - 0.1).abs() < 1.0e-12);
+        assert!((surface.tangent.normalize() - DVec3::Z).length() < 1.0e-12);
+        assert!((surface.normal - DVec3::X).length() < 1.0e-12);
+        assert_eq!(surface.curve_random, Some(0.25));
+    }
+    #[test]
+    fn tapered_bezier_shading_uses_radial_normal_not_culling_normal() {
+        let curves = HairCurvesData {
+            curves: vec![HairCurve {
+                points: vec![
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 2.0 / 3.0],
+                    [0.0, 0.0, 4.0 / 3.0],
+                    [0.0, 0.0, 2.0],
+                ],
+                radius: 0.1,
+            }],
+            attributes: BTreeMap::from([
+                (
+                    "curve_type".to_owned(),
+                    HairCurveAttribute {
+                        domain: "CURVE".to_owned(),
+                        data_type: "INT8".to_owned(),
+                        values: vec![json!(2)],
+                    },
+                ),
+                (
+                    "radius".to_owned(),
+                    HairCurveAttribute {
+                        domain: "POINT".to_owned(),
+                        data_type: "FLOAT".to_owned(),
+                        values: vec![json!(0.1), json!(0.1), json!(0.3), json!(0.3)],
+                    },
+                ),
+            ]),
+            ..HairCurvesData::default()
+        };
+        let curve =
+            prepare_hair_curve_geometry(&curves, DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0)))
+                .unwrap()
+                .remove(0);
+        let normals = curve_normals_for_geometry(&curve).unwrap();
+        let curves = vec![HairCurveInstance {
+            curve,
+            normals,
+            material_index: 0,
+            object_index: 1,
+            element_index: 1,
+            curve_random: None,
+            ray_mask: RayKind::Camera.bit(),
+        }];
+        let hair_bvh = HairBvh::build(&[], &[]);
+        let hair_curve_bvh = HairBvh::build_splines(curves.iter().map(|curve| &curve.curve));
+        let warnings = RefCell::new(Vec::new());
+        let geometry = TraceGeometry::with_warnings(
+            SharedGeometry {
+                hair_keys: &[],
+                hair_curve_types: &[],
+                hair_masks: &[],
+                hair_segments: &[],
+                hair_bvh: &hair_bvh,
+                hair_curve_bvh: &hair_curve_bvh,
+                hair_curve_instances: &curves,
+                triangles: &[],
+                materials: &[],
+                prepared: &[],
+                objects: &[],
+                elements: &[],
+                shadows: None,
+            },
+            &warnings,
+        );
+        let origin = DVec3::new(1.0, 0.0, 1.0);
+        let direction = -DVec3::X;
+        let hit = closest_hair_hit(
+            &geometry,
+            origin,
+            direction,
+            0.0,
+            f64::INFINITY,
+            RayKind::Camera.bit(),
+        )
+        .unwrap();
+        let PathHit::SplineHair { hit: curve_hit, .. } = hit else {
+            panic!("Bezier strand should produce an analytic spline hit")
+        };
+        assert!(
+            (curve_hit.geometric_normal.normalize() - DVec3::X).length() > 0.05,
+            "taper contributes to the unnormalized culling normal"
+        );
+        let surface = hair_surface_hit(&geometry, hit, origin, direction).unwrap();
+        assert!((surface.radius - 0.2).abs() < 1.0e-12);
+        assert!((surface.normal - DVec3::X).length() < 1.0e-12);
+    }
+}
+#[cfg(test)]
+mod sampled_side_tests {
+    use crate::{
+        model::RayKind,
+        shader::{BsdfModel, SheenDistribution},
+    };
+
+    use super::Closures;
+
+    #[test]
+    fn ashikhmin_diffuse_label_does_not_make_its_closure_diffuse() {
+        assert!(!Closures::sampled_side_test(
+            BsdfModel::Sheen(SheenDistribution::Ashikhmin),
+            false,
+            Some(RayKind::Diffuse),
+        ));
+        assert!(Closures::sampled_side_test(
+            BsdfModel::Sheen(SheenDistribution::Microfiber),
+            false,
+            Some(RayKind::Glossy),
+        ));
+        assert!(Closures::sampled_side_test(
+            BsdfModel::Principled,
+            false,
+            Some(RayKind::Diffuse),
+        ));
+        assert!(!Closures::sampled_side_test(
+            BsdfModel::Principled,
+            false,
+            Some(RayKind::Glossy),
+        ));
+        assert!(Closures::sampled_side_test(
+            BsdfModel::Sheen(SheenDistribution::Ashikhmin),
+            true,
+            None,
+        ));
     }
 }
