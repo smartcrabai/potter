@@ -27,7 +27,7 @@ fn normalized_eq(a: &str, b: &str) -> bool {
         .map(|byte| byte.to_ascii_lowercase())
         .eq(b
             .bytes()
-            .filter(|byte| byte.is_ascii_alphanumeric())
+            .filter(u8::is_ascii_alphanumeric)
             .map(|byte| byte.to_ascii_lowercase()))
 }
 

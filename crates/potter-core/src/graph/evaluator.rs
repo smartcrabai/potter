@@ -782,7 +782,7 @@ fn typed_socket_value(socket_type: &str, value: &Value) -> Result<Value> {
         "vector" | "rotation" => {
             let values = value
                 .as_array()
-                .ok_or_else(|| evaluation(format!("{} socket input must be an array", kind)))?;
+                .ok_or_else(|| evaluation(format!("{kind} socket input must be an array")))?;
             let valid_len = if kind == "rotation" {
                 matches!(values.len(), 3 | 4)
             } else {
@@ -4592,6 +4592,9 @@ fn function_default_vector_input(node_type: &str, socket: &str) -> Option<Value>
         return Some(json!([1.0, 1.0, 1.0]));
     }
     let unit_scalar = match node_type {
+        "FunctionNodeAlignEulerToVector" | "FunctionNodeAlignRotationToVector" => {
+            socket == "Factor"
+        }
         "FunctionNodeQuaternionToRotation" => socket == "W",
         "GeometryNodeDistributePointsOnFaces" => socket == "Density Factor",
         "ShaderNodeVectorMath" => socket == "Scale",
@@ -4653,61 +4656,6 @@ fn default_input(node_type: &str, socket: &str) -> Option<Value> {
     }
     let value = match (node_type, socket) {
         ("ShaderNodeMixRGB", "Color1" | "Color2") => json!([0.5, 0.5, 0.5, 1.0]),
-        ("FunctionNodeAlignEulerToVector" | "FunctionNodeAlignRotationToVector", "Rotation")
-        | ("FunctionNodeEulerToRotation", "Euler")
-        | ("FunctionNodeInvertRotation" | "FunctionNodeRotateRotation", "Rotation")
-        | ("FunctionNodeRotateRotation", "Rotate By")
-        | ("FunctionNodeRotateEuler", "Rotation" | "Rotate By")
-        | (
-            "FunctionNodeRotationToAxisAngle"
-            | "FunctionNodeRotationToEuler"
-            | "FunctionNodeRotationToQuaternion",
-            "Rotation",
-        ) => json!([0.0, 0.0, 0.0]),
-        ("FunctionNodeAlignEulerToVector" | "FunctionNodeAlignRotationToVector", "Factor") => {
-            json!(1.0)
-        }
-        ("FunctionNodeAlignEulerToVector" | "FunctionNodeAlignRotationToVector", "Vector")
-        | ("FunctionNodeAxisAngleToRotation", "Axis")
-        | ("FunctionNodeAxesToRotation", "Primary Axis") => json!([0.0, 0.0, 1.0]),
-        ("FunctionNodeAxesToRotation", "Secondary Axis") => json!([1.0, 0.0, 0.0]),
-        ("FunctionNodeAxisAngleToRotation", "Angle") => json!(0.0),
-        ("FunctionNodeRotateEuler", "Axis") => json!([0.0, 0.0, 1.0]),
-        ("FunctionNodeRotateEuler", "Angle") => json!(0.0),
-        ("FunctionNodeCombineTransform", "Translation")
-        | ("FunctionNodeRotateVector", "Vector")
-        | ("FunctionNodeProjectPoint", "Vector")
-        | ("FunctionNodeTransformDirection", "Direction")
-        | ("FunctionNodeTransformPoint", "Vector") => json!([0.0, 0.0, 0.0]),
-        ("FunctionNodeCombineTransform", "Rotation") | ("FunctionNodeRotateVector", "Rotation") => {
-            json!([0.0, 0.0, 0.0])
-        }
-        ("FunctionNodeCombineTransform", "Scale") => json!([1.0, 1.0, 1.0]),
-        ("FunctionNodeQuaternionToRotation", "W") => json!(1.0),
-        ("FunctionNodeQuaternionToRotation", "X" | "Y" | "Z") => json!(0.0),
-        ("FunctionNodeCombineMatrix", "Column 1 Row 1")
-        | ("FunctionNodeCombineMatrix", "Column 2 Row 2")
-        | ("FunctionNodeCombineMatrix", "Column 3 Row 3")
-        | ("FunctionNodeCombineMatrix", "Column 4 Row 4") => json!(1.0),
-        ("FunctionNodeCombineMatrix", "Column 1 Row 2" | "Column 1 Row 3" | "Column 1 Row 4")
-        | ("FunctionNodeCombineMatrix", "Column 2 Row 1" | "Column 2 Row 3" | "Column 2 Row 4")
-        | ("FunctionNodeCombineMatrix", "Column 3 Row 1" | "Column 3 Row 2" | "Column 3 Row 4")
-        | ("FunctionNodeCombineMatrix", "Column 4 Row 1" | "Column 4 Row 2" | "Column 4 Row 3") => {
-            json!(0.0)
-        }
-        (
-            "FunctionNodeInvertMatrix"
-            | "FunctionNodeMatrixDeterminant"
-            | "FunctionNodeMatrixMultiply"
-            | "FunctionNodeMatrixSVD"
-            | "FunctionNodeProjectPoint"
-            | "FunctionNodeSeparateMatrix"
-            | "FunctionNodeSeparateTransform"
-            | "FunctionNodeTransformDirection"
-            | "FunctionNodeTransformPoint"
-            | "FunctionNodeTransposeMatrix",
-            "Matrix" | "Matrix_001" | "Transform",
-        ) => Value::Null,
         ("GeometryNodeTransform", "Mode") => json!("Components"),
         ("GeometryNodeTransform" | "GeometryNodeInstanceOnPoints", "Rotation") => {
             json!([0.0, 0.0, 0.0, 1.0])
