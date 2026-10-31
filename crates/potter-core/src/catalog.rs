@@ -1745,13 +1745,6 @@ pub fn feature_catalog() -> Value {
             "Only Blender's RANDOM and POISSON methods are implemented.",
         ),
         unsupported(
-            "graph.node.distribute_points.attribute_propagation",
-            "Distribute Points on Faces generic input attributes",
-            "GeometryNodeTree",
-            &[],
-            "Point-position sampling is supported, but named non-edge mesh attributes, Blender UV/color layers, and vertex groups are refused because Potter does not yet interpolate them onto the point output.",
-        ),
-        unsupported(
             "graph.node.mesh_line.endpoint_mode",
             "Mesh Line endpoint mode",
             "GeometryNodeTree",

@@ -7898,37 +7898,32 @@ fn distribute_attribute_value(
 ) -> Result<Value> {
     match data_type {
         "BOOLEAN" => {
-            let values = values
-                .map(|value| {
-                    value
-                        .as_bool()
-                        .map(|value| if value { 1.0 } else { 0.0 })
-                        .ok_or_else(|| evaluation("BOOLEAN mesh attribute value is malformed"))
-                })
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
-            let mixed = weights.x * values[0] + weights.y * values[1] + weights.z * values[2];
+            let [first, second, third] = values.map(|value| {
+                value
+                    .as_bool()
+                    .map(|value| if value { 1.0 } else { 0.0 })
+                    .ok_or_else(|| evaluation("BOOLEAN mesh attribute value is malformed"))
+            });
+            let mixed = weights.x * first? + weights.y * second? + weights.z * third?;
             Ok(json!(mixed >= 0.5))
         }
         "STRING" => Ok(json!("")),
         "BYTE_COLOR" => {
-            let colors = values
-                .map(|value| {
-                    value
-                        .as_array()
-                        .and_then(|components| match components.as_slice() {
-                            [red, green, blue, alpha] => Some([
-                                red.as_f64()?,
-                                green.as_f64()?,
-                                blue.as_f64()?,
-                                alpha.as_f64()?,
-                            ]),
-                            _ => None,
-                        })
-                        .ok_or_else(|| evaluation("byte color mesh attribute value is malformed"))
-                })
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
+            let [first, second, third] = values.map(|value| {
+                value
+                    .as_array()
+                    .and_then(|components| match components.as_slice() {
+                        [red, green, blue, alpha] => Some([
+                            red.as_f64()?,
+                            green.as_f64()?,
+                            blue.as_f64()?,
+                            alpha.as_f64()?,
+                        ]),
+                        _ => None,
+                    })
+                    .ok_or_else(|| evaluation("byte color mesh attribute value is malformed"))
+            });
+            let colors = [first?, second?, third?];
             let color = crate::geom::color_layers::mix_byte_color(
                 &colors,
                 &[
