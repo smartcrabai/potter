@@ -1609,7 +1609,6 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "modifier.geometry_nodes.curve_input_geometry",
         "graph.node.distribute_points.outputs",
         "graph.node.distribute_points.method",
-        "graph.node.distribute_points.attribute_propagation",
         "graph.node.mesh_line.endpoint_mode",
         "graph.node.mesh_line.resolution_count_mode",
         "graph.node.mesh_to_points.mode",
