@@ -1046,8 +1046,15 @@ mod tests {
             colors.layers[2].values,
             [[0.3, 0.4, 0.5, 0.6], [0.0; 4], [0.3, 0.4, 0.5, 0.6]]
         );
-        assert_eq!(colors.active.as_deref(), Some("PointPaint"));
+        assert_eq!(colors.active.as_deref(), Some("CornerPaint"));
         assert_eq!(colors.render.as_deref(), Some("CornerPaint"));
+        assert!(
+            colors.layers.iter().any(|layer| {
+                Some(layer.name.as_str()) == colors.active.as_deref()
+                    && matches!(layer.domain, ColorDomain::Point | ColorDomain::Corner)
+            }),
+            "active color layer must be on a supported domain"
+        );
         assert_eq!(
             output.attributes["blender_metadata"]["color_data_types"]["PointPaint"],
             "BYTE_COLOR"
@@ -1061,6 +1068,14 @@ mod tests {
             Some(vec![true, false, true])
         );
         color_layers::validate(&output)?;
+        let mut unsupported_role = output.clone();
+        let role_store = unsupported_role
+            .attributes
+            .get_mut("color_layers")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("color layer store is missing")?;
+        role_store.insert("active".to_owned(), json!("PointPaint"));
+        assert!(color_layers::validate(&unsupported_role).is_err());
         uv_layers::validate(&output)?;
         assert_eq!(
             output.attributes["user:__potter_origindex"],

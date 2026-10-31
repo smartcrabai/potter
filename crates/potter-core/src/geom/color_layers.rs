@@ -498,7 +498,11 @@ pub(crate) fn write(mesh: &mut Mesh, store: &ColorStore) {
         .map(|layer| &layer.name);
     let named = |name: &Option<String>| {
         name.as_ref()
-            .and_then(|name| store.layers.iter().find(|layer| layer.name == *name))
+            .and_then(|name| {
+                store.layers.iter().find(|layer| {
+                    layer.name == *name && layer.domain.supports_active_render()
+                })
+            })
             .map(|layer| &layer.name)
             .or(fallback)
             .cloned()
@@ -541,8 +545,6 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
         .and_then(Value::as_array)
         .ok_or_else(|| invalid("color_layers.layers must be an array".to_owned()))?;
     let mut seen = HashSet::new();
-    let mut layer_names = Vec::with_capacity(names.len());
-    let mut role_names = Vec::with_capacity(names.len());
     let mut default_role_names = Vec::with_capacity(names.len());
     for name in names {
         let name = name
@@ -552,7 +554,6 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
         if !seen.insert(name) {
             return Err(invalid(format!("color layer name `{name}` is not unique")));
         }
-        layer_names.push(name);
         let attribute = mesh
             .attributes
             .get(attribute_keys::storage_key(name).as_ref())
@@ -570,7 +571,6 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
         if domain.supports_active_render() {
             default_role_names.push(name);
         }
-        role_names.push(name);
         if attribute.get("type").and_then(Value::as_str) != Some(COLOR_TYPE) {
             return Err(invalid(format!("color layer `{name}` type must be color")));
         }
@@ -633,7 +633,7 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
         let value = object.get(key).unwrap_or(&Value::Null);
         let valid = match value {
             Value::Null => default_role_names.is_empty(),
-            Value::String(name) => role_names.contains(&name.as_str()),
+            Value::String(name) => default_role_names.contains(&name.as_str()),
             _ => false,
         };
         if !valid {
