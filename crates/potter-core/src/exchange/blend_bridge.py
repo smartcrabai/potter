@@ -3454,7 +3454,8 @@ def _eevee_volumetric_end(scene):
 
 def _eevee_gi_cubemap_resolution(scene):
     eevee = getattr(scene, "eevee", None)
-    return int(getattr(eevee, "gi_cubemap_resolution", 512)) if eevee is not None else 512
+    value = getattr(eevee, "gi_cubemap_resolution", None) if eevee is not None else None
+    return int(value) if value is not None else None
 
 
 def _cryptomatte_accurate(scene):
@@ -3701,6 +3702,415 @@ def blender_color_look(value):
     return _BLENDER_LOOK_BY_POTTER.get(str(value), value)
 
 
+_CYCLES_HAIR_RAY_FLAGS = (
+    ("camera", "visible_camera"), ("diffuse", "visible_diffuse"),
+    ("glossy", "visible_glossy"), ("transmission", "visible_transmission"),
+    ("shadow", "visible_shadow"), ("volume_scatter", "visible_volume_scatter"),
+)
+
+
+def _cycles_particle_hair_enabled(obj):
+    for modifier in obj.modifiers:
+        if modifier.type != "PARTICLE_SYSTEM" or not modifier.show_render:
+            continue
+        settings = modifier.particle_system.settings
+        if settings.type == "HAIR" and settings.render_type == "PATH":
+            return True
+    return False
+
+
+def _cycles_hair_ray_visibility(obj, parent=None):
+    return {
+        flag: bool(getattr(obj, property_name))
+        and (parent is None or bool(getattr(parent, property_name)))
+        for flag, property_name in _CYCLES_HAIR_RAY_FLAGS
+    }
+
+
+def _cycles_hair_ray_visible(obj, parent=None):
+    return any(_cycles_hair_ray_visibility(obj, parent).values())
+
+
+def _cycles_hair_is_culled(scene, depsgraph, instance, obj):
+    if not scene.render.use_simplify:
+        return False
+    camera = depsgraph.scene_eval.camera
+    if (camera is None or camera.data is None
+            or camera.data.type not in ("PERSP", "ORTHO")
+            or scene.render.use_multiview):
+        return False
+
+    cycles_scene = scene.cycles
+    cycles_object = obj.cycles
+    use_camera_cull = (cycles_scene.use_camera_cull
+                       and cycles_object.use_camera_cull)
+    if use_camera_cull:
+        raise RuntimeError(
+            "exact Cycles Hair provenance is unavailable when Cycles camera culling is active: "
+            "the render callback exposes the depsgraph but not Cycles Camera.worldtondc"
+        )
+
+    margin = float(cycles_scene.distance_cull_margin)
+    if (not cycles_scene.use_distance_cull or margin == 0.0
+            or not cycles_object.use_distance_cull):
+        return False
+
+    try:
+        corners = [Vector(corner) for corner in obj.bound_box]
+    except (AttributeError, TypeError, ValueError):
+        corners = []
+    if len(corners) != 8:
+        corners = [Vector((0.0, 0.0, 0.0)) for _ in range(8)]
+    world_corners = [instance.matrix_world @ corner for corner in corners]
+    bounds_min = [min(point[axis] for point in world_corners) for axis in range(3)]
+    bounds_max = [max(point[axis] for point in world_corners) for axis in range(3)]
+    camera_position = camera.matrix_world.translation
+    closest = [
+        max(min(bounds_max[axis], camera_position[axis]), bounds_min[axis])
+        for axis in range(3)
+    ]
+
+    def f32(value):
+        return struct.unpack("=f", struct.pack("=f", value))[0]
+
+    distance_squared = f32(0.0)
+    for axis in range(3):
+        delta = f32(camera_position[axis] - closest[axis])
+        distance_squared = f32(distance_squared + f32(delta * delta))
+    return distance_squared > f32(margin * margin)
+
+
+def _cycles_object_modified_for_hair(real_object, scene):
+    if real_object.type == "META" or real_object.is_modified(scene, "RENDER"):
+        return True
+    return any(slot.link == "OBJECT" for slot in real_object.material_slots)
+
+
+def _cycles_source_object_name(real_object):
+    source = real_object.original
+    if source is None:
+        source = real_object
+    datablock = bpy.data.objects.get(source.name_full)
+    if datablock is None or datablock.as_pointer() != source.as_pointer():
+        raise RuntimeError(
+            "Cycles Hair geometry references a source Object that the bridge cannot map exactly"
+        )
+    return source.name_full
+
+
+def _cycles_source_material_name(material):
+    source = material.original
+    if source is None:
+        source = material
+    datablock = bpy.data.materials.get(source.name_full)
+    if datablock is None or datablock.as_pointer() != source.as_pointer():
+        raise RuntimeError(
+            "Cycles Hair representative references a Material that the bridge cannot map exactly"
+        )
+    return source.name_full
+
+
+def _cycles_source_curve_indices(scene, obj, real_object):
+    data = obj.data
+    if data is None or data.bl_rna.identifier != "Curves":
+        return None
+
+    source_object = real_object.original
+    if source_object is None:
+        source_object = real_object
+    source_data = source_object.data
+    if source_data is None or source_data.bl_rna.identifier != "Curves":
+        return None
+    source_count = len(source_data.curves)
+    evaluated_count = len(data.curves)
+    evaluated_source = data.original
+    if evaluated_source is None:
+        evaluated_source = data
+    if (not real_object.is_modified(scene, "RENDER")
+            and evaluated_source.as_pointer() == source_data.as_pointer()
+            and source_count == evaluated_count):
+        return list(range(evaluated_count))
+
+    attributes = getattr(data, "attributes", None)
+    original_indices = attributes.get("orig_index") if attributes is not None else None
+    if (original_indices is None or original_indices.domain != "CURVE"
+            or original_indices.data_type != "INT" or len(original_indices.data) != evaluated_count):
+        return None
+    indices = [int(item.value) for item in original_indices.data]
+    if any(index < 0 or index >= source_count for index in indices):
+        return None
+    return indices
+
+
+def _cycles_hair_instance_key(instance, real_object, use_particle_hair):
+    real_object_name = _cycles_source_object_name(real_object)
+    if instance.is_instance:
+        parent = instance.parent
+        parent_name = _cycles_source_object_name(parent) if parent is not None else None
+        persistent_id = [int(value) for value in instance.persistent_id]
+        if len(persistent_id) != 8:
+            raise RuntimeError("Cycles Hair instance persistent_id must contain eight integers")
+    else:
+        parent_name = real_object_name
+        persistent_id = [0] * 8
+    return {
+        "real_object": real_object_name,
+        "parent": parent_name,
+        "persistent_id": persistent_id,
+        "is_instance": bool(instance.is_instance),
+        "use_particle_hair": bool(use_particle_hair),
+    }
+
+
+def _cycles_evaluated_hair_curves(obj, real_object):
+    data = obj.data
+    if data is None or data.bl_rna.identifier != "Curves":
+        return None
+    source_object = real_object.original
+    if source_object is None:
+        source_object = real_object
+    source_data = source_object.data
+    if source_data is not None and source_data.as_pointer() == data.as_pointer():
+        return None
+    return hair_curves_dump(data)
+
+
+def _cycles_hair_shadow_member(scene, instance, obj, real_object, use_particle_hair):
+    material = obj.material_slots[0].material if len(obj.material_slots) else None
+    parent = instance.parent if instance.is_instance else None
+    return {
+        "instance": _cycles_hair_instance_key(instance, real_object, use_particle_hair),
+        "object_to_world": matrix_rows(instance.matrix_world),
+        "object_color": plain(obj.color),
+        "object_pass_index": int(obj.pass_index),
+        "object_random_id": int(instance.random_id),
+        "slot_0_material": _cycles_source_material_name(material) if material else None,
+        "ray_visibility": _cycles_hair_ray_visibility(obj, parent),
+    }
+
+
+
+
+def _cycles_hair_shadow_groups_from_depsgraph(scene, view_layer, depsgraph):
+    if depsgraph.mode != "RENDER":
+        raise RuntimeError("Cycles Hair provenance requires a RENDER dependency graph")
+    if depsgraph.scene_eval.original.as_pointer() != scene.as_pointer():
+        raise RuntimeError("Cycles Hair provenance callback returned the wrong Scene")
+    if depsgraph.view_layer_eval.name != view_layer.name:
+        raise RuntimeError("Cycles Hair provenance callback returned the wrong View Layer")
+
+    groups = []
+    groups_by_geometry_key = {}
+    instance_keys_by_geometry_key = {}
+    for instance in depsgraph.object_instances:
+        obj = instance.object
+        data = obj.data
+        if data is None:
+            continue
+        hair_invocations = []
+        if data.bl_rna.identifier == "Curves" and instance.show_self:
+            hair_invocations.append(False)
+        if instance.show_particles and _cycles_particle_hair_enabled(obj):
+            hair_invocations.append(True)
+        if not hair_invocations:
+            continue
+        if not (obj.type in ("VOLUME", "CURVES", "POINTCLOUD", "LIGHT")
+                or data.bl_rna.identifier == "Mesh"):
+            continue
+        parent = instance.parent if instance.is_instance else None
+        ray_visibility = _cycles_hair_ray_visibility(obj, parent)
+        if not any(ray_visibility.values()):
+            continue
+        if _cycles_hair_is_culled(scene, depsgraph, instance, obj):
+            continue
+
+        real_object = instance.instance_object if instance.is_instance else obj
+        real_object_data = real_object.data
+        is_real_object_data = (
+            real_object_data is not None
+            and real_object_data.as_pointer() == data.as_pointer()
+        )
+        if is_real_object_data and _cycles_object_modified_for_hair(real_object, scene):
+            geometry_key = real_object.as_pointer()
+            geometry_key_description = {
+                "kind": "object",
+                "node": _cycles_source_object_name(real_object),
+            }
+        else:
+            geometry_key = data.as_pointer()
+            geometry_key_description = {
+                "kind": "data",
+                "uses_source_data": bool(is_real_object_data),
+            }
+
+        group = groups_by_geometry_key.get(geometry_key)
+        if group is None:
+            group = {
+                "view_layer": view_layer.name,
+                "geometry_key": geometry_key_description,
+                "representative": _cycles_source_object_name(real_object),
+                "member_nodes": [],
+                "members": [],
+                "source_curve_indices": None,
+                "evaluated_hair_curves": None,
+            }
+            groups_by_geometry_key[geometry_key] = group
+            instance_keys_by_geometry_key[geometry_key] = set()
+            groups.append(group)
+
+        for use_particle_hair in hair_invocations:
+            member = _cycles_hair_shadow_member(
+                scene, instance, obj, real_object, use_particle_hair)
+            instance_key = member["instance"]
+            identity = (
+                instance_key["real_object"], instance_key["parent"],
+                tuple(instance_key["persistent_id"]), instance_key["is_instance"],
+                instance_key["use_particle_hair"],
+            )
+            if identity in instance_keys_by_geometry_key[geometry_key]:
+                continue
+            instance_keys_by_geometry_key[geometry_key].add(identity)
+            if instance_key["real_object"] not in group["member_nodes"]:
+                group["member_nodes"].append(instance_key["real_object"])
+            group["members"].append(member)
+            if len(group["members"]) == 1:
+                group["source_curve_indices"] = _cycles_source_curve_indices(
+                    scene, obj, real_object)
+                group["evaluated_hair_curves"] = _cycles_evaluated_hair_curves(
+                    obj, real_object)
+    return groups
+
+
+def _cycles_object_may_render_hair(obj, seen_objects, seen_collections):
+    if obj.hide_render or not _cycles_hair_ray_visible(obj):
+        return False
+    pointer = obj.as_pointer()
+    if pointer in seen_objects:
+        return False
+    seen_objects.add(pointer)
+
+    data = obj.data
+    if data is not None and data.bl_rna.identifier == "Curves":
+        return True
+
+    instance_collection = getattr(obj, "instance_collection", None)
+    if (instance_collection is not None
+            and _cycles_collection_may_render_hair(
+                instance_collection, seen_objects, seen_collections)):
+        return True
+
+    for modifier in obj.modifiers:
+        if not modifier.show_render:
+            continue
+        if modifier.type == "NODES":
+            return True
+        if modifier.type != "PARTICLE_SYSTEM":
+            continue
+        settings = modifier.particle_system.settings
+        if settings.type == "HAIR" and settings.render_type == "PATH":
+            return True
+        if settings.render_type == "OBJECT":
+            instance_object = getattr(settings, "instance_object", None)
+            if (instance_object is not None
+                    and _cycles_object_may_render_hair(
+                        instance_object, seen_objects, seen_collections)):
+                return True
+        elif settings.render_type == "COLLECTION":
+            instance_collection = getattr(settings, "instance_collection", None)
+            if (instance_collection is not None
+                    and _cycles_collection_may_render_hair(
+                        instance_collection, seen_objects, seen_collections)):
+                return True
+    return False
+
+
+def _cycles_collection_may_render_hair(collection, seen_objects, seen_collections):
+    if collection.hide_render:
+        return False
+    pointer = collection.as_pointer()
+    if pointer in seen_collections:
+        return False
+    seen_collections.add(pointer)
+    for obj in collection.objects:
+        if _cycles_object_may_render_hair(obj, seen_objects, seen_collections):
+            return True
+    return any(
+        _cycles_collection_may_render_hair(child, seen_objects, seen_collections)
+        for child in collection.children
+    )
+
+
+def _cycles_layer_collection_may_render_hair(layer_collection, seen_objects, seen_collections):
+    if layer_collection.exclude or layer_collection.collection.hide_render:
+        return False
+    for obj in layer_collection.collection.objects:
+        if _cycles_object_may_render_hair(obj, seen_objects, seen_collections):
+            return True
+    return any(
+        _cycles_layer_collection_may_render_hair(child, seen_objects, seen_collections)
+        for child in layer_collection.children
+    )
+
+
+def _cycles_view_layer_may_render_hair(view_layer):
+    return _cycles_layer_collection_may_render_hair(
+        view_layer.layer_collection, set(), set()
+    )
+
+
+def _cycles_hair_shadow_groups_for_view_layer(scene, view_layer):
+    if not _cycles_view_layer_may_render_hair(view_layer):
+        return []
+    from cycles import engine as cycles_engine
+
+    original_render = cycles_engine.render
+    original_engine = scene.render.engine
+    original_compositing = scene.render.use_compositing
+    original_sequencer = scene.render.use_sequencer
+    captures = []
+    handler_names = (
+        "depsgraph_update_pre", "depsgraph_update_post",
+        "frame_change_pre", "frame_change_post",
+        "render_init", "render_pre", "render_post", "render_write", "render_complete",
+        "render_cancel", "render_stats", "render_aa_pre", "render_aa_post",
+    )
+    handlers = []
+
+    def capture_render(_engine, depsgraph):
+        captures.append(
+            _cycles_hair_shadow_groups_from_depsgraph(scene, view_layer, depsgraph)
+        )
+
+    try:
+        for name in handler_names:
+            callbacks = getattr(bpy.app.handlers, name, None)
+            if callbacks is not None:
+                handlers.append((callbacks, list(callbacks)))
+                callbacks.clear()
+        # The callbacks-only render must not run scene File Output, sequencer, or user handlers during import.
+        scene.render.engine = "CYCLES"
+        scene.render.use_compositing = False
+        scene.render.use_sequencer = False
+        cycles_engine.render = capture_render
+        with bpy.context.temp_override(scene=scene, view_layer=view_layer):
+            result = bpy.ops.render.render(write_still=False, layer=view_layer.name)
+        if "FINISHED" not in result:
+            raise RuntimeError("Cycles Hair provenance render callback did not finish")
+    finally:
+        cycles_engine.render = original_render
+        scene.render.engine = original_engine
+        scene.render.use_compositing = original_compositing
+        scene.render.use_sequencer = original_sequencer
+        for callbacks, saved in handlers:
+            callbacks[:] = saved
+
+    if not captures or any(capture != captures[0] for capture in captures[1:]):
+        raise RuntimeError(
+            "Cycles Hair provenance did not produce one consistent render dependency graph"
+        )
+    return captures[0]
+
+
 def dump_scene(scene):
     layers = []
     view_layer_ids = _id_map(scene, "potter.view_layer_ids_json")
@@ -3714,6 +4124,13 @@ def dump_scene(scene):
         walk(view_layer.layer_collection)
         layers.append({"name": view_layer.name, "potter_id": view_layer_ids.get(view_layer.name),
                        "excluded_collections": excluded})
+    cycles_hair_shadow_groups = None
+    if scene.camera is not None:
+        cycles_hair_shadow_groups = []
+        for view_layer in scene.view_layers:
+            cycles_hair_shadow_groups.extend(
+                _cycles_hair_shadow_groups_for_view_layer(scene, view_layer)
+            )
     world = scene.world
     world_info = None
     if world:
@@ -3747,6 +4164,7 @@ def dump_scene(scene):
         samples = int(scene.eevee.taa_render_samples)
     cycles = getattr(scene, "cycles", None)
     dicing_camera = getattr(cycles, "dicing_camera", None)
+    cycles_curves = getattr(scene, "cycles_curves", None)
     return {"name": scene.name_full, "potter_id": scene.get("potter.id"),
             "frame_current": float(scene.frame_current) + float(getattr(scene, "frame_subframe", 0.0)),
             "frame_start": int(scene.frame_start), "frame_end": int(scene.frame_end), "fps": int(scene.render.fps),
@@ -3780,6 +4198,10 @@ def dump_scene(scene):
                 "dicing_rate": float(getattr(cycles, "dicing_rate", 1.0)),
                 "preview_dicing_rate": float(getattr(cycles, "preview_dicing_rate", 8.0)),
                 "max_subdivisions": int(getattr(cycles, "max_subdivisions", 12)),
+                "cycles_curves_shape": (cycles_curves.shape.lower()
+                                        if cycles_curves is not None else None),
+                "cycles_curves_subdivisions": (int(cycles_curves.subdivisions)
+                                               if cycles_curves is not None else None),
                 "offscreen_dicing_scale": float(getattr(cycles, "offscreen_dicing_scale", 4.0)),
                 "dicing_camera": dicing_camera.name_full if dicing_camera else None,
                 "passes": _render_passes(scene),
@@ -3800,6 +4222,7 @@ def dump_scene(scene):
             "compositor": _scene_compositor(scene),
             "color_management": _color_management_dump(scene),
             "view_layers": layers,
+            "cycles_hair_shadow_groups": cycles_hair_shadow_groups,
             "display_shading": _display_shading_dump(scene),
             "markers": [{"name": marker.name, "frame": int(marker.frame)} for marker in scene.timeline_markers],
             "rigid_body_world": _rigid_body_world_dump(scene),
@@ -9770,6 +10193,23 @@ def export_doc(doc, target, pack, scene_hash, context):
             if "transparent_max_bounces" in render:
                 scene.cycles.transparent_max_bounces = int(render["transparent_max_bounces"])
         scene.render.engine = engine
+        cycles_curves = getattr(scene, "cycles_curves", None)
+        curve_shape = render.get("cycles_curves_shape")
+        if cycles_curves is not None:
+            if curve_shape is not None:
+                if curve_shape == "ribbons":
+                    cycles_curves.shape = "RIBBONS"
+                elif curve_shape == "thick":
+                    cycles_curves.shape = "THICK"
+                elif curve_shape == "thick_linear":
+                    cycles_curves.shape = "THICK_LINEAR"
+                else:
+                    raise ValueError("unsupported cycles_curves_shape: " + str(curve_shape))
+            curve_subdivisions = render.get("cycles_curves_subdivisions")
+            if curve_subdivisions is not None:
+                if type(curve_subdivisions) is not int or not 0 <= curve_subdivisions <= 24:
+                    raise ValueError("cycles_curves_subdivisions must be an integer in 0..24")
+                cycles_curves.subdivisions = curve_subdivisions
         if hasattr(scene, "cycles"):
             scene.cycles.blur_glossy = float(render.get("filter_glossy", 1.0))
             scene.cycles.dicing_rate = float(render.get("dicing_rate", 1.0))
@@ -9783,6 +10223,15 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.cycles.seed = int(render.get("seed", 0))
         elif hasattr(scene, "eevee"):
             scene.eevee.taa_render_samples = int(render.get("samples", 64))
+        resolution = render.get("eevee_gi_cubemap_resolution")
+        if resolution is not None:
+            if type(resolution) is not int or resolution not in (128, 256, 512, 1024, 2048, 4096):
+                raise ValueError("eevee_gi_cubemap_resolution must be a Blender enum value")
+            eevee = getattr(scene, "eevee", None)
+            if eevee is None or not hasattr(eevee, "gi_cubemap_resolution"):
+                raise ValueError("Blender build does not expose SceneEEVEE.gi_cubemap_resolution")
+            eevee.gi_cubemap_resolution = str(resolution)
+
         if hasattr(scene, "eevee"):
             scene.eevee.light_threshold = float(render.get("eevee_light_threshold", 0.01))
             scene.eevee.use_volumetric_shadows = bool(render.get("eevee_use_volumetric_shadows", False))

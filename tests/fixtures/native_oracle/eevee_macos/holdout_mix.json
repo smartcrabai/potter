@@ -1,0 +1,77 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "engine": "BLENDER_EEVEE",
+  "resolution": [
+    64,
+    64
+  ],
+  "samples": 16,
+  "film_transparent": true,
+  "view_transform": "Standard",
+  "backplate_rgb": [
+    0.08,
+    0.36,
+    0.72
+  ],
+  "probe_size_world_units": 1.5,
+  "probes": {
+    "holdout_diffuse": {
+      "contract_id": "EEVEE_HOLDOUT_DIFFUSE_50_50",
+      "target": {
+        "xy": [
+          20,
+          32
+        ],
+        "rgba": [
+          0.030029296875,
+          0.0120086669921875,
+          0.0045013427734375,
+          0.498046875
+        ]
+      },
+      "backplate_neighbor": {
+        "xy": [
+          10,
+          32
+        ],
+        "rgba": [
+          0.0799560546875,
+          0.35986328125,
+          0.7197265625,
+          1.0
+        ]
+      }
+    },
+    "holdout_transparent": {
+      "contract_id": "EEVEE_HOLDOUT_TRANSPARENT_50_50",
+      "target": {
+        "xy": [
+          44,
+          32
+        ],
+        "rgba": [
+          0.03997802734375,
+          0.179931640625,
+          0.35986328125,
+          0.498046875
+        ]
+      },
+      "backplate_neighbor": {
+        "xy": [
+          54,
+          32
+        ],
+        "rgba": [
+          0.0799560546875,
+          0.35986328125,
+          0.7197265625,
+          1.0
+        ]
+      }
+    }
+  },
+  "artifacts": {
+    "blend": "holdout_mix.blend",
+    "exr": "holdout_mix.exr"
+  }
+}

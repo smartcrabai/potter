@@ -1,0 +1,139 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "blender_build_hash": "d13f752e3b9c",
+  "engine": "CYCLES",
+  "resolution": [
+    64,
+    64
+  ],
+  "samples": 64,
+  "seed": 29,
+  "pixel_filter": "BOX",
+  "filter_width": 1.0,
+  "view_transform": "Standard",
+  "linear_exr": "hair_shadow_transparency.exr",
+  "cases": [
+    {
+      "name": "shadow_patch",
+      "probe": [
+        32,
+        32,
+        1
+      ],
+      "linear_rgba": [
+        0.14345167577266693,
+        0.09862294793128967,
+        0.06276010721921921,
+        1.0
+      ]
+    },
+    {
+      "name": "lit_patch",
+      "probe": [
+        32,
+        20,
+        1
+      ],
+      "linear_rgba": [
+        0.5092960596084595,
+        0.3501409888267517,
+        0.22281672060489655,
+        1.0
+      ]
+    }
+  ],
+  "inputs": {
+    "attribute_source": "ATTR_STD_SHADOW_TRANSPARENCY",
+    "attribute_name": "shadow_transparency",
+    "expected_baked_shadow_transparency": 0.2816666666666667,
+    "curve": {
+      "name": "Camera Hidden Hair",
+      "spline_type": "CATMULL_ROM",
+      "key_positions": [
+        [
+          -3.0,
+          0.0,
+          0.0
+        ],
+        [
+          -1.0,
+          0.0,
+          0.0
+        ],
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          3.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "key_radii": [
+        0.35,
+        0.35,
+        0.35,
+        0.35
+      ],
+      "visible_camera": false,
+      "visible_diffuse": false,
+      "visible_glossy": false,
+      "visible_transmission": false,
+      "visible_volume_scatter": false,
+      "visible_shadow": true
+    },
+    "hair_material": {
+      "nodes": [
+        "ShaderNodeBsdfTransparent",
+        "ShaderNodeBsdfDiffuse",
+        "ShaderNodeMixShader"
+      ],
+      "transparent_color": [
+        0.2,
+        0.7,
+        0.4,
+        1.0
+      ],
+      "mix_factor": 0.35,
+      "transparent_weight": 0.65,
+      "opaque_closure": "ShaderNodeBsdfDiffuse",
+      "dynamic_hair_model": null
+    },
+    "receiver": {
+      "diffuse_color": [
+        0.8,
+        0.55,
+        0.35,
+        1.0
+      ]
+    },
+    "sun": {
+      "type": "SUN",
+      "energy": 2.0,
+      "angle": 0.0,
+      "rotation_euler": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "probes": {
+      "shadow_patch": {
+        "pixel": [
+          32,
+          32
+        ],
+        "radius": 1
+      },
+      "lit_patch": {
+        "pixel": [
+          32,
+          20
+        ],
+        "radius": 1
+      }
+    }
+  }
+}

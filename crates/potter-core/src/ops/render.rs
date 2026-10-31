@@ -2,7 +2,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     error::{ErrorCode, Result},
-    model::PixelFilterType,
+    model::{CyclesCurveShape, EEVEE_GI_CUBEMAP_RESOLUTIONS, PixelFilterType},
 };
 
 use super::{ChangeKind, Engine, check_fields, operation_pointer, parse_id, pointer_escape};
@@ -30,6 +30,9 @@ const SET_FIELDS: &[&str] = &[
     "dicing_rate",
     "preview_dicing_rate",
     "max_subdivisions",
+    "cycles_curves_shape",
+    "cycles_curves_subdivisions",
+    "eevee_gi_cubemap_resolution",
     "offscreen_dicing_scale",
     "eevee_use_volumetric_shadows",
     "eevee_volumetric_tile_size",
@@ -166,6 +169,84 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
     let filter_size = optional_f64(engine, set, "filter_size", 0.0, 500.0)?;
     let preview_dicing_rate = optional_f64(engine, set, "preview_dicing_rate", 0.1, 1000.0)?;
     let max_subdivisions = optional_u32(engine, set, "max_subdivisions", 0, 16)?;
+    let cycles_curves_shape = set
+        .get("cycles_curves_shape")
+        .map(|value| {
+            if value.is_null() {
+                return Ok(None);
+            }
+            let name = value.as_str().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "cycles_curves_shape must be null or a snake_case enum value",
+                    &operation_pointer(engine.operation_index, "set/cycles_curves_shape"),
+                )
+            })?;
+            match name {
+                "ribbons" => Ok(Some(CyclesCurveShape::Ribbons)),
+                "thick" => Ok(Some(CyclesCurveShape::Thick)),
+                "thick_linear" => Ok(Some(CyclesCurveShape::ThickLinear)),
+                _ => Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    "cycles_curves_shape must be ribbons, thick, or thick_linear",
+                    &operation_pointer(engine.operation_index, "set/cycles_curves_shape"),
+                )),
+            }
+        })
+        .transpose()?;
+    let cycles_curves_subdivisions = set
+        .get("cycles_curves_subdivisions")
+        .map(|value| {
+            if value.is_null() {
+                return Ok(None);
+            }
+            let subdivisions = value.as_u64().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "cycles_curves_subdivisions must be null or a non-negative integer",
+                    &operation_pointer(engine.operation_index, "set/cycles_curves_subdivisions"),
+                )
+            })?;
+            let subdivisions = u32::try_from(subdivisions).map_err(|_| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "cycles_curves_subdivisions exceeds the supported integer range",
+                    &operation_pointer(engine.operation_index, "set/cycles_curves_subdivisions"),
+                )
+            })?;
+            if subdivisions > 24 {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    "cycles_curves_subdivisions must be in 0..=24",
+                    &operation_pointer(engine.operation_index, "set/cycles_curves_subdivisions"),
+                ));
+            }
+            Ok(Some(subdivisions))
+        })
+        .transpose()?;
+    let eevee_gi_cubemap_resolution = set
+        .get("eevee_gi_cubemap_resolution")
+        .map(|value| {
+            if value.is_null() {
+                return Ok::<Option<u32>, crate::error::PotError>(None);
+            }
+            let resolution = value
+                .as_u64()
+                .and_then(|resolution| u32::try_from(resolution).ok())
+                .filter(|resolution| EEVEE_GI_CUBEMAP_RESOLUTIONS.contains(resolution))
+                .ok_or_else(|| {
+                    engine.error(
+                        ErrorCode::InvalidOperation,
+                        "eevee_gi_cubemap_resolution must be null or one of 128, 256, 512, 1024, 2048, or 4096",
+                        &operation_pointer(
+                            engine.operation_index,
+                            "set/eevee_gi_cubemap_resolution",
+                        ),
+                    )
+                })?;
+            Ok(Some(resolution))
+        })
+        .transpose()?;
     let offscreen_dicing_scale =
         optional_f64(engine, set, "offscreen_dicing_scale", 1.0, f32::MAX as f64)?;
     let dicing_camera = set
@@ -425,6 +506,15 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         if let Some(value) = max_subdivisions {
             scene.render.max_subdivisions = value;
         }
+        if let Some(value) = cycles_curves_shape {
+            scene.render.cycles_curves_shape = value;
+        }
+        if let Some(value) = cycles_curves_subdivisions {
+            scene.render.cycles_curves_subdivisions = value;
+        }
+        if let Some(value) = eevee_gi_cubemap_resolution {
+            scene.render.eevee_gi_cubemap_resolution = value;
+        }
         if let Some(value) = offscreen_dicing_scale {
             scene.render.offscreen_dicing_scale = value;
         }
@@ -515,4 +605,134 @@ fn optional_positive_f64(
                 })
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::expect_used, reason = "render operation tests")]
+    use serde_json::json;
+
+    use crate::{
+        error::ErrorCode,
+        model::{CyclesCurveShape, Id, SceneDoc},
+        ops::apply_batch,
+    };
+
+    #[test]
+    fn cycles_curve_render_settings_can_be_set_cleared_and_validated() -> crate::error::Result<()> {
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let updated = apply_batch(
+            &doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [{
+                    "op": "render.update",
+                    "target": {"id": "scene_main"},
+                    "set": {
+                        "cycles_curves_shape": "ribbons",
+                        "cycles_curves_subdivisions": 2
+                    }
+                }]
+            }),
+        )?;
+        let scene_id = Id::from_static("scene_main");
+        let render = &updated.doc.scenes[&scene_id].render;
+        assert_eq!(render.cycles_curves_shape, Some(CyclesCurveShape::Ribbons));
+        assert_eq!(render.cycles_curves_subdivisions, Some(2));
+
+        let cleared = apply_batch(
+            &updated.doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": updated.doc.revision,
+                "operations": [{
+                    "op": "render.update",
+                    "target": {"id": "scene_main"},
+                    "set": {
+                        "cycles_curves_shape": null,
+                        "cycles_curves_subdivisions": null
+                    }
+                }]
+            }),
+        )?;
+        let render = &cleared.doc.scenes[&scene_id].render;
+        assert_eq!(render.cycles_curves_shape, None);
+        assert_eq!(render.cycles_curves_subdivisions, None);
+
+        let error = apply_batch(
+            &doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [{
+                    "op": "render.update",
+                    "target": {"id": "scene_main"},
+                    "set": {"cycles_curves_subdivisions": 25}
+                }]
+            }),
+        )
+        .expect_err("subdivisions beyond Blender's RNA range must be rejected");
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
+        Ok(())
+    }
+    #[test]
+    fn eevee_probe_resolution_render_update_sets_clears_and_validates() -> crate::error::Result<()>
+    {
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let updated = apply_batch(
+            &doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [{
+                    "op": "render.update",
+                    "target": {"id": "scene_main"},
+                    "set": {"eevee_gi_cubemap_resolution": 1024}
+                }]
+            }),
+        )?;
+        let scene_id = Id::from_static("scene_main");
+        assert_eq!(
+            updated.doc.scenes[&scene_id]
+                .render
+                .eevee_gi_cubemap_resolution,
+            Some(1024)
+        );
+
+        let cleared = apply_batch(
+            &updated.doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": updated.doc.revision,
+                "operations": [{
+                    "op": "render.update",
+                    "target": {"id": "scene_main"},
+                    "set": {"eevee_gi_cubemap_resolution": null}
+                }]
+            }),
+        )?;
+        assert_eq!(
+            cleared.doc.scenes[&scene_id]
+                .render
+                .eevee_gi_cubemap_resolution,
+            None
+        );
+
+        let error = apply_batch(
+            &doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [{
+                    "op": "render.update",
+                    "target": {"id": "scene_main"},
+                    "set": {"eevee_gi_cubemap_resolution": 2049}
+                }]
+            }),
+        )
+        .expect_err("unsupported Blender enum values must be rejected");
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
+        Ok(())
+    }
 }

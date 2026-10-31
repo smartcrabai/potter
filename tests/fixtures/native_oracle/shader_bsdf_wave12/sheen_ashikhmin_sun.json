@@ -1,0 +1,44 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "engine": "CYCLES",
+  "resolution": [
+    192,
+    192
+  ],
+  "samples": 256,
+  "seed": 17,
+  "linear_exr": "sheen_ashikhmin_sun.exr",
+  "cases": [
+    {
+      "name": "sheen_ashikhmin_sun",
+      "mode": {
+        "distribution": "ASHIKHMIN"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Roughness": 0.43,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        96,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        9.08087158203125,
+        3.909820318222046,
+        1.5134795904159546,
+        1.0
+      ]
+    }
+  ]
+}

@@ -1,0 +1,278 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "blender_build_hash": "d13f752e3b9c",
+  "blender_binary": "/Applications/Blender.app/Contents/MacOS/Blender",
+  "blender_sha256": "f5c1f2a0c0bca3389ec772d355242b700975ea84e66cbb3f5257a7bce8e5adeb",
+  "generator": "generate.py --toon-sun-only",
+  "engine": "CYCLES",
+  "resolution": [
+    4,
+    4
+  ],
+  "samples": 32,
+  "seeds": [
+    31,
+    43
+  ],
+  "cycles": {
+    "device": "CPU",
+    "threads_mode": "FIXED",
+    "threads": 2,
+    "denoising": false,
+    "pixel_filter": "BOX",
+    "filter_width": 1.0,
+    "max_bounces": 8,
+    "transparent_max_bounces": 8
+  },
+  "pixel_filter": "BOX",
+  "filter_width": 1.0,
+  "view_transform": "Standard",
+  "look": "None",
+  "exposure": 0.0,
+  "gamma": 1.0,
+  "linear_exr": "32-bit RGBA OpenEXR",
+  "canonical_material_source": {
+    "blend": "path.blend",
+    "sha256": "a1ac3915c57a899cd4c18dccea1715aad4d8c38adda0be23579d2e0fe8b7055f",
+    "case": "toon_diffuse"
+  },
+  "world": {
+    "background_color": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "strength": 0.0
+  },
+  "sun": {
+    "type": "SUN",
+    "energy": 1.0,
+    "angular_diameter_radians": 0.0
+  },
+  "camera": {
+    "projection": "ORTHO",
+    "location": [
+      0.0,
+      0.0,
+      12.0
+    ],
+    "ortho_scale": 4.0
+  },
+  "plane": {
+    "size": [
+      8.0,
+      8.0
+    ],
+    "location": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "normal": [
+      0.0,
+      0.0,
+      1.0
+    ]
+  },
+  "cases": [
+    {
+      "name": "toon_diffuse_sun_plateau",
+      "regime": "plateau",
+      "theta_radians": 0.0,
+      "theta_degrees": 0.0,
+      "mode": {
+        "component": "DIFFUSE"
+      },
+      "inputs": {
+        "Color": [
+          0.7200000286102295,
+          0.3100000023841858,
+          0.11999999731779099,
+          1.0
+        ],
+        "Size": 0.3799999952316284,
+        "Smooth": 0.17000000178813934,
+        "Normal": [
+          0.05999999865889549,
+          0.019999999552965164,
+          0.9980000257492065
+        ]
+      },
+      "normal_linked": false,
+      "probe": [
+        1,
+        1,
+        1
+      ],
+      "blend": "toon_diffuse_sun_plateau.blend",
+      "blend_sha256": "ea26b85d399df30040bbadc7ef15461f5581c2cacdfaafe1b7506e9838f65b9f",
+      "seed_captures": [
+        {
+          "seed": 31,
+          "exr": "toon_diffuse_sun_plateau_seed31.exr",
+          "linear_rgba": [
+            0.3268890082836151,
+            0.14074379205703735,
+            0.05448149889707565,
+            1.0
+          ],
+          "field_range_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "seed": 43,
+          "exr": "toon_diffuse_sun_plateau_seed43.exr",
+          "linear_rgba": [
+            0.3268890082836151,
+            0.14074379205703735,
+            0.05448149889707565,
+            1.0
+          ],
+          "field_range_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "toon_diffuse_sun_mid_smooth",
+      "regime": "mid_smooth",
+      "theta_radians": 0.730420291959627,
+      "theta_degrees": 41.85,
+      "mode": {
+        "component": "DIFFUSE"
+      },
+      "inputs": {
+        "Color": [
+          0.7200000286102295,
+          0.3100000023841858,
+          0.11999999731779099,
+          1.0
+        ],
+        "Size": 0.3799999952316284,
+        "Smooth": 0.17000000178813934,
+        "Normal": [
+          0.05999999865889549,
+          0.019999999552965164,
+          0.9980000257492065
+        ]
+      },
+      "normal_linked": false,
+      "probe": [
+        1,
+        1,
+        1
+      ],
+      "blend": "toon_diffuse_sun_mid_smooth.blend",
+      "blend_sha256": "97f2a456c3791d76bac868146fe6a409d5a4f64324a0d2ceaa042d8b91bff7af",
+      "seed_captures": [
+        {
+          "seed": 31,
+          "exr": "toon_diffuse_sun_mid_smooth_seed31.exr",
+          "linear_rgba": [
+            0.16344453394412994,
+            0.07037196308374405,
+            0.027240755036473274,
+            1.0
+          ],
+          "field_range_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "seed": 43,
+          "exr": "toon_diffuse_sun_mid_smooth_seed43.exr",
+          "linear_rgba": [
+            0.16344453394412994,
+            0.07037196308374405,
+            0.027240755036473274,
+            1.0
+          ],
+          "field_range_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "toon_diffuse_sun_outside",
+      "regime": "outside",
+      "theta_radians": 1.0210176124166828,
+      "theta_degrees": 58.5,
+      "mode": {
+        "component": "DIFFUSE"
+      },
+      "inputs": {
+        "Color": [
+          0.7200000286102295,
+          0.3100000023841858,
+          0.11999999731779099,
+          1.0
+        ],
+        "Size": 0.3799999952316284,
+        "Smooth": 0.17000000178813934,
+        "Normal": [
+          0.05999999865889549,
+          0.019999999552965164,
+          0.9980000257492065
+        ]
+      },
+      "normal_linked": false,
+      "probe": [
+        1,
+        1,
+        1
+      ],
+      "blend": "toon_diffuse_sun_outside.blend",
+      "blend_sha256": "8727fcbeb5e30f2fca1fdb43cb189d663d40cad8677f3ab41820436ed6d13267",
+      "seed_captures": [
+        {
+          "seed": 31,
+          "exr": "toon_diffuse_sun_outside_seed31.exr",
+          "linear_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "field_range_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "seed": 43,
+          "exr": "toon_diffuse_sun_outside_seed43.exr",
+          "linear_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "field_range_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    }
+  ]
+}

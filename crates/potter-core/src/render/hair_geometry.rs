@@ -3,9 +3,7 @@ use serde_json::Value;
 
 use crate::model::HairCurvesData;
 
-use super::hair_intersect::{
-    CurveKey, HairCurveGeometry, HairCurveShape, MAX_NURBS_ORDER, NurbsCurve, curve_normal_to_world,
-};
+use super::hair_intersect::{CurveKey, HairCurveGeometry, HairCurveRenderMode, HairCurveShape};
 
 const CATMULL_ROM: u8 = 0;
 const POLY: u8 = 1;
@@ -17,37 +15,33 @@ const FREE: u8 = 2;
 
 #[derive(Debug)]
 pub(crate) enum HairCurveGeometryError {
-    InvalidAttribute(&'static str),
-    InvalidCurve(usize),
-    MissingCustomKnots { curve_index: usize },
-    InvalidTransform,
+    Attribute(&'static str),
+    Curve(usize),
+    Transform,
 }
 
-/// Prepares the native analytic spline controls from serialized Hair Curves attributes.
+/// Prepares Cycles' path geometry from raw Hair Curves point keys.
 ///
-/// The transform is retained as an affine pair so intersection can transform rays into object
-/// space; this preserves circular local radii under non-uniform scale and shear.
-#[expect(
-    clippy::float_cmp,
-    reason = "Blender's affine matrices require exact homogeneous-row values"
-)]
-pub(crate) fn prepare_hair_curve_geometry(
+/// Point-domain normals are evaluated from authored curve types before applying the global path basis.
+pub(crate) fn prepare_cycles_hair_curve_geometry(
     data: &HairCurvesData,
     object_to_world: DMat4,
-) -> Result<Vec<HairCurveGeometry>, HairCurveGeometryError> {
+    scene_render_mode: HairCurveRenderMode,
+    ribbon_subdivisions: usize,
+) -> Result<Vec<PreparedHairCurve>, HairCurveGeometryError> {
     let determinant = object_to_world.determinant();
     if !object_to_world
         .to_cols_array()
         .iter()
         .all(|value| value.is_finite())
         || !determinant.is_finite()
-        || determinant == 0.0
-        || object_to_world.x_axis.w != 0.0
-        || object_to_world.y_axis.w != 0.0
-        || object_to_world.z_axis.w != 0.0
-        || object_to_world.w_axis.w != 1.0
+        || determinant.partial_cmp(&0.0) == Some(std::cmp::Ordering::Equal)
+        || object_to_world.x_axis.w.partial_cmp(&0.0) != Some(std::cmp::Ordering::Equal)
+        || object_to_world.y_axis.w.partial_cmp(&0.0) != Some(std::cmp::Ordering::Equal)
+        || object_to_world.z_axis.w.partial_cmp(&0.0) != Some(std::cmp::Ordering::Equal)
+        || object_to_world.w_axis.w.partial_cmp(&1.0) != Some(std::cmp::Ordering::Equal)
     {
-        return Err(HairCurveGeometryError::InvalidTransform);
+        return Err(HairCurveGeometryError::Transform);
     }
     let world_to_object = object_to_world.inverse();
     if !world_to_object
@@ -55,68 +49,85 @@ pub(crate) fn prepare_hair_curve_geometry(
         .iter()
         .all(|value| value.is_finite())
     {
-        return Err(HairCurveGeometryError::InvalidTransform);
+        return Err(HairCurveGeometryError::Transform);
     }
 
     let point_count = data
         .curves
         .iter()
         .try_fold(0usize, |count, curve| count.checked_add(curve.points.len()))
-        .ok_or(HairCurveGeometryError::InvalidAttribute("point count"))?;
+        .ok_or(HairCurveGeometryError::Attribute("point count"))?;
     let curve_count = data.curves.len();
     let curve_type = curve_attr(data, "curve_type", "CURVE", "INT8", curve_count)?;
+    let first_curve_is_poly = curve_type
+        .and_then(|values| values.first())
+        .and_then(Value::as_i64)
+        .is_some_and(|value| value == i64::from(POLY));
+    let render_mode = if first_curve_is_poly {
+        HairCurveRenderMode::ThickLinear
+    } else {
+        scene_render_mode
+    };
     let cyclic = curve_attr(data, "cyclic", "CURVE", "BOOLEAN", curve_count)?;
     let resolution = curve_attr(data, "resolution", "CURVE", "INT", curve_count)?;
     let normal_mode = curve_attr(data, "normal_mode", "CURVE", "INT8", curve_count)?;
-    let nurbs_order = curve_attr(data, "nurbs_order", "CURVE", "INT8", curve_count)?;
-    let knots_mode = curve_attr(data, "knots_mode", "CURVE", "INT8", curve_count)?;
     let radius = curve_attr(data, "radius", "POINT", "FLOAT", point_count)?;
     let tilt = curve_attr(data, "tilt", "POINT", "FLOAT", point_count)?;
     let left = curve_attr(data, "handle_left", "POINT", "FLOAT_VECTOR", point_count)?;
     let right = curve_attr(data, "handle_right", "POINT", "FLOAT_VECTOR", point_count)?;
     let left_type = curve_attr(data, "handle_type_left", "POINT", "INT8", point_count)?;
     let right_type = curve_attr(data, "handle_type_right", "POINT", "INT8", point_count)?;
-    let nurbs_weight = curve_attr(data, "nurbs_weight", "POINT", "FLOAT", point_count)?;
     let custom_normals = curve_vec3_attr(data, "custom_normal", point_count)?;
 
     let mut prepared = Vec::new();
     prepared
         .try_reserve_exact(curve_count)
-        .map_err(|_| HairCurveGeometryError::InvalidAttribute("curve allocation"))?;
+        .map_err(|_| HairCurveGeometryError::Attribute("curve allocation"))?;
     let mut point_offset = 0usize;
     for (curve_index, curve) in data.curves.iter().enumerate() {
         let count = curve.points.len();
         if !curve.radius.is_finite() || curve.radius < 0.0 {
-            return Err(HairCurveGeometryError::InvalidCurve(curve_index));
+            return Err(HairCurveGeometryError::Curve(curve_index));
         }
         if count == 0 {
-            prepared.push(HairCurveGeometry {
-                resolution: 12,
-                normal_mode: MINIMUM_TWIST,
-                tilts: Vec::new(),
-                custom_normals: None,
-                shape: HairCurveShape::Linear {
-                    keys: Vec::new(),
+            prepared.push(PreparedHairCurve {
+                curve: HairCurveGeometry {
+                    shape: if render_mode == HairCurveRenderMode::ThickLinear {
+                        HairCurveShape::Linear {
+                            keys: Vec::new(),
+                            cyclic: false,
+                        }
+                    } else {
+                        HairCurveShape::CatmullRom {
+                            keys: Vec::new(),
+                            cyclic: false,
+                        }
+                    },
+                    render_mode,
+                    ribbon_subdivisions,
+                    object_to_world,
+                    world_to_object,
+                },
+                point_normals: HairCurvePointNormals {
+                    normals: Vec::new(),
                     cyclic: false,
                 },
-                object_to_world,
-                world_to_object,
             });
             continue;
         }
         let mut keys = Vec::new();
         keys.try_reserve_exact(count)
-            .map_err(|_| HairCurveGeometryError::InvalidAttribute("point allocation"))?;
+            .map_err(|_| HairCurveGeometryError::Attribute("point allocation"))?;
         for (point_index, point) in curve.points.iter().enumerate() {
             let position = DVec3::from_array(*point);
             let point_radius = match radius {
                 Some(values) => values[point_offset + point_index]
                     .as_f64()
-                    .ok_or(HairCurveGeometryError::InvalidCurve(curve_index))?,
+                    .ok_or(HairCurveGeometryError::Curve(curve_index))?,
                 None => curve.radius,
             };
             if !position.is_finite() || !point_radius.is_finite() || point_radius < 0.0 {
-                return Err(HairCurveGeometryError::InvalidCurve(curve_index));
+                return Err(HairCurveGeometryError::Curve(curve_index));
             }
             keys.push(CurveKey {
                 position,
@@ -127,13 +138,13 @@ pub(crate) fn prepare_hair_curve_geometry(
         let spline_type = match curve_type {
             Some(values) => values[curve_index]
                 .as_i64()
-                .ok_or(HairCurveGeometryError::InvalidCurve(curve_index))?,
+                .ok_or(HairCurveGeometryError::Curve(curve_index))?,
             None => i64::from(CATMULL_ROM),
         };
         let cyclic = match cyclic {
             Some(values) => values[curve_index]
                 .as_bool()
-                .ok_or(HairCurveGeometryError::InvalidCurve(curve_index))?,
+                .ok_or(HairCurveGeometryError::Curve(curve_index))?,
             None => false,
         };
         let resolution = match resolution {
@@ -141,129 +152,82 @@ pub(crate) fn prepare_hair_curve_geometry(
                 .as_u64()
                 .and_then(|value| usize::try_from(value).ok())
                 .filter(|value| *value > 0)
-                .ok_or(HairCurveGeometryError::InvalidCurve(curve_index))?,
+                .ok_or(HairCurveGeometryError::Curve(curve_index))?,
             None => 12,
         };
         let normal_mode = match normal_mode {
             Some(values) => values[curve_index]
                 .as_i64()
                 .and_then(|value| u8::try_from(value).ok())
-                .ok_or(HairCurveGeometryError::InvalidCurve(curve_index))?,
+                .ok_or(HairCurveGeometryError::Curve(curve_index))?,
             None => MINIMUM_TWIST,
         };
         if !matches!(normal_mode, MINIMUM_TWIST | Z_UP | FREE) {
-            return Err(HairCurveGeometryError::InvalidCurve(curve_index));
+            return Err(HairCurveGeometryError::Curve(curve_index));
         }
         let tilts = point_values_f64(tilt, point_offset, count, 0.0, curve_index)?;
         let curve_custom_normals = custom_normals
             .as_ref()
             .map(|values| values[point_offset..point_offset + count].to_vec());
-        let shape = match spline_type {
-            value if value == i64::from(CATMULL_ROM) => HairCurveShape::CatmullRom { keys, cyclic },
-            value if value == i64::from(POLY) => HairCurveShape::Linear { keys, cyclic },
-            value if value == i64::from(BEZIER) => {
-                let handle_left = point_vec3_values(left, point_offset, &keys, curve_index)?;
-                let handle_right = point_vec3_values(right, point_offset, &keys, curve_index)?;
-                let left_types = point_values_i64(left_type, point_offset, count, 1, curve_index)?;
-                let right_types =
-                    point_values_i64(right_type, point_offset, count, 1, curve_index)?;
-                let (handle_left, handle_right) = calculate_bezier_handles(
-                    &keys,
-                    &handle_left,
-                    &handle_right,
-                    &left_types,
-                    &right_types,
-                    cyclic,
-                    curve_index,
-                )?;
-                let segment_count = if cyclic {
-                    count
-                } else {
-                    count.saturating_sub(1)
-                };
-                let mut spans = Vec::new();
-                spans
-                    .try_reserve_exact(segment_count)
-                    .map_err(|_| HairCurveGeometryError::InvalidAttribute("Bezier allocation"))?;
-                for segment in 0..segment_count {
-                    let next = (segment + 1) % count;
-                    spans.push([
-                        keys[segment],
-                        CurveKey {
-                            position: handle_right[segment],
-                            radius: keys[segment].radius,
-                        },
-                        CurveKey {
-                            position: handle_left[next],
-                            radius: keys[next].radius,
-                        },
-                        keys[next],
-                    ]);
-                }
-                HairCurveShape::Bezier { spans, cyclic }
-            }
-            value if value == i64::from(NURBS) => {
-                let mode = match knots_mode {
-                    Some(values) => values[curve_index]
-                        .as_i64()
-                        .ok_or(HairCurveGeometryError::InvalidCurve(curve_index))?,
-                    None => 0,
-                };
-                if !(0..=4).contains(&mode) {
-                    return Err(HairCurveGeometryError::InvalidCurve(curve_index));
-                }
-                let order = match nurbs_order {
-                    Some(values) => values[curve_index]
-                        .as_i64()
-                        .and_then(|value| usize::try_from(value).ok())
-                        .ok_or(HairCurveGeometryError::InvalidCurve(curve_index))?,
-                    None => 4,
-                };
-                let invalid_nurbs = order < 2
-                    || order > count
-                    || (mode == 2 && count <= order)
-                    || ((mode == 2 || mode == 3) && cyclic && count % (order - 1) != 0);
-                if invalid_nurbs {
-                    HairCurveShape::Linear { keys, cyclic }
-                } else if mode == 4 {
-                    return Err(HairCurveGeometryError::MissingCustomKnots { curve_index });
-                } else if order > MAX_NURBS_ORDER {
-                    return Err(HairCurveGeometryError::InvalidCurve(curve_index));
-                } else {
-                    let weights =
-                        point_values_f64(nurbs_weight, point_offset, count, 1.0, curve_index)?;
-                    if weights.iter().any(|weight| *weight <= 0.0) {
-                        return Err(HairCurveGeometryError::InvalidCurve(curve_index));
-                    }
-                    let nurbs = make_nurbs_curve(
-                        keys,
-                        weights,
-                        order,
-                        mode & 1 != 0,
-                        mode & 2 != 0,
-                        cyclic,
-                    )
-                    .ok_or(HairCurveGeometryError::InvalidCurve(curve_index))?;
-                    HairCurveShape::Nurbs(NurbsCurve {
-                        keys: nurbs.controls,
-                        weights: nurbs.weights,
-                        knots: nurbs.knots,
-                        order,
-                        spans: nurbs.spans,
-                        cyclic,
-                    })
-                }
-            }
-            _ => return Err(HairCurveGeometryError::InvalidCurve(curve_index)),
+        if !matches!(spline_type, 0..=3) {
+            return Err(HairCurveGeometryError::Curve(curve_index));
+        }
+        let (bezier_spans, bezier_left_types, bezier_right_types) = if spline_type
+            == i64::from(BEZIER)
+        {
+            let handle_left = point_vec3_values(left, point_offset, &keys, curve_index)?;
+            let handle_right = point_vec3_values(right, point_offset, &keys, curve_index)?;
+            let left_types = point_values_i64(left_type, point_offset, count, 1, curve_index)?;
+            let right_types = point_values_i64(right_type, point_offset, count, 1, curve_index)?;
+            let spans = make_bezier_spans(
+                &keys,
+                &handle_left,
+                &handle_right,
+                &left_types,
+                &right_types,
+                cyclic,
+                curve_index,
+            )?;
+            (Some(spans), Some(left_types), Some(right_types))
+        } else {
+            (None, None, None)
         };
-        prepared.push(HairCurveGeometry {
+        let point_normals = curve_point_normals_from_source(
+            &keys,
+            spline_type,
+            cyclic,
             resolution,
             normal_mode,
-            tilts,
-            custom_normals: curve_custom_normals,
-            shape,
-            object_to_world,
-            world_to_object,
+            &tilts,
+            curve_custom_normals.as_deref(),
+            bezier_spans.as_deref(),
+            bezier_left_types.as_deref(),
+            bezier_right_types.as_deref(),
+        )
+        .ok_or(HairCurveGeometryError::Curve(curve_index))?;
+        let shape = if render_mode == HairCurveRenderMode::ThickLinear {
+            HairCurveShape::Linear {
+                keys,
+                cyclic: false,
+            }
+        } else {
+            HairCurveShape::CatmullRom {
+                keys,
+                cyclic: false,
+            }
+        };
+        prepared.push(PreparedHairCurve {
+            curve: HairCurveGeometry {
+                shape,
+                render_mode,
+                ribbon_subdivisions,
+                object_to_world,
+                world_to_object,
+            },
+            point_normals: HairCurvePointNormals {
+                normals: point_normals,
+                cyclic,
+            },
         });
         point_offset += count;
     }
@@ -284,7 +248,7 @@ fn curve_attr<'a>(
         || attribute.data_type != data_type
         || attribute.values.len() != expected_len
     {
-        return Err(HairCurveGeometryError::InvalidAttribute(name));
+        return Err(HairCurveGeometryError::Attribute(name));
     }
     Ok(Some(&attribute.values))
 }
@@ -303,23 +267,23 @@ fn curve_vec3_attr(
             let array = value
                 .as_array()
                 .filter(|array| array.len() == 3)
-                .ok_or(HairCurveGeometryError::InvalidAttribute(name))?;
+                .ok_or(HairCurveGeometryError::Attribute(name))?;
             let coordinates = [
                 array[0]
                     .as_f64()
-                    .ok_or(HairCurveGeometryError::InvalidAttribute(name))?,
+                    .ok_or(HairCurveGeometryError::Attribute(name))?,
                 array[1]
                     .as_f64()
-                    .ok_or(HairCurveGeometryError::InvalidAttribute(name))?,
+                    .ok_or(HairCurveGeometryError::Attribute(name))?,
                 array[2]
                     .as_f64()
-                    .ok_or(HairCurveGeometryError::InvalidAttribute(name))?,
+                    .ok_or(HairCurveGeometryError::Attribute(name))?,
             ];
             let vector = DVec3::from_array(coordinates);
             vector
                 .is_finite()
                 .then_some(vector)
-                .ok_or(HairCurveGeometryError::InvalidAttribute(name))
+                .ok_or(HairCurveGeometryError::Attribute(name))
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
@@ -343,12 +307,12 @@ fn point_vec3_values(
                 .and_then(|array| {
                     Some([array[0].as_f64()?, array[1].as_f64()?, array[2].as_f64()?])
                 })
-                .ok_or(HairCurveGeometryError::InvalidCurve(curve_index))?;
+                .ok_or(HairCurveGeometryError::Curve(curve_index))?;
             let vector = DVec3::from_array(coordinates);
             vector
                 .is_finite()
                 .then_some(vector)
-                .ok_or(HairCurveGeometryError::InvalidCurve(curve_index))
+                .ok_or(HairCurveGeometryError::Curve(curve_index))
         })
         .collect()
 }
@@ -363,16 +327,16 @@ fn point_values_f64(
     let mut result = Vec::new();
     result
         .try_reserve_exact(count)
-        .map_err(|_| HairCurveGeometryError::InvalidAttribute("point allocation"))?;
+        .map_err(|_| HairCurveGeometryError::Attribute("point allocation"))?;
     for index in 0..count {
         let value = match values {
             Some(values) => values[offset + index]
                 .as_f64()
-                .ok_or(HairCurveGeometryError::InvalidCurve(curve_index))?,
+                .ok_or(HairCurveGeometryError::Curve(curve_index))?,
             None => default,
         };
         if !value.is_finite() {
-            return Err(HairCurveGeometryError::InvalidCurve(curve_index));
+            return Err(HairCurveGeometryError::Curve(curve_index));
         }
         result.push(value);
     }
@@ -389,16 +353,16 @@ fn point_values_i64(
     let mut result = Vec::new();
     result
         .try_reserve_exact(count)
-        .map_err(|_| HairCurveGeometryError::InvalidAttribute("point allocation"))?;
+        .map_err(|_| HairCurveGeometryError::Attribute("point allocation"))?;
     for index in 0..count {
         let value = match values {
             Some(values) => values[offset + index]
                 .as_i64()
-                .ok_or(HairCurveGeometryError::InvalidCurve(curve_index))?,
+                .ok_or(HairCurveGeometryError::Curve(curve_index))?,
             None => default,
         };
         if !(0..=3).contains(&value) {
-            return Err(HairCurveGeometryError::InvalidCurve(curve_index));
+            return Err(HairCurveGeometryError::Curve(curve_index));
         }
         result.push(value);
     }
@@ -419,7 +383,7 @@ fn calculate_bezier_handles(
         || keys.len() != left_types.len()
         || keys.len() != right_types.len()
     {
-        return Err(HairCurveGeometryError::InvalidAttribute("Bezier handles"));
+        return Err(HairCurveGeometryError::Attribute("Bezier handles"));
     }
     let mut left = source_left.to_vec();
     let mut right = source_right.to_vec();
@@ -485,298 +449,116 @@ fn calculate_bezier_handles(
                 point - (left[index] - point) * (right_handle_length / left_handle_length);
         }
         if !left[index].is_finite() || !right[index].is_finite() {
-            return Err(HairCurveGeometryError::InvalidCurve(curve_index));
+            return Err(HairCurveGeometryError::Curve(curve_index));
         }
     }
     Ok((left, right))
 }
 
-struct NurbsCurveData {
-    controls: Vec<CurveKey>,
-    weights: Vec<f64>,
-    knots: Vec<f64>,
-    spans: Vec<usize>,
-}
-
-fn make_nurbs_curve(
-    mut keys: Vec<CurveKey>,
-    mut weights: Vec<f64>,
-    order: usize,
-    use_endpoint: bool,
-    use_bezier: bool,
+fn make_bezier_spans(
+    keys: &[CurveKey],
+    left: &[DVec3],
+    right: &[DVec3],
+    left_types: &[i64],
+    right_types: &[i64],
     cyclic: bool,
-) -> Option<NurbsCurveData> {
-    if cyclic {
-        let repeated = order.checked_sub(1)?;
-        let extra_keys = keys.iter().take(repeated).copied().collect::<Vec<_>>();
-        let extra_weights = weights.iter().take(repeated).copied().collect::<Vec<_>>();
-        keys.try_reserve_exact(repeated).ok()?;
-        weights.try_reserve_exact(repeated).ok()?;
-        keys.extend(extra_keys);
-        weights.extend(extra_weights);
-    }
-    let control_count = keys.len();
-    let knot_count = control_count.checked_add(order)?;
-    let mut knots = Vec::new();
-    knots.try_reserve_exact(knot_count).ok()?;
-    knots.resize(knot_count, 0.0);
-    let repeat_inner = if use_bezier { order - 1 } else { 1 };
-    let head = if use_endpoint && cyclic {
-        order - 1
-    } else if use_endpoint {
-        order
-    } else if use_bezier {
-        2.min(repeat_inner)
+    curve_index: usize,
+) -> Result<Vec<[CurveKey; 4]>, HairCurveGeometryError> {
+    let (handle_left, handle_right) = calculate_bezier_handles(
+        keys,
+        left,
+        right,
+        left_types,
+        right_types,
+        cyclic,
+        curve_index,
+    )?;
+    let segment_count = if cyclic {
+        keys.len()
     } else {
-        1
+        keys.len().saturating_sub(1)
     };
-    let tail = if cyclic {
-        order.checked_mul(2)?.checked_sub(1)?
-    } else if use_endpoint {
-        order
-    } else {
-        0
-    };
-    let offset = usize::from(use_endpoint && cyclic);
-    if head == 0 || tail > knot_count || offset > knot_count - tail {
-        return None;
+    let mut spans = Vec::new();
+    spans
+        .try_reserve_exact(segment_count)
+        .map_err(|_| HairCurveGeometryError::Attribute("Bezier allocation"))?;
+    for segment in 0..segment_count {
+        let next = (segment + 1) % keys.len();
+        spans.push([
+            keys[segment],
+            CurveKey {
+                position: handle_right[segment],
+                radius: keys[segment].radius,
+            },
+            CurveKey {
+                position: handle_left[next],
+                radius: keys[next].radius,
+            },
+            keys[next],
+        ]);
     }
-    let mut current = 0.0;
-    if offset != 0 {
-        knots[0] = current;
-        current += 1.0;
-    }
-    let mut repeat = head;
-    for knot in knots.iter_mut().take(knot_count - tail).skip(offset) {
-        *knot = current;
-        repeat -= 1;
-        if repeat == 0 {
-            current += 1.0;
-            repeat = repeat_inner;
-        }
-    }
-    let tail_start = knot_count - tail;
-    for index in 0..tail {
-        knots[tail_start + index] = current + (knots[index] - knots[0]);
-    }
-    let degree = order.checked_sub(1)?;
-    let spans = (degree..control_count)
-        .filter(|span| knots[*span + 1] > knots[*span])
-        .collect::<Vec<_>>();
-    (!spans.is_empty()).then_some(NurbsCurveData {
-        controls: keys,
-        weights,
-        knots,
-        spans,
-    })
+    Ok(spans)
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct HairCurveNormalSamples {
+pub(crate) struct HairCurvePointNormals {
     normals: Vec<DVec3>,
-    samples_per_span: usize,
-    span_count: usize,
     cyclic: bool,
 }
 
-impl HairCurveNormalSamples {
+impl HairCurvePointNormals {
+    /// Interpolates the source point-domain `std_vertex_normal` attribute without normalization.
     pub(crate) fn at(&self, span: usize, u: f64) -> Option<DVec3> {
-        if span >= self.span_count || !u.is_finite() || self.normals.is_empty() {
+        if !u.is_finite() {
             return None;
         }
-        let coordinate = u.clamp(0.0, 1.0) * self.samples_per_span as f64;
-        let lower = coordinate.floor() as usize;
-        let first = span
-            .checked_mul(self.samples_per_span)?
-            .checked_add(lower)?
-            .min(self.normals.len() - 1);
-        let next = if lower >= self.samples_per_span {
-            if self.cyclic {
-                0
-            } else {
-                self.normals.len() - 1
-            }
-        } else {
-            let candidate = first.saturating_add(1);
-            if candidate == self.normals.len() {
-                if self.cyclic {
-                    0
-                } else {
-                    self.normals.len() - 1
-                }
-            } else {
-                candidate
-            }
+        let first = *self.normals.get(span)?;
+        let next = match span
+            .checked_add(1)
+            .and_then(|index| self.normals.get(index))
+        {
+            Some(normal) => *normal,
+            None if self.cyclic => *self.normals.first()?,
+            None => return None,
         };
-        let normal = self.normals[first].lerp(self.normals[next], coordinate - lower as f64);
-        let length = normal.length();
-        (length.is_finite() && length > 0.0).then_some(normal / length)
+        Some(first.lerp(next, u.clamp(0.0, 1.0)))
     }
 }
 
-pub(crate) fn curve_normal_world(
-    curve: &HairCurveGeometry,
-    samples: &HairCurveNormalSamples,
-    span: usize,
-    u: f64,
-) -> Option<DVec3> {
-    let normal = curve_normal_to_world(curve.world_to_object, samples.at(span, u)?)?;
-    let length = normal.length();
-    (length.is_finite() && length > 0.0).then_some(normal / length)
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HairCurveShadowTransparency {
+    values: Option<Vec<f32>>,
+    cyclic: bool,
 }
 
-pub(crate) fn curve_normals_for_geometry(
-    curve: &HairCurveGeometry,
-) -> Option<HairCurveNormalSamples> {
-    let (span_count, samples_per_span, cyclic) = match &curve.shape {
-        HairCurveShape::CatmullRom { keys, cyclic } => (
-            if *cyclic {
-                keys.len()
-            } else {
-                keys.len().saturating_sub(1)
-            },
-            curve.resolution.max(1),
-            *cyclic,
-        ),
-        HairCurveShape::Linear { keys, cyclic } => (
-            if *cyclic {
-                keys.len()
-            } else {
-                keys.len().saturating_sub(1)
-            },
-            1,
-            *cyclic,
-        ),
-        HairCurveShape::Bezier { spans, cyclic } => (spans.len(), curve.resolution.max(1), *cyclic),
-        HairCurveShape::Nurbs(nurbs) => (nurbs.spans.len(), curve.resolution.max(1), nurbs.cyclic),
-    };
-    if span_count == 0 {
-        return None;
+impl HairCurveShadowTransparency {
+    pub(crate) fn new(values: Option<Vec<f32>>, cyclic: bool) -> Self {
+        Self { values, cyclic }
     }
-    let point_count = span_count
-        .checked_mul(samples_per_span)?
-        .checked_add(usize::from(!cyclic))?;
-    let mut positions = Vec::new();
-    let mut tilts = Vec::new();
-    let mut custom_normals = curve.custom_normals.as_ref().map(|_| Vec::new());
-    positions.try_reserve_exact(point_count).ok()?;
-    tilts.try_reserve_exact(point_count).ok()?;
-    if let Some(normals) = &mut custom_normals {
-        normals.try_reserve_exact(point_count).ok()?;
+
+    /// Samples Cycles' per-key shadow transparency without an extra clamp.
+    pub(crate) fn at(&self, span: usize, u: f64) -> Option<f64> {
+        if !u.is_finite() {
+            return None;
+        }
+        let Some(values) = self.values.as_deref() else {
+            return Some(0.0);
+        };
+        let first = *values.get(span)?;
+        let next = match span.checked_add(1).and_then(|index| values.get(index)) {
+            Some(value) => *value,
+            None if self.cyclic => *values.first()?,
+            None => return None,
+        };
+        let u = u as f32;
+        (u.is_finite()).then_some(f64::from(first * (1.0 - u) + next * u))
     }
-    match &curve.shape {
-        HairCurveShape::CatmullRom { keys, cyclic } => {
-            let control_positions: Vec<_> = keys.iter().map(|key| key.position).collect();
-            resize_filled(&mut positions, point_count, DVec3::ZERO).then_some(())?;
-            evaluate_catmull_rom(
-                &control_positions,
-                *cyclic,
-                samples_per_span,
-                &mut positions,
-                catmull_vec3,
-            );
-            resize_filled(&mut tilts, point_count, 0.0).then_some(())?;
-            evaluate_catmull_rom(
-                &curve.tilts,
-                *cyclic,
-                samples_per_span,
-                &mut tilts,
-                catmull_f64,
-            );
-            if let (Some(source), Some(destination)) =
-                (curve.custom_normals.as_deref(), custom_normals.as_mut())
-            {
-                resize_filled(destination, point_count, DVec3::ZERO).then_some(())?;
-                evaluate_catmull_rom(source, *cyclic, samples_per_span, destination, catmull_vec3);
-            }
-        }
-        HairCurveShape::Linear { keys, .. } => {
-            positions.extend(keys.iter().map(|key| key.position));
-            tilts.extend_from_slice(&curve.tilts);
-            if let (Some(source), Some(destination)) =
-                (curve.custom_normals.as_deref(), custom_normals.as_mut())
-            {
-                destination.extend_from_slice(source);
-            }
-        }
-        HairCurveShape::Bezier { spans, cyclic } => {
-            for (span_index, span) in spans.iter().enumerate() {
-                let next = (span_index + 1) % curve.tilts.len();
-                for step in 0..samples_per_span {
-                    let u = step as f64 / samples_per_span as f64;
-                    positions.push(super::hair_intersect::bezier_position(*span, u)?);
-                    tilts.push(bezier_scalar(curve.tilts[span_index], curve.tilts[next], u));
-                    if let (Some(source), Some(destination)) =
-                        (curve.custom_normals.as_deref(), custom_normals.as_mut())
-                    {
-                        destination.push(normalize(bezier_vector(
-                            source[span_index],
-                            source[next],
-                            u,
-                        )));
-                    }
-                }
-            }
-            if !cyclic {
-                positions.push((spans.last()?)[3].position);
-                tilts.push(*curve.tilts.last()?);
-                if let (Some(source), Some(destination)) =
-                    (curve.custom_normals.as_deref(), custom_normals.as_mut())
-                {
-                    destination.push(*source.last()?);
-                }
-            }
-        }
-        HairCurveShape::Nurbs(nurbs) => {
-            for (span_index, span) in nurbs.spans.iter().copied().enumerate() {
-                let (start, end) = super::hair_intersect::nurbs_span_range(nurbs, span)?;
-                for step in 0..samples_per_span {
-                    let parameter = start + (end - start) * step as f64 / samples_per_span as f64;
-                    let (position, tilt, normal) = super::hair_intersect::nurbs_curve_frame_sample(
-                        nurbs,
-                        span,
-                        parameter,
-                        &curve.tilts,
-                        curve.custom_normals.as_deref(),
-                    )?;
-                    positions.push(position);
-                    tilts.push(tilt);
-                    if let (Some(destination), Some(normal)) = (custom_normals.as_mut(), normal) {
-                        destination.push(normal);
-                    }
-                }
-                if span_index + 1 == nurbs.spans.len() && !cyclic {
-                    let (position, tilt, normal) = super::hair_intersect::nurbs_curve_frame_sample(
-                        nurbs,
-                        span,
-                        end,
-                        &curve.tilts,
-                        curve.custom_normals.as_deref(),
-                    )?;
-                    positions.push(position);
-                    tilts.push(tilt);
-                    if let (Some(destination), Some(normal)) = (custom_normals.as_mut(), normal) {
-                        destination.push(normal);
-                    }
-                }
-            }
-        }
-    }
-    let normals = curve_normals(
-        &positions,
-        POLY,
-        cyclic,
-        1,
-        curve.normal_mode,
-        &tilts,
-        custom_normals.as_deref(),
-    )?;
-    Some(HairCurveNormalSamples {
-        normals,
-        samples_per_span,
-        span_count,
-        cyclic,
-    })
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedHairCurve {
+    pub(crate) curve: HairCurveGeometry,
+    pub(crate) point_normals: HairCurvePointNormals,
 }
 
 fn bezier_scalar(start: f64, end: f64, u: f64) -> f64 {
@@ -785,6 +567,258 @@ fn bezier_scalar(start: f64, end: f64, u: f64) -> f64 {
 
 fn bezier_vector(start: DVec3, end: DVec3, u: f64) -> DVec3 {
     start.lerp(end, u)
+}
+
+fn source_bezier_handle_differs(handle: DVec3, position: DVec3) -> bool {
+    let handle = handle.to_array().map(|value| value as f32);
+    let position = position.to_array().map(|value| value as f32);
+    (0..3).any(|component| {
+        (handle[component] - position[component]).abs() > 1.0e-6 * handle[component].abs()
+    })
+}
+
+fn source_bezier_handle_direction(from: DVec3, to: DVec3) -> DVec3 {
+    let from = from.to_array().map(|value| value as f32);
+    let to = to.to_array().map(|value| value as f32);
+    let direction = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    let length =
+        (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2])
+            .sqrt();
+    if length > 0.0 {
+        DVec3::new(
+            f64::from(direction[0] / length),
+            f64::from(direction[1] / length),
+            f64::from(direction[2] / length),
+        )
+    } else {
+        DVec3::ZERO
+    }
+}
+
+fn curve_point_normals_from_source(
+    keys: &[CurveKey],
+    curve_type: i64,
+    cyclic: bool,
+    resolution: usize,
+    normal_mode: u8,
+    tilts: &[f64],
+    custom_normals: Option<&[DVec3]>,
+    bezier_spans: Option<&[[CurveKey; 4]]>,
+    bezier_left_types: Option<&[i64]>,
+    bezier_right_types: Option<&[i64]>,
+) -> Option<Vec<DVec3>> {
+    let key_count = keys.len();
+    if key_count == 0 {
+        return Some(Vec::new());
+    }
+    // Blender's POINT normal field treats NURBS controls as poly keys and copies FREE normals raw.
+    if curve_type == i64::from(NURBS) && normal_mode == FREE {
+        let mut normals = Vec::new();
+        normals.try_reserve_exact(key_count).ok()?;
+        if let Some(custom_normals) = custom_normals {
+            normals.extend_from_slice(custom_normals);
+        } else {
+            normals.resize(key_count, DVec3::Z);
+        }
+        return Some(normals);
+    }
+    let source_positions: Vec<_> = keys.iter().map(|key| key.position).collect();
+    if curve_type == i64::from(NURBS) {
+        let zero_tilts = vec![0.0; key_count];
+        return curve_normals(
+            &source_positions,
+            POLY,
+            cyclic,
+            1,
+            normal_mode,
+            &zero_tilts,
+            None,
+            &[],
+        );
+    }
+
+    let sample_resolution = resolution.max(1);
+    let mut bezier_key_offsets = None;
+    let mut tangent_overrides = [(0_usize, DVec3::ZERO); 2];
+    let mut tangent_override_count = 0;
+    let (evaluated_positions, evaluated_tilts, evaluated_custom_normals, key_stride) =
+        match curve_type {
+            value if value == i64::from(CATMULL_ROM) => {
+                let segment_count = if cyclic && key_count > 1 {
+                    key_count
+                } else {
+                    key_count - 1
+                };
+                let sample_count = segment_count.checked_mul(sample_resolution)?;
+                let sample_count = if cyclic {
+                    sample_count.max(1)
+                } else {
+                    sample_count.checked_add(1)?
+                };
+                let mut positions = Vec::new();
+                positions.try_reserve_exact(sample_count).ok()?;
+                positions.resize(sample_count, DVec3::ZERO);
+                evaluate_catmull_rom(
+                    &source_positions,
+                    cyclic,
+                    sample_resolution,
+                    &mut positions,
+                    catmull_vec3,
+                );
+                let mut evaluated_tilts = Vec::new();
+                evaluated_tilts.try_reserve_exact(sample_count).ok()?;
+                evaluated_tilts.resize(sample_count, 0.0);
+                evaluate_catmull_rom(
+                    tilts,
+                    cyclic,
+                    sample_resolution,
+                    &mut evaluated_tilts,
+                    catmull_f64,
+                );
+                let evaluated_custom = if let Some(custom_normals) = custom_normals {
+                    let mut evaluated = Vec::new();
+                    evaluated.try_reserve_exact(sample_count).ok()?;
+                    evaluated.resize(sample_count, DVec3::ZERO);
+                    evaluate_catmull_rom(
+                        custom_normals,
+                        cyclic,
+                        sample_resolution,
+                        &mut evaluated,
+                        catmull_vec3,
+                    );
+                    Some(evaluated)
+                } else {
+                    None
+                };
+                (
+                    positions,
+                    evaluated_tilts,
+                    evaluated_custom,
+                    sample_resolution,
+                )
+            }
+            value if value == i64::from(POLY) => (
+                source_positions,
+                tilts.to_vec(),
+                custom_normals.map(<[DVec3]>::to_vec),
+                1,
+            ),
+            value if value == i64::from(BEZIER) => {
+                let spans = bezier_spans?;
+                if spans.is_empty() {
+                    (
+                        source_positions,
+                        tilts.to_vec(),
+                        custom_normals.map(<[DVec3]>::to_vec),
+                        1,
+                    )
+                } else {
+                    let left_types = bezier_left_types?;
+                    let right_types = bezier_right_types?;
+                    if left_types.len() != key_count || right_types.len() != key_count {
+                        return None;
+                    }
+                    let mut key_offsets = Vec::new();
+                    key_offsets.try_reserve_exact(key_count).ok()?;
+                    let mut sample_count = 0_usize;
+                    for (segment, right_type) in right_types.iter().enumerate().take(spans.len()) {
+                        key_offsets.push(sample_count);
+                        let next = (segment + 1) % key_count;
+                        let segment_samples = if *right_type == 2 && left_types[next] == 2 {
+                            1
+                        } else {
+                            sample_resolution
+                        };
+                        sample_count = sample_count.checked_add(segment_samples)?;
+                    }
+                    if !cyclic {
+                        key_offsets.push(sample_count);
+                        sample_count = sample_count.checked_add(1)?;
+                    }
+                    bezier_key_offsets = Some(key_offsets);
+
+                    let mut positions = Vec::new();
+                    positions.try_reserve_exact(sample_count).ok()?;
+                    let mut evaluated_tilts = Vec::new();
+                    evaluated_tilts.try_reserve_exact(sample_count).ok()?;
+                    let mut evaluated_custom = custom_normals.map(|_| Vec::new());
+                    if let Some(custom) = &mut evaluated_custom {
+                        custom.try_reserve_exact(sample_count).ok()?;
+                    }
+                    for (segment, span) in spans.iter().enumerate() {
+                        let next = (segment + 1) % key_count;
+                        let segment_samples = if right_types[segment] == 2 && left_types[next] == 2
+                        {
+                            1
+                        } else {
+                            sample_resolution
+                        };
+                        for step in 0..segment_samples {
+                            let u = step as f64 / segment_samples as f64;
+                            positions.push(super::hair_intersect::bezier_position(*span, u)?);
+                            evaluated_tilts.push(bezier_scalar(tilts[segment], tilts[next], u));
+                            if let (Some(source), Some(destination)) =
+                                (custom_normals, evaluated_custom.as_mut())
+                            {
+                                destination.push(bezier_vector(source[segment], source[next], u));
+                            }
+                        }
+                    }
+                    if !cyclic {
+                        positions.push((spans.last()?)[3].position);
+                        evaluated_tilts.push(*tilts.last()?);
+                        if let (Some(source), Some(destination)) =
+                            (custom_normals, evaluated_custom.as_mut())
+                        {
+                            destination.push(*source.last()?);
+                        }
+
+                        let first_position = keys.first()?.position;
+                        let first_handle = spans.first()?[1].position;
+                        if source_bezier_handle_differs(first_handle, first_position) {
+                            tangent_overrides[tangent_override_count] = (
+                                0,
+                                source_bezier_handle_direction(first_position, first_handle),
+                            );
+                            tangent_override_count += 1;
+                        }
+                        let last_position = keys.last()?.position;
+                        let last_handle = spans.last()?[2].position;
+                        if source_bezier_handle_differs(last_handle, last_position) {
+                            let last_offset = *bezier_key_offsets.as_ref()?.last()?;
+                            tangent_overrides[tangent_override_count] = (
+                                last_offset,
+                                source_bezier_handle_direction(last_handle, last_position),
+                            );
+                            tangent_override_count += 1;
+                        }
+                    }
+                    (positions, evaluated_tilts, evaluated_custom, 1)
+                }
+            }
+            _ => return None,
+        };
+    let evaluated_normals = curve_normals(
+        &evaluated_positions,
+        POLY,
+        cyclic,
+        1,
+        normal_mode,
+        &evaluated_tilts,
+        evaluated_custom_normals.as_deref(),
+        &tangent_overrides[..tangent_override_count],
+    )?;
+    let mut normals = Vec::new();
+    normals.try_reserve_exact(key_count).ok()?;
+    for key_index in 0..key_count {
+        let normal_index = if let Some(offsets) = &bezier_key_offsets {
+            *offsets.get(key_index)?
+        } else {
+            key_index.checked_mul(key_stride)?
+        };
+        normals.push(*evaluated_normals.get(normal_index)?);
+    }
+    Some(normals)
 }
 
 #[derive(Default)]
@@ -803,6 +837,7 @@ pub(crate) fn curve_normals(
     normal_mode: u8,
     tilt: &[f64],
     custom_normals: Option<&[DVec3]>,
+    tangent_overrides: &[(usize, DVec3)],
 ) -> Option<Vec<DVec3>> {
     let mut result = Vec::new();
     result.try_reserve_exact(positions.len()).ok()?;
@@ -816,6 +851,7 @@ pub(crate) fn curve_normals(
         normal_mode,
         tilt,
         custom_normals,
+        tangent_overrides,
         &mut scratch,
         &mut result,
     )
@@ -830,6 +866,7 @@ pub(crate) fn curve_normals_into(
     normal_mode: u8,
     tilt: &[f64],
     custom_normals: Option<&[DVec3]>,
+    tangent_overrides: &[(usize, DVec3)],
     scratch: &mut CurveNormalsScratch,
     output: &mut [DVec3],
 ) -> bool {
@@ -837,6 +874,9 @@ pub(crate) fn curve_normals_into(
         || output.len() != positions.len()
         || tilt.len() != positions.len()
         || custom_normals.is_some_and(|normals| normals.len() != positions.len())
+        || tangent_overrides
+            .iter()
+            .any(|(index, tangent)| *index >= positions.len() || !tangent.is_finite())
         || !matches!(normal_mode, MINIMUM_TWIST | Z_UP | FREE)
     {
         return false;
@@ -896,6 +936,9 @@ pub(crate) fn curve_normals_into(
         return false;
     }
     calculate_tangents(evaluated_positions, cyclic, &mut scratch.tangents);
+    for (index, tangent) in tangent_overrides {
+        scratch.tangents[*index] = *tangent;
+    }
 
     match normal_mode {
         Z_UP => calculate_normals_z_up(&scratch.tangents, &mut scratch.normals),
@@ -1226,186 +1269,496 @@ mod tests {
 
     use crate::model::{HairCurve, HairCurveAttribute, HairCurvesData};
 
-    use super::super::hair_intersect::{CurveKey, HairCurveGeometry};
+    use super::super::hair_intersect::HairCurveRenderMode;
     use super::{
-        FREE, HairCurveGeometryError, HairCurveShape, Z_UP, curve_normals,
-        curve_normals_for_geometry, prepare_hair_curve_geometry,
+        BEZIER, FREE, HairCurveShadowTransparency, HairCurveShape, MINIMUM_TWIST, NURBS, Z_UP,
+        curve_normals, prepare_cycles_hair_curve_geometry,
     };
 
     #[test]
     fn straight_z_up_poly_strand_uses_x_normals() {
         let positions = [DVec3::ZERO, DVec3::Z, DVec3::Z * 2.0];
-        let normals = curve_normals(&positions, 1, false, 1, 1, &[0.0; 3], None).unwrap();
+        let normals = curve_normals(&positions, 1, false, 1, 1, &[0.0; 3], None, &[]).unwrap();
         assert_eq!(normals, [DVec3::X; 3]);
     }
 
     #[test]
-    fn custom_nurbs_knots_fail_with_the_missing_serialized_payload() {
-        let attribute = |domain: &str, data_type: &str, value| HairCurveAttribute {
-            domain: domain.to_owned(),
-            data_type: data_type.to_owned(),
-            values: vec![value],
-        };
-        let curves = HairCurvesData {
-            curves: vec![HairCurve {
-                points: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
-                radius: 0.1,
-            }],
-            attributes: BTreeMap::from([
-                (
-                    "curve_type".to_owned(),
-                    attribute("CURVE", "INT8", json!(3)),
-                ),
-                (
-                    "nurbs_order".to_owned(),
-                    attribute("CURVE", "INT8", json!(2)),
-                ),
-                (
-                    "knots_mode".to_owned(),
-                    attribute("CURVE", "INT8", json!(4)),
-                ),
-            ]),
-            ..HairCurvesData::default()
-        };
-        let error = prepare_hair_curve_geometry(&curves, DMat4::IDENTITY).unwrap_err();
-        assert!(matches!(
-            error,
-            HairCurveGeometryError::MissingCustomKnots { curve_index: 0 }
-        ));
-    }
-    #[test]
-    fn empty_custom_nurbs_curve_needs_no_missing_knot_payload() {
-        let attribute = |domain: &str, data_type: &str, value| HairCurveAttribute {
-            domain: domain.to_owned(),
-            data_type: data_type.to_owned(),
-            values: vec![value],
-        };
+    fn empty_curve_has_empty_cycles_path_geometry() {
         let curves = HairCurvesData {
             curves: vec![HairCurve {
                 points: Vec::new(),
                 radius: 0.1,
             }],
-            attributes: BTreeMap::from([
-                (
-                    "curve_type".to_owned(),
-                    attribute("CURVE", "INT8", json!(3)),
-                ),
-                (
-                    "knots_mode".to_owned(),
-                    attribute("CURVE", "INT8", json!(4)),
-                ),
-            ]),
             ..HairCurvesData::default()
         };
-        assert_eq!(
-            prepare_hair_curve_geometry(&curves, DMat4::IDENTITY)
-                .unwrap()
-                .len(),
-            1
-        );
+        let prepared = prepare_cycles_hair_curve_geometry(
+            &curves,
+            DMat4::IDENTITY,
+            HairCurveRenderMode::Thick,
+            2,
+        )
+        .unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert!(matches!(
+            &prepared[0].curve.shape,
+            HairCurveShape::CatmullRom { keys, cyclic: false } if keys.is_empty()
+        ));
     }
 
-    fn straight_bezier_curve(
-        normal_mode: u8,
-        tilt_end: f64,
-        custom_normals: Option<Vec<DVec3>>,
-    ) -> HairCurveGeometry {
-        let keys = [
-            CurveKey {
-                position: DVec3::ZERO,
-                radius: 0.1,
-            },
-            CurveKey {
-                position: DVec3::Z / 3.0,
-                radius: 0.1,
-            },
-            CurveKey {
-                position: DVec3::Z * (2.0 / 3.0),
-                radius: 0.2,
-            },
-            CurveKey {
-                position: DVec3::Z,
-                radius: 0.2,
-            },
+    #[test]
+    fn cycles_path_uses_one_global_basis_for_every_authored_type() {
+        let curve_data = |curve_types: &[i64]| HairCurvesData {
+            curves: curve_types
+                .iter()
+                .enumerate()
+                .map(|(index, _)| HairCurve {
+                    points: vec![
+                        [index as f64, 0.0, 0.0],
+                        [index as f64, 0.0, 1.0],
+                        [index as f64, 0.0, 2.0],
+                    ],
+                    radius: 0.1,
+                })
+                .collect(),
+            attributes: BTreeMap::from([(
+                "curve_type".to_owned(),
+                HairCurveAttribute {
+                    domain: "CURVE".to_owned(),
+                    data_type: "INT8".to_owned(),
+                    values: curve_types.iter().map(|value| json!(value)).collect(),
+                },
+            )]),
+            ..HairCurvesData::default()
+        };
+
+        let first_poly = curve_data(&[1, 0]);
+        let prepared = prepare_cycles_hair_curve_geometry(
+            &first_poly,
+            DMat4::IDENTITY,
+            HairCurveRenderMode::Ribbon,
+            2,
+        )
+        .unwrap();
+        assert!(prepared.iter().all(|curve| {
+            curve.curve.render_mode == HairCurveRenderMode::ThickLinear
+                && matches!(
+                    &curve.curve.shape,
+                    HairCurveShape::Linear { keys, cyclic: false } if keys.len() == 3
+                )
+        }));
+
+        let later_poly = curve_data(&[0, 1]);
+        let prepared = prepare_cycles_hair_curve_geometry(
+            &later_poly,
+            DMat4::IDENTITY,
+            HairCurveRenderMode::Ribbon,
+            2,
+        )
+        .unwrap();
+        assert!(prepared.iter().all(|curve| {
+            curve.curve.render_mode == HairCurveRenderMode::Ribbon
+                && matches!(
+                    &curve.curve.shape,
+                    HairCurveShape::CatmullRom { keys, cyclic: false } if keys.len() == 3
+                )
+        }));
+
+        let configured_linear = curve_data(&[0, 3]);
+        let prepared = prepare_cycles_hair_curve_geometry(
+            &configured_linear,
+            DMat4::IDENTITY,
+            HairCurveRenderMode::ThickLinear,
+            2,
+        )
+        .unwrap();
+        assert!(prepared.iter().all(|curve| {
+            curve.curve.render_mode == HairCurveRenderMode::ThickLinear
+                && matches!(
+                    &curve.curve.shape,
+                    HairCurveShape::Linear { keys, cyclic: false } if keys.len() == 3
+                )
+        }));
+    }
+
+    #[test]
+    fn point_normal_keys_mix_raw_before_huang_projection() {
+        // Blender 5.2.2 source point-domain normals for the canonical four-key curve.
+        let source_normals = [
+            DVec3::new(0.239_537_27, -0.970_887_18, 0.0),
+            DVec3::new(0.002_283_36, -0.989_907_44, -0.141_696_97),
+            DVec3::new(-0.194_739_65, -0.942_921_94, -0.270_138_38),
+            DVec3::new(-0.148_964_48, -0.943_107_96, -0.297_249_14),
         ];
-        HairCurveGeometry {
-            resolution: 4,
-            normal_mode,
-            tilts: vec![0.0, tilt_end],
-            custom_normals,
-            shape: HairCurveShape::Bezier {
-                spans: vec![keys],
-                cyclic: false,
-            },
-            object_to_world: DMat4::IDENTITY,
-            world_to_object: DMat4::IDENTITY,
-        }
-    }
-
-    #[test]
-    fn bezier_radius_tilt_and_custom_normals_use_linear_attribute_interpolation() {
-        // Blender 5.2.2 `curve_bezier.cc::linear_interpolation` evaluates generic Bezier attributes
-        // linearly; the curve position remains cubic.
-        let curve = straight_bezier_curve(Z_UP, std::f64::consts::FRAC_PI_2, None);
-        let sample = curve.sample_local(0, 0.25).unwrap();
-        assert!((sample.radius - 0.125).abs() < 1.0e-12);
-        let normals = curve_normals_for_geometry(&curve).unwrap();
-        let expected_tilt = DVec3::new(
-            (std::f64::consts::FRAC_PI_8).cos(),
-            (std::f64::consts::FRAC_PI_8).sin(),
-            0.0,
-        );
-        assert!((normals.at(0, 0.25).unwrap() - expected_tilt).length() < 1.0e-12);
-
-        let curve = straight_bezier_curve(FREE, 0.0, Some(vec![DVec3::X, DVec3::Y]));
-        let normals = curve_normals_for_geometry(&curve).unwrap();
-        let expected = (DVec3::X * 0.75 + DVec3::Y * 0.25).normalize();
-        assert!((normals.at(0, 0.25).unwrap() - expected).length() < 1.0e-12);
-    }
-
-    #[test]
-    fn free_normal_without_custom_attribute_uses_blender_z_up_fallback() {
-        // Blender 5.2.2 `curves_geometry.cc::evaluated_normals` uses Z-up when FREE has no
-        // `custom_normal` point attribute.
-        let curve = straight_bezier_curve(FREE, 0.0, None);
-        let normals = curve_normals_for_geometry(&curve).unwrap();
-        assert!((normals.at(0, 0.25).unwrap() - DVec3::X).length() < 1.0e-12);
-    }
-
-    #[test]
-    fn underspecified_nurbs_falls_back_to_control_point_poly() {
-        // Blender 5.2.2 `curves_nurbs.cc::check_valid_eval_params` rejects order > point count;
-        // `calculate_evaluated_num` then keeps the input control-point count.
-        let attribute = |domain: &str, data_type: &str, value| HairCurveAttribute {
+        let attribute = |domain: &str, data_type: &str, values| HairCurveAttribute {
             domain: domain.to_owned(),
             data_type: data_type.to_owned(),
-            values: vec![value],
+            values,
         };
         let curves = HairCurvesData {
             curves: vec![HairCurve {
-                points: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                points: vec![
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, 0.0, 2.0],
+                    [0.0, 0.0, 3.0],
+                ],
                 radius: 0.1,
             }],
             attributes: BTreeMap::from([
                 (
                     "curve_type".to_owned(),
-                    attribute("CURVE", "INT8", json!(3)),
+                    attribute("CURVE", "INT8", vec![json!(0)]),
                 ),
                 (
-                    "nurbs_order".to_owned(),
-                    attribute("CURVE", "INT8", json!(4)),
+                    "normal_mode".to_owned(),
+                    attribute("CURVE", "INT8", vec![json!(FREE)]),
                 ),
                 (
-                    "knots_mode".to_owned(),
-                    attribute("CURVE", "INT8", json!(0)),
+                    "custom_normal".to_owned(),
+                    attribute(
+                        "POINT",
+                        "FLOAT_VECTOR",
+                        source_normals
+                            .iter()
+                            .map(|normal| json!([normal.x, normal.y, normal.z]))
+                            .collect(),
+                    ),
                 ),
             ]),
             ..HairCurvesData::default()
         };
-        let prepared = prepare_hair_curve_geometry(&curves, DMat4::IDENTITY).unwrap();
+        let prepared = prepare_cycles_hair_curve_geometry(
+            &curves,
+            DMat4::IDENTITY,
+            HairCurveRenderMode::ThickLinear,
+            2,
+        )
+        .unwrap()
+        .remove(0);
         assert!(matches!(
-            &prepared[0].shape,
-            HairCurveShape::Linear { keys, cyclic: false } if keys.len() == 2
+            prepared.curve.shape,
+            HairCurveShape::Linear { .. }
         ));
+
+        let u = 0.471_619_776;
+        let expected = source_normals[1]
+            .normalize()
+            .lerp(source_normals[2].normalize(), u);
+        let point_normal = prepared.point_normals.at(1, u).unwrap();
+        assert!((point_normal - expected).length() < 1.0e-12);
+        assert!(point_normal.length() < 0.995);
+
+        // Huang projects the attribute against dPdu; keep a near-parallel case non-degenerate.
+        let tangent = (expected.normalize() + DVec3::Z * 1.0e-5).normalize();
+        let projection = tangent
+            .cross(point_normal.cross(tangent).normalize_or_zero())
+            .normalize_or_zero();
+        assert!(point_normal.cross(tangent).length() < 1.0e-5);
+        assert!(
+            (projection - DVec3::new(0.018_997_49, 0.202_840_71, -0.979_027_45)).length() < 1.0e-6
+        );
+    }
+
+    #[test]
+    fn shadow_transparency_interpolates_f32_keys_and_defaults_missing_values_to_zero() {
+        let values = HairCurveShadowTransparency::new(Some(vec![0.2_f32, 0.8, 0.4]), false);
+        let expected = f64::from(0.8_f32 * (1.0 - 0.25_f32) + 0.4 * 0.25_f32);
+        assert!((values.at(1, 0.25).unwrap() - expected).abs() < 1.0e-12);
+
+        let cyclic = HairCurveShadowTransparency::new(Some(vec![0.2_f32, 0.8, 0.4]), true);
+        let expected = f64::from(0.4_f32 * (1.0 - 0.25_f32) + 0.2 * 0.25_f32);
+        assert!((cyclic.at(2, 0.25).unwrap() - expected).abs() < 1.0e-12);
+
+        let missing = HairCurveShadowTransparency::new(None, false);
+        assert_eq!(missing.at(0, 0.5), Some(0.0));
+    }
+
+    #[test]
+    fn cycles_path_uses_raw_bezier_and_nurbs_control_keys() {
+        let attribute = |domain: &str, data_type: &str, values| HairCurveAttribute {
+            domain: domain.to_owned(),
+            data_type: data_type.to_owned(),
+            values,
+        };
+        let source_points = [
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 2.0],
+                [0.0, 0.0, 3.0],
+            ],
+            [
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 1.0],
+                [1.0, 0.0, 2.0],
+                [1.0, 0.0, 3.0],
+            ],
+        ];
+        let source_radii = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let curves = HairCurvesData {
+            curves: source_points
+                .iter()
+                .map(|points| HairCurve {
+                    points: points.to_vec(),
+                    radius: 0.1,
+                })
+                .collect(),
+            attributes: BTreeMap::from([
+                (
+                    "curve_type".to_owned(),
+                    attribute("CURVE", "INT8", vec![json!(BEZIER), json!(NURBS)]),
+                ),
+                (
+                    "radius".to_owned(),
+                    attribute(
+                        "POINT",
+                        "FLOAT",
+                        source_radii.iter().map(|radius| json!(radius)).collect(),
+                    ),
+                ),
+            ]),
+            ..HairCurvesData::default()
+        };
+        let prepared = prepare_cycles_hair_curve_geometry(
+            &curves,
+            DMat4::IDENTITY,
+            HairCurveRenderMode::Thick,
+            2,
+        )
+        .unwrap();
+        for (curve_index, (prepared, source_points)) in
+            prepared.iter().zip(source_points.iter()).enumerate()
+        {
+            assert_eq!(prepared.curve.render_mode, HairCurveRenderMode::Thick);
+            let HairCurveShape::CatmullRom {
+                keys,
+                cyclic: false,
+            } = &prepared.curve.shape
+            else {
+                panic!("Cycles path must use open Catmull-Rom raw keys in thick mode");
+            };
+            assert_eq!(
+                keys.iter()
+                    .map(|key| key.position.to_array())
+                    .collect::<Vec<_>>(),
+                source_points.to_vec()
+            );
+            assert_eq!(
+                keys.iter().map(|key| key.radius).collect::<Vec<_>>(),
+                source_radii[curve_index * 4..curve_index * 4 + 4].to_vec()
+            );
+        }
+    }
+
+    #[test]
+    fn cyclic_source_keeps_normals_cyclic_but_path_endpoints_open() {
+        let attribute = |domain: &str, data_type: &str, values| HairCurveAttribute {
+            domain: domain.to_owned(),
+            data_type: data_type.to_owned(),
+            values,
+        };
+        let curves = HairCurvesData {
+            curves: vec![HairCurve {
+                points: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 2.0]],
+                radius: 0.1,
+            }],
+            attributes: BTreeMap::from([
+                (
+                    "cyclic".to_owned(),
+                    attribute("CURVE", "BOOLEAN", vec![json!(true)]),
+                ),
+                (
+                    "normal_mode".to_owned(),
+                    attribute("CURVE", "INT8", vec![json!(FREE)]),
+                ),
+                (
+                    "custom_normal".to_owned(),
+                    attribute(
+                        "POINT",
+                        "FLOAT_VECTOR",
+                        vec![
+                            json!([1.0, 0.0, 0.0]),
+                            json!([0.0, 1.0, 0.0]),
+                            json!([0.0, 0.0, 1.0]),
+                        ],
+                    ),
+                ),
+            ]),
+            ..HairCurvesData::default()
+        };
+        let prepared = prepare_cycles_hair_curve_geometry(
+            &curves,
+            DMat4::IDENTITY,
+            HairCurveRenderMode::Thick,
+            2,
+        )
+        .unwrap()
+        .remove(0);
+        let HairCurveShape::CatmullRom {
+            keys,
+            cyclic: false,
+        } = &prepared.curve.shape
+        else {
+            panic!("Cycles path uses the raw open key sequence");
+        };
+        assert_eq!(keys.len(), 3);
+        assert_eq!(
+            prepared.curve.sample_local(1, 1.0).unwrap().position,
+            DVec3::new(0.0, 0.0, 2.0)
+        );
+        assert!(prepared.curve.sample_local(2, 0.0).is_none());
+        assert_eq!(
+            prepared.point_normals.at(2, 0.5),
+            Some(DVec3::new(0.5, 0.0, 0.5))
+        );
+    }
+    #[test]
+    fn bezier_free_handle_tangents_define_source_point_normals() {
+        let attribute = |domain: &str, data_type: &str, values| HairCurveAttribute {
+            domain: domain.to_owned(),
+            data_type: data_type.to_owned(),
+            values,
+        };
+        let curves = HairCurvesData {
+            curves: vec![HairCurve {
+                points: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                radius: 0.1,
+            }],
+            attributes: BTreeMap::from([
+                (
+                    "curve_type".to_owned(),
+                    attribute("CURVE", "INT8", vec![json!(BEZIER)]),
+                ),
+                (
+                    "normal_mode".to_owned(),
+                    attribute("CURVE", "INT8", vec![json!(Z_UP)]),
+                ),
+                (
+                    "handle_left".to_owned(),
+                    attribute(
+                        "POINT",
+                        "FLOAT_VECTOR",
+                        vec![json!([0.0, 0.0, 0.0]), json!([0.0, 1.0, 0.0])],
+                    ),
+                ),
+                (
+                    "handle_right".to_owned(),
+                    attribute(
+                        "POINT",
+                        "FLOAT_VECTOR",
+                        vec![json!([1.0, 1.0, 0.0]), json!([1.0, 0.0, 0.0])],
+                    ),
+                ),
+                (
+                    "handle_type_left".to_owned(),
+                    attribute("POINT", "INT8", vec![json!(0), json!(0)]),
+                ),
+                (
+                    "handle_type_right".to_owned(),
+                    attribute("POINT", "INT8", vec![json!(0), json!(0)]),
+                ),
+            ]),
+            ..HairCurvesData::default()
+        };
+        let prepared = prepare_cycles_hair_curve_geometry(
+            &curves,
+            DMat4::IDENTITY,
+            HairCurveRenderMode::ThickLinear,
+            2,
+        )
+        .unwrap()
+        .remove(0);
+        let inverse_sqrt_two = std::f64::consts::FRAC_1_SQRT_2;
+        let expected_first = DVec3::new(inverse_sqrt_two, -inverse_sqrt_two, 0.0);
+        let expected_last = DVec3::new(-inverse_sqrt_two, -inverse_sqrt_two, 0.0);
+        assert!((prepared.point_normals.at(0, 0.0).unwrap() - expected_first).length() < 1.0e-6);
+        assert!((prepared.point_normals.at(0, 1.0).unwrap() - expected_last).length() < 1.0e-6);
+        assert_eq!(
+            prepared.curve.sample_local(0, 0.0).unwrap().tangent,
+            DVec3::X,
+            "render geometry remains on its raw linear path basis"
+        );
+    }
+
+    #[test]
+    fn bezier_vector_segments_use_source_variable_offsets_for_point_normals() {
+        let attribute = |domain: &str, data_type: &str, values| HairCurveAttribute {
+            domain: domain.to_owned(),
+            data_type: data_type.to_owned(),
+            values,
+        };
+        let points = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0],
+        ];
+        let curves = HairCurvesData {
+            curves: vec![HairCurve {
+                points: points.to_vec(),
+                radius: 0.1,
+            }],
+            attributes: BTreeMap::from([
+                (
+                    "curve_type".to_owned(),
+                    attribute("CURVE", "INT8", vec![json!(BEZIER)]),
+                ),
+                (
+                    "normal_mode".to_owned(),
+                    attribute("CURVE", "INT8", vec![json!(MINIMUM_TWIST)]),
+                ),
+                (
+                    "resolution".to_owned(),
+                    attribute("CURVE", "INT", vec![json!(2)]),
+                ),
+                (
+                    "handle_left".to_owned(),
+                    attribute(
+                        "POINT",
+                        "FLOAT_VECTOR",
+                        points.iter().map(|point| json!(point)).collect(),
+                    ),
+                ),
+                (
+                    "handle_right".to_owned(),
+                    attribute(
+                        "POINT",
+                        "FLOAT_VECTOR",
+                        points.iter().map(|point| json!(point)).collect(),
+                    ),
+                ),
+                (
+                    "handle_type_left".to_owned(),
+                    attribute("POINT", "INT8", vec![json!(2); points.len()]),
+                ),
+                (
+                    "handle_type_right".to_owned(),
+                    attribute("POINT", "INT8", vec![json!(2); points.len()]),
+                ),
+            ]),
+            ..HairCurvesData::default()
+        };
+        let prepared = prepare_cycles_hair_curve_geometry(
+            &curves,
+            DMat4::IDENTITY,
+            HairCurveRenderMode::ThickLinear,
+            2,
+        )
+        .unwrap()
+        .remove(0);
+        let expected = DVec3::new(
+            2.0 * std::f64::consts::SQRT_2 / 3.0,
+            -std::f64::consts::SQRT_2 / 6.0,
+            std::f64::consts::SQRT_2 / 6.0,
+        );
+        assert!(
+            (prepared.point_normals.at(2, 0.0).unwrap() - expected).length() < 1.0e-4,
+            "point normals must use the variable-offset Bezier evaluation, not uniform render subdivisions"
+        );
+        assert_eq!(
+            prepared.curve.sample_local(1, 0.0).unwrap().tangent,
+            DVec3::Y,
+            "normal evaluation must not change the linear render basis"
+        );
     }
 }

@@ -1,19 +1,15 @@
-"""Model bound of the glass world test: the transmission model of `eevee_transmission.rs` over the world of
-`eevee_glass_world.py`, against the committed macOS arm64 EEVEE render (`eevee_macos/glass_world.f32le`).
+"""Historical diagnostic model for the original glass-world EEVEE capture.
 
-The port follows the Rust functions in order: `probe_radiance` (EEVEE's UFLOAT 11-11-10 capture, six mantissa bits for red
-and green and five for blue, truncated), `prefiltered_with` (five taps, each captured, then averaged), `reflection_direction`,
-`transmission_roughness`, `dominant_transmission`, `sphere_exit_normal` and `transmission_direction` (a sphere thickness,
-so two refraction events), and `glass_closures`' weights (the reflectance, and the transmittance squared with a thickness).
-`glass_split` is `eevee_glass_direct_mirror.py`'s port of `bsdf_lut`, called once per channel with the tint
-`sqrt(Base Color)`, since its normalisation depends on the tint.
+This retained script models the former fixed 64-face / nearest-probe implementation and its UFLOAT 11-11-10
+five-tap transmission approximation. It is not the current realtime probe implementation: EEVEE now captures at
+`SceneEEVEE.gi_cubemap_resolution / 2` and filters a half-float octahedral mip atlas. The current EEVEE and Path probe
+paths are distinct; do not use this historical mirror to change production behavior, captures, or acceptance bounds.
 
-The world is `t = (z + 1) / 2`, colour `(0.25 + 0.5 t, 0.5, 0.75 - 0.5 t)` by the direction's elevation `z`. Potter
-reads the world through its render's world probe (`render/world_probe.rs`): a cube map of 64 texels per face, each holding
-the world at its centre, and a lookup returns the texel the direction pierces (nearest, no filtering). The mirror builds
-the same table and looks up the same texels.
+The old mirror followed `probe_radiance`, `prefiltered_with`, `reflection_direction`, `transmission_roughness`,
+`dominant_transmission`, `sphere_exit_normal`, `transmission_direction` and `glass_closures`. `glass_split` is the
+direct-mirror port of `bsdf_lut`, called once per channel with the tint `sqrt(Base Color)`.
 
-The test's tolerance is the largest deviation printed here, rounded up. Run it with no arguments:
+The original captures and bounds are retained without being repinned. Run the historical diagnostic with no arguments:
 
     python3 eevee_glass_world_mirror.py
 """

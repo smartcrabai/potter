@@ -156,7 +156,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":17},
+        "schema_version":{"const":18},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -443,6 +443,10 @@ fn complete_scene_schema(root: &mut Value) {
     }
     let render = &mut defs["render_settings"];
     render["properties"]["eevee_light_threshold"] = json!({"type":"number","minimum":0.0});
+    render["properties"]["eevee_gi_cubemap_resolution"] = json!({
+        "oneOf":[{"type":"integer","enum":[128,256,512,1024,2048,4096]},{"type":"null"}],
+        "default":512
+    });
     render["properties"]["eevee_use_volumetric_shadows"] =
         json!({"type":"boolean","default":false});
     render["properties"]["eevee_volumetric_tile_size"] =
@@ -474,6 +478,9 @@ fn complete_scene_schema(root: &mut Value) {
         "motion_blur_samples",
         "dicing_rate",
         "preview_dicing_rate",
+        "cycles_curves_shape",
+        "cycles_curves_subdivisions",
+        "eevee_gi_cubemap_resolution",
         "max_subdivisions",
         "offscreen_dicing_scale"
     ]);
@@ -494,6 +501,11 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["filter_size"] = json!({"type":"number","minimum":0,"maximum":500});
     render["properties"]["filter_glossy"] = json!({"type":"number","minimum":0,"maximum":10});
     render["properties"]["volume_bounces"] = json!({"type":"integer","minimum":0,"maximum":1024});
+    render["properties"]["cycles_curves_shape"] = json!({
+        "oneOf":[{"enum":["ribbons","thick","thick_linear"]},{"type":"null"}]
+    });
+    render["properties"]["cycles_curves_subdivisions"] =
+        json!({"type":["integer","null"],"minimum":0,"maximum":24});
 
     defs["light"]["properties"]["sun_angle"] =
         json!({"type":"number","minimum":0,"maximum":std::f64::consts::PI});
@@ -3115,6 +3127,9 @@ fn set_schema(operation: &str) -> Value {
             "samples":{"type":"integer","minimum":1,"maximum":1_000_000},
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
             "max_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "cycles_curves_shape":{"oneOf":[{"enum":["ribbons","thick","thick_linear"]},{"type":"null"}]},
+            "cycles_curves_subdivisions":{"type":["integer","null"],"minimum":0,"maximum":24},
+            "eevee_gi_cubemap_resolution":{"oneOf":[{"type":"integer","enum":[128,256,512,1024,2048,4096]},{"type":"null"}]},
             "volume_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "pixel_filter_type":{"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"]},
@@ -3665,6 +3680,61 @@ mod tests {
             "^[a-z][a-z0-9_-]{0,63}$"
         );
         assert_eq!(update["properties"]["image"]["oneOf"][1]["type"], "null");
+        Ok(())
+    }
+    #[test]
+    fn cycles_curve_settings_are_visible_in_scene_and_render_schemas() -> crate::error::Result<()> {
+        let scene = schema("scene", None)?;
+        assert_eq!(scene["properties"]["schema_version"]["const"], 18);
+        let render = &scene["$defs"]["render_settings"];
+        for field in ["cycles_curves_shape", "cycles_curves_subdivisions"] {
+            assert!(
+                render["required"]
+                    .as_array()
+                    .is_some_and(|required| required.iter().any(|value| value == field))
+            );
+        }
+        assert_eq!(
+            render["properties"]["cycles_curves_shape"]["oneOf"][0]["enum"],
+            serde_json::json!(["ribbons", "thick", "thick_linear"])
+        );
+        assert_eq!(
+            render["properties"]["cycles_curves_subdivisions"]["maximum"],
+            24
+        );
+
+        let update = schema("operations", Some("render.update"))?;
+        let set = &update["properties"]["set"]["properties"];
+        assert_eq!(
+            set["cycles_curves_shape"]["oneOf"][0]["enum"],
+            serde_json::json!(["ribbons", "thick", "thick_linear"])
+        );
+        assert_eq!(set["cycles_curves_subdivisions"]["minimum"], 0);
+        assert_eq!(set["cycles_curves_subdivisions"]["maximum"], 24);
+        Ok(())
+    }
+
+    #[test]
+    fn eevee_probe_resolution_is_visible_in_scene_and_render_update_schemas()
+    -> crate::error::Result<()> {
+        let scene = schema("scene", None)?;
+        let render = &scene["$defs"]["render_settings"];
+        assert!(render["required"].as_array().is_some_and(|required| {
+            required
+                .iter()
+                .any(|field| field == "eevee_gi_cubemap_resolution")
+        }));
+        let expected = serde_json::json!([128, 256, 512, 1024, 2048, 4096]);
+        assert_eq!(
+            render["properties"]["eevee_gi_cubemap_resolution"]["oneOf"][0]["enum"],
+            expected
+        );
+
+        let update = schema("operations", Some("render.update"))?;
+        assert_eq!(
+            update["properties"]["set"]["properties"]["eevee_gi_cubemap_resolution"]["oneOf"][0]["enum"],
+            expected
+        );
         Ok(())
     }
     use serde_json::Value;

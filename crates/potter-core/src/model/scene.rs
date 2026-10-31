@@ -96,6 +96,7 @@ impl SceneDoc {
                         excluded_collections: Vec::new(),
                     },
                 )]),
+                cycles_hair_shadow_groups: None,
                 frame_current: 1.0,
                 frame_start: 1,
                 frame_end: 250,
@@ -127,7 +128,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 17,
+            schema_version: 18,
             scene_id,
             revision: 0,
             active_scene,
@@ -155,7 +156,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 17 {
+        if self.schema_version != 18 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -237,6 +238,136 @@ impl SceneDoc {
         }
         for (scene_id, scene) in &self.scenes {
             scene.render.validate()?;
+            if let Some(groups) = &scene.cycles_hair_shadow_groups {
+                let mut group_keys = Vec::new();
+                for group in groups {
+                    let stable_geometry_key = !matches!(
+                        &group.geometry_key,
+                        CyclesHairShadowGeometryKey::Data { data_id: None }
+                    );
+                    if stable_geometry_key {
+                        let group_key = (group.view_layer_id.clone(), group.geometry_key.clone());
+                        if group_keys.contains(&group_key) {
+                            return Err(PotError::with_details(
+                                ErrorCode::SceneInvalid,
+                                "Cycles Hair shadow groups duplicate a stable view-layer GeometryKey",
+                                json!({"scene_id":scene_id,"view_layer_id":group.view_layer_id}),
+                            ));
+                        }
+                        group_keys.push(group_key);
+                    }
+                    if !scene.view_layers.contains_key(&group.view_layer_id) {
+                        return Err(PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "Cycles Hair shadow group references a missing view layer",
+                            json!({"scene_id":scene_id,"view_layer_id":group.view_layer_id}),
+                        ));
+                    }
+                    let mut member_nodes = Vec::new();
+                    let mut member_node_set = BTreeSet::new();
+                    let mut instance_keys = BTreeSet::new();
+                    let mut invalid_member = false;
+                    for member in &group.members {
+                        let instance = &member.instance;
+                        if !self.nodes.contains_key(&instance.real_object_node_id)
+                            || instance
+                                .parent_node_id
+                                .as_ref()
+                                .is_some_and(|parent| !self.nodes.contains_key(parent))
+                            || (!instance.is_instance
+                                && (instance.parent_node_id.as_ref()
+                                    != Some(&instance.real_object_node_id)
+                                    || instance.persistent_id != [0; 8]))
+                            || !instance_keys.insert(instance)
+                        {
+                            invalid_member = true;
+                        }
+                        if member_node_set.insert(instance.real_object_node_id.clone()) {
+                            member_nodes.push(instance.real_object_node_id.clone());
+                        }
+                        if member
+                            .object_to_world
+                            .iter()
+                            .flatten()
+                            .any(|value| !value.is_finite())
+                            || !member.object_color.iter().all(|value| value.is_finite())
+                            || member
+                                .slot_0_material_id
+                                .as_ref()
+                                .is_some_and(|material_id| {
+                                    !self.materials.contains_key(material_id)
+                                })
+                        {
+                            invalid_member = true;
+                        }
+                    }
+                    if group.members.is_empty()
+                        || invalid_member
+                        || group.member_node_ids.first() != Some(&group.representative_node_id)
+                        || group.member_node_ids != member_nodes
+                        || group.members.first().is_none_or(|member| {
+                            member.instance.real_object_node_id != group.representative_node_id
+                        })
+                    {
+                        return Err(PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "Cycles Hair shadow group has invalid representative or member records",
+                            json!({"scene_id":scene_id,"view_layer_id":group.view_layer_id}),
+                        ));
+                    }
+                    let representative_node = &self.nodes[&group.representative_node_id];
+                    let source_hair_curves = representative_node
+                        .data
+                        .as_ref()
+                        .and_then(|data_id| self.data_blocks.get(data_id))
+                        .and_then(|data| data.hair_curves.as_ref());
+                    let curve_indices_invalid =
+                        group.source_curve_indices.as_ref().is_some_and(|indices| {
+                            source_hair_curves.is_none_or(|hair| {
+                                indices.iter().any(|index| {
+                                    usize::try_from(*index)
+                                        .ok()
+                                        .is_none_or(|index| index >= hair.curves.len())
+                                })
+                            })
+                        });
+                    let source_input_fingerprint_invalid = group
+                        .source_input_fingerprint
+                        .as_deref()
+                        .is_some_and(|fingerprint| {
+                            !fingerprint.strip_prefix("sha256:").is_some_and(|hex| {
+                                hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            })
+                        });
+                    let geometry_key_valid = match &group.geometry_key {
+                        CyclesHairShadowGeometryKey::Object { node_id } => {
+                            node_id == &group.representative_node_id
+                        }
+                        CyclesHairShadowGeometryKey::Data { data_id } => {
+                            data_id.as_ref().is_none_or(|data_id| {
+                                self.data_blocks.contains_key(data_id)
+                                    && representative_node.data.as_ref() == Some(data_id)
+                            })
+                        }
+                    };
+                    if group.evaluated_hair_curves.as_ref().is_some_and(|hair| {
+                        !matches!(hair.selection_domain.as_str(), "POINT" | "CURVE")
+                            || hair
+                                .surface
+                                .as_ref()
+                                .is_some_and(|surface| !self.nodes.contains_key(surface))
+                    }) || curve_indices_invalid
+                        || source_input_fingerprint_invalid
+                        || !geometry_key_valid
+                    {
+                        return Err(PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "Cycles Hair shadow group geometry context is invalid",
+                            json!({"scene_id":scene_id,"view_layer_id":group.view_layer_id}),
+                        ));
+                    }
+                }
+            }
             if let Some(camera_id) = &scene.render.dicing_camera
                 && !self.is_camera_object(camera_id)
             {
@@ -542,6 +673,14 @@ impl SceneDoc {
         Ok(())
     }
 
+    pub(crate) fn cycles_hair_shadow_source_fingerprint(
+        &self,
+        scene_id: &Id,
+        group: &CyclesHairShadowGroup,
+    ) -> Result<Option<String>> {
+        cycles_hair_shadow_source_fingerprint(self, scene_id, group)
+    }
+
     pub(crate) fn is_camera_object(&self, camera_id: &Id) -> bool {
         self.nodes
             .get(camera_id)
@@ -550,6 +689,765 @@ impl SceneDoc {
             .and_then(|data_id| self.data_blocks.get(data_id))
             .is_some_and(|data| data.camera.is_some())
     }
+}
+
+fn cycles_hair_shadow_source_fingerprint(
+    doc: &SceneDoc,
+    scene_id: &Id,
+    group: &CyclesHairShadowGroup,
+) -> Result<Option<String>> {
+    let Some(scene) = doc.scenes.get(scene_id) else {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "Cycles Hair provenance names a missing Scene",
+        ));
+    };
+    let Some(view_layer) = scene.view_layers.get(&group.view_layer_id) else {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "Cycles Hair provenance names a missing View Layer",
+        ));
+    };
+    let mut closure = CyclesHairSourceClosure {
+        complete: true,
+        ..CyclesHairSourceClosure::default()
+    };
+    let member_node_ids = group
+        .member_node_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let instance_member_node_ids = group
+        .members
+        .iter()
+        .filter(|member| member.instance.is_instance)
+        .map(|member| member.instance.real_object_node_id.clone())
+        .collect::<BTreeSet<_>>();
+    closure
+        .instance_context_nodes
+        .clone_from(&instance_member_node_ids);
+    let instance_data_ids = group
+        .members
+        .iter()
+        .filter(|member| member.instance.is_instance)
+        .filter_map(|member| {
+            doc.nodes
+                .get(&member.instance.real_object_node_id)
+                .and_then(|node| node.data.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    for member in &group.members {
+        closure.visit_node(
+            doc,
+            &member.instance.real_object_node_id,
+            member.instance.is_instance,
+            0,
+        );
+        if member.instance.is_instance
+            && let Some(parent) = &member.instance.parent_node_id
+        {
+            closure.visit_node(doc, parent, true, 0);
+        }
+    }
+    closure.visit_scene_collection(
+        doc,
+        &scene.root_collection,
+        &view_layer.excluded_collections,
+        &member_node_ids,
+        &instance_member_node_ids,
+        0,
+    );
+    if !closure.complete {
+        return Ok(None);
+    }
+
+    let nodes = closure
+        .nodes
+        .iter()
+        .map(|id| -> Result<_> {
+            let node = &doc.nodes[id];
+            Ok((
+                id.to_string(),
+                cycles_hair_node_geometry_state(
+                    node,
+                    closure.transforms.contains(id),
+                    instance_member_node_ids.contains(id),
+                )?,
+            ))
+        })
+        .collect::<Result<serde_json::Map<_, _>>>()?;
+    let data_blocks = closure
+        .data_blocks
+        .iter()
+        .map(|id| {
+            let data = &doc.data_blocks[id];
+            let state = serde_json::json!({
+                "type": data.data_type,
+                "descriptor": data.descriptor,
+                "mesh": data.mesh,
+                "grease_pencil": data.grease_pencil,
+                "armature": data.armature,
+                "shape_keys": data.shape_keys,
+                "vertex_groups": data.vertex_groups,
+                "vertex_weights": data.vertex_weights,
+                "curve": data.curve,
+                "surface": data.surface,
+                "text": data.text,
+                "hair_curves": data.hair_curves,
+                "metaball": data.metaball,
+                "lattice": data.lattice,
+                "pointcloud": data.pointcloud,
+                "volume": data.volume,
+                "material_slots": instance_data_ids.contains(id).then_some(&data.materials),
+                "material_slot_count": data.materials.len(),
+            });
+            (id.to_string(), state)
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let scene_membership = closure
+        .scene_membership
+        .iter()
+        .map(|(id, objects)| (id.to_string(), serde_json::json!(objects)))
+        .collect::<serde_json::Map<_, _>>();
+
+    let collections = closure
+        .collections
+        .iter()
+        .map(|id| {
+            let collection = &doc.collections[id];
+            (
+                id.to_string(),
+                serde_json::json!({
+                    "children": collection.children,
+                    "objects": collection.objects,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let node_groups = closure
+        .node_groups
+        .iter()
+        .map(|id| {
+            (
+                id.to_string(),
+                cycles_hair_node_group_geometry_state(&doc.node_groups[id]),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let actions = closure
+        .actions
+        .iter()
+        .map(|(id, (include_all, include_instance_context))| {
+            (
+                id.to_string(),
+                cycles_hair_action_geometry_state(
+                    &doc.actions[id],
+                    *include_all,
+                    *include_instance_context,
+                    &closure.nodes,
+                ),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    let images = closure
+        .images
+        .iter()
+        .map(|id| {
+            serde_json::to_value(&doc.images[id])
+                .map(|state| (id.to_string(), state))
+                .map_err(PotError::internal_json)
+        })
+        .collect::<Result<serde_json::Map<_, _>>>()?;
+    let member_instance_keys = group
+        .members
+        .iter()
+        .map(|member| &member.instance)
+        .collect::<Vec<_>>();
+    let instance_contexts = group
+        .members
+        .iter()
+        .filter(|member| member.instance.is_instance)
+        .collect::<Vec<_>>();
+    let state = serde_json::json!({
+        "scene": {
+            "frame_current": scene.frame_current,
+            "root_collection": scene.root_collection,
+            "use_gravity": scene.use_gravity,
+        },
+        "view_layer": {
+            "id": group.view_layer_id,
+            "excluded_collections": view_layer.excluded_collections,
+            "candidate_membership": scene_membership,
+        },
+        "geometry_key": group.geometry_key,
+        "representative_node_id": group.representative_node_id,
+        "member_node_ids": group.member_node_ids,
+        "member_instance_keys": member_instance_keys,
+        "instance_contexts": instance_contexts,
+        "source_curve_indices": group.source_curve_indices,
+        "nodes": nodes,
+        "data_blocks": data_blocks,
+        "collections": collections,
+        "node_groups": node_groups,
+        "actions": actions,
+        "images": images,
+    });
+    let bytes = crate::hash::canonicalize(&state)?;
+    Ok(Some(crate::hash::sha256(&bytes)))
+}
+
+#[derive(Default)]
+struct CyclesHairSourceClosure {
+    nodes: BTreeSet<Id>,
+    transforms: BTreeSet<Id>,
+    data_blocks: BTreeSet<Id>,
+    collections: BTreeSet<Id>,
+    scene_membership: BTreeMap<Id, serde_json::Value>,
+    node_groups: BTreeSet<Id>,
+    instance_context_nodes: BTreeSet<Id>,
+    actions: BTreeMap<Id, (bool, bool)>,
+    images: BTreeSet<Id>,
+    complete: bool,
+}
+
+impl CyclesHairSourceClosure {
+    fn visit_node(&mut self, doc: &SceneDoc, id: &Id, with_transform: bool, depth: usize) {
+        if depth > 64 {
+            self.complete = false;
+            return;
+        }
+        if with_transform {
+            self.transforms.insert(id.clone());
+        }
+        if !self.nodes.insert(id.clone()) {
+            return;
+        }
+        let Some(node) = doc.nodes.get(id) else {
+            self.complete = false;
+            return;
+        };
+        let include_instance_context = self.instance_context_nodes.contains(id);
+        if let Some(action) = &node.action {
+            self.visit_action(
+                doc,
+                action,
+                !matches!(node.kind.as_str(), "light" | "camera"),
+                include_instance_context,
+                depth + 1,
+            );
+        }
+        for track in &node.nla_tracks {
+            for strip in &track.strips {
+                self.visit_action(
+                    doc,
+                    &strip.action,
+                    !matches!(node.kind.as_str(), "light" | "camera"),
+                    include_instance_context,
+                    depth + 1,
+                );
+            }
+        }
+        if let Some(data_id) = &node.data {
+            self.visit_data_block(doc, data_id, depth + 1);
+        }
+        for modifier in &node.modifiers {
+            if modifier.is_active(crate::eval::EvaluationPurpose::Render) {
+                for value in modifier.params.values() {
+                    self.visit_value(doc, value, depth + 1);
+                }
+            }
+        }
+        for key in ["instance_collection", "physics_particle_systems"] {
+            if let Some(value) = node.properties.get(key) {
+                self.visit_value(doc, value, depth + 1);
+            }
+        }
+        for constraint in &node.constraints {
+            if let Some(target) = &constraint.target {
+                self.visit_node(doc, target, true, depth + 1);
+            }
+            for value in constraint.params.values() {
+                self.visit_value(doc, value, depth + 1);
+            }
+        }
+        for driver in &node.drivers {
+            if let Ok(value) = serde_json::to_value(driver) {
+                self.visit_value(doc, &value, depth + 1);
+            } else {
+                self.complete = false;
+            }
+        }
+        if with_transform && let Some(parent) = &node.parent {
+            self.visit_node(doc, parent, true, depth + 1);
+        }
+    }
+
+    fn visit_data_block(&mut self, doc: &SceneDoc, id: &Id, depth: usize) {
+        if depth > 64 {
+            self.complete = false;
+            return;
+        }
+        let Some(data) = doc.data_blocks.get(id) else {
+            self.complete = false;
+            return;
+        };
+        if !self.data_blocks.insert(id.clone()) {
+            return;
+        }
+        self.visit_serializable(doc, &data.descriptor, depth + 1);
+        self.visit_serializable(doc, &data.mesh, depth + 1);
+        self.visit_serializable(doc, &data.grease_pencil, depth + 1);
+        self.visit_serializable(doc, &data.armature, depth + 1);
+        self.visit_serializable(doc, &data.shape_keys, depth + 1);
+        self.visit_serializable(doc, &data.vertex_groups, depth + 1);
+        self.visit_serializable(doc, &data.vertex_weights, depth + 1);
+        self.visit_serializable(doc, &data.curve, depth + 1);
+        self.visit_serializable(doc, &data.surface, depth + 1);
+        self.visit_serializable(doc, &data.text, depth + 1);
+        self.visit_serializable(doc, &data.hair_curves, depth + 1);
+        self.visit_serializable(doc, &data.metaball, depth + 1);
+        self.visit_serializable(doc, &data.lattice, depth + 1);
+        self.visit_serializable(doc, &data.pointcloud, depth + 1);
+        self.visit_serializable(doc, &data.volume, depth + 1);
+        if !data.materials.is_empty() {
+            self.visit_value(
+                doc,
+                &serde_json::json!({"material_slot_count": data.materials.len()}),
+                depth + 1,
+            );
+        }
+        let has_geometry = data.mesh.is_some()
+            || data.grease_pencil.is_some()
+            || data.armature.is_some()
+            || data.shape_keys.is_some()
+            || !data.vertex_groups.is_empty()
+            || !data.vertex_weights.is_empty()
+            || data.curve.is_some()
+            || data.surface.is_some()
+            || data.text.is_some()
+            || data.hair_curves.is_some()
+            || data.metaball.is_some()
+            || data.lattice.is_some()
+            || data.pointcloud.is_some()
+            || data.volume.is_some();
+        if !has_geometry && !matches!(data.data_type.as_str(), "camera" | "light") {
+            self.complete = false;
+        }
+    }
+
+    fn visit_serializable<T: serde::Serialize>(&mut self, doc: &SceneDoc, value: &T, depth: usize) {
+        match serde_json::to_value(value) {
+            Ok(value) => self.visit_value(doc, &value, depth + 1),
+            Err(_) => self.complete = false,
+        }
+    }
+
+    fn visit_scene_collection(
+        &mut self,
+        doc: &SceneDoc,
+        id: &Id,
+        excluded: &[Id],
+        member_node_ids: &BTreeSet<Id>,
+        instance_member_node_ids: &BTreeSet<Id>,
+        depth: usize,
+    ) {
+        if depth > 64 {
+            self.complete = false;
+            return;
+        }
+        if excluded.contains(id) || self.scene_membership.contains_key(id) {
+            return;
+        }
+        let Some(collection) = doc.collections.get(id) else {
+            self.complete = false;
+            return;
+        };
+        let mut candidates = Vec::new();
+        for object_id in &collection.objects {
+            if cycles_hair_source_candidate(doc, object_id) {
+                candidates.push(object_id.clone());
+                let include_transform = !member_node_ids.contains(object_id)
+                    || instance_member_node_ids.contains(object_id);
+                self.visit_node(doc, object_id, include_transform, depth + 1);
+            }
+        }
+        self.scene_membership.insert(
+            id.clone(),
+            serde_json::json!({
+                "children": collection.children,
+                "candidate_objects": candidates,
+            }),
+        );
+        for child in &collection.children {
+            self.visit_scene_collection(
+                doc,
+                child,
+                excluded,
+                member_node_ids,
+                instance_member_node_ids,
+                depth + 1,
+            );
+        }
+    }
+
+    fn visit_collection(&mut self, doc: &SceneDoc, id: &Id, depth: usize) {
+        if depth > 64 {
+            self.complete = false;
+            return;
+        }
+        if !self.collections.insert(id.clone()) {
+            return;
+        }
+        let Some(collection) = doc.collections.get(id) else {
+            self.complete = false;
+            return;
+        };
+        for object_id in &collection.objects {
+            self.visit_node(doc, object_id, true, depth + 1);
+        }
+        for child in &collection.children {
+            self.visit_collection(doc, child, depth + 1);
+        }
+    }
+
+    fn visit_value(&mut self, doc: &SceneDoc, value: &serde_json::Value, depth: usize) {
+        if depth > 64 {
+            self.complete = false;
+            return;
+        }
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    self.visit_value(doc, value, depth + 1);
+                }
+            }
+            serde_json::Value::Object(object) => {
+                if let (Some(kind), Some(name)) = (
+                    object.get("id_type").and_then(serde_json::Value::as_str),
+                    object.get("name").and_then(serde_json::Value::as_str),
+                ) {
+                    match kind {
+                        "Material" | "ShaderNodeTree" | "CompositorNodeTree" => return,
+                        "Object" => {
+                            if let Some(id) = cycles_hair_mapped_id(doc, "Object", name) {
+                                self.visit_node(doc, &id, true, depth + 1);
+                            } else {
+                                self.complete = false;
+                            }
+                        }
+                        "Collection" => {
+                            let id = object
+                                .get("bridge_id")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|value| Id::new(value.to_owned()).ok())
+                                .or_else(|| cycles_hair_mapped_id(doc, "Collection", name));
+                            if let Some(id) = id {
+                                self.visit_collection(doc, &id, depth + 1);
+                            } else {
+                                self.complete = false;
+                            }
+                        }
+                        "GeometryNodeTree" | "NodeTree" => {
+                            if let Some(id) = cycles_hair_mapped_id(doc, "NodeGroup", name) {
+                                self.visit_node_group(doc, &id, depth + 1);
+                            } else {
+                                self.complete = false;
+                            }
+                        }
+                        "Image" => {
+                            if let Some(id) = cycles_hair_mapped_id(doc, "Image", name) {
+                                self.images.insert(id);
+                            } else {
+                                self.complete = false;
+                            }
+                        }
+                        _ => self.complete = false,
+                    }
+                    return;
+                }
+                for value in object.values() {
+                    self.visit_value(doc, value, depth + 1);
+                }
+            }
+            serde_json::Value::String(value) => {
+                if let Ok(id) = Id::new(value.clone()) {
+                    if doc.nodes.contains_key(&id) {
+                        self.visit_node(doc, &id, true, depth + 1);
+                    } else if doc.data_blocks.contains_key(&id) {
+                        self.visit_data_block(doc, &id, depth + 1);
+                    } else if doc.collections.contains_key(&id) {
+                        self.visit_collection(doc, &id, depth + 1);
+                    } else if doc.node_groups.contains_key(&id) {
+                        self.visit_node_group(doc, &id, depth + 1);
+                    } else if doc.images.contains_key(&id) {
+                        self.images.insert(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_action(
+        &mut self,
+        doc: &SceneDoc,
+        id: &Id,
+        include_all: bool,
+        include_instance_context: bool,
+        depth: usize,
+    ) {
+        if depth > 64 || !doc.actions.contains_key(id) {
+            self.complete = false;
+            return;
+        }
+        self.actions
+            .entry(id.clone())
+            .and_modify(|scope| {
+                scope.0 |= include_all;
+                scope.1 |= include_instance_context;
+            })
+            .or_insert((include_all, include_instance_context));
+    }
+
+    fn visit_node_group(&mut self, doc: &SceneDoc, id: &Id, depth: usize) {
+        if depth > 64 {
+            self.complete = false;
+            return;
+        }
+        let Some(group) = doc.node_groups.get(id) else {
+            self.complete = false;
+            return;
+        };
+        if group.kind != crate::graph::GraphKind::Geometry {
+            self.complete = false;
+            return;
+        }
+        if !self.node_groups.insert(id.clone()) {
+            return;
+        }
+        for node in group.nodes.values() {
+            for value in node.properties.values().chain(node.inputs.values()) {
+                self.visit_value(doc, value, depth + 1);
+            }
+        }
+        for socket in group
+            .interface
+            .inputs
+            .iter()
+            .chain(group.interface.outputs.iter())
+        {
+            self.visit_value(doc, &socket.default, depth + 1);
+        }
+    }
+}
+
+fn cycles_hair_node_group_geometry_state(group: &NodeGroup) -> Value {
+    let nodes = group
+        .nodes
+        .iter()
+        .map(|(id, node)| {
+            (
+                id.to_string(),
+                json!({
+                    "type": node.node_type,
+                    "properties": node.properties,
+                    "inputs": node.inputs,
+                }),
+            )
+        })
+        .collect::<Map<_, _>>();
+    json!({
+        "kind": group.kind,
+        "interface": group.interface,
+        "nodes": nodes,
+        "links": group.links,
+    })
+}
+
+fn cycles_hair_action_geometry_state(
+    action: &Action,
+    include_all: bool,
+    include_instance_context: bool,
+    node_ids: &BTreeSet<Id>,
+) -> Value {
+    let fcurves = action
+        .fcurves
+        .iter()
+        .filter(|curve| {
+            cycles_hair_action_fcurve(&curve.path, include_all, include_instance_context)
+        })
+        .collect::<Vec<_>>();
+    let slots = action
+        .slots
+        .iter()
+        .filter(|slot| node_ids.contains(&slot.node))
+        .collect::<Vec<_>>();
+    let active_slots = action
+        .active_slots
+        .iter()
+        .filter(|(node_id, _)| node_ids.contains(*node_id))
+        .map(|(node_id, slot)| ((*node_id).clone(), (*slot).clone()))
+        .collect::<BTreeMap<_, _>>();
+    let modifier_bindings = action
+        .modifier_bindings
+        .iter()
+        .filter_map(|(index, bindings)| {
+            let bindings = bindings
+                .iter()
+                .filter(|binding| node_ids.contains(&binding.node))
+                .collect::<Vec<_>>();
+            (!bindings.is_empty()).then_some((*index, bindings))
+        })
+        .collect::<BTreeMap<_, _>>();
+    json!({
+        "fcurves": fcurves,
+        "slots": slots,
+        "active_slots": active_slots,
+        "modifier_bindings": modifier_bindings,
+    })
+}
+
+fn cycles_hair_action_fcurve(
+    path: &str,
+    include_all: bool,
+    include_instance_context: bool,
+) -> bool {
+    let path = path.to_ascii_lowercase();
+    let object_context = [
+        "color",
+        "pass_index",
+        "random_id",
+        "material_slots[",
+        "materials[",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix));
+    if object_context {
+        return include_instance_context;
+    }
+    include_all || cycles_hair_transform_fcurve(&path)
+}
+
+fn cycles_hair_transform_fcurve(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    [
+        "location",
+        "rotation",
+        "scale",
+        "delta_",
+        "matrix_",
+        "parent",
+        "constraints[",
+        "modifiers[",
+        "data.",
+        "pose.bones[",
+        "hide_render",
+        "visible_",
+        "instance_collection",
+        "particle_systems[",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
+}
+
+fn cycles_hair_source_candidate(doc: &SceneDoc, node_id: &Id) -> bool {
+    let Some(node) = doc.nodes.get(node_id) else {
+        return false;
+    };
+    if node.kind == "hair_curves"
+        || node
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .is_some_and(|data| data.hair_curves.is_some())
+    {
+        return true;
+    }
+    if node.modifiers.iter().any(|modifier| {
+        modifier.is_active(crate::eval::EvaluationPurpose::Render)
+            && matches!(
+                modifier.modifier_type.as_str(),
+                "nodes" | "particle_instance" | "particle_system"
+            )
+    }) {
+        return true;
+    }
+    node.properties
+        .get("instance_collection")
+        .is_some_and(|value| !value.is_null())
+        || node
+            .properties
+            .get("physics_particle_systems")
+            .is_some_and(|value| match value {
+                serde_json::Value::Array(values) => !values.is_empty(),
+                serde_json::Value::Object(values) => !values.is_empty(),
+                _ => !value.is_null(),
+            })
+}
+
+fn cycles_hair_mapped_id(doc: &SceneDoc, kind: &str, name: &str) -> Option<Id> {
+    doc.compatibility
+        .get("blender_adapter")?
+        .get("id_mappings")?
+        .get(format!("{kind}:{name}"))?
+        .as_str()
+        .and_then(|value| Id::new(value.to_owned()).ok())
+}
+
+fn cycles_hair_node_geometry_state(
+    node: &Node,
+    include_transform: bool,
+    include_instance_context: bool,
+) -> Result<serde_json::Value> {
+    let modifiers = node
+        .modifiers
+        .iter()
+        .filter(|modifier| modifier.is_active(crate::eval::EvaluationPurpose::Render))
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(PotError::internal_json)?;
+    let metadata = node.properties.get("blender_object_metadata");
+    let rna_properties = metadata.and_then(|value| value.get("rna_properties"));
+    Ok(serde_json::json!({
+        "name": node.name,
+        "kind": node.kind,
+        "data": node.data,
+        "modifiers": modifiers,
+        "render_visible": node.render_visible,
+        "ray_visibility": node.ray_visibility,
+        "material_links": node.material_links,
+        "material_slot_count": node.materials.len(),
+        "material_slots": include_instance_context.then_some(&node.materials),
+        "instance_collection": node.properties.get("instance_collection"),
+        "physics_particle_systems": node.properties.get("physics_particle_systems"),
+        "action": node.action,
+        "nla_tracks": node.nla_tracks,
+        "action_blend_type": node.action_blend_type,
+        "action_influence": node.action_influence,
+        "action_extrapolation": node.action_extrapolation,
+        "transform": include_transform.then_some(&node.transform),
+        "captured_matrix_basis": include_transform.then_some(&node.blender_matrix_basis),
+        "parent": include_transform.then_some(&node.parent),
+        "parent_inverse": include_transform.then_some(&node.parent_inverse),
+        "parent_type": include_transform.then_some(&node.parent_type),
+        "parent_bone": include_transform.then_some(&node.parent_bone),
+        "constraints": include_transform.then_some(&node.constraints),
+        "drivers": node.drivers,
+        "object_info": include_instance_context.then(|| serde_json::json!({
+            "color": rna_properties.and_then(|properties| properties.get("color")),
+            "pass_index": rna_properties.and_then(|properties| properties.get("pass_index")),
+        })),
+        "object_transform_metadata": include_transform.then(|| serde_json::json!({
+            "matrix_basis": metadata.and_then(|value| value.get("matrix_basis")),
+            "matrix_local": metadata.and_then(|value| value.get("matrix_local")),
+            "matrix_world": metadata.and_then(|value| value.get("matrix_world")),
+            "delta_location": metadata.and_then(|value| value.get("delta_location")),
+            "delta_rotation_euler": metadata.and_then(|value| value.get("delta_rotation_euler")),
+            "delta_rotation_quaternion": metadata.and_then(|value| value.get("delta_rotation_quaternion")),
+            "delta_scale": metadata.and_then(|value| value.get("delta_scale")),
+        })),
+    }))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -653,6 +1551,11 @@ pub struct Scene {
     pub name: String,
     pub root_collection: Id,
     pub view_layers: Registry<ViewLayer>,
+    /// Exact Cycles Hair geometry-key groups captured from each Blender render view layer.
+    /// `None` means this document has no captured Blender provenance; `Some([])` means the
+    /// Cycles render callback captured no Hair geometry groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycles_hair_shadow_groups: Option<Vec<CyclesHairShadowGroup>>,
     pub frame_current: f64,
     pub frame_start: i32,
     pub frame_end: i32,
@@ -688,6 +1591,54 @@ pub struct Scene {
     pub rigid_body_world: Option<RigidBodyWorld>,
     #[serde(default)]
     pub sequencer: Sequencer,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CyclesHairShadowGroup {
+    pub view_layer_id: Id,
+    pub geometry_key: CyclesHairShadowGeometryKey,
+    pub representative_node_id: Id,
+    pub member_node_ids: Vec<Id>,
+    /// Each exact Cycles Scene Object, in source order; the first is the representative.
+    pub members: Vec<CyclesHairShadowMember>,
+    /// Evaluated Hair Curves index to source curve index; `None` when no exact mapping exists.
+    pub source_curve_indices: Option<Vec<u32>>,
+    /// Render-evaluated raw controls when the Cycles iterator's Curves ID differs from source data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluated_hair_curves: Option<HairCurvesData>,
+    /// Fingerprint of the geometry-affecting source dependency closure; `None` means it was unmodeled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_input_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CyclesHairShadowMember {
+    pub instance: CyclesHairShadowInstanceKey,
+    /// Blender row-major evaluated `Object.matrix_world`.
+    pub object_to_world: [[f64; 4]; 4],
+    pub object_color: [f64; 4],
+    pub object_pass_index: i32,
+    pub object_random_id: i32,
+    pub slot_0_material_id: Option<Id>,
+    pub ray_visibility: RayVisibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CyclesHairShadowInstanceKey {
+    pub real_object_node_id: Id,
+    pub parent_node_id: Option<Id>,
+    pub persistent_id: [i32; 8],
+    pub is_instance: bool,
+    pub use_particle_hair: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CyclesHairShadowGeometryKey {
+    Data { data_id: Option<Id> },
+    Object { node_id: Id },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1295,6 +2246,9 @@ fn is_default_filter_width<T: Copy + Into<f64>>(value: &T) -> bool {
     equal_f64((*value).into(), DEFAULT_FILTER_WIDTH)
 }
 
+/// Blender's `SceneEEVEE.gi_cubemap_resolution` enum values.
+pub const EEVEE_GI_CUBEMAP_RESOLUTIONS: [u32; 6] = [128, 256, 512, 1024, 2048, 4096];
+
 fn default_eevee_volumetric_tile_size() -> u32 {
     8
 }
@@ -1334,6 +2288,14 @@ fn default_eevee_volumetric_end() -> f64 {
 
 fn is_default_eevee_volumetric_end<T: Copy + Into<f64>>(value: &T) -> bool {
     equal_f64(f64::from((*value).into() as f32), f64::from(100.0_f32))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CyclesCurveShape {
+    Ribbons,
+    Thick,
+    ThickLinear,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1396,6 +2358,9 @@ pub struct RenderSettings {
         skip_serializing_if = "is_default_light_threshold"
     )]
     pub eevee_light_threshold: f64,
+    /// Blender's `SceneEEVEE.gi_cubemap_resolution`; EEVEE sphere probes capture at half this extent.
+    pub eevee_gi_cubemap_resolution: Option<u32>,
+
     /// EEVEE's volume resolve settings (`scene.eevee`), omitted at Blender defaults.
     #[serde(
         default = "default_eevee_volumetric_tile_size",
@@ -1439,6 +2404,8 @@ pub struct RenderSettings {
     pub offscreen_dicing_scale: f64,
     #[serde(default)]
     pub dicing_camera: Option<Id>,
+    pub cycles_curves_shape: Option<CyclesCurveShape>,
+    pub cycles_curves_subdivisions: Option<u32>,
 }
 
 impl RenderSettings {
@@ -1462,6 +2429,25 @@ impl RenderSettings {
                 "Cycles filter_width is outside Blender RNA range 0.01..=10",
             ));
         }
+        if self
+            .cycles_curves_subdivisions
+            .is_some_and(|subdivisions| subdivisions > 24)
+        {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "Cycles curves subdivisions must be in Blender RNA range 0..=24",
+            ));
+        }
+        if self
+            .eevee_gi_cubemap_resolution
+            .is_some_and(|resolution| !EEVEE_GI_CUBEMAP_RESOLUTIONS.contains(&resolution))
+        {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "EEVEE gi_cubemap_resolution must be one of 128, 256, 512, 1024, 2048, or 4096",
+            ));
+        }
+
         if !matches!(self.eevee_volumetric_tile_size, 1 | 2 | 4 | 8 | 16)
             || !(1..=256).contains(&self.eevee_volumetric_samples)
             || !self.eevee_volumetric_sample_distribution.is_finite()
@@ -1502,6 +2488,8 @@ impl Default for RenderSettings {
             passes: vec!["combined".to_owned()],
             cryptomatte_accurate: false,
             eevee_light_threshold: default_light_threshold(),
+            eevee_gi_cubemap_resolution: Some(512),
+
             eevee_volumetric_tile_size: default_eevee_volumetric_tile_size(),
             eevee_volumetric_samples: default_eevee_volumetric_samples(),
             eevee_volumetric_sample_distribution: default_eevee_volumetric_sample_distribution(),
@@ -1517,6 +2505,8 @@ impl Default for RenderSettings {
             max_subdivisions: 12,
             offscreen_dicing_scale: 4.0,
             dicing_camera: None,
+            cycles_curves_shape: Some(CyclesCurveShape::Thick),
+            cycles_curves_subdivisions: None,
         }
     }
 }
@@ -3663,7 +4653,13 @@ mod tests {
     #[test]
     fn default_scene_has_contract_initial_state_and_empty_registries() {
         let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
-        assert_eq!(doc.schema_version, 17);
+        let render = &doc.scenes[&Id::from_static("scene_main")].render;
+        assert_eq!(
+            render.cycles_curves_shape,
+            Some(super::CyclesCurveShape::Thick)
+        );
+        assert_eq!(render.cycles_curves_subdivisions, None);
+        assert_eq!(doc.schema_version, 18);
         doc.validate().unwrap();
         let value = serde_json::to_value(doc).unwrap();
         assert_eq!(value["revision"], 0);
@@ -3673,6 +4669,341 @@ mod tests {
             value["collections"]["collection_root"]["objects"],
             serde_json::json!([])
         );
+    }
+    #[test]
+    fn cycles_hair_shadow_groups_round_trip_and_remain_absent_for_old_scenes() {
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let mut value = serde_json::to_value(doc).unwrap();
+        let scene = &value["scenes"]["scene_main"];
+        assert!(scene.get("cycles_hair_shadow_groups").is_none());
+
+        value["scenes"]["scene_main"]["cycles_hair_shadow_groups"] = serde_json::json!([{
+            "view_layer_id": "view_main",
+            "geometry_key": {"kind": "data", "data_id": null},
+            "representative_node_id": "hair_first",
+            "member_node_ids": ["hair_first", "hair_second"],
+            "members": [
+                {
+                    "instance": {
+                        "real_object_node_id": "hair_first",
+                        "parent_node_id": "hair_first",
+                        "persistent_id": [0, 0, 0, 0, 0, 0, 0, 0],
+                        "is_instance": false,
+                        "use_particle_hair": false
+                    },
+                    "object_to_world": [[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],
+                                        [0.0,0.0,1.0,0.0],[0.0,0.0,0.0,1.0]],
+                    "object_color": [1.0,0.0,0.0,1.0],
+                    "object_pass_index": 0,
+                    "object_random_id": 1,
+                    "slot_0_material_id": null,
+                    "ray_visibility": {
+                        "camera": true, "diffuse": true, "glossy": true,
+                        "transmission": true, "volume_scatter": true, "shadow": true
+                    }
+                },
+                {
+                    "instance": {
+                        "real_object_node_id": "hair_first",
+                        "parent_node_id": "hair_second",
+                        "persistent_id": [1, 0, 0, 0, 0, 0, 0, 0],
+                        "is_instance": true,
+                        "use_particle_hair": false
+                    },
+                    "object_to_world": [[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,2.0],
+                                        [0.0,0.0,1.0,0.0],[0.0,0.0,0.0,1.0]],
+                    "object_color": [0.0,0.0,1.0,1.0],
+                    "object_pass_index": 22,
+                    "object_random_id": -947_307_473,
+                    "slot_0_material_id": "mat_hair",
+                    "ray_visibility": {
+                        "camera": false, "diffuse": true, "glossy": true,
+                        "transmission": true, "volume_scatter": true, "shadow": true
+                    }
+                },
+                {
+                    "instance": {
+                        "real_object_node_id": "hair_second",
+                        "parent_node_id": "hair_second",
+                        "persistent_id": [0, 0, 0, 0, 0, 0, 0, 0],
+                        "is_instance": false,
+                        "use_particle_hair": false
+                    },
+                    "object_to_world": [[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],
+                                        [0.0,0.0,1.0,0.0],[0.0,0.0,0.0,1.0]],
+                    "object_color": [0.0,0.0,1.0,1.0],
+                    "object_pass_index": 0,
+                    "object_random_id": 3,
+                    "slot_0_material_id": null,
+                    "ray_visibility": {
+                        "camera": true, "diffuse": true, "glossy": true,
+                        "transmission": true, "volume_scatter": true, "shadow": true
+                    }
+                }
+            ],
+            "source_curve_indices": null,
+            "evaluated_hair_curves": null,
+            "source_input_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        }]);
+        value["materials"]["mat_hair"] = serde_json::json!({"name": "Hair"});
+        let loaded: SceneDoc = serde_json::from_value(value).unwrap();
+        let groups = loaded.scenes[&Id::from_static("scene_main")]
+            .cycles_hair_shadow_groups
+            .as_ref()
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].view_layer_id, Id::from_static("view_main"));
+        assert_eq!(
+            groups[0].geometry_key,
+            super::CyclesHairShadowGeometryKey::Data { data_id: None }
+        );
+        assert!(groups[0].source_curve_indices.is_none());
+        assert_eq!(groups[0].members.len(), 3);
+        assert!(groups[0].members[1].instance.is_instance);
+        assert_eq!(
+            groups[0].members[1].instance.real_object_node_id,
+            Id::from_static("hair_first")
+        );
+        assert_eq!(
+            groups[0].members[0].instance.real_object_node_id,
+            Id::from_static("hair_first")
+        );
+        assert_eq!(
+            groups[0].members[2].instance.real_object_node_id,
+            Id::from_static("hair_second")
+        );
+        assert_eq!(groups[0].members[1].object_pass_index, 22);
+        assert_eq!(groups[0].members[1].object_color, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(
+            groups[0].members[1].slot_0_material_id,
+            Some(Id::from_static("mat_hair"))
+        );
+        assert_eq!(groups[0].members[1].object_random_id, -947_307_473);
+        assert_eq!(groups[0].members[1].object_to_world[1][3], 2.0);
+        assert!(
+            !groups[0].members[1]
+                .ray_visibility
+                .allows(super::RayKind::Camera)
+        );
+        assert_eq!(
+            groups[0].source_input_fingerprint.as_deref(),
+            Some(format!("sha256:{}", "0".repeat(64)).as_str())
+        );
+        assert_eq!(
+            groups[0].representative_node_id,
+            Id::from_static("hair_first")
+        );
+        assert_eq!(
+            groups[0].member_node_ids,
+            [
+                Id::from_static("hair_first"),
+                Id::from_static("hair_second")
+            ]
+        );
+        let mut empty_value = serde_json::to_value(SceneDoc::new(
+            "00000000-0000-4000-8000-000000000001".to_owned(),
+        ))
+        .unwrap();
+        empty_value["scenes"]["scene_main"]["cycles_hair_shadow_groups"] = serde_json::json!([]);
+        let empty: SceneDoc = serde_json::from_value(empty_value).unwrap();
+        assert_eq!(
+            empty.scenes[&Id::from_static("scene_main")].cycles_hair_shadow_groups,
+            Some(Vec::new())
+        );
+        assert_eq!(
+            serde_json::to_value(empty).unwrap()["scenes"]["scene_main"]["cycles_hair_shadow_groups"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn cycles_hair_source_fingerprint_tracks_geometry_node_edits_in_place() {
+        let scene_id = Id::from_static("scene_main");
+        let object_id = Id::new("hair_object").unwrap();
+        let data_id = Id::new("hair_data").unwrap();
+        let group_id = Id::new("geometry_group").unwrap();
+        let mat_a = Id::new("material_a").unwrap();
+        let mat_b = Id::new("material_b").unwrap();
+        let graph_node_id = Id::new("set_position").unwrap();
+        let mut doc = SceneDoc::new("fingerprint-test".to_owned());
+        doc.materials
+            .insert(mat_a.clone(), super::Material::default());
+        doc.materials
+            .insert(mat_b.clone(), super::Material::default());
+        let mut graph = crate::graph::NodeGroup::new("Geometry", crate::graph::GraphKind::Geometry);
+        let mut set_position = crate::graph::GraphNode::new("GeometryNodeSetPosition");
+        set_position
+            .inputs
+            .insert("Offset".to_owned(), serde_json::json!([0.0, 0.0, 0.0]));
+        graph.nodes.insert(graph_node_id.clone(), set_position);
+        doc.node_groups.insert(group_id.clone(), graph);
+        doc.data_blocks.insert(
+            data_id.clone(),
+            super::DataBlock {
+                data_type: "hair_curves".to_owned(),
+                mesh: None,
+                hair_curves: Some(super::HairCurvesData {
+                    curves: vec![super::HairCurve {
+                        points: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                        radius: 0.1,
+                    }],
+                    ..super::HairCurvesData::default()
+                }),
+                materials: vec![Some(mat_a.clone())],
+                ..super::DataBlock::default()
+            },
+        );
+        let mut modifier = Modifier {
+            id: Id::new("geometry_modifier").unwrap(),
+            modifier_type: "nodes".to_owned(),
+            name: "Geometry Nodes".to_owned(),
+            enabled: true,
+            show_viewport: true,
+            show_render: true,
+            params: serde_json::Map::new(),
+            baked_ocean_cache: None,
+            binding_data: None,
+            runtime: super::ModifierRuntime::default(),
+        };
+        modifier
+            .params
+            .insert("node_group".to_owned(), serde_json::json!(group_id));
+        let mut node = super::Node {
+            name: "Hair".to_owned(),
+            kind: "hair_curves".to_owned(),
+            data: Some(data_id.clone()),
+            materials: vec![Some(mat_a.clone())],
+            material_links: vec![super::MaterialLink::Data],
+            modifiers: vec![modifier],
+            ..super::Node::default()
+        };
+        node.properties.insert(
+            "blender_object_metadata".to_owned(),
+            serde_json::json!({
+                "rna_properties": {"color": [1.0, 1.0, 1.0, 1.0], "pass_index": 4}
+            }),
+        );
+        doc.nodes.insert(object_id.clone(), node);
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .unwrap()
+            .objects
+            .push(object_id.clone());
+        let group = super::CyclesHairShadowGroup {
+            view_layer_id: Id::from_static("view_main"),
+            geometry_key: super::CyclesHairShadowGeometryKey::Data {
+                data_id: Some(data_id.clone()),
+            },
+            representative_node_id: object_id.clone(),
+            member_node_ids: vec![object_id.clone()],
+            members: vec![super::CyclesHairShadowMember {
+                instance: super::CyclesHairShadowInstanceKey {
+                    real_object_node_id: object_id.clone(),
+                    parent_node_id: Some(Id::from_static("hair_object")),
+                    persistent_id: [0; 8],
+                    is_instance: false,
+                    use_particle_hair: false,
+                },
+                object_to_world: [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                object_color: [1.0; 4],
+                object_pass_index: 4,
+                object_random_id: -1,
+                slot_0_material_id: Some(mat_a.clone()),
+                ray_visibility: super::RayVisibility::default(),
+            }],
+            source_curve_indices: None,
+            // An identity Geometry Nodes offset is represented by the authored keys, so no
+            // evaluated payload exists; the dependency fingerprint must still cover the graph.
+            evaluated_hair_curves: None,
+            source_input_fingerprint: None,
+        };
+        let first = doc
+            .cycles_hair_shadow_source_fingerprint(&scene_id, &group)
+            .unwrap()
+            .unwrap();
+        {
+            let node = doc.nodes.get_mut(&object_id).unwrap();
+            node.transform.translation[0] = 3.0;
+            let rna = node
+                .properties
+                .get_mut("blender_object_metadata")
+                .and_then(|metadata| metadata.get_mut("rna_properties"))
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap();
+            rna.insert("color".to_owned(), serde_json::json!([0.1, 0.2, 0.3, 1.0]));
+            rna.insert("pass_index".to_owned(), serde_json::json!(99));
+            node.materials[0] = Some(mat_b.clone());
+        }
+        doc.data_blocks.get_mut(&data_id).unwrap().materials[0] = Some(mat_b.clone());
+        let live_context = doc
+            .cycles_hair_shadow_source_fingerprint(&scene_id, &group)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, live_context);
+
+        let parent_id = Id::new("hair_parent").unwrap();
+        doc.nodes.insert(
+            parent_id.clone(),
+            super::Node {
+                name: "Instancer".to_owned(),
+                ..super::Node::default()
+            },
+        );
+        let mut instance_group = group.clone();
+        let instance = &mut instance_group.members[0];
+        instance.instance.parent_node_id = Some(parent_id);
+        instance.instance.persistent_id = [1, 0, 0, 0, 0, 0, 0, 0];
+        instance.instance.is_instance = true;
+        instance.object_to_world[0][3] = 3.0;
+        instance.object_color = [0.1, 0.2, 0.3, 1.0];
+        instance.object_pass_index = 99;
+        instance.object_random_id = -947_307_473;
+        instance.slot_0_material_id = Some(mat_b.clone());
+        let instance_fingerprint = doc
+            .cycles_hair_shadow_source_fingerprint(&scene_id, &instance_group)
+            .unwrap()
+            .unwrap();
+        {
+            let node = doc.nodes.get_mut(&object_id).unwrap();
+            node.transform.translation[0] = 4.0;
+            let rna = node
+                .properties
+                .get_mut("blender_object_metadata")
+                .and_then(|metadata| metadata.get_mut("rna_properties"))
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap();
+            rna.insert("color".to_owned(), serde_json::json!([0.9, 0.8, 0.7, 1.0]));
+            rna.insert("pass_index".to_owned(), serde_json::json!(100));
+            node.materials[0] = Some(mat_a.clone());
+        }
+        doc.data_blocks.get_mut(&data_id).unwrap().materials[0] = Some(mat_a);
+        let changed_instance = doc
+            .cycles_hair_shadow_source_fingerprint(&scene_id, &instance_group)
+            .unwrap()
+            .unwrap();
+        assert_ne!(instance_fingerprint, changed_instance);
+        let before_graph_edit = doc
+            .cycles_hair_shadow_source_fingerprint(&scene_id, &group)
+            .unwrap()
+            .unwrap();
+        doc.node_groups
+            .get_mut(&group_id)
+            .unwrap()
+            .nodes
+            .get_mut(&graph_node_id)
+            .unwrap()
+            .inputs
+            .insert("Offset".to_owned(), serde_json::json!([1.0, 0.0, 0.0]));
+        let changed = doc
+            .cycles_hair_shadow_source_fingerprint(&scene_id, &group)
+            .unwrap()
+            .unwrap();
+        assert_ne!(before_graph_edit, changed);
     }
 
     #[test]
@@ -3696,6 +5027,82 @@ mod tests {
         ] {
             assert!(value.get(field).is_none(), "{field} should be omitted");
         }
+    }
+    #[test]
+    fn eevee_cubemap_resolution_round_trips_only_blender_enum_values() {
+        let render: super::RenderSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(render.eevee_gi_cubemap_resolution, Some(512));
+        for resolution in super::EEVEE_GI_CUBEMAP_RESOLUTIONS {
+            let render = super::RenderSettings {
+                eevee_gi_cubemap_resolution: Some(resolution),
+                ..super::RenderSettings::default()
+            };
+            assert!(render.validate().is_ok(), "{resolution}");
+            let value = serde_json::to_value(&render).unwrap();
+            assert_eq!(value["eevee_gi_cubemap_resolution"], resolution);
+            let round_trip: super::RenderSettings = serde_json::from_value(value).unwrap();
+            assert_eq!(round_trip.eevee_gi_cubemap_resolution, Some(resolution));
+        }
+        let unknown = super::RenderSettings {
+            eevee_gi_cubemap_resolution: None,
+            ..super::RenderSettings::default()
+        };
+        let value = serde_json::to_value(&unknown).unwrap();
+        assert!(value["eevee_gi_cubemap_resolution"].is_null());
+        let round_trip: super::RenderSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip.eevee_gi_cubemap_resolution, None);
+
+        let invalid = super::RenderSettings {
+            eevee_gi_cubemap_resolution: Some(2049),
+            ..super::RenderSettings::default()
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn cycles_curve_render_settings_round_trip_all_shapes_and_subdivisions() {
+        for (shape, serialized) in [
+            (super::CyclesCurveShape::Ribbons, "ribbons"),
+            (super::CyclesCurveShape::Thick, "thick"),
+            (super::CyclesCurveShape::ThickLinear, "thick_linear"),
+        ] {
+            let render = super::RenderSettings {
+                cycles_curves_shape: Some(shape),
+                cycles_curves_subdivisions: Some(2),
+                ..super::RenderSettings::default()
+            };
+            let value = serde_json::to_value(&render).unwrap();
+            assert_eq!(value["cycles_curves_shape"], serialized);
+            assert_eq!(value["cycles_curves_subdivisions"], 2);
+            let round_trip: super::RenderSettings = serde_json::from_value(value).unwrap();
+            assert_eq!(round_trip.cycles_curves_shape, Some(shape));
+            assert_eq!(round_trip.cycles_curves_subdivisions, Some(2));
+        }
+
+        let unknown = super::RenderSettings {
+            cycles_curves_shape: None,
+            cycles_curves_subdivisions: None,
+            ..super::RenderSettings::default()
+        };
+        let value = serde_json::to_value(&unknown).unwrap();
+        assert!(value["cycles_curves_shape"].is_null());
+        assert!(value["cycles_curves_subdivisions"].is_null());
+        let round_trip: super::RenderSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip.cycles_curves_shape, None);
+        assert_eq!(round_trip.cycles_curves_subdivisions, None);
+
+        for subdivisions in [0, 24] {
+            let settings = super::RenderSettings {
+                cycles_curves_subdivisions: Some(subdivisions),
+                ..super::RenderSettings::default()
+            };
+            assert!(settings.validate().is_ok());
+        }
+        let invalid = super::RenderSettings {
+            cycles_curves_subdivisions: Some(25),
+            ..super::RenderSettings::default()
+        };
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

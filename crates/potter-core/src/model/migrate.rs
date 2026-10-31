@@ -16,6 +16,12 @@
 //! Legacy documents capture `STRETCH_TO` and `CHILD_OF` first-evaluation state at the active
 //! scene's frame; targeted states that cannot be captured move to compatibility while targetless
 //! constraints remain editable.
+//! Version 18 captures Cycles curve shape and subdivisions, recovering a complete pair from the
+//! retained Blender intermediate before marking unavailable imported-hair settings unknown. It
+//! also recovers EEVEE sphere-probe resolution from retained scene metadata and leaves unavailable
+//! Blender realtime values unknown rather than substituting a default.
+//! Additive `Scene.cycles_hair_shadow_groups` defaults to `None` for legacy/history snapshots and
+//! is not synthesized during checksum-preserving upgrades.
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -109,7 +115,11 @@ fn parse_scene_inner(
         || (source_schema_version.is_some_and(|version| version <= 13)
             && has_uninitialized_initial_constraint_states(&value))
         || (source_schema_version.is_some_and(|version| version <= 16)
-            && has_legacy_mixrgb_alpha_links(&value));
+            && has_legacy_mixrgb_alpha_links(&value))
+        || (source_schema_version.is_some_and(|version| version <= 17)
+            && has_imported_hair_with_missing_cycles_curve_settings(&value))
+        || (source_schema_version.is_some_and(|version| version <= 17)
+            && has_blender_realtime_scene(&value));
     let source_hash = if retain_original_hash
         && (legacy
             || has_uninitialized_limit_distance_states(&value)
@@ -628,12 +638,13 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 17. Version 12 constraint states move
+/// Upgrades a scene document in place through schema version 18. Version 12 constraint states move
 /// to compatibility data, version 14 migrates legacy Geometry Nodes Mesh to Points domains, and
 /// version 15 marks Blender-mapped materials without saved pass indices unknown and shader nodes
-/// without stored output defaults. Version 16 migrates `NodeMath` shader state. Version 11 retires
-/// unsupported animation outputs. `root` is the project directory that holds image blobs and linked
-/// sources, which the version 3 to 4 step reads.
+/// without stored output defaults. Version 16 migrates `NodeMath` shader state; version 17 restores
+/// Cycles curve settings from the retained Blender intermediate where possible, otherwise marking
+/// unavailable imported-hair settings unknown. `root` is the project directory that holds image
+/// blobs and linked sources, which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     let mut warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
         upgrade_v1(value)?
@@ -686,7 +697,258 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     if value.get("schema_version").and_then(Value::as_u64) == Some(16) {
         warnings.extend(upgrade_v16(value)?);
     }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(17) {
+        warnings.extend(upgrade_v17(value)?);
+    }
     upgrade_scene_gravity_from_blender_metadata(value);
+    Ok(warnings)
+}
+
+fn has_blender_hair_curves(value: &Value) -> bool {
+    let has_adapter = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .is_some_and(Value::is_object);
+    has_adapter
+        && value
+            .get("data_blocks")
+            .and_then(Value::as_object)
+            .is_some_and(|data_blocks| {
+                data_blocks.values().any(|data_block| {
+                    data_block
+                        .get("hair_curves")
+                        .is_some_and(|hair_curves| !hair_curves.is_null())
+                })
+            })
+}
+fn has_blender_realtime_scene(value: &Value) -> bool {
+    value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .is_some_and(Value::is_object)
+        && value
+            .get("scenes")
+            .and_then(Value::as_object)
+            .is_some_and(|scenes| {
+                scenes.values().any(|scene| {
+                    scene
+                        .get("render")
+                        .and_then(|render| render.get("engine"))
+                        .and_then(Value::as_str)
+                        == Some("realtime")
+                })
+            })
+}
+
+fn has_complete_cycles_curve_pair(render: &Map<String, Value>) -> bool {
+    render
+        .get("cycles_curves_shape")
+        .is_some_and(|shape| !shape.is_null())
+        && render
+            .get("cycles_curves_subdivisions")
+            .is_some_and(|subdivisions| !subdivisions.is_null())
+}
+
+fn retained_blender_scene<'a>(value: &'a Value, scene_id: &str) -> Option<&'a Value> {
+    let adapter = value.get("compatibility")?.get("blender_adapter")?;
+    let raw_scenes = adapter.get("intermediate")?.get("scenes")?.as_array()?;
+    let mappings = adapter.get("id_mappings").and_then(Value::as_object);
+    raw_scenes.iter().find(|raw| {
+        if raw.get("potter_id").and_then(Value::as_str) == Some(scene_id) {
+            return true;
+        }
+        let Some(name) = raw.get("name").and_then(Value::as_str) else {
+            return false;
+        };
+        mappings
+            .and_then(|mappings| mappings.get(&format!("Scene:{name}")))
+            .and_then(Value::as_str)
+            == Some(scene_id)
+    })
+}
+
+fn retained_cycles_curve_pair(value: &Value, scene_id: &str) -> Option<(Value, Value)> {
+    let render = retained_blender_scene(value, scene_id)?
+        .get("render")?
+        .as_object()?;
+    let shape = match render.get("cycles_curves_shape").and_then(Value::as_str)? {
+        "ribbons" | "RIBBONS" => "ribbons",
+        "thick" | "THICK" => "thick",
+        "thick_linear" | "THICK_LINEAR" => "thick_linear",
+        _ => return None,
+    };
+    let subdivisions = render
+        .get("cycles_curves_subdivisions")
+        .and_then(Value::as_u64)
+        .filter(|subdivisions| *subdivisions <= 24)?;
+    Some((json!(shape), json!(subdivisions)))
+}
+fn retained_eevee_gi_cubemap_resolution(value: &Value, scene_id: &str) -> Option<u32> {
+    let resolution = retained_blender_scene(value, scene_id)?
+        .get("render")?
+        .get("eevee_gi_cubemap_resolution")?
+        .as_u64()
+        .and_then(|resolution| u32::try_from(resolution).ok())?;
+    crate::model::EEVEE_GI_CUBEMAP_RESOLUTIONS
+        .contains(&resolution)
+        .then_some(resolution)
+}
+
+fn validate_present_cycles_curve_settings(render: &Map<String, Value>) -> Result<()> {
+    if render.get("cycles_curves_shape").is_some_and(|shape| {
+        !shape.is_null()
+            && !shape
+                .as_str()
+                .is_some_and(|shape| matches!(shape, "ribbons" | "thick" | "thick_linear"))
+    }) {
+        return Err(invalid("scene render cycles_curves_shape is invalid"));
+    }
+    if render
+        .get("cycles_curves_subdivisions")
+        .is_some_and(|subdivisions| {
+            !subdivisions.is_null()
+                && subdivisions
+                    .as_u64()
+                    .is_none_or(|subdivisions| subdivisions > 24)
+        })
+    {
+        return Err(invalid(
+            "scene render cycles_curves_subdivisions must be an integer in 0..=24",
+        ));
+    }
+    Ok(())
+}
+fn validate_present_eevee_gi_cubemap_resolution(render: &Map<String, Value>) -> Result<()> {
+    if let Some(value) = render.get("eevee_gi_cubemap_resolution")
+        && !value.is_null()
+        && !value
+            .as_u64()
+            .and_then(|resolution| u32::try_from(resolution).ok())
+            .is_some_and(|resolution| {
+                crate::model::EEVEE_GI_CUBEMAP_RESOLUTIONS.contains(&resolution)
+            })
+    {
+        return Err(invalid(
+            "scene render eevee_gi_cubemap_resolution must be one of 128, 256, 512, 1024, 2048, or 4096",
+        ));
+    }
+    Ok(())
+}
+
+fn has_imported_hair_with_missing_cycles_curve_settings(value: &Value) -> bool {
+    has_blender_hair_curves(value)
+        && value
+            .get("scenes")
+            .and_then(Value::as_object)
+            .is_some_and(|scenes| {
+                scenes.values().any(|scene| {
+                    scene
+                        .get("render")
+                        .and_then(Value::as_object)
+                        .is_none_or(|render| !has_complete_cycles_curve_pair(render))
+                })
+            })
+}
+
+fn upgrade_v17(value: &mut Value) -> Result<Vec<Value>> {
+    let imported_hair = has_blender_hair_curves(value);
+    let retained_pairs: BTreeMap<String, (Value, Value)> = if imported_hair {
+        value
+            .get("scenes")
+            .and_then(Value::as_object)
+            .map(|scenes| {
+                scenes
+                    .keys()
+                    .filter_map(|scene_id| {
+                        retained_cycles_curve_pair(value, scene_id)
+                            .map(|pair| (scene_id.clone(), pair))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
+    let imported_blender = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .is_some_and(Value::is_object);
+    let retained_probe_resolutions: BTreeMap<String, u32> = if imported_blender {
+        value
+            .get("scenes")
+            .and_then(Value::as_object)
+            .map(|scenes| {
+                scenes
+                    .keys()
+                    .filter_map(|scene_id| {
+                        retained_eevee_gi_cubemap_resolution(value, scene_id)
+                            .map(|resolution| (scene_id.clone(), resolution))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
+    let mut warnings = Vec::new();
+    if let Some(scenes) = value.get_mut("scenes").and_then(Value::as_object_mut) {
+        for (scene_id, scene) in scenes {
+            let scene = scene
+                .as_object_mut()
+                .ok_or_else(|| invalid("scene entry must be an object"))?;
+            let render = scene
+                .entry("render".to_owned())
+                .or_insert_with(|| json!({}));
+            let render = render
+                .as_object_mut()
+                .ok_or_else(|| invalid("scene render settings must be an object"))?;
+            validate_present_eevee_gi_cubemap_resolution(render)?;
+            if imported_blender {
+                if let Some(resolution) = retained_probe_resolutions.get(scene_id) {
+                    render.insert("eevee_gi_cubemap_resolution".to_owned(), json!(resolution));
+                } else if render.get("engine").and_then(Value::as_str) == Some("realtime")
+                    && render
+                        .get("eevee_gi_cubemap_resolution")
+                        .is_none_or(Value::is_null)
+                {
+                    render.insert("eevee_gi_cubemap_resolution".to_owned(), Value::Null);
+                    warnings.push(json!({
+                        "code":"render.eevee_gi_cubemap_resolution_unavailable_migrated",
+                        "feature_id":"render.eevee.gi_cubemap_resolution",
+                        "message":"This Blender-imported EEVEE realtime scene has no retained SceneEEVEE.gi_cubemap_resolution value; it remains unknown (None), not Blender's 512 default. Reimport the source .blend to recover the exact setting.",
+                        "scene_id":scene_id,
+                    }));
+                }
+            }
+            validate_present_cycles_curve_settings(render)?;
+            if imported_hair && !has_complete_cycles_curve_pair(render) {
+                if let Some((shape, subdivisions)) = retained_pairs.get(scene_id) {
+                    render.insert("cycles_curves_shape".to_owned(), shape.clone());
+                    render.insert(
+                        "cycles_curves_subdivisions".to_owned(),
+                        subdivisions.clone(),
+                    );
+                } else {
+                    render.insert("cycles_curves_shape".to_owned(), Value::Null);
+                    render.insert("cycles_curves_subdivisions".to_owned(), Value::Null);
+                    warnings.push(json!({
+                        "code":"cycles_curves.settings_unavailable_migrated",
+                        "feature_id":"render.cycles_curves.settings",
+                        "message":"Blender-imported hair curves are missing the captured shape/subdivision pair; both settings are unknown. Reimport the source .blend to recover their exact values.",
+                        "scene_id":scene_id,
+                    }));
+                }
+            } else {
+                render
+                    .entry("cycles_curves_shape".to_owned())
+                    .or_insert_with(|| json!("thick"));
+                render
+                    .entry("cycles_curves_subdivisions".to_owned())
+                    .or_insert(Value::Null);
+            }
+        }
+    }
+    value["schema_version"] = json!(18);
     Ok(warnings)
 }
 
@@ -701,38 +963,12 @@ fn upgrade_scene_gravity_from_blender_metadata(value: &mut Value) {
     {
         return;
     }
-    let Some(adapter) = value
-        .get("compatibility")
-        .and_then(|compatibility| compatibility.get("blender_adapter"))
-    else {
-        return;
-    };
-    let Some(raw_scenes) = adapter
-        .get("intermediate")
-        .and_then(|intermediate| intermediate.get("scenes"))
-        .and_then(Value::as_array)
-    else {
-        return;
-    };
-    let mappings = adapter.get("id_mappings").and_then(Value::as_object);
     let mut recovered = Vec::new();
     for (scene_id, scene) in scenes {
         if scene.get("use_gravity").is_some() {
             continue;
         }
-        let raw_scene = raw_scenes.iter().find(|raw| {
-            if raw.get("potter_id").and_then(Value::as_str) == Some(scene_id.as_str()) {
-                return true;
-            }
-            let Some(name) = raw.get("name").and_then(Value::as_str) else {
-                return false;
-            };
-            mappings
-                .and_then(|mappings| mappings.get(&format!("Scene:{name}")))
-                .and_then(Value::as_str)
-                == Some(scene_id.as_str())
-        });
-        let Some(raw_scene) = raw_scene else {
+        let Some(raw_scene) = retained_blender_scene(value, scene_id.as_str()) else {
             continue;
         };
         let gravity = raw_scene
@@ -4183,6 +4419,59 @@ mod tests {
     fn no_assets() -> &'static Path {
         Path::new("no-assets")
     }
+    fn schema_seventeen_curve_scene(
+        blender_adapter: bool,
+        hair_curves: bool,
+        shape: Option<&str>,
+        subdivisions: Option<u32>,
+    ) -> Value {
+        let mut source = serde_json::to_value(SceneDoc::new(
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+        ))
+        .expect("scene document");
+        source["schema_version"] = json!(17);
+        let render = source["scenes"]["scene_main"]["render"]
+            .as_object_mut()
+            .expect("render settings");
+        render.remove("cycles_curves_shape");
+        render.remove("eevee_gi_cubemap_resolution");
+        render.remove("cycles_curves_subdivisions");
+        if let Some(shape) = shape {
+            render.insert("cycles_curves_shape".to_owned(), json!(shape));
+        }
+        if let Some(subdivisions) = subdivisions {
+            render.insert("cycles_curves_subdivisions".to_owned(), json!(subdivisions));
+        }
+        if blender_adapter {
+            source["compatibility"]["blender_adapter"] = json!({"intermediate":{}});
+        }
+        if hair_curves {
+            source["data_blocks"]["hair_data"] = json!({
+                "type":"hair_curves",
+                "hair_curves":{"curves":[]}
+            });
+        }
+        source
+    }
+    fn schema_seventeen_probe_scene(
+        blender_adapter: bool,
+        engine: &str,
+        retained_resolution: Option<u32>,
+    ) -> Value {
+        let mut source = schema_seventeen_curve_scene(blender_adapter, false, None, None);
+        source["scenes"]["scene_main"]["render"]["engine"] = json!(engine);
+        if blender_adapter {
+            source["compatibility"]["blender_adapter"]["id_mappings"] =
+                json!({"Scene:Scene":"scene_main"});
+            let mut render = serde_json::Map::new();
+            if let Some(resolution) = retained_resolution {
+                render.insert("eevee_gi_cubemap_resolution".to_owned(), json!(resolution));
+            }
+            source["compatibility"]["blender_adapter"]["intermediate"]["scenes"] =
+                json!([{"name":"Scene", "potter_id":null, "render":render}]);
+        }
+        source
+    }
 
     #[test]
     fn upgrade_v14_maps_legacy_mesh_to_points_domains() {
@@ -4201,7 +4490,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         for (node, mode) in [
             ("point", "VERTICES"),
             ("edge", "EDGES"),
@@ -4306,6 +4595,73 @@ mod tests {
         assert_native_value_noise(&record.snapshot);
         assert_eq!(record.snapshot.resources.len(), 1);
     }
+    #[test]
+    fn history_snapshot_round_trips_cycles_hair_groups_and_old_snapshots_stay_unknown() {
+        let mut document =
+            crate::model::SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let scene = document
+            .scenes
+            .get_mut(&Id::from_static("scene_main"))
+            .expect("default Scene");
+        let member = crate::model::CyclesHairShadowMember {
+            instance: crate::model::CyclesHairShadowInstanceKey {
+                real_object_node_id: Id::from_static("hair_first"),
+                parent_node_id: Some(Id::from_static("hair_first")),
+                persistent_id: [0; 8],
+                is_instance: false,
+                use_particle_hair: false,
+            },
+            object_to_world: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            object_color: [1.0; 4],
+            object_pass_index: 0,
+            object_random_id: 0,
+            slot_0_material_id: None,
+            ray_visibility: crate::model::RayVisibility::default(),
+        };
+        let groups = vec![crate::model::CyclesHairShadowGroup {
+            view_layer_id: Id::from_static("view_main"),
+            geometry_key: crate::model::CyclesHairShadowGeometryKey::Data { data_id: None },
+            representative_node_id: Id::from_static("hair_first"),
+            member_node_ids: vec![Id::from_static("hair_first")],
+            members: vec![member],
+            source_curve_indices: None,
+            evaluated_hair_curves: Some(crate::model::HairCurvesData::default()),
+            source_input_fingerprint: Some(format!("sha256:{}", "0".repeat(64))),
+        }];
+        scene.cycles_hair_shadow_groups = Some(groups.clone());
+        let snapshot = serde_json::to_value(document).expect("snapshot JSON");
+        let (record, warnings) = parse_history_record(
+            &serde_json::to_vec(&history_record(&snapshot)).expect("history JSON"),
+            no_assets(),
+        )
+        .expect("history snapshot migration");
+        assert_eq!(warnings, Vec::<serde_json::Value>::new());
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")].cycles_hair_shadow_groups,
+            Some(groups)
+        );
+
+        let old_snapshot = serde_json::to_value(crate::model::SceneDoc::new(
+            "00000000-0000-4000-8000-000000000001".to_owned(),
+        ))
+        .expect("legacy snapshot JSON");
+        let (record, warnings) = parse_history_record(
+            &serde_json::to_vec(&history_record(&old_snapshot)).expect("history JSON"),
+            no_assets(),
+        )
+        .expect("legacy history snapshot");
+        assert_eq!(warnings, Vec::<serde_json::Value>::new());
+        assert!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .cycles_hair_shadow_groups
+                .is_none()
+        );
+    }
 
     #[test]
     fn legacy_volume_noise_sentinel_respects_owned_ids() {
@@ -4378,7 +4734,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -4400,7 +4756,7 @@ mod tests {
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         assert_eq!(scene["materials"], before["materials"]);
     }
 
@@ -4420,7 +4776,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
         for id in ["legacy", "panorama"] {
             let camera = &scene["data_blocks"][id]["camera"];
@@ -4491,7 +4847,7 @@ mod tests {
 
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         let first: Vec<&str> = scene["node_groups"]["first"]["links"]
             .as_array()
             .expect("first links")
@@ -4546,7 +4902,7 @@ mod tests {
 
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         let sources: Vec<&str> = scene["node_groups"]["group"]["links"]
             .as_array()
             .expect("links")
@@ -4612,7 +4968,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
 
         assert!(parsed.legacy);
-        assert_eq!(parsed.doc.schema_version, 17);
+        assert_eq!(parsed.doc.schema_version, 18);
         assert!(!parsed.doc.compatibility.contains_key("constraints"));
         let node_id = Id::new("owner")?;
         let constraints = &parsed.doc.nodes[&node_id].constraints;
@@ -4844,7 +5200,7 @@ mod tests {
 
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         let imported_nodes = &scene["node_groups"]["imported"]["nodes"];
         for node_id in ["value", "rgb", "normal"] {
             assert_eq!(
@@ -4885,7 +5241,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_fourteen_chains_mesh_shader_defaults_and_node_math_migrations_to_seventeen() {
+    fn schema_fourteen_chains_mesh_shader_defaults_and_node_math_migrations_to_eighteen() {
         let mut scene = json!({
             "schema_version":14,
             "node_groups":{
@@ -4990,38 +5346,246 @@ mod tests {
             "ShaderNodeValToRGB",
             &scene["node_groups"]["native_states"]["nodes"]["ramp"]["properties"]["color_ramp"]
         ));
+        assert_eq!(
+            upgrade_v17(&mut scene).expect("upgrade v17 to v18"),
+            Vec::<Value>::new()
+        );
 
         let chained_warnings =
             upgrade_scene(&mut chained, no_assets()).expect("upgrade chained scene");
-        assert_eq!(chained["schema_version"], json!(17));
+        assert_eq!(chained["schema_version"], json!(18));
         assert_eq!(chained, scene);
         assert_eq!(chained_warnings, warnings);
     }
 
     #[test]
-    fn schema_thirteen_scenes_upgrade_to_seventeen_without_other_changes() {
+    fn schema_thirteen_scenes_upgrade_to_eighteen_without_other_changes() {
         let mut scene = json!({
             "schema_version": 13,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let mut expected = scene.clone();
-        expected["schema_version"] = json!(17);
+        expected["schema_version"] = json!(18);
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         assert_eq!(scene, expected);
     }
 
     #[test]
-    fn schema_twelve_scenes_chain_migrations_to_seventeen() {
+    fn schema_twelve_scenes_chain_migrations_to_eighteen() {
         let mut scene = json!({
             "schema_version": 12,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let mut expected = scene.clone();
-        expected["schema_version"] = json!(17);
+        expected["schema_version"] = json!(18);
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         assert_eq!(scene, expected);
+    }
+
+    #[test]
+    fn schema_seventeen_native_hair_keeps_thick_curve_defaults() -> TestResult {
+        let source = schema_seventeen_curve_scene(false, true, None, None);
+        let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+        let render = &parsed.doc.scenes[&Id::from_static("scene_main")].render;
+
+        assert_eq!(parsed.doc.schema_version, 18);
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(
+            render.cycles_curves_shape,
+            Some(crate::model::CyclesCurveShape::Thick)
+        );
+        assert_eq!(render.cycles_curves_subdivisions, None);
+        Ok(())
+    }
+    #[test]
+    fn schema_seventeen_blender_realtime_recovers_probe_resolution_from_retained_scene()
+    -> TestResult {
+        let source = schema_seventeen_probe_scene(true, "realtime", Some(1024));
+        let expected_hash = crate::hash::sha256(&crate::hash::canonicalize(&source)?);
+        let bytes = serde_json::to_vec(&source)?;
+        let parsed = parse_scene_with_original_hash(&bytes, no_assets(), no_assets())?;
+        let render = &parsed.doc.scenes[&Id::from_static("scene_main")].render;
+
+        assert!(parsed.legacy);
+        assert_eq!(parsed.legacy_hash.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(parsed.warnings, Vec::<Value>::new());
+        assert_eq!(render.eevee_gi_cubemap_resolution, Some(1024));
+        assert_eq!(
+            parsed.doc.compatibility["blender_adapter"]["intermediate"]["scenes"][0]["render"]["eevee_gi_cubemap_resolution"],
+            1024
+        );
+
+        let history = history_record(&source);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .render
+                .eevee_gi_cubemap_resolution,
+            Some(1024)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_seventeen_blender_realtime_keeps_unavailable_probe_resolution_unknown() -> TestResult
+    {
+        let source = schema_seventeen_probe_scene(true, "realtime", None);
+        let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+        let render = &parsed.doc.scenes[&Id::from_static("scene_main")].render;
+
+        assert!(parsed.legacy);
+        assert_eq!(render.eevee_gi_cubemap_resolution, None);
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        assert_eq!(
+            parsed.warnings[0]["code"],
+            "render.eevee_gi_cubemap_resolution_unavailable_migrated"
+        );
+        assert_eq!(parsed.warnings[0]["scene_id"], "scene_main");
+        assert!(
+            parsed.doc.compatibility["blender_adapter"]["intermediate"]["scenes"][0]["render"]
+                .get("eevee_gi_cubemap_resolution")
+                .is_none()
+        );
+
+        let history = history_record(&source);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .render
+                .eevee_gi_cubemap_resolution,
+            None
+        );
+        assert_eq!(warnings, parsed.warnings);
+        Ok(())
+    }
+
+    #[test]
+    fn schema_seventeen_native_and_path_scenes_keep_probe_migration_unaffected() -> TestResult {
+        for (blender_adapter, engine, retained, expected) in [
+            (false, "realtime", None, 512),
+            (true, "path", None, 512),
+            (true, "path", Some(2048), 2048),
+        ] {
+            let source = schema_seventeen_probe_scene(blender_adapter, engine, retained);
+            let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+            assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+            assert_eq!(
+                parsed.doc.scenes[&Id::from_static("scene_main")]
+                    .render
+                    .eevee_gi_cubemap_resolution,
+                Some(expected),
+                "{engine}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn schema_seventeen_blender_hair_without_complete_curve_pair_becomes_unknown() -> TestResult {
+        for shape in [None, Some("ribbons")] {
+            let source = schema_seventeen_curve_scene(true, true, shape, None);
+            let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+            let render = &parsed.doc.scenes[&Id::from_static("scene_main")].render;
+
+            assert!(parsed.legacy);
+            assert_eq!(parsed.doc.schema_version, 18);
+            assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+            assert_eq!(
+                parsed.warnings[0]["code"],
+                json!("cycles_curves.settings_unavailable_migrated")
+            );
+            assert!(
+                parsed.warnings[0]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Reimport"))
+            );
+            assert_eq!(render.cycles_curves_shape, None);
+            assert_eq!(render.cycles_curves_subdivisions, None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn schema_seventeen_hair_recovers_captured_pair_from_mapped_retained_scene() -> TestResult {
+        let mut source = schema_seventeen_curve_scene(true, true, None, None);
+        source["compatibility"]["blender_adapter"]["id_mappings"] =
+            json!({"Scene:Scene":"scene_main"});
+        source["compatibility"]["blender_adapter"]["intermediate"]["scenes"] = json!([{
+            "name":"Scene",
+            "potter_id":null,
+            "render":{
+                "cycles_curves_shape":"RIBBONS",
+                "cycles_curves_subdivisions":2
+            }
+        }]);
+
+        let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+        let render = &parsed.doc.scenes[&Id::from_static("scene_main")].render;
+
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(
+            render.cycles_curves_shape,
+            Some(crate::model::CyclesCurveShape::Ribbons)
+        );
+        assert_eq!(render.cycles_curves_subdivisions, Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_seventeen_blender_hair_preserves_all_captured_curve_shapes() -> TestResult {
+        for (shape, expected) in [
+            ("ribbons", crate::model::CyclesCurveShape::Ribbons),
+            ("thick", crate::model::CyclesCurveShape::Thick),
+            ("thick_linear", crate::model::CyclesCurveShape::ThickLinear),
+        ] {
+            let source = schema_seventeen_curve_scene(true, true, Some(shape), Some(2));
+            let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+            let render = &parsed.doc.scenes[&Id::from_static("scene_main")].render;
+            let serialized = serde_json::to_value(render)?;
+
+            assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+            assert_eq!(render.cycles_curves_shape, Some(expected));
+            assert_eq!(render.cycles_curves_subdivisions, Some(2));
+            assert_eq!(serialized["cycles_curves_shape"], json!(shape));
+            assert_eq!(serialized["cycles_curves_subdivisions"], 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn schema_seventeen_blender_adapter_without_hair_keeps_thick_curve_default() -> TestResult {
+        let source = schema_seventeen_curve_scene(true, false, None, None);
+        let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+        let render = &parsed.doc.scenes[&Id::from_static("scene_main")].render;
+
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(
+            render.cycles_curves_shape,
+            Some(crate::model::CyclesCurveShape::Thick)
+        );
+        assert_eq!(render.cycles_curves_subdivisions, None);
+        Ok(())
+    }
+
+    #[test]
+    fn history_schema_seventeen_hair_migration_marks_both_curve_settings_unknown() -> TestResult {
+        let source = schema_seventeen_curve_scene(true, true, None, None);
+        let history = history_record(&source);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        let render = &record.snapshot.scenes[&Id::from_static("scene_main")].render;
+
+        assert_eq!(record.snapshot.schema_version, 18);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            warnings[0]["code"],
+            "cycles_curves.settings_unavailable_migrated"
+        );
+        assert_eq!(render.cycles_curves_shape, None);
+        assert_eq!(render.cycles_curves_subdivisions, None);
+        Ok(())
     }
 
     #[test]
@@ -5062,7 +5626,7 @@ mod tests {
 
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("schema upgrade");
 
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         assert_eq!(warnings.len(), 2);
         assert!(
             warnings.iter().all(|warning| {
@@ -5126,7 +5690,7 @@ mod tests {
         let parsed = parse_scene_with_original_hash(&bytes, no_assets(), no_assets())?;
 
         assert!(parsed.legacy);
-        assert_eq!(parsed.doc.schema_version, 17);
+        assert_eq!(parsed.doc.schema_version, 18);
         assert_eq!(parsed.legacy_hash.as_deref(), Some(expected_hash.as_str()));
         assert_eq!(
             parsed.doc.compatibility["blender_adapter"]["intermediate"]["node_groups"][0]["tree"]["links"],
@@ -5186,7 +5750,7 @@ mod tests {
 
         upgrade_scene(&mut scene, no_assets()).expect("schema upgrade");
 
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         assert_eq!(
             scene["node_groups"]["graph"]["nodes"]["curve"]["properties"]["mapping"],
             mapping
@@ -5305,7 +5869,7 @@ mod tests {
             parse_history_record(&bytes, no_assets()).expect("history snapshot migration");
 
         assert_eq!(warnings, Vec::<Value>::new());
-        assert_eq!(record.snapshot.schema_version, 17);
+        assert_eq!(record.snapshot.schema_version, 18);
         let snapshot = serde_json::to_value(record.snapshot).expect("upgraded snapshot");
         assert!(graph_node_state_is_valid(
             "ShaderNodeFloatCurve",
@@ -5486,7 +6050,7 @@ mod tests {
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
         assert_eq!(warnings, Vec::<Value>::new());
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         let curves = scene["actions"]["shared"]["fcurves"]
             .as_array()
             .expect("restored action curves");
@@ -5580,7 +6144,7 @@ mod tests {
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
         assert_eq!(warnings.len(), 2);
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         assert_eq!(
             scene["actions"]["shared"]["fcurves"]
                 .as_array()
@@ -5648,7 +6212,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&doc)?, no_assets())?;
 
         assert!(parsed.legacy);
-        assert_eq!(parsed.doc.schema_version, 17);
+        assert_eq!(parsed.doc.schema_version, 18);
         assert_eq!(parsed.doc.actions[&action_id].fcurves.len(), 2);
         assert_eq!(
             parsed.doc.compatibility["animation"]["unsupported_outputs"]
@@ -5701,7 +6265,7 @@ mod tests {
         source["schema_version"] = json!(11);
         let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
         assert!(parsed.legacy);
-        assert_eq!(parsed.doc.schema_version, 17);
+        assert_eq!(parsed.doc.schema_version, 18);
         assert_eq!(parsed.doc.actions[&action_id].fcurves, Vec::new());
         assert_eq!(parsed.doc.nodes[&node_id].drivers, Vec::new());
         assert_eq!(
@@ -5740,7 +6304,7 @@ mod tests {
 
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         let curves = scene["actions"]["shared"]["fcurves"]
             .as_array()
             .expect("migrated action curves");
@@ -5948,7 +6512,7 @@ mod tests {
         )
         .expect("brush migration");
         assert!(migrated.legacy);
-        assert_eq!(migrated.doc.schema_version, 17);
+        assert_eq!(migrated.doc.schema_version, 18);
         let settings = &migrated.doc.nodes[&crate::model::Id::new("brush").expect("brush ID")]
             .properties["physics_dynamic_paint"];
         assert_eq!(settings["paint_source"], json!("POINT"));
@@ -6120,7 +6684,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         let nodes = &scene["nodes"];
         assert_eq!(
             nodes["cam_off"]["ray_visibility"],
@@ -6163,7 +6727,7 @@ mod tests {
             ]}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         let modifiers = &scene["nodes"]["body"]["modifiers"];
         let first = &modifiers[0]["params"];
         assert_eq!(first["is_sequence"], json!(true));
@@ -6211,7 +6775,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 17);
+        assert_eq!(parsed.doc.schema_version, 18);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -6257,7 +6821,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets())?;
-        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(scene["schema_version"], json!(18));
         assert_eq!(
             scene["scenes"]["empty"]["color_management"]["curve"],
             Value::Null
@@ -6300,7 +6864,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
         parsed.doc.validate()?;
         let migrated = serde_json::to_value(parsed.doc)?;
-        expected["schema_version"] = json!(17);
+        expected["schema_version"] = json!(18);
         assert_eq!(migrated, expected);
         Ok(())
     }
@@ -6338,7 +6902,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 17);
+        assert_eq!(migrated.schema_version, 18);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -6842,7 +7406,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 17);
+        assert_eq!(record.snapshot.schema_version, 18);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -6909,7 +7473,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 17);
+        assert_eq!(record.snapshot.schema_version, 18);
         let history_mesh = record
             .snapshot
             .data_blocks

@@ -238,6 +238,36 @@ pub(crate) fn continuous_density(params: &BsdfParams, layers: &Layers, light: DV
         .sum()
 }
 
+/// Cycles' `SD_BSDF_HAS_EVAL`: whether an active closure set has any non-singular BSDF to pair with direct-light sampling.
+pub(crate) fn bsdf_has_direct_eval(params: &BsdfParams, layers: &Layers) -> bool {
+    match params.model {
+        BsdfModel::Holdout
+        | BsdfModel::RayPortal(_)
+        | BsdfModel::Refraction(MicrofacetDistribution::MultiGgx) => false,
+        BsdfModel::Subsurface => {
+            params.thin_wall || standalone_subsurface_weights(params).1.max_element() > 0.0
+        }
+        BsdfModel::Refraction(distribution) => {
+            let microfacet = standalone_refraction_microfacet(params, layers, distribution);
+            microfacet.alpha_x * microfacet.alpha_y > GLASS_SINGULAR_ALPHA_SQUARED
+        }
+        BsdfModel::Metallic(metallic) => {
+            let microfacet = standalone_metallic_microfacet(params, layers, metallic.distribution);
+            microfacet.alpha_x * microfacet.alpha_y > GLASS_SINGULAR_ALPHA_SQUARED
+        }
+        BsdfModel::Principled => {
+            let normal = layers.normal;
+            [normal, -normal, layers.view, -layers.view]
+                .into_iter()
+                .flat_map(|light| continuous_lobes(params, layers, light))
+                .any(|lobe| {
+                    lobe.weight > 0.0 && lobe.roughness_squared > GLASS_SINGULAR_ALPHA_SQUARED
+                })
+        }
+        _ => true,
+    }
+}
+
 /// Density of a normal drawn from the isotropic GGX NDF and reflected around the half vector.
 fn ndf_half_vector_pdf(normal: DVec3, microfacet: GgxMicrofacet, view: DVec3, light: DVec3) -> f64 {
     let half = (view + light).normalize_or_zero();
@@ -3629,6 +3659,42 @@ mod tests {
         assert_eq!(subsurface_probability, 0.0);
         assert_eq!(diffuse_probability, 1.0);
         assert!((total - 1.15 / 3.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn direct_eval_capability_tracks_bssrdf_only_and_diffuse_fallback() {
+        let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        params.base_color = [0.72, 0.31, 0.12, 1.0];
+        params.subsurface_radius = [0.85, 0.31, 0.12];
+        params.subsurface_scale = 0.24;
+        params.subsurface_weight = 1.0;
+        params.model = BsdfModel::Subsurface;
+        let layer_set = layers(&params, DVec3::Z, DVec3::Z);
+        assert!(!bsdf_has_direct_eval(&params, &layer_set));
+
+        params.subsurface_radius[2] = 1.0e-9;
+        let layer_set = layers(&params, DVec3::Z, DVec3::Z);
+        assert!(bsdf_has_direct_eval(&params, &layer_set));
+
+        params.subsurface_radius = [0.85, 0.31, 0.12];
+        params.thin_wall = true;
+        let layer_set = layers(&params, DVec3::Z, DVec3::Z);
+        assert!(bsdf_has_direct_eval(&params, &layer_set));
+
+        params.model = BsdfModel::Principled;
+        params.thin_wall = false;
+        params.reflectance = 0.0;
+        params.specular_ior_level = 0.0;
+        params.coat_weight = 0.0;
+        params.sheen_weight = 0.0;
+        params.transmission = 0.0;
+        params.roughness = 0.0;
+        let layer_set = layers(&params, DVec3::Z, DVec3::Z);
+        assert!(bsdf_has_direct_eval(&params, &layer_set));
+
+        params.subsurface_radius[0] = 1.0e-9;
+        let layer_set = layers(&params, DVec3::Z, DVec3::Z);
+        assert!(bsdf_has_direct_eval(&params, &layer_set));
     }
 
     #[test]

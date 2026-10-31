@@ -3148,12 +3148,12 @@ pub fn feature_catalog() -> Value {
             &["render.update"],
             [false, true, true, false, false, false, false],
         ),
-        unsupported(
+        supported(
             "blender.scene.eevee.gi_cubemap_resolution",
-            "Non-default EEVEE world-probe cubemap resolution",
+            "Exact EEVEE sphere-probe cubemap resolution (Blender enum value; capture extent is value / 2)",
             "SceneEEVEE.gi_cubemap_resolution",
             &["render.update"],
-            "Blender 5.2.2 defaults `SceneEEVEE.gi_cubemap_resolution` to 512, and EEVEE captures the sphere probe at half that extent (256). Potter's realtime world probe supports that default 256-texel capture only; `.blend` import reports a non-default source value only when that Scene's `render.engine` is `realtime`, with the feature ID and scene name as `data_id`, while retaining the source value in compatibility (`DNA_scene_types.h:2656`, `eevee_lightprobe_sphere.cc:14-16`).",
+            [false, true, true, false, false, false, false],
         ),
         supported(
             "render.passes",

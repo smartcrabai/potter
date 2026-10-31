@@ -25,13 +25,15 @@ use crate::{
         Action, ActionSlot, ArmatureData, Bone, CameraData, CameraProjection, Collection,
         Constraint, ConstraintType, CurveData, CurveDimensions, CurveFillMode, CurveFillRule,
         CurveFillSolver, CurveHandleType, CurvePoint, CurveSpline, CurveSplineType,
-        CurveTaperRadiusMode, DEFAULT_FILTER_WIDTH, DataBlock, Driver, DriverType, DriverVariable,
-        DriverVariableType, Extrapolation, FCurve, FCurveAutoSmoothing, FCurveHandleType,
-        FCurveModifier, ForceField, ForceFieldType, GreasePencilData, GreasePencilFrame,
-        GreasePencilLayer, GreasePencilPoint, GreasePencilStroke, Id, Image, ImageAlphaMode,
-        ImageColorspace, ImageSource, ImageTile, Interpolation, Keyframe, Library, LibraryKind,
-        LibraryOverride, LibraryOverrideProperty, LibraryStatus, LightData, LightType, Material,
-        MaterialLink, Modifier, ModifierParameterBinding, MovieClip, MovieTracking, NlaBlendType,
+        CurveTaperRadiusMode, CyclesCurveShape, CyclesHairShadowGeometryKey, CyclesHairShadowGroup,
+        CyclesHairShadowInstanceKey, CyclesHairShadowMember, DEFAULT_FILTER_WIDTH, DataBlock,
+        Driver, DriverType, DriverVariable, DriverVariableType, Extrapolation, FCurve,
+        FCurveAutoSmoothing, FCurveHandleType, FCurveModifier, ForceField, ForceFieldType,
+        GreasePencilData, GreasePencilFrame, GreasePencilLayer, GreasePencilPoint,
+        GreasePencilStroke, HairCurvesData, Id, Image, ImageAlphaMode, ImageColorspace,
+        ImageSource, ImageTile, Interpolation, Keyframe, Library, LibraryKind, LibraryOverride,
+        LibraryOverrideProperty, LibraryStatus, LightData, LightType, Material, MaterialLink,
+        Modifier, ModifierParameterBinding, MovieClip, MovieTracking, NlaBlendType,
         NlaExtrapolation, NlaStrip, NlaTrack, Node, ParentType, PixelFilterType, Profile, RayKind,
         RayVisibility, Registry, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType,
         RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint,
@@ -3020,6 +3022,34 @@ fn validate_intermediate(raw: &Value) -> Result<()> {
                         "`{collection}` contains a non-object item"
                     )));
                 }
+                if collection == "scenes"
+                    && let Some(render) = item.get("render").and_then(Value::as_object)
+                {
+                    if render.get("cycles_curves_shape").is_some_and(|shape| {
+                        !shape.is_null()
+                            && !shape.as_str().is_some_and(|shape| {
+                                matches!(shape, "ribbons" | "thick" | "thick_linear")
+                            })
+                    }) {
+                        return Err(invalid_intermediate("scene cycles_curves_shape is invalid"));
+                    }
+                    if render
+                        .get("cycles_curves_subdivisions")
+                        .is_some_and(|subdivisions| {
+                            !subdivisions.is_null()
+                                && subdivisions
+                                    .as_u64()
+                                    .is_none_or(|subdivisions| subdivisions > 24)
+                        })
+                    {
+                        return Err(invalid_intermediate(
+                            "scene cycles_curves_subdivisions must be an integer in 0..=24",
+                        ));
+                    }
+                    if let Some(resolution) = render.get("eevee_gi_cubemap_resolution") {
+                        parse_eevee_gi_cubemap_resolution(Some(resolution))?;
+                    }
+                }
             }
         }
     }
@@ -3031,6 +3061,375 @@ fn invalid_intermediate(message: &str) -> PotError {
         ErrorCode::ImportFailed,
         format!("invalid Blender intermediate JSON: {message}"),
     )
+}
+
+fn parse_cycles_hair_shadow_instance_key(
+    raw: &Value,
+    object_ids: &BTreeMap<String, Id>,
+) -> Result<CyclesHairShadowInstanceKey> {
+    let real_object_name = string_field(raw, "real_object")?;
+    let real_object_node_id = object_ids
+        .get(real_object_name)
+        .cloned()
+        .ok_or_else(|| invalid_intermediate("Cycles Hair instance references an unknown Object"))?;
+    let parent_node_id = match raw.get("parent") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(parent_name)) => {
+            Some(object_ids.get(parent_name).cloned().ok_or_else(|| {
+                invalid_intermediate("Cycles Hair instance parent references an unknown Object")
+            })?)
+        }
+        Some(_) => {
+            return Err(invalid_intermediate(
+                "Cycles Hair instance parent must be an Object name or null",
+            ));
+        }
+    };
+    let persistent_values = raw
+        .get("persistent_id")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 8)
+        .ok_or_else(|| {
+            invalid_intermediate("Cycles Hair instance persistent_id must contain eight integers")
+        })?;
+    let mut persistent_id = [0_i32; 8];
+    for (index, value) in persistent_values.iter().enumerate() {
+        persistent_id[index] = value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| {
+                invalid_intermediate(
+                    "Cycles Hair instance persistent_id entries must be 32-bit integers",
+                )
+            })?;
+    }
+    let is_instance = raw
+        .get("is_instance")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            invalid_intermediate("Cycles Hair instance is_instance must be a boolean")
+        })?;
+    let use_particle_hair = raw
+        .get("use_particle_hair")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            invalid_intermediate("Cycles Hair instance use_particle_hair must be a boolean")
+        })?;
+    if !is_instance
+        && (parent_node_id.as_ref() != Some(&real_object_node_id) || persistent_id != [0; 8])
+    {
+        return Err(invalid_intermediate(
+            "non-instance Cycles Hair key has an invalid parent or persistent_id",
+        ));
+    }
+    Ok(CyclesHairShadowInstanceKey {
+        real_object_node_id,
+        parent_node_id,
+        persistent_id,
+        is_instance,
+        use_particle_hair,
+    })
+}
+
+fn parse_cycles_hair_shadow_member(
+    raw: &Value,
+    object_ids: &BTreeMap<String, Id>,
+    material_ids: &BTreeMap<String, Id>,
+) -> Result<CyclesHairShadowMember> {
+    let instance = parse_cycles_hair_shadow_instance_key(
+        raw.get("instance")
+            .ok_or_else(|| invalid_intermediate("Cycles Hair member has no instance key"))?,
+        object_ids,
+    )?;
+    let matrix_rows = raw
+        .get("object_to_world")
+        .and_then(Value::as_array)
+        .filter(|rows| rows.len() == 4)
+        .ok_or_else(|| invalid_intermediate("Cycles Hair object_to_world must have four rows"))?;
+    let mut object_to_world = [[0.0; 4]; 4];
+    for (row_index, row) in matrix_rows.iter().enumerate() {
+        let row_values = row
+            .as_array()
+            .filter(|values| values.len() == 4)
+            .ok_or_else(|| {
+                invalid_intermediate("Cycles Hair object_to_world rows must have four values")
+            })?;
+        for (column_index, value) in row_values.iter().enumerate() {
+            object_to_world[row_index][column_index] = value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    invalid_intermediate("Cycles Hair object_to_world values must be finite")
+                })?;
+        }
+    }
+    let color_values = raw
+        .get("object_color")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 4)
+        .ok_or_else(|| invalid_intermediate("Cycles Hair object_color must have four values"))?;
+    let mut object_color = [0.0; 4];
+    for (index, value) in color_values.iter().enumerate() {
+        object_color[index] = value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| {
+                invalid_intermediate("Cycles Hair object_color values must be finite")
+            })?;
+    }
+    let object_pass_index = raw
+        .get("object_pass_index")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| invalid_intermediate("Cycles Hair object_pass_index must be an integer"))?;
+    let object_random_id = raw
+        .get("object_random_id")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| invalid_intermediate("Cycles Hair object_random_id must be an i32"))?;
+    let slot_0_material_id = match raw.get("slot_0_material") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(material_ids.get(name).cloned().ok_or_else(|| {
+            invalid_intermediate("Cycles Hair slot-0 Material references an unknown Material")
+        })?),
+        Some(_) => {
+            return Err(invalid_intermediate(
+                "Cycles Hair slot-0 Material must be a name or null",
+            ));
+        }
+    };
+    let ray_visibility = serde_json::from_value(
+        raw.get("ray_visibility")
+            .cloned()
+            .ok_or_else(|| invalid_intermediate("Cycles Hair member has no ray visibility"))?,
+    )
+    .map_err(|_| invalid_intermediate("Cycles Hair member ray visibility is invalid"))?;
+    Ok(CyclesHairShadowMember {
+        instance,
+        object_to_world,
+        object_color,
+        object_pass_index,
+        object_random_id,
+        slot_0_material_id,
+        ray_visibility,
+    })
+}
+
+fn parse_cycles_hair_shadow_groups(
+    raw: Option<&Value>,
+    doc: &SceneDoc,
+    scene_id: &Id,
+    materials: &BTreeMap<String, Id>,
+    object_ids: &BTreeMap<String, Id>,
+) -> Result<Option<Vec<CyclesHairShadowGroup>>> {
+    let Some(raw) = raw.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let raw_groups = raw.as_array().ok_or_else(|| {
+        invalid_intermediate("cycles_hair_shadow_groups must be an array or null")
+    })?;
+    let scene = doc
+        .scenes
+        .get(scene_id)
+        .ok_or_else(|| invalid_intermediate("Cycles Hair group Scene mapping is missing"))?;
+    let mut groups = Vec::with_capacity(raw_groups.len());
+    for raw_group in raw_groups {
+        let view_layer_name = string_field(raw_group, "view_layer")?;
+        let view_layer_id = scene
+            .view_layers
+            .iter()
+            .find_map(|(id, layer)| (layer.name == view_layer_name).then(|| id.clone()))
+            .ok_or_else(|| {
+                invalid_intermediate("Cycles Hair group references an unknown view layer")
+            })?;
+        let representative_name = string_field(raw_group, "representative")?;
+        let representative_node_id =
+            object_ids
+                .get(representative_name)
+                .cloned()
+                .ok_or_else(|| {
+                    invalid_intermediate(
+                        "Cycles Hair group representative references an unknown Object",
+                    )
+                })?;
+        let raw_members = raw_group
+            .get("members")
+            .and_then(Value::as_array)
+            .filter(|members| !members.is_empty())
+            .ok_or_else(|| invalid_intermediate("Cycles Hair group members must be non-empty"))?;
+        let members = raw_members
+            .iter()
+            .map(|member| parse_cycles_hair_shadow_member(member, object_ids, materials))
+            .collect::<Result<Vec<_>>>()?;
+        if members[0].instance.real_object_node_id != representative_node_id {
+            return Err(invalid_intermediate(
+                "Cycles Hair representative is not the first ordered member",
+            ));
+        }
+        let member_node_ids = raw_group
+            .get("member_nodes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_intermediate("Cycles Hair member_nodes must be an array"))?
+            .iter()
+            .map(|member| {
+                let member_name = member.as_str().ok_or_else(|| {
+                    invalid_intermediate("Cycles Hair member_nodes must contain Object names")
+                })?;
+                object_ids.get(member_name).cloned().ok_or_else(|| {
+                    invalid_intermediate("Cycles Hair member_nodes references an unknown Object")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut unique_member_node_ids = Vec::new();
+        for member in &members {
+            let node_id = &member.instance.real_object_node_id;
+            if !unique_member_node_ids.contains(node_id) {
+                unique_member_node_ids.push(node_id.clone());
+            }
+        }
+        if member_node_ids != unique_member_node_ids {
+            return Err(invalid_intermediate(
+                "Cycles Hair member_nodes do not match ordered physical members",
+            ));
+        }
+        let geometry_key_raw = raw_group
+            .get("geometry_key")
+            .ok_or_else(|| invalid_intermediate("Cycles Hair group has no GeometryKey"))?;
+        let geometry_key = match string_field(geometry_key_raw, "kind")? {
+            "object" => {
+                let node_name = string_field(geometry_key_raw, "node")?;
+                let node_id = object_ids.get(node_name).cloned().ok_or_else(|| {
+                    invalid_intermediate(
+                        "Cycles Hair object GeometryKey references an unknown Object",
+                    )
+                })?;
+                if node_id != representative_node_id {
+                    return Err(invalid_intermediate(
+                        "Cycles Hair object GeometryKey differs from the representative Object",
+                    ));
+                }
+                CyclesHairShadowGeometryKey::Object { node_id }
+            }
+            "data" => {
+                let uses_source_data = geometry_key_raw
+                    .get("uses_source_data")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        invalid_intermediate(
+                            "Cycles Hair data GeometryKey uses_source_data must be a boolean",
+                        )
+                    })?;
+                let data_id = if uses_source_data {
+                    Some(
+                        doc.nodes
+                            .get(&representative_node_id)
+                            .and_then(|node| node.data.clone())
+                            .ok_or_else(|| {
+                                invalid_intermediate(
+                                    "Cycles Hair source Data GeometryKey has no mapped source DataBlock",
+                                )
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                CyclesHairShadowGeometryKey::Data { data_id }
+            }
+            _ => {
+                return Err(invalid_intermediate(
+                    "Cycles Hair GeometryKey kind is unknown",
+                ));
+            }
+        };
+        let source_curve_indices = match raw_group.get("source_curve_indices") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(indices)) => Some(
+                indices
+                    .iter()
+                    .map(|index| {
+                        index
+                            .as_u64()
+                            .and_then(|index| u32::try_from(index).ok())
+                            .ok_or_else(|| {
+                                invalid_intermediate(
+                                    "Cycles Hair source curve indices must be u32 values",
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            Some(_) => {
+                return Err(invalid_intermediate(
+                    "Cycles Hair source_curve_indices must be an array or null",
+                ));
+            }
+        };
+        let evaluated_hair_curves = match raw_group.get("evaluated_hair_curves") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(parse_hair_curves_data_payload(value, Some(object_ids))?),
+        };
+        let mut group = CyclesHairShadowGroup {
+            view_layer_id,
+            geometry_key,
+            representative_node_id,
+            member_node_ids,
+            members,
+            source_curve_indices,
+            evaluated_hair_curves,
+            source_input_fingerprint: None,
+        };
+        group.source_input_fingerprint =
+            doc.cycles_hair_shadow_source_fingerprint(scene_id, &group)?;
+        groups.push(group);
+    }
+    Ok(Some(groups))
+}
+
+fn parse_eevee_gi_cubemap_resolution(value: Option<&Value>) -> Result<Option<u32>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let resolution = value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| crate::model::EEVEE_GI_CUBEMAP_RESOLUTIONS.contains(value))
+        .ok_or_else(|| {
+            invalid_intermediate(
+                "render eevee_gi_cubemap_resolution must be one of 128, 256, 512, 1024, 2048, or 4096",
+            )
+        })?;
+    Ok(Some(resolution))
+}
+
+fn parse_cycles_curve_shape(value: Option<&Value>) -> Result<Option<CyclesCurveShape>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(shape)) => match shape.as_str() {
+            "ribbons" => Ok(Some(CyclesCurveShape::Ribbons)),
+            "thick" => Ok(Some(CyclesCurveShape::Thick)),
+            "thick_linear" => Ok(Some(CyclesCurveShape::ThickLinear)),
+            _ => Err(invalid_intermediate(
+                "render cycles_curves_shape is unknown",
+            )),
+        },
+        Some(_) => Err(invalid_intermediate(
+            "render cycles_curves_shape must be a string or null",
+        )),
+    }
+}
+
+fn parse_cycles_curve_subdivisions(value: Option<&Value>) -> Result<Option<u32>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let subdivisions = value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value <= 24)
+        .ok_or_else(|| {
+            invalid_intermediate("render cycles_curves_subdivisions must be an integer in 0..=24")
+        })?;
+    Ok(Some(subdivisions))
 }
 
 fn discover_nested_blend_libraries(
@@ -3291,6 +3690,11 @@ fn build_imported_graph(
         let fps = u32::try_from(integer_field(item, "fps", 24))
             .map_err(|_| invalid_intermediate("scene fps is out of range"))?;
         let render = item.get("render").cloned().unwrap_or(Value::Null);
+        let cycles_curves_shape = parse_cycles_curve_shape(render.get("cycles_curves_shape"))?;
+        let cycles_curves_subdivisions =
+            parse_cycles_curve_subdivisions(render.get("cycles_curves_subdivisions"))?;
+        let eevee_gi_cubemap_resolution =
+            parse_eevee_gi_cubemap_resolution(render.get("eevee_gi_cubemap_resolution"))?;
         let render_settings = RenderSettings {
             resolution_x: u32::try_from(integer_field(&render, "resolution_x", 1920))
                 .map_err(|_| invalid_intermediate("render resolution_x is out of range"))?,
@@ -3334,6 +3738,8 @@ fn build_imported_graph(
                 .map_err(|_| invalid_intermediate("render max_subdivisions is out of range"))?,
             offscreen_dicing_scale: number_field(&render, "offscreen_dicing_scale", 4.0),
             dicing_camera: None,
+            cycles_curves_shape,
+            cycles_curves_subdivisions,
             film_transparent: render
                 .get("film_transparent")
                 .and_then(Value::as_bool)
@@ -3368,6 +3774,7 @@ fn build_imported_graph(
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             eevee_light_threshold: number_field(&render, "eevee_light_threshold", 0.01),
+            eevee_gi_cubemap_resolution,
             eevee_use_volumetric_shadows: render
                 .get("eevee_use_volumetric_shadows")
                 .and_then(Value::as_bool)
@@ -3437,6 +3844,7 @@ fn build_imported_graph(
             name: name.to_owned(),
             root_collection: root,
             view_layers,
+            cycles_hair_shadow_groups: None,
             frame_current: number_field(item, "frame_current", 1.0),
             frame_start,
             frame_end,
@@ -5096,33 +5504,51 @@ fn build_imported_graph(
             .filter_map(|object| object_ids.get(object).cloned())
             .collect();
     }
+    let preliminary_id_mappings =
+        serde_json::to_value(&mappings).map_err(PotError::internal_json)?;
+    doc.compatibility.insert(
+        "blender_adapter".to_owned(),
+        json!({"id_mappings": preliminary_id_mappings}),
+    );
+
     for item in scenes {
         let name = string_field(item, "name")?;
-        if let Some(scene_id) = scene_ids.get(name).cloned()
-            && let Some(scene) = doc.scenes.get_mut(&scene_id)
+        let Some(scene_id) = scene_ids.get(name).cloned() else {
+            continue;
+        };
+        let cycles_hair_shadow_groups = parse_cycles_hair_shadow_groups(
+            item.get("cycles_hair_shadow_groups"),
+            &doc,
+            &scene_id,
+            &material_ids,
+            &object_ids,
+        )?;
+        let scene = doc
+            .scenes
+            .get_mut(&scene_id)
+            .ok_or_else(|| invalid_intermediate("Scene ID mapping is missing"))?;
+        scene.camera = item
+            .get("camera")
+            .and_then(Value::as_str)
+            .and_then(|camera_name| object_ids.get(camera_name))
+            .cloned();
+        scene.render.dicing_camera = match item
+            .get("render")
+            .and_then(|render| render.get("dicing_camera"))
         {
-            scene.camera = item
-                .get("camera")
-                .and_then(Value::as_str)
-                .and_then(|camera_name| object_ids.get(camera_name))
-                .cloned();
-            scene.render.dicing_camera = match item
-                .get("render")
-                .and_then(|render| render.get("dicing_camera"))
-            {
-                None | Some(Value::Null) => None,
-                Some(Value::String(camera_name)) => {
-                    Some(object_ids.get(camera_name).cloned().ok_or_else(|| {
-                        invalid_intermediate("render dicing_camera references a missing object")
-                    })?)
-                }
-                Some(_) => {
-                    return Err(invalid_intermediate(
-                        "render dicing_camera must be an object name or null",
-                    ));
-                }
-            };
-        }
+            None | Some(Value::Null) => None,
+            Some(Value::String(camera_name)) => {
+                Some(object_ids.get(camera_name).cloned().ok_or_else(|| {
+                    invalid_intermediate("render dicing_camera references a missing object")
+                })?)
+            }
+            Some(_) => {
+                return Err(invalid_intermediate(
+                    "render dicing_camera must be an object name or null",
+                ));
+            }
+        };
+        scene.cycles_hair_shadow_groups = cycles_hair_shadow_groups;
     }
     let mut generic_ids = BTreeMap::<String, BTreeMap<String, Id>>::new();
     for (collection, kind, prefix) in [("texts", "Text", "text")] {
@@ -7003,115 +7429,137 @@ fn import_hair_curves(
             mappings,
             "Curves",
         )?;
-        let raw_curves = optional_array(item, "curves")?;
-        let mut curves = Vec::with_capacity(raw_curves.len());
-        let mut point_count = 0_usize;
-        for raw_curve in raw_curves {
-            let points = array(raw_curve, "points")?
-                .iter()
-                .map(|point| {
-                    parse_vec3_value(point)
-                        .ok_or_else(|| invalid_intermediate("hair Curves point is invalid"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            point_count = point_count
-                .checked_add(points.len())
-                .ok_or_else(|| invalid_intermediate("hair Curves point count overflowed"))?;
-            curves.push(crate::model::HairCurve {
-                points,
-                radius: number_field(raw_curve, "radius", 0.0),
-            });
-        }
-        let curve_count = curves.len();
-        let mut attributes = BTreeMap::new();
-        for raw_attribute in optional_array(item, "attributes")? {
-            let attribute_name = string_field(raw_attribute, "name")?;
-            let domain = string_field(raw_attribute, "domain")?;
-            if !matches!(domain, "POINT" | "CURVE") {
-                return Err(invalid_intermediate(
-                    "hair Curves attribute has an unsupported domain",
-                ));
-            }
-            let data_type = string_field(raw_attribute, "data_type")?;
-            if data_type.is_empty() {
-                return Err(invalid_intermediate(
-                    "hair Curves attribute has an empty data type",
-                ));
-            }
-            let values = array(raw_attribute, "values")?;
-            let expected_count = if domain == "POINT" {
-                point_count
-            } else {
-                curve_count
-            };
-            if values.len() != expected_count {
-                return Err(invalid_intermediate(
-                    "hair Curves attribute value count does not match its domain",
-                ));
-            }
-            if attribute_name == "position" && domain == "POINT" {
-                continue;
-            }
-            if attributes
-                .insert(
-                    attribute_name.to_owned(),
-                    crate::model::HairCurveAttribute {
-                        domain: domain.to_owned(),
-                        data_type: data_type.to_owned(),
-                        values: values.to_vec(),
-                    },
-                )
-                .is_some()
-            {
-                return Err(invalid_intermediate(
-                    "hair Curves contains a duplicate attribute name",
-                ));
-            }
-        }
-        let selection_domain = match item
-            .get("selection_domain")
-            .and_then(Value::as_str)
-            .unwrap_or("POINT")
-        {
-            domain @ ("POINT" | "CURVE") => domain.to_owned(),
-            _ => {
-                return Err(invalid_intermediate(
-                    "hair Curves selection domain is invalid",
-                ));
-            }
-        };
+        let hair_curves = parse_hair_curves_data_payload(item, None)?;
         doc.data_blocks.insert(
             id,
             DataBlock {
                 data_type: "hair_curves".to_owned(),
-                hair_curves: Some(crate::model::HairCurvesData {
-                    curves,
-                    attributes,
-                    surface: None,
-                    surface_uv_map: item
-                        .get("surface_uv_map")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    use_mirror_x: item
-                        .get("use_mirror_x")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    use_mirror_y: item
-                        .get("use_mirror_y")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    use_mirror_z: item
-                        .get("use_mirror_z")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    selection_domain,
-                }),
+                hair_curves: Some(hair_curves),
                 ..DataBlock::default()
             },
         );
     }
     Ok(data_ids)
+}
+
+fn parse_hair_curves_data_payload(
+    raw: &Value,
+    object_ids: Option<&BTreeMap<String, Id>>,
+) -> Result<HairCurvesData> {
+    let raw_curves = optional_array(raw, "curves")?;
+    let mut curves = Vec::with_capacity(raw_curves.len());
+    let mut point_count = 0_usize;
+    for raw_curve in raw_curves {
+        let points = array(raw_curve, "points")?
+            .iter()
+            .map(|point| {
+                parse_vec3_value(point)
+                    .ok_or_else(|| invalid_intermediate("hair Curves point is invalid"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        point_count = point_count
+            .checked_add(points.len())
+            .ok_or_else(|| invalid_intermediate("hair Curves point count overflowed"))?;
+        curves.push(crate::model::HairCurve {
+            points,
+            radius: number_field(raw_curve, "radius", 0.0),
+        });
+    }
+    let curve_count = curves.len();
+    let mut attributes = BTreeMap::new();
+    for raw_attribute in optional_array(raw, "attributes")? {
+        let attribute_name = string_field(raw_attribute, "name")?;
+        let domain = string_field(raw_attribute, "domain")?;
+        if !matches!(domain, "POINT" | "CURVE") {
+            return Err(invalid_intermediate(
+                "hair Curves attribute has an unsupported domain",
+            ));
+        }
+        let data_type = string_field(raw_attribute, "data_type")?;
+        if data_type.is_empty() {
+            return Err(invalid_intermediate(
+                "hair Curves attribute has an empty data type",
+            ));
+        }
+        let values = array(raw_attribute, "values")?;
+        let expected_count = if domain == "POINT" {
+            point_count
+        } else {
+            curve_count
+        };
+        if values.len() != expected_count {
+            return Err(invalid_intermediate(
+                "hair Curves attribute value count does not match its domain",
+            ));
+        }
+        if attribute_name == "position" && domain == "POINT" {
+            continue;
+        }
+        if attributes
+            .insert(
+                attribute_name.to_owned(),
+                crate::model::HairCurveAttribute {
+                    domain: domain.to_owned(),
+                    data_type: data_type.to_owned(),
+                    values: values.to_vec(),
+                },
+            )
+            .is_some()
+        {
+            return Err(invalid_intermediate(
+                "hair Curves contains a duplicate attribute name",
+            ));
+        }
+    }
+    let selection_domain = match raw
+        .get("selection_domain")
+        .and_then(Value::as_str)
+        .unwrap_or("POINT")
+    {
+        domain @ ("POINT" | "CURVE") => domain.to_owned(),
+        _ => {
+            return Err(invalid_intermediate(
+                "hair Curves selection domain is invalid",
+            ));
+        }
+    };
+    let surface = match raw.get("surface") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => match object_ids {
+            Some(object_ids) => Some(object_ids.get(name).cloned().ok_or_else(|| {
+                invalid_intermediate("hair Curves surface references an unknown Object")
+            })?),
+            None => None,
+        },
+        Some(_) => {
+            return Err(invalid_intermediate(
+                "hair Curves surface must be an Object name or null",
+            ));
+        }
+    };
+    Ok(HairCurvesData {
+        curves,
+        attributes,
+        surface,
+        surface_uv_map: raw
+            .get("surface_uv_map")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        use_mirror_x: raw
+            .get("use_mirror_x")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        use_mirror_y: raw
+            .get("use_mirror_y")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        use_mirror_z: raw
+            .get("use_mirror_z")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        selection_domain,
+    })
 }
 
 fn register_blend_libraries(
@@ -12672,24 +13120,6 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 losses.push(loss(feature, name, reason));
             }
         }
-        let render = scene.get("render");
-        if render
-            .and_then(|render| render.get("engine"))
-            .and_then(Value::as_str)
-            == Some("realtime")
-            && let Some(resolution) = render
-                .and_then(|render| render.get("eevee_gi_cubemap_resolution"))
-                .and_then(Value::as_u64)
-                .filter(|resolution| *resolution != 512)
-        {
-            losses.push(loss(
-                "blender.scene.eevee.gi_cubemap_resolution",
-                name,
-                &format!(
-                    "Blender SceneEEVEE.gi_cubemap_resolution is {resolution}; Potter preserves only the default 512, which EEVEE captures at 256 texels (512 / 2), so this non-default setting is not restored"
-                ),
-            ));
-        }
     }
     for material in raw
         .get("materials")
@@ -14393,6 +14823,10 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             ),
         ));
     }
+    let has_blender_adapter = doc
+        .compatibility
+        .get("blender_adapter")
+        .is_some_and(Value::is_object);
     for (scene_id, scene) in &doc.scenes {
         if scene
             .world
@@ -14422,6 +14856,46 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                 "blender.render.engine",
                 Some(scene_id.as_str()),
                 "only path and realtime render engines are mapped by the adapter",
+            ));
+        }
+        if scene.render.engine == "realtime" && scene.render.eevee_gi_cubemap_resolution.is_none() {
+            losses.push(loss(
+                "blender.scene.eevee.gi_cubemap_resolution_unknown",
+                Some(scene_id.as_str()),
+                "The EEVEE sphere-probe capture resolution is unknown; Blender export would substitute its 512 default. Reimport the source .blend to recover the exact value or set eevee_gi_cubemap_resolution.",
+            ));
+        }
+
+        let hair_curves_in_scene = doc.nodes.iter().any(|(node_id, node)| {
+            node.kind == "hair_curves"
+                && node
+                    .data
+                    .as_ref()
+                    .and_then(|data_id| doc.data_blocks.get(data_id))
+                    .is_some_and(|data| data.hair_curves.is_some())
+                && collection_contains_object(doc, &scene.root_collection, node_id)
+        });
+        let shape_unknown = scene.render.cycles_curves_shape.is_none();
+        let subdivisions_unknown =
+            has_blender_adapter && scene.render.cycles_curves_subdivisions.is_none();
+        if hair_curves_in_scene && (shape_unknown || subdivisions_unknown) {
+            let missing_settings = match (shape_unknown, subdivisions_unknown) {
+                (true, true) => "shape and subdivisions",
+                (true, false) => "shape",
+                (false, true) => "subdivisions",
+                (false, false) => unreachable!(),
+            };
+            let recovery = if has_blender_adapter {
+                "Reimport the source .blend to recover the exact pair."
+            } else {
+                "Set cycles_curves_shape before export."
+            };
+            losses.push(loss(
+                "blender.cycles_curves.settings_unknown",
+                Some(scene_id.as_str()),
+                &format!(
+                    "Cycles curve settings ({missing_settings}) are unknown for hair in this scene; Blender export would use its defaults. {recovery}"
+                ),
             ));
         }
     }
@@ -16014,6 +16488,127 @@ mod tests {
     use super::*;
     use crate::model::{HairCurveAttribute, HairCurvesData};
     #[test]
+    fn cycles_hair_bridge_group_import_preserves_instance_context_and_evaluated_curves() {
+        let scene_id = Id::from_static("scene_main");
+        let object_id = Id::new("hair_object").unwrap();
+        let data_id = Id::new("hair_data").unwrap();
+        let material_id = Id::new("hair_material").unwrap();
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000012".to_owned());
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "hair_curves".to_owned(),
+                mesh: None,
+                hair_curves: Some(HairCurvesData {
+                    curves: vec![crate::model::HairCurve {
+                        points: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                        radius: 0.05,
+                    }],
+                    ..HairCurvesData::default()
+                }),
+                ..DataBlock::default()
+            },
+        );
+        doc.materials
+            .insert(material_id.clone(), Material::default());
+        doc.nodes.insert(
+            object_id.clone(),
+            Node {
+                name: "Hair".to_owned(),
+                kind: "hair_curves".to_owned(),
+                data: Some(data_id.clone()),
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .unwrap()
+            .objects
+            .push(object_id.clone());
+
+        let identity = json!([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ]);
+        let raw_groups = json!([{
+            "view_layer": "View Layer",
+            "geometry_key": {"kind": "data", "uses_source_data": true},
+            "representative": "Hair",
+            "member_nodes": ["Hair"],
+            "members": [{
+                "instance": {
+                    "real_object": "Hair",
+                    "parent": "Hair",
+                    "persistent_id": [0, 0, 0, 0, 0, 0, 0, 0],
+                    "is_instance": false,
+                    "use_particle_hair": false
+                },
+                "object_to_world": identity,
+                "object_color": [0.2, 0.3, 0.4, 1.0],
+                "object_pass_index": 22,
+                "object_random_id": -947_307_473,
+                "slot_0_material": "HairMaterial",
+                "ray_visibility": {
+                    "camera": true, "diffuse": true, "glossy": true,
+                    "transmission": true, "shadow": true, "volume_scatter": true
+                }
+            }],
+            "source_curve_indices": [0],
+            "evaluated_hair_curves": {
+                "curves": [{"points": [[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]], "radius": 0.1}],
+                "attributes": [{
+                    "name": "test_attr", "domain": "CURVE", "data_type": "FLOAT", "values": [0.75]
+                }],
+                "surface": null,
+                "surface_uv_map": "",
+                "use_mirror_x": false,
+                "use_mirror_y": false,
+                "use_mirror_z": false,
+                "selection_domain": "POINT"
+            }
+        }]);
+        let object_ids = BTreeMap::from([("Hair".to_owned(), object_id)]);
+        let material_ids = BTreeMap::from([("HairMaterial".to_owned(), material_id.clone())]);
+        let groups = parse_cycles_hair_shadow_groups(
+            Some(&raw_groups),
+            &doc,
+            &scene_id,
+            &material_ids,
+            &object_ids,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].geometry_key,
+            CyclesHairShadowGeometryKey::Data {
+                data_id: Some(data_id)
+            }
+        );
+        assert_eq!(groups[0].members[0].object_pass_index, 22);
+        assert_eq!(groups[0].members[0].object_random_id, -947_307_473);
+        assert_eq!(groups[0].members[0].slot_0_material_id, Some(material_id));
+        assert_eq!(
+            groups[0].evaluated_hair_curves.as_ref().unwrap().curves[0].points[1],
+            [0.0, 0.0, 2.0]
+        );
+        assert_eq!(groups[0].source_curve_indices, Some(vec![0]));
+        assert!(
+            groups[0]
+                .source_input_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| fingerprint.starts_with("sha256:"))
+        );
+        doc.scenes
+            .get_mut(&scene_id)
+            .unwrap()
+            .cycles_hair_shadow_groups = Some(groups);
+        doc.validate().unwrap();
+    }
+
+    #[test]
     fn nla_import_preserves_influence_flag_and_curves() {
         let mappings = BTreeMap::new();
         let static_disabled = json!({"properties": {
@@ -17138,6 +17733,78 @@ mod tests {
         ));
     }
     #[test]
+    fn intermediate_validates_cycles_curve_shape_and_subdivisions() {
+        let mut intermediate = json!({
+            "bridge_version": 2,
+            "blender_version": "5.2.2",
+            "file_version": [5, 2, 2],
+            "scenes": [{
+                "render": {
+                    "cycles_curves_shape": "ribbons",
+                    "cycles_curves_subdivisions": 0
+                }
+            }],
+            "collections": [],
+            "objects": [],
+            "meshes": [],
+            "materials": [],
+            "cameras": [],
+            "lights": [],
+            "actions": [],
+            "texts": [],
+            "node_groups": [],
+            "other_datablocks": [],
+            "unused_datablocks": []
+        });
+        intermediate["scenes"][0]["render"] = json!({});
+
+        assert!(validate_intermediate(&intermediate).is_ok());
+        intermediate["scenes"][0]["render"] = json!({
+            "cycles_curves_shape": null,
+            "cycles_curves_subdivisions": null
+        });
+        assert!(validate_intermediate(&intermediate).is_ok());
+        for (shape, subdivisions) in [("ribbons", 0), ("thick", 2), ("thick_linear", 24)] {
+            intermediate["scenes"][0]["render"]["cycles_curves_shape"] = json!(shape);
+            intermediate["scenes"][0]["render"]["cycles_curves_subdivisions"] = json!(subdivisions);
+            assert!(validate_intermediate(&intermediate).is_ok());
+        }
+        intermediate["scenes"][0]["render"]["cycles_curves_shape"] = json!("bad");
+        assert!(validate_intermediate(&intermediate).is_err());
+        intermediate["scenes"][0]["render"]["cycles_curves_shape"] = json!("thick");
+        intermediate["scenes"][0]["render"]["cycles_curves_subdivisions"] = json!(25);
+        assert!(validate_intermediate(&intermediate).is_err());
+    }
+    #[test]
+    fn intermediate_validates_eevee_cubemap_resolution_enum() {
+        let mut intermediate = json!({
+            "bridge_version": 2,
+            "blender_version": "5.2.2",
+            "file_version": [5, 2, 2],
+            "scenes": [{"render": {}}],
+            "collections": [],
+            "objects": [],
+            "meshes": [],
+            "materials": [],
+            "cameras": [],
+            "lights": [],
+            "actions": [],
+            "texts": [],
+            "node_groups": [],
+            "other_datablocks": [],
+            "unused_datablocks": []
+        });
+        intermediate["scenes"][0]["render"]["eevee_gi_cubemap_resolution"] = Value::Null;
+        assert!(validate_intermediate(&intermediate).is_ok());
+        for resolution in crate::model::EEVEE_GI_CUBEMAP_RESOLUTIONS {
+            intermediate["scenes"][0]["render"]["eevee_gi_cubemap_resolution"] = json!(resolution);
+            assert!(validate_intermediate(&intermediate).is_ok(), "{resolution}");
+        }
+        intermediate["scenes"][0]["render"]["eevee_gi_cubemap_resolution"] = json!(2049);
+        assert!(validate_intermediate(&intermediate).is_err());
+    }
+
+    #[test]
     fn intermediate_uv_layers_become_storage_values_with_active_and_render_layers() -> Result<()> {
         let item = json!({
             "vertices": [{"co": [0.0, 0.0, 0.0]}, {"co": [1.0, 0.0, 0.0]}, {"co": [1.0, 1.0, 0.0]}, {"co": [0.0, 1.0, 0.0]}],
@@ -17449,7 +18116,8 @@ mod tests {
                 "display_shading": {"type": "SOLID", "light": "STUDIO", "studio_light": "Default", "color_type": "MATERIAL", "use_world_space_lighting": false, "show_specular_highlight": true, "show_cavity": false, "show_shadows": false, "show_object_outline": false, "show_backface_culling": false, "show_xray": false, "xray_alpha": 0.5, "use_dof": false, "camera_dof": false, "background_type": "THEME"},
                 "render": {"resolution_x": 640, "resolution_y": 360, "resolution_percentage": 100,
                            "samples": 12, "seed": 5, "film_transparent": false, "engine": "path",
-                           "engine_native": "CYCLES"},
+                           "engine_native": "CYCLES", "cycles_curves_shape": "thick",
+                           "cycles_curves_subdivisions": 2},
                 "view_layers": [{"name": "View Layer", "excluded_collections": []}]
             }],
             "collections": [{
@@ -17718,7 +18386,7 @@ mod tests {
                 "frame_current":1.0,"frame_start":1,"frame_end":250,"fps":24,"fps_base":1.0,
                 "camera":null,"world":null,"unit":{"system":"METRIC","scale_length":1.0},
                 "display_shading":{"type":"SOLID","light":"STUDIO","studio_light":"Default","color_type":"MATERIAL","use_world_space_lighting":false,"show_specular_highlight":true,"show_cavity":false,"show_shadows":false,"show_object_outline":false,"show_backface_culling":false,"show_xray":false,"xray_alpha":0.5,"use_dof":false,"camera_dof":false,"background_type":"THEME"},
-                "render":{},"view_layers":[{"name":"View Layer","excluded_collections":[]}],
+                "render":{"cycles_curves_shape":"thick","cycles_curves_subdivisions":2},
                 "markers":[{"name":"Marker","frame":12.0}],
                 "rigid_body_world":{"enabled":true,"gravity":[0.0,0.0,-9.81],
                     "substeps":4,"solver_iterations":10,"frame_start":1,"frame_end":250,"seed":3}
@@ -18259,6 +18927,82 @@ mod tests {
                 "sharp_face presence after a .blend round trip"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn blender_roundtrip_preserves_cycles_curve_shape_and_subdivisions() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let scene_id = Id::from_static("scene_main");
+        for (index, (shape, expected)) in [
+            (CyclesCurveShape::Ribbons, "ribbons"),
+            (CyclesCurveShape::Thick, "thick"),
+            (CyclesCurveShape::ThickLinear, "thick_linear"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut doc = roundtrip_scene()?;
+            let scene = doc
+                .scenes
+                .get_mut(&scene_id)
+                .ok_or_else(|| invalid_intermediate("roundtrip scene is missing"))?;
+            scene.render.cycles_curves_shape = Some(shape);
+            scene.render.cycles_curves_subdivisions = Some(2);
+            let output = directory
+                .path()
+                .join(format!("cycles-curves-{index}.blend"));
+            let context = crate::eval::EvaluationContext::default();
+            let options = ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            };
+            export_blend(&doc, &project, &output, &options)?;
+            let imported = import_blend(&output, Some(&blender))?;
+            let render = &imported.doc.scenes[&scene_id].render;
+            assert_eq!(render.cycles_curves_shape, Some(shape), "{expected}");
+            assert_eq!(render.cycles_curves_subdivisions, Some(2), "{expected}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blender_roundtrip_preserves_nondefault_eevee_probe_resolution() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let scene_id = Id::from_static("scene_main");
+        let mut doc = roundtrip_scene()?;
+        let scene = doc
+            .scenes
+            .get_mut(&scene_id)
+            .ok_or_else(|| invalid_intermediate("roundtrip scene is missing"))?;
+        scene.render.engine = "realtime".to_owned();
+        scene.render.eevee_gi_cubemap_resolution = Some(1024);
+        let output = directory.path().join("eevee-probe-1024.blend");
+        let context = crate::eval::EvaluationContext::default();
+        let options = ExportOptions {
+            allow_lossy: false,
+            pack: false,
+            blender: Some(&blender),
+            context: &context,
+        };
+        export_blend(&doc, &project, &output, &options)?;
+        let imported = import_blend(&output, Some(&blender))?;
+        assert_eq!(
+            imported.doc.scenes[&scene_id]
+                .render
+                .eevee_gi_cubemap_resolution,
+            Some(1024)
+        );
         Ok(())
     }
 
@@ -24881,6 +25625,106 @@ print("UNSUPPORTED_POSE " + json.dumps({
     }
 
     #[test]
+    fn blender_export_reports_unknown_realtime_probe_resolution_without_fabricating_it() {
+        let scene_id = Id::from_static("scene_main");
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let scene = doc.scenes.get_mut(&scene_id).expect("default scene");
+        scene.render.engine = "realtime".to_owned();
+        scene.render.eevee_gi_cubemap_resolution = None;
+        let unknown = export_losses(&doc)
+            .into_iter()
+            .find(|loss| loss.feature_id == "blender.scene.eevee.gi_cubemap_resolution_unknown")
+            .expect("unknown realtime probe resolution is an export loss");
+        assert_eq!(unknown.data_id.as_deref(), Some("scene_main"));
+        assert!(unknown.reason.contains("512 default"));
+
+        {
+            let scene = doc.scenes.get_mut(&scene_id).expect("default scene");
+            scene.render.engine = "path".to_owned();
+        }
+        assert!(export_losses(&doc).iter().all(|loss| {
+            loss.feature_id != "blender.scene.eevee.gi_cubemap_resolution_unknown"
+        }));
+        {
+            let scene = doc.scenes.get_mut(&scene_id).expect("default scene");
+            scene.render.engine = "realtime".to_owned();
+            scene.render.eevee_gi_cubemap_resolution = Some(1024);
+        }
+        assert!(export_losses(&doc).iter().all(|loss| {
+            loss.feature_id != "blender.scene.eevee.gi_cubemap_resolution_unknown"
+        }));
+    }
+
+    #[test]
+    fn blender_export_reports_unknown_curve_settings_only_for_hair_scenes() {
+        let scene_id = Id::from_static("scene_main");
+        let hair_id = Id::from_static("hair_data");
+        let hair_node_id = Id::from_static("hair_object");
+        let mut imported = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        imported
+            .compatibility
+            .insert("blender_adapter".to_owned(), json!({}));
+        imported.data_blocks.insert(
+            hair_id.clone(),
+            DataBlock {
+                data_type: "hair_curves".to_owned(),
+                mesh: None,
+                hair_curves: Some(HairCurvesData::default()),
+                ..DataBlock::default()
+            },
+        );
+        imported.nodes.insert(
+            hair_node_id.clone(),
+            Node {
+                kind: "hair_curves".to_owned(),
+                data: Some(hair_id),
+                ..Node::default()
+            },
+        );
+        imported
+            .collections
+            .get_mut(&Id::from_static("collection_root"))
+            .expect("root collection")
+            .objects
+            .push(hair_node_id);
+        let scene = imported.scenes.get_mut(&scene_id).expect("default scene");
+        scene.render.cycles_curves_shape = None;
+        scene.render.cycles_curves_subdivisions = None;
+
+        let unknown = export_losses(&imported)
+            .into_iter()
+            .find(|loss| loss.feature_id == "blender.cycles_curves.settings_unknown")
+            .expect("unknown imported hair settings are an export loss");
+        assert_eq!(unknown.data_id.as_deref(), Some("scene_main"));
+        assert!(unknown.reason.contains("shape and subdivisions"));
+        assert!(unknown.reason.contains("Reimport"));
+
+        let mut no_hair = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        no_hair
+            .compatibility
+            .insert("blender_adapter".to_owned(), json!({}));
+        let scene = no_hair.scenes.get_mut(&scene_id).expect("default scene");
+        scene.render.cycles_curves_shape = None;
+        scene.render.cycles_curves_subdivisions = None;
+        assert!(
+            export_losses(&no_hair)
+                .iter()
+                .all(|loss| loss.feature_id != "blender.cycles_curves.settings_unknown")
+        );
+
+        let mut native = imported;
+        native.compatibility.remove("blender_adapter");
+        let scene = native.scenes.get_mut(&scene_id).expect("default scene");
+        scene.render.cycles_curves_shape = Some(CyclesCurveShape::Thick);
+        scene.render.cycles_curves_subdivisions = None;
+        assert!(
+            export_losses(&native)
+                .iter()
+                .all(|loss| loss.feature_id != "blender.cycles_curves.settings_unknown")
+        );
+    }
+
+    #[test]
     fn export_losses_report_unknown_shader_mappings_with_node_ids() -> Result<()> {
         let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
         let graph_id = Id::new("shader_graph")?;
@@ -25843,7 +26687,7 @@ mod workbench_display_loss_tests {
         );
     }
     #[test]
-    fn eevee_cubemap_resolution_reports_only_nondefault_values() {
+    fn eevee_cubemap_resolution_is_no_longer_an_import_loss() {
         let raw = |resolution| {
             json!({
                 "scenes": [{
@@ -25856,23 +26700,15 @@ mod workbench_display_loss_tests {
                 }]
             })
         };
-        let feature_id = "blender.scene.eevee.gi_cubemap_resolution";
-        assert!(
-            !import_losses(&raw(512))
-                .iter()
-                .any(|loss| loss.feature_id == feature_id)
-        );
-        let losses = import_losses(&raw(1024));
-        assert!(losses.iter().any(|loss| {
-            loss.feature_id == feature_id && loss.data_id.as_deref() == Some("Scene")
-        }));
+        for resolution in [128, 256, 512, 1024, 2048, 4096] {
+            assert!(
+                import_losses(&raw(resolution)).is_empty(),
+                "exact enum value {resolution} is supported"
+            );
+        }
         let mut path_scene = raw(1024);
         path_scene["scenes"][0]["render"]["engine"] = json!("path");
-        assert!(
-            !import_losses(&path_scene)
-                .iter()
-                .any(|loss| loss.feature_id == feature_id)
-        );
+        assert!(import_losses(&path_scene).is_empty());
     }
 }
 

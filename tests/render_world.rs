@@ -318,15 +318,22 @@ fn constant_white_environment_lights_a_diffuse_sphere_without_channel_tint()
 }
 
 #[test]
-fn homogeneous_volume_cube_transmittance_matches_beer_lambert() -> Result<(), Box<dyn Error>> {
+fn homogeneous_absorbing_volume_cube_transmittance_matches_beer_lambert()
+-> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let density = 0.7_f64;
     let scene = directory.path().join("scene");
-    let mut operations = vec![json!({
-    "op":"volume.create","id":"fog","grids":[{
-        "dims":[2,2,2],"voxel_size":1.0,"origin":[-0.5,-0.5,-0.5],
-        "values":[density,density,density,density,density,density,density,density]
-    }]})];
+    let mut operations = vec![
+        json!({"op":"graph.create","id":"absorption_graph","kind":"shader"}),
+        json!({"op":"graph.node_add","graph":"absorption_graph","id":"output","type":"ShaderNodeOutputMaterial"}),
+        json!({"op":"graph.node_add","graph":"absorption_graph","id":"volume","type":"ShaderNodeVolumePrincipled","inputs":{"Density":1.0,"Color":[0.0,0.0,0.0,1.0],"Anisotropy":0.0}}),
+        json!({"op":"graph.link","graph":"absorption_graph","from_node":"volume","from_socket":"Volume","to_node":"output","to_socket":"Volume"}),
+        json!({"op":"material.create","id":"fog_absorption","graph":"absorption_graph"}),
+        json!({"op":"volume.create","id":"fog","materials":["fog_absorption"],"grids":[{
+            "dims":[2,2,2],"voxel_size":1.0,"origin":[-0.5,-0.5,-0.5],
+            "values":[density,density,density,density,density,density,density,density]
+        }]}),
+    ];
     append_camera_and_render(
         &mut operations,
         &json!({"translation":[0.0,0.0,3.0]}),
@@ -355,6 +362,36 @@ fn homogeneous_volume_cube_transmittance_matches_beer_lambert() -> Result<(), Bo
     assert!(
         (measured_transmittance - blender).abs() <= 3.0 * blender_error,
         "2x2x2 grid of density {density}: Potter transmits {measured_transmittance}, Blender {blender} +- {blender_error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn accepted_grid_volume_scatter_clears_transparent_background() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    let density = 0.7_f64;
+    let mut operations = vec![json!({
+        "op":"volume.create","id":"fog","grids":[{
+            "dims":[2,2,2],"voxel_size":1.0,"origin":[-0.5,-0.5,-0.5],
+            "values":[density,density,density,density,density,density,density,density]
+        }]
+    })];
+    append_camera_and_render(
+        &mut operations,
+        &json!({"translation":[0.0,0.0,3.0]}),
+        &json!({"projection":"orthographic","ortho_scale":2.0}),
+        &json!({"resolution_x":24,"resolution_y":24,"samples":1,"seed":0,"max_bounces":0,"film_transparent":true}),
+        None,
+    );
+    make_scene(&scene, &operations)?;
+
+    let (width, height, pixels) =
+        render_png(&scene, &directory.path().join("render"), Some("path"))?;
+    assert_eq!(
+        pixel(&pixels, width, height, width / 2, height / 2)?[3],
+        255,
+        "an accepted volume-scatter event must clear background transparency"
     );
     Ok(())
 }

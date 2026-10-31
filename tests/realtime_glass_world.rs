@@ -11,14 +11,14 @@
 //!
 //! EEVEE's pixels are the committed macOS arm64 render (`fixtures/native_oracle/eevee_macos/`, made by Blender 5.2.2 on
 //! macOS; see its `MANIFEST.json`), not a live render, so the test has no platform term. Every pixel whose centre lies
-//! within 0.75 of a sphere's radius is compared with the committed pixel at the same UV.
+//! within 0.75 of a sphere's radius is paired with the committed pixel at the same physical location. Blender's EXR rows
+//! are bottom-up while the loaded Potter image stores top-down rows, so the Potter sampler uses `1 - oracle_v`.
+//! Potter renders the same 64 EEVEE TAA samples as Blender because G-buffer closure packing is dithered per sample.
 //!
-//! The tolerance per sphere is the model bound alone: the largest deviation of the Python mirror over the world
-//! (`fixtures/native_oracle/eevee_glass_world_mirror.py`, which reads the world through the render's 64-texel cube-map
-//! probe, as Potter does) from the committed render, rounded up. Those are clear 0.01049 (bound 1.1e-2), tinted 0.00341
-//! (3.5e-3) and rough 0.01038 (1.1e-2). The worst clear and rough pixels sit on the probe's 5-bit blue truncation and its
-//! texel edges, where EEVEE and the model both sample a texel. The same mirror with a single refraction event (a thin
-//! object) gives 0.062 (clear), 0.187 (tinted) and 0.059 (rough), far outside the bounds.
+//! The unchanged capture bounds were derived from a historical Python mirror
+//! (`fixtures/native_oracle/eevee_glass_world_mirror.py`) of the former fixed 64-face nearest-texel probe path.
+//! That script remains a diagnostic for the original capture, not a model of the current realtime probe: EEVEE uses the
+//! scene's `gi_cubemap_resolution / 2` capture and its filtered half-float mip atlas. Captures and bounds are unchanged.
 //!
 //! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
 
@@ -99,7 +99,7 @@ fn realtime_glass_world_transmission_matches_eevee() -> TestResult {
         json!([
             {"op": "camera.create", "id": "camera_main", "transform": {"translation": [0.0, 0.0, 10.0]}, "projection": "orthographic", "ortho_scale": ORTHO_SCALE},
             {"op": "scene.update", "target": {"id": active}, "set": {"camera": "camera_main"}},
-            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": SIZE, "resolution_y": SIZE, "samples": 1, "seed": 0}}
+            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": SIZE, "resolution_y": SIZE, "samples": 64, "seed": 0}}
         ]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
@@ -215,12 +215,13 @@ fn worst_deviation(
                 continue;
             }
             count += 1;
-            let uv = [
+            let oracle_uv = [
                 (f64::from(column) + 0.5) / size,
                 (f64::from(row) + 0.5) / size,
             ];
+            let potter_uv = [oracle_uv[0], 1.0 - oracle_uv[1]];
             let wanted = eevee[(row * SIZE + column) as usize];
-            let rgba = sample(data, uv, false);
+            let rgba = sample(data, potter_uv, false);
             let actual = [rgba[0], rgba[1], rgba[2]];
             let deviation = actual
                 .iter()
@@ -230,7 +231,7 @@ fn worst_deviation(
             if deviation > worst.max {
                 worst = Deviation {
                     max: deviation,
-                    uv,
+                    uv: oracle_uv,
                     actual,
                     wanted,
                 };

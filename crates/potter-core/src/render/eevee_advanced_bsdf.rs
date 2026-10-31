@@ -12,7 +12,7 @@
 //! - `node_shader_holdout.cc`, `gpu_shader_material_holdout.glsl`, `eevee_surf_forward.bsl.hh`, and
 //!   `eevee_forward_resolve.bsl.hh` for holdout alpha/transmittance separation.
 
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::PI;
 
 use glam::DVec3;
 
@@ -20,7 +20,7 @@ use super::eevee_transmission::Thickness;
 use crate::shader::{BsdfModel, BsdfParams, MetallicFresnel, ShaderClosure, SubsurfaceMethod};
 
 const SSS_SAMPLE_COUNT: usize = 16;
-const SSS_BURLEY_TRUNCATE_CDF: f32 = 0.996_379;
+const SSS_BURLEY_TRUNCATE_CDF: f64 = 0.996_379_009_370_832_8;
 const SSS_BURLEY_TRUNCATE: f32 = 16.0;
 const SSS_MIN_RADIUS: f32 = 1.0e-4;
 const RADIANCE_MANTISSA_BITS: [u32; 3] = [6, 6, 5];
@@ -34,6 +34,8 @@ pub(crate) struct EeveeSubsurfaceSample {
     pub(crate) closures: [Option<EeveeSubsurfaceClosure>; MAX_EEVEE_SUBSURFACE_CLOSURES],
     pub(crate) direct: [f32; 3],
     pub(crate) indirect: [f32; 3],
+    /// Apply G-buffer color association after the screen-space convolution.
+    pub(crate) association_scale: f64,
     pub(crate) object_index: u32,
     pub(crate) depth: f64,
     pub(crate) split_radiance: bool,
@@ -90,6 +92,19 @@ struct ProfileSample {
     pdf_inverse: f32,
 }
 
+#[derive(Clone, Copy)]
+struct SubsurfaceResolveStack<'a> {
+    samples: &'a [Option<EeveeSubsurfacePixel>],
+    frame: EeveeSubsurfaceFrame,
+    sample_locations: &'a [ProfileSample; SSS_SAMPLE_COUNT],
+    pixel_jitter: [f64; 2],
+    eye_start: usize,
+    eye_width: usize,
+    height: usize,
+    y: usize,
+    local_x: usize,
+}
+
 #[derive(Clone, Copy, Default)]
 struct NeighborhoodSample {
     radiance: [f32; 3],
@@ -128,15 +143,19 @@ pub(crate) fn eevee_metallic_fresnel(params: &BsdfParams) -> Option<([f64; 3], [
     ))
 }
 
-/// EEVEE's `brdf_f82_tint_lut`: the view-dependent metallic reflectance used by direct and probe lighting.
-pub(crate) fn eevee_metallic_brdf(
-    params: &BsdfParams,
-    normal: DVec3,
-    view: DVec3,
-) -> Option<DVec3> {
-    let (f0, f82) = eevee_metallic_fresnel(params)?;
-    let n_dot_v = normal.dot(view).clamp(0.0, 1.0);
-    let roughness = params.roughness.clamp(0.0, 1.0);
+/// EEVEE's `brdf_f82_tint_lut`, with the explicit Fresnel inputs shared by Metallic and Principled.
+///
+/// `f0` and `f82` are already clamped as their node does before calling the LUT. The result is the node-stage closure
+/// color before G-buffer packing; callers apply the G-buffer color roundtrip separately.
+pub(crate) fn eevee_brdf_f82_tint_lut(
+    f0: DVec3,
+    f82: DVec3,
+    cos_theta: f64,
+    roughness: f64,
+    do_multiscatter: bool,
+) -> DVec3 {
+    let n_dot_v = cos_theta.clamp(0.0, 1.0);
+    let roughness = roughness.clamp(0.0, 1.0);
     let scale = metallic_brdf_channel(0, roughness, n_dot_v);
     let bias = metallic_brdf_channel(1, roughness, n_dot_v);
     let metal_bias = metallic_brdf_channel(2, roughness, n_dot_v);
@@ -145,26 +164,45 @@ pub(crate) fn eevee_metallic_brdf(
         let f: f64 = 6.0 / 7.0;
         (f.powi(5), f.powi(6))
     };
-    let f_schlick = DVec3::from_array(f0).lerp(DVec3::ONE, f5);
-    let f82_tint = f_schlick * (7.0 / f6) * (DVec3::ONE - DVec3::from_array(f82));
-    let mut reflectance = DVec3::from_array(f0) * scale + DVec3::splat(bias);
-    if let BsdfModel::Metallic(metallic) = params.model
-        && metallic.distribution == crate::shader::MicrofacetDistribution::MultiGgx
-    {
+    let f_schlick = f0.lerp(DVec3::ONE, f5);
+    let f82_tint = f_schlick * (7.0 / f6) * (DVec3::ONE - f82);
+    let mut reflectance = f0 * scale + DVec3::splat(bias);
+    if do_multiscatter {
         let ess = scale + bias;
         let ems = 1.0 - ess;
-        let f_avg = DVec3::from_array(f0) + (DVec3::ONE - DVec3::from_array(f0)) / 21.0;
+        let f_avg = f0 + (DVec3::ONE - f0) / 21.0;
         reflectance /= DVec3::ONE - f_avg * ems;
     }
-    Some(reflectance - f82_tint * metal_bias)
+    reflectance - f82_tint * metal_bias
+}
+
+/// The view-dependent metallic reflectance used by direct and probe lighting.
+pub(crate) fn eevee_metallic_brdf(
+    params: &BsdfParams,
+    normal: DVec3,
+    view: DVec3,
+) -> Option<DVec3> {
+    let (f0, f82) = eevee_metallic_fresnel(params)?;
+    let do_multiscatter = matches!(
+        params.model,
+        BsdfModel::Metallic(metallic)
+            if metallic.distribution == crate::shader::MicrofacetDistribution::MultiGgx
+    );
+    Some(eevee_brdf_f82_tint_lut(
+        DVec3::from_array(f0),
+        DVec3::from_array(f82),
+        normal.dot(view),
+        params.roughness,
+        do_multiscatter,
+    ))
 }
 
 fn metallic_brdf_channel(channel: usize, roughness: f64, n_dot_v: f64) -> f64 {
-    use super::eevee_transmission::{blend, texel_weights};
+    use super::eevee_transmission::{blend, texel_weights, utility_texel};
 
     let (x0, x1, fx) = texel_weights(roughness);
     let (y0, y1, fy) = texel_weights((1.0 - n_dot_v).sqrt());
-    let texel = |x, y| super::eevee_transmission_tables::brdf(x, y, channel);
+    let texel = |x, y| utility_texel(super::eevee_transmission_tables::brdf(x, y, channel));
     blend(
         blend(texel(x0, y0), texel(x1, y0), fx),
         blend(texel(x0, y1), texel(x1, y1), fx),
@@ -173,10 +211,6 @@ fn metallic_brdf_channel(channel: usize, roughness: f64, n_dot_v: f64) -> f64 {
 }
 
 /// `fresnel_conductor` from `gpu_shader_material_metallic.glsl`.
-#[expect(
-    clippy::manual_midpoint,
-    reason = "Blender's metallic node averages the two Fresnel polarizations with this exact expression"
-)]
 fn conductor_fresnel(cosine: f64, ior: [f64; 3], extinction: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|channel| {
         let eta = ior[channel];
@@ -187,23 +221,27 @@ fn conductor_fresnel(cosine: f64, ior: [f64; 3], extinction: [f64; 3]) -> [f64; 
         let tmp = eta2_k2 * cos2;
         let parallel = (tmp - two_eta_cos + 1.0) / (tmp + two_eta_cos + 1.0);
         let perpendicular = (eta2_k2 - two_eta_cos + cos2) / (eta2_k2 + two_eta_cos + cos2);
-        0.5 * (parallel + perpendicular)
+        parallel.midpoint(perpendicular)
     })
 }
 
+fn f64_is_zero(value: f64) -> bool {
+    value == 0.0
+}
+
+fn f64_is_one(value: f64) -> bool {
+    value.to_bits() == 1.0_f64.to_bits()
+}
+
 /// EEVEE's Principled and standalone Subsurface radius, including its legacy `4π` random-walk factor.
-#[expect(
-    clippy::float_cmp,
-    reason = "Blender's Principled subsurface gate compares these weights exactly against one"
-)]
 pub(crate) fn eevee_subsurface_radius(params: &BsdfParams) -> Option<[f64; 3]> {
     let has_subsurface = match params.model {
         BsdfModel::Subsurface => true,
         BsdfModel::Principled => {
-            params.subsurface_weight != 0.0
+            !f64_is_zero(params.subsurface_weight)
                 && !params.thin_wall
-                && (params.sheen_weight != 0.0
-                    || (params.metallic != 1.0 && params.transmission != 1.0))
+                && (!f64_is_zero(params.sheen_weight)
+                    || (!f64_is_one(params.metallic) && !f64_is_one(params.transmission)))
         }
         _ => false,
     };
@@ -221,14 +259,27 @@ pub(crate) fn eevee_subsurface_radius(params: &BsdfParams) -> Option<[f64; 3]> {
             .map(|radius| (radius * params.subsurface_scale * scale).max(0.0)),
     )
 }
-/// EEVEE's SSS profile after its G-buffer `UNORM_10_10_10_2` pack/unpack round trip.
+/// The source inputs to `eevee::gbuffer::closure_data_layer_dither_round_to_nearest`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EeveeGBufferContext {
+    /// `frag_co.xy`: pixel coordinates including the half-pixel center.
+    pub(crate) frag_coord: [f32; 2],
+    /// `sampling.rng_3D_get(SAMPLING_GBUFFER_U)`: Halton bases 11, 13 and 17 at sample + 1.
+    pub(crate) sample_offset: [f32; 3],
+    /// The closure-data storage layer, not the closure bin/layer index.
+    pub(crate) data_layer: u32,
+}
+
+/// EEVEE's SSS profile after each of its G-buffer `UNORM_10_10_10_2` store/resolve stages.
 pub(crate) fn eevee_subsurface_gbuffer_profile(
     color: [f64; 3],
     radius: [f64; 3],
+    color_context: EeveeGBufferContext,
+    radius_context: EeveeGBufferContext,
 ) -> ([f32; 3], [f32; 3]) {
-    let color = closure_color_roundtrip(color.map(|value| value as f32));
+    let color = closure_color_roundtrip(color.map(|value| value as f32), color_context);
     let radius = radius.map(|value| ior_pack(value as f32));
-    let radius = closure_color_roundtrip(radius).map(ior_unpack);
+    let radius = closure_color_roundtrip(radius, radius_context).map(ior_unpack);
     (color, radius)
 }
 
@@ -261,7 +312,28 @@ pub(crate) fn eevee_gbuffer_normal(normal: DVec3) -> DVec3 {
     )
 }
 
-fn closure_color_roundtrip(color: [f32; 3]) -> [f32; 3] {
+/// EEVEE's G-buffer `closure_color_pack` roundtrip for a closure color stored at this data layer.
+pub(crate) fn eevee_gbuffer_closure_color(color: DVec3, context: EeveeGBufferContext) -> DVec3 {
+    DVec3::from_array(
+        closure_color_roundtrip(color.to_array().map(|value| value as f32), context).map(f64::from),
+    )
+}
+
+/// EEVEE's G-buffer roundtrip for a reflection or refraction's normalized roughness.
+pub(crate) fn eevee_gbuffer_roughness(value: f64, context: EeveeGBufferContext) -> f64 {
+    f64::from(eevee_gbuffer_unorm10(value as f32, 0, context))
+}
+
+/// EEVEE's G-buffer roundtrip for a refraction IOR stored in data component 1.
+pub(crate) fn eevee_gbuffer_ior(value: f64, context: EeveeGBufferContext) -> f64 {
+    f64::from(ior_unpack(eevee_gbuffer_unorm10(
+        ior_pack(value as f32),
+        1,
+        context,
+    )))
+}
+
+fn closure_color_roundtrip(color: [f32; 3], context: EeveeGBufferContext) -> [f32; 3] {
     let maximum = color[0].max(color[1]).max(color[2]);
     let exponent = if maximum > 4.0 {
         3
@@ -271,18 +343,46 @@ fn closure_color_roundtrip(color: [f32; 3]) -> [f32; 3] {
         i32::from(maximum > 1.0)
     };
     let scale = 2.0_f32.powi(exponent);
-    color.map(|value| quantize_unorm(value / scale, 1023) * scale)
+    std::array::from_fn(|component| {
+        eevee_gbuffer_unorm10(color[component] / scale, component, context) * scale
+    })
 }
 
-#[expect(
-    clippy::float_cmp,
-    reason = "EEVEE's G-buffer radius codec preserves IOR 1.0 with an exact sentinel"
-)]
+/// EEVEE's dithered UNORM10 roundtrip for one G-buffer data component.
+pub(crate) fn eevee_gbuffer_unorm10(
+    value: f32,
+    component: usize,
+    context: EeveeGBufferContext,
+) -> f32 {
+    let noise = gbuffer_dither_noise(component, context);
+    let step = 1.0_f32 / 1023.0;
+    let value = if context.data_layer < 2 {
+        (value + (noise - 0.5) * step).clamp(0.0, 1.0) * 1023.0
+    } else {
+        (value + noise * step).clamp(0.0, 1.0) * 1023.0
+    };
+    if context.data_layer < 2 {
+        value.round() / 1023.0
+    } else {
+        value.floor() / 1023.0
+    }
+}
+
+fn gbuffer_dither_noise(component: usize, context: EeveeGBufferContext) -> f32 {
+    let seed = context.data_layer as f32 * 3.0 + component as f32;
+    let pixel = [
+        context.frag_coord[0] + seed * (47.0 * 0.695),
+        context.frag_coord[1] + seed * (17.0 * 0.695),
+    ];
+    let noise = (0.067_110_56 * pixel[0] + 0.005_837_15 * pixel[1]).fract();
+    (context.sample_offset[component] + 52.982_92 * noise).fract()
+}
+
 fn ior_pack(value: f32) -> f32 {
     const SCALE: f32 = 511.0 / 1023.0;
     const ONE: f32 = 512.0 / 1023.0;
     const BIAS: f32 = 510.0 / 1023.0;
-    if value == 1.0 {
+    if value.to_bits() == 1.0_f32.to_bits() {
         ONE
     } else if value > 1.0 {
         1.0 - BIAS / value
@@ -295,7 +395,7 @@ fn ior_unpack(value: f32) -> f32 {
     const SCALE: f32 = 511.0 / 1023.0;
     const ONE: f32 = 512.0 / 1023.0;
     const BIAS: f32 = 510.0 / 1023.0;
-    if value == ONE {
+    if value.to_bits() == ONE.to_bits() {
         1.0
     } else if value > ONE {
         BIAS / (1.0 - value)
@@ -358,44 +458,41 @@ pub(crate) fn resolve_screen_space_subsurface(
             let Some((eye_start, eye_width, local_x)) = eye_for_column(x, width, eye_split) else {
                 continue;
             };
+            let stack = SubsurfaceResolveStack {
+                samples,
+                frame,
+                sample_locations: &sample_locations,
+                pixel_jitter,
+                eye_start,
+                eye_width,
+                height,
+                y,
+                local_x,
+            };
             for closure in center.sample.closures.iter().flatten().copied() {
-                resolve_subsurface_closure(
-                    center,
-                    closure,
-                    samples,
-                    &mut sample_color[pixel],
-                    frame,
-                    &sample_locations,
-                    pixel_jitter,
-                    eye_start,
-                    eye_width,
-                    height,
-                    y,
-                    local_x,
-                );
+                resolve_subsurface_closure(center, closure, &mut sample_color[pixel], stack);
             }
         }
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one EEVEE SSS profile needs its screen, depth, and projection inputs"
-)]
 fn resolve_subsurface_closure(
     center: EeveeSubsurfacePixel,
     closure: EeveeSubsurfaceClosure,
-    samples: &[Option<EeveeSubsurfacePixel>],
     sample_color: &mut [f32; 4],
-    frame: EeveeSubsurfaceFrame,
-    sample_locations: &[ProfileSample; SSS_SAMPLE_COUNT],
-    pixel_jitter: [f64; 2],
-    eye_start: usize,
-    eye_width: usize,
-    height: usize,
-    y: usize,
-    local_x: usize,
+    stack: SubsurfaceResolveStack<'_>,
 ) {
+    let SubsurfaceResolveStack {
+        samples,
+        frame,
+        sample_locations,
+        pixel_jitter,
+        eye_start,
+        eye_width,
+        height,
+        y,
+        local_x,
+    } = stack;
     let max_radius = closure.radius.iter().copied().fold(0.0_f32, f32::max);
     let depth = center.sample.depth as f32;
     let homogeneous = match frame.projection {
@@ -648,7 +745,8 @@ fn add_radiance(
     for channel in 0..3 {
         color[channel] += (f64::from(closure.color[channel])
             * center.weight[channel]
-            * f64::from(radiance[channel])) as f32;
+            * f64::from(radiance[channel])
+            * center.sample.association_scale) as f32;
     }
 }
 
@@ -679,12 +777,15 @@ fn burley_sample_locations(sample_index: u32) -> [ProfileSample; SSS_SAMPLE_COUN
     let sample_u = halton(2, u64::from(sample_index) * 5 + 1) as f32;
     let sample_v = halton(3, u64::from(sample_index) * 5 + 1) as f32;
     let d = burley_setup([1.0; 3], [1.0; 3])[0];
-    let golden_angle = PI * (3.0 - 5.0_f32.sqrt());
+    // Match `precompute_samples_location`: Blender computes the angle in double, then stores float taps.
+    let golden_angle = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
     std::array::from_fn(|index| {
-        let theta = golden_angle * index as f32 + TAU * sample_u;
+        let theta =
+            (golden_angle * index as f64 + std::f64::consts::PI * 2.0 * f64::from(sample_u)) as f32;
         let radius = burley_sample(d, (sample_v + index as f32) / SSS_SAMPLE_COUNT as f32);
         let pdf_inverse = 1.0 / burley_pdf(d, radius);
-        let (sin_theta, cos_theta) = theta.sin_cos();
+        let cos_theta = theta.cos();
+        let sin_theta = theta.sin();
         ProfileSample {
             x: cos_theta * radius,
             y: sin_theta * radius,
@@ -696,55 +797,55 @@ fn burley_sample_locations(sample_index: u32) -> [ProfileSample; SSS_SAMPLE_COUN
 fn burley_setup(radius: [f32; 3], albedo: [f32; 3]) -> [f32; 3] {
     std::array::from_fn(|channel| {
         let a = albedo[channel];
-        let s = 1.9 - a + 3.5 * (a - 0.8) * (a - 0.8);
-        (0.25 / PI * radius[channel]) / s
+        let offset = a - 0.8;
+        let s = 1.9 - a + 3.5 * (offset * offset);
+        let l = 0.25 * 0.318_309_87_f32 * radius[channel];
+        l / s
     })
 }
 
-fn burley_sample(d: f32, x: f32) -> f32 {
-    let x = x * SSS_BURLEY_TRUNCATE_CDF;
-    let mut radius = if x <= 0.9 {
-        (x * x * 2.4).exp() - 1.0
+fn burley_sample(d: f32, x_rand: f32) -> f32 {
+    let x = (f64::from(x_rand) * SSS_BURLEY_TRUNCATE_CDF) as f32;
+    let mut radius = if f64::from(x) <= 0.9 {
+        let x_squared = x * x;
+        ((f64::from(x_squared) * 2.4).exp() - 1.0) as f32
     } else {
         15.0
     };
     for _ in 0..10 {
-        let exp_r_3 = (-radius / 3.0).exp();
+        let exp_r_3 = (-f64::from(radius) / 3.0).exp() as f32;
         let exp_r = exp_r_3 * exp_r_3 * exp_r_3;
-        let f = 1.0 - 0.25 * exp_r - 0.75 * exp_r_3 - x;
-        let f_derivative = 0.25 * exp_r + 0.25 * exp_r_3;
+        let f = (1.0 - 0.25 * f64::from(exp_r) - 0.75 * f64::from(exp_r_3) - f64::from(x)) as f32;
+        let f_derivative = (0.25 * f64::from(exp_r) + 0.25 * f64::from(exp_r_3)) as f32;
         if f.abs() < 1.0e-6 || f_derivative == 0.0 {
             break;
         }
-        radius = (radius - f / f_derivative).max(0.0);
+        radius = f64::from(radius - f / f_derivative).max(0.0) as f32;
     }
     radius * d
 }
 
 fn burley_pdf(d: f32, radius: f32) -> f32 {
+    if radius >= SSS_BURLEY_TRUNCATE * d {
+        return 0.0;
+    }
     let exp_r_3_d = (-radius / (3.0 * d)).exp();
     let exp_r_d = exp_r_3_d * exp_r_3_d * exp_r_3_d;
-    (exp_r_d + exp_r_3_d) / (8.0 * PI * d * SSS_BURLEY_TRUNCATE_CDF)
+    let burley_eval = (exp_r_d + exp_r_3_d) / (8.0 * PI * d);
+    (f64::from(burley_eval) / SSS_BURLEY_TRUNCATE_CDF) as f32
 }
 
+/// GPU `burley_eval` retains the positive exponential tail; only the CPU proposal PDF is truncated.
 fn burley_eval(d: [f32; 3], radius: f32) -> [f32; 3] {
     std::array::from_fn(|channel| {
-        if radius >= SSS_BURLEY_TRUNCATE * d[channel] {
-            0.0
-        } else {
-            let exp_r_3_d = (-radius / (3.0 * d[channel])).exp();
-            let exp_r_d = exp_r_3_d * exp_r_3_d * exp_r_3_d;
-            (exp_r_d + exp_r_3_d) / (4.0 * d[channel])
-        }
+        let exp_r_3_d = (-radius / (3.0 * d[channel])).exp();
+        let exp_r_d = exp_r_3_d * exp_r_3_d * exp_r_3_d;
+        (exp_r_d + exp_r_3_d) / (4.0 * d[channel])
     })
 }
 
-#[expect(
-    clippy::excessive_precision,
-    reason = "this is EEVEE's f32 interleaved-gradient-noise multiplier"
-)]
 fn interleaved_gradient_noise(x: f32, y: f32) -> f32 {
-    fract(52.982_918_9 * fract(0.067_110_56 * x + 0.005_837_15 * y))
+    fract(52.982_918 * fract(0.067_110_56 * x + 0.005_837_15 * y))
 }
 
 fn halton(base: u64, mut index: u64) -> f64 {
@@ -797,49 +898,55 @@ fn quantize_unsigned_float(value: f32, mantissa_bits: u32) -> f32 {
     if value == 0.0 {
         return 0.0;
     }
-    let bits = value.to_bits();
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let unbiased = exponent - 127;
-    let mut target_exponent = unbiased + 15;
-    if target_exponent <= 0 {
-        let scaled = value * 2.0_f32.powi(14 + mantissa_bits as i32);
-        let mantissa = (scaled + 0.5) as u32;
-        return if mantissa >= (1 << mantissa_bits) {
-            2.0_f32.powi(-14)
-        } else {
-            mantissa as f32 * 2.0_f32.powi(-14 - mantissa_bits as i32)
-        };
-    }
-    if target_exponent >= 31 {
+    let exponent = ((value.to_bits() >> 23) & 0xff) as i32;
+    if exponent - 127 + 15 >= 31 {
         return f32::INFINITY;
     }
-    let shift = 23 - mantissa_bits;
-    let mut mantissa = ((bits & 0x7f_ffff) + (1 << (shift - 1))) >> shift;
-    if mantissa >= (1 << mantissa_bits) {
-        mantissa = 0;
-        target_exponent += 1;
-    }
-    if target_exponent >= 31 {
-        f32::INFINITY
-    } else {
-        (1.0 + mantissa as f32 / (1 << mantissa_bits) as f32) * 2.0_f32.powi(target_exponent - 15)
-    }
+    // SSS_RADIANCE is UFLOAT_11_11_10; reuse the existing measured truncating store conversion.
+    super::eevee_transmission::truncate_ufloat(f64::from(value), mantissa_bits as i32) as f32
 }
 #[cfg(test)]
 mod gbuffer_tests {
-    use super::{eevee_gbuffer_normal, eevee_subsurface_gbuffer_profile};
+    use super::{
+        EeveeGBufferContext, eevee_gbuffer_ior, eevee_gbuffer_normal, eevee_gbuffer_roughness,
+        eevee_subsurface_gbuffer_profile,
+    };
     use glam::DVec3;
 
     #[test]
-    fn subsurface_profile_matches_gbuffer_unorm_roundtrip() {
-        let (color, radius) =
-            eevee_subsurface_gbuffer_profile([0.72, 0.31, 0.12], [0.204, 0.0744, 0.0288]);
-        let expected_color = [737.0 / 1023.0, 317.0 / 1023.0, 123.0 / 1023.0];
-        let expected_radius = [104.0 / 511.0, 38.0 / 511.0, 15.0 / 511.0];
-        for channel in 0..3 {
-            assert!((color[channel] - expected_color[channel]).abs() < 1.0e-7);
-            assert!((radius[channel] - expected_radius[channel]).abs() < 1.0e-6);
-        }
+    fn subsurface_profile_and_closure_parameters_match_dithered_gbuffer_storage() {
+        let context = |data_layer| EeveeGBufferContext {
+            frag_coord: [5.5, 7.5],
+            sample_offset: [0.25, 0.5, 0.75],
+            data_layer,
+        };
+        let (color, radius) = eevee_subsurface_gbuffer_profile(
+            [0.72, 0.31, 0.12],
+            [0.204, 0.0744, 0.0288],
+            context(0),
+            context(1),
+        );
+        let expected_color = [736.0_f32 / 1023.0, 317.0 / 1023.0, 123.0 / 1023.0];
+        // Preserve the source f32 `ior_unpack(code / 1023)` operation order at the ROP store.
+        let expected_radius = [
+            104.0_f32 / 511.0,
+            (38.0_f32 / 1023.0) / (511.0_f32 / 1023.0),
+            15.0_f32 / 511.0,
+        ];
+        assert_eq!(color.map(f32::to_bits), expected_color.map(f32::to_bits));
+        assert_eq!(radius.map(f32::to_bits), expected_radius.map(f32::to_bits));
+        assert_eq!(
+            eevee_gbuffer_roughness(0.26916, context(1)).to_bits(),
+            f64::from(276.0_f32 / 1023.0).to_bits()
+        );
+        assert_eq!(
+            eevee_gbuffer_roughness(0.26916, context(2)).to_bits(),
+            f64::from(275.0_f32 / 1023.0).to_bits()
+        );
+        assert_eq!(
+            eevee_gbuffer_ior(1.43, context(1)).to_bits(),
+            1.432_584_166_526_794_4_f64.to_bits()
+        );
     }
 
     #[test]
@@ -848,11 +955,24 @@ mod gbuffer_tests {
         let expected = DVec3::new(0.059_988_83, 0.019_985_31, 0.997_999);
         assert!(normal.distance(expected) < 2.0e-6);
     }
+
     #[test]
-    fn burley_profile_stops_at_the_blender_support_radius() {
-        let weights = super::burley_eval([0.1, 0.2, 0.3], 3.2);
-        assert_eq!(weights[0], 0.0);
-        assert_eq!(weights[1], 0.0);
-        assert!(weights[2] > 0.0);
+    fn subsurface_radiance_uses_eevee_ufloat_truncation() {
+        assert_eq!(
+            super::quantize_radiance([0.6, 0.6, 0.3]),
+            [0.59375, 0.59375, 0.296_875]
+        );
+        assert_eq!(
+            super::quantize_radiance([0.436_523_44; 3]),
+            [0.433_593_75, 0.433_593_75, 0.429_687_5]
+        );
+    }
+    #[test]
+
+    fn burley_gpu_profile_keeps_tail_while_cpu_pdf_truncates() {
+        let d = 0.1;
+        let radius = 16.0 * d;
+        assert!(super::burley_eval([d; 3], radius)[0] > 0.0);
+        assert_eq!(super::burley_pdf(d, radius), 0.0);
     }
 }

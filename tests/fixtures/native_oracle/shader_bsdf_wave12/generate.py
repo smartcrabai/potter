@@ -1,5 +1,6 @@
 """Generate the committed Blender 5.2.2 native BSDF scenes and linear EXR references."""
 import bpy
+import hashlib
 import json
 import math
 import os
@@ -15,7 +16,15 @@ PATCH_RADIUS = 1
 CYCLES_SAMPLES = 256
 EEVEE_SAMPLES = 64
 SEED = 17
-OUT = sys.argv[sys.argv.index("--") + 1]
+CLI_ARGS = sys.argv[sys.argv.index("--") + 1 :]
+SUN_ONLY = "--sun-only" in CLI_ARGS
+EEVEE_SHEEN_ONLY = "--eevee-sheen-only" in CLI_ARGS
+EEVEE_PREVIEW_ONLY = "--eevee-preview-only" in CLI_ARGS
+SKIN_CROP_ONLY = "--skin-crop-only" in CLI_ARGS
+TOON_SUN_ONLY = "--toon-sun-only" in CLI_ARGS
+OUT = CLI_ARGS[-1]
+SKIN_CROP_SIZE = 4
+SKIN_SAMPLES = 4096
 
 if bpy.app.version != (5, 2, 2):
     raise RuntimeError(f"expected Blender 5.2.2, got {bpy.app.version_string}")
@@ -54,6 +63,15 @@ EEVEE_CASES = [case for case in CASES if case[1] in {
     "ShaderNodeSubsurfaceScattering", "ShaderNodeBsdfTranslucent",
     "ShaderNodeBsdfRefraction", "ShaderNodeBsdfMetallic", "ShaderNodeHoldout",
 }]
+
+EEVEE_PREVIEW_CASES = [
+    ("toon_diffuse_eevee", "ShaderNodeBsdfToon", {"component": "DIFFUSE"}),
+    ("toon_glossy_eevee", "ShaderNodeBsdfToon", {"component": "GLOSSY"}),
+    ("hair_eevee", "ShaderNodeBsdfHair", {"component": "Transmission"}),
+    ("principled_hair_eevee", "ShaderNodeBsdfHairPrincipled",
+     {"model": "HUANG", "parametrization": "ABSORPTION"}),
+    ("ray_portal_eevee", "ShaderNodeBsdfRayPortal", {}),
+]
 
 
 def set_input(node, name, value):
@@ -203,7 +221,7 @@ def make_hair_curve(name, location, material):
     return obj
 
 
-def make_scene(name, cases, engine, output_prefix):
+def make_scene(name, cases, engine, output_prefix, hair_on_mesh=False, link_normal_input=False):
     scene = bpy.context.scene
     clear_scene(scene)
     scene.name = name
@@ -259,7 +277,19 @@ def make_scene(name, cases, engine, output_prefix):
 
         material, inputs = new_material(case)
         case_name, node_type, properties = case
-        if node_type in {"ShaderNodeBsdfHair", "ShaderNodeBsdfHairPrincipled"}:
+        normal_linked = False
+        normal_value = inputs.get("Normal")
+        if link_normal_input and normal_value is not None:
+            bsdf = next(node for node in material.node_tree.nodes if node.bl_idname == node_type)
+            normal_socket = bsdf.inputs.get("Normal")
+            if normal_socket is not None:
+                normal_node = material.node_tree.nodes.new("ShaderNodeCombineXYZ")
+                normal_node.inputs["X"].default_value = normal_value[0]
+                normal_node.inputs["Y"].default_value = normal_value[1]
+                normal_node.inputs["Z"].default_value = normal_value[2]
+                material.node_tree.links.new(normal_node.outputs["Vector"], normal_socket)
+                normal_linked = True
+        if not hair_on_mesh and node_type in {"ShaderNodeBsdfHair", "ShaderNodeBsdfHairPrincipled"}:
             obj = make_hair_curve(case_name, (x, y, 0.0), material)
         else:
             bpy.ops.mesh.primitive_uv_sphere_add(segments=24, ring_count=16, radius=0.47,
@@ -271,8 +301,11 @@ def make_scene(name, cases, engine, output_prefix):
                 polygon.use_smooth = True
         px = round((x / ORTHO + 0.5) * SIZE - 0.5)
         py = round((0.5 - y / ORTHO) * SIZE - 0.5)
-        probes.append({"name": case_name, "x": px, "y": py, "patch_radius": PATCH_RADIUS,
-                       "mode": properties, "inputs": inputs})
+        probe = {"name": case_name, "x": px, "y": py, "patch_radius": PATCH_RADIUS,
+                 "mode": properties, "inputs": inputs}
+        if normal_linked:
+            probe["normal_linked"] = True
+        probes.append(probe)
 
     bpy.context.view_layer.objects.active = scene.camera
     for obj in scene.objects:
@@ -300,6 +333,8 @@ def make_scene(name, cases, engine, output_prefix):
         case = {"name": probe["name"], "mode": probe["mode"], "inputs": probe["inputs"],
                 "probe": [probe["x"], probe["y"], probe["patch_radius"]],
                 "linear_rgba": [value / count for value in totals]}
+        if probe.get("normal_linked"):
+            case["normal_linked"] = True
         if probe["name"] == "holdout":
             source_index = ((height - 1 - probe["y"]) * width + probe["x"] + 13) * 4
             case["neighbor_rgba"] = [float(pixels[source_index + channel]) for channel in range(4)]
@@ -340,11 +375,497 @@ def make_scene(name, cases, engine, output_prefix):
             stream.write("\n")
         bpy.data.images.remove(second)
 
+def make_eevee_sheen_scenes():
+    for distribution in ("ASHIKHMIN", "MICROFIBER"):
+        case = ("sheen_eevee", "ShaderNodeBsdfSheen", {"distribution": distribution})
+        output_prefix = f"eevee_sheen_{distribution.lower()}"
+        make_scene(
+            "Shader BSDF EEVEE Sheen",
+            [case],
+            "BLENDER_EEVEE",
+            output_prefix,
+            link_normal_input=True,
+        )
+
+def make_eevee_preview_scene():
+    make_scene(
+        "Shader BSDF EEVEE GPU Previews",
+        EEVEE_PREVIEW_CASES,
+        "BLENDER_EEVEE",
+        "eevee_preview",
+        hair_on_mesh=True,
+        link_normal_input=True,
+    )
+
+
+
+def frame_bounds(camera, scene):
+    frame = camera.data.view_frame(scene=scene)
+    return (min(point.x for point in frame), max(point.x for point in frame),
+            min(point.y for point in frame), max(point.y for point in frame), frame[0].z)
+
+
+def pixel_local_origin(bounds, width, height, x, y):
+    left, right, bottom, top, depth = bounds
+    return Vector((left + (x + 0.5) * (right - left) / width,
+                   top - (y + 0.5) * (top - bottom) / height, depth))
+
+
+def world_ray(matrix_world, local_origin):
+    origin = matrix_world @ local_origin
+    direction = matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0))
+    direction.normalize()
+    return origin, direction
+
+
+def render_skin_crop():
+    blend_path = os.path.join(OUT, "path.blend")
+    json_path = os.path.join(OUT, "path.json")
+    with open(json_path, encoding="utf-8") as stream:
+        source_capture = json.load(stream)
+    source_case = next(case for case in source_capture["cases"]
+                       if case["name"] == "subsurface_random_walk_skin")
+
+    bpy.ops.wm.open_mainfile(filepath=blend_path)
+    scene = bpy.context.scene
+    camera = scene.camera
+    if camera is None or camera.data.type != "ORTHO":
+        raise RuntimeError("path scene must have an orthographic camera")
+    if scene.render.engine != "CYCLES" or scene.cycles.max_bounces != 8 or \
+            scene.cycles.transparent_max_bounces != 8:
+        raise RuntimeError("path scene must use Cycles with 8 maximum and transparent bounces")
+
+    original_width = source_capture["resolution"][0]
+    original_height = source_capture["resolution"][1]
+    probe_x, probe_y, patch_radius = source_case["probe"]
+    bpy.context.view_layer.update()
+    source_bounds = frame_bounds(camera, scene)
+    source_matrix = camera.matrix_world.copy()
+    source_scale = camera.data.ortho_scale
+
+    scene.render.resolution_x = SKIN_CROP_SIZE
+    scene.render.resolution_y = SKIN_CROP_SIZE
+    camera.data.ortho_scale = source_scale * SKIN_CROP_SIZE / original_width
+    crop_bounds = frame_bounds(camera, scene)
+    source_first = pixel_local_origin(source_bounds, original_width, original_height,
+                                      probe_x - patch_radius, probe_y - patch_radius)
+    crop_first = pixel_local_origin(crop_bounds, SKIN_CROP_SIZE, SKIN_CROP_SIZE, 0, 0)
+    shift = camera.matrix_world.to_3x3() @ Vector(
+        (source_first.x - crop_first.x, source_first.y - crop_first.y, 0.0))
+    camera.location += shift
+    bpy.context.view_layer.update()
+
+    max_origin_delta = 0.0
+    for dy in range(patch_radius * 2 + 1):
+        for dx in range(patch_radius * 2 + 1):
+            source_local = Vector((
+                source_first.x + dx * (source_bounds[1] - source_bounds[0]) / original_width,
+                source_first.y - dy * (source_bounds[3] - source_bounds[2]) / original_height,
+                source_bounds[4]))
+            source_ray = world_ray(source_matrix, source_local)
+            crop_local = pixel_local_origin(crop_bounds, SKIN_CROP_SIZE, SKIN_CROP_SIZE, dx, dy)
+            crop_ray = world_ray(camera.matrix_world, crop_local)
+            delta = max(abs(a - b) for a, b in zip(source_ray[0], crop_ray[0]))
+            max_origin_delta = max(max_origin_delta, delta)
+            if tuple(source_ray[1]) != tuple(crop_ray[1]):
+                raise RuntimeError("skin crop changed a primary ray direction")
+    if max_origin_delta > 3e-7:
+        raise RuntimeError(f"skin crop ray origin delta {max_origin_delta} exceeds 3e-7")
+
+    scene.cycles.samples = SKIN_SAMPLES
+    scene.cycles.seed = 31
+    blend_path = os.path.join(OUT, "path_skin_crop.blend")
+    scene.render.filepath = os.path.join(OUT, "path_skin_crop_seed31.exr")
+    bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+    for seed in (31, 43):
+        exr_name = f"path_skin_crop_seed{seed}.exr"
+        scene.cycles.seed = seed
+        scene.render.filepath = os.path.join(OUT, exr_name)
+        bpy.ops.render.render(write_still=True)
+        image = bpy.data.images.load(scene.render.filepath, check_existing=False)
+        width, height = image.size[:]
+        pixels = array("f", [0.0]) * (width * height * 4)
+        image.pixels.foreach_get(pixels)
+        totals = [0.0, 0.0, 0.0, 0.0]
+        for y in range(patch_radius * 2 + 1):
+            for x in range(patch_radius * 2 + 1):
+                source_index = ((height - 1 - y) * width + x) * 4
+                for channel in range(4):
+                    totals[channel] += float(pixels[source_index + channel])
+        count = (patch_radius * 2 + 1) ** 2
+        capture_case = {
+            "name": source_case["name"],
+            "mode": source_case["mode"],
+            "inputs": source_case["inputs"],
+            "probe": [1, 1, 1],
+            "linear_rgba": [value / count for value in totals],
+        }
+        capture = {
+            "blender_version": bpy.app.version_string,
+            "engine": "CYCLES",
+            "resolution": [width, height],
+            "samples": SKIN_SAMPLES,
+            "seed": seed,
+            "linear_exr": exr_name,
+            "cases": [capture_case],
+        }
+        with open(os.path.join(OUT, f"path_skin_crop_seed{seed}.json"), "w",
+                  encoding="utf-8") as stream:
+            json.dump(capture, stream, indent=2)
+            stream.write("\n")
+        bpy.data.images.remove(image)
+    print(f"skin crop ray proof max world-origin delta: {max_origin_delta:.9g}")
+
+
+
+def make_sheen_sun_scene():
+    scene = bpy.context.scene
+    clear_scene(scene)
+    scene.name = "Shader BSDF Ashikhmin Direct Control"
+    scene.render.engine = "CYCLES"
+    scene.render.resolution_x = SIZE
+    scene.render.resolution_y = SIZE
+    scene.render.resolution_percentage = 100
+    scene.render.film_transparent = False
+    scene.render.image_settings.file_format = "OPEN_EXR"
+    scene.render.image_settings.color_mode = "RGBA"
+    scene.render.image_settings.color_depth = "32"
+    scene.render.image_settings.exr_codec = "ZIP"
+    scene.render.threads_mode = "FIXED"
+    scene.render.threads = 1
+    scene.render.use_file_extension = True
+    scene.view_settings.view_transform = "Standard"
+    scene.view_settings.look = "None"
+    scene.view_settings.exposure = 0.0
+    scene.view_settings.gamma = 1.0
+    scene.cycles.device = "CPU"
+    scene.cycles.samples = CYCLES_SAMPLES
+    scene.cycles.seed = SEED
+    scene.cycles.pixel_filter_type = "BOX"
+    scene.cycles.filter_width = 1.0
+    scene.cycles.use_denoising = False
+    scene.cycles.max_bounces = 8
+    scene.cycles.transparent_max_bounces = 8
+
+    world = bpy.data.worlds.new("Black World")
+    world.use_nodes = True
+    world.node_tree.nodes.clear()
+    background = world.node_tree.nodes.new("ShaderNodeBackground")
+    background.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+    background.inputs["Strength"].default_value = 0.0
+    output = world.node_tree.nodes.new("ShaderNodeOutputWorld")
+    world.node_tree.links.new(background.outputs["Background"], output.inputs["Surface"])
+    scene.world = world
+
+    mesh = bpy.data.meshes.new("Direct Control Plane")
+    mesh.from_pydata(
+        [(-32.0, -32.0, 0.0), (32.0, -32.0, 0.0), (32.0, 32.0, 0.0), (-32.0, 32.0, 0.0)],
+        [],
+        [(0, 1, 2, 3)],
+    )
+    plane = bpy.data.objects.new("Direct Control Plane", mesh)
+    scene.collection.objects.link(plane)
+    plane.rotation_euler[1] = math.radians(60.0)
+    case = ("sheen_ashikhmin_sun", "ShaderNodeBsdfSheen", {"distribution": "ASHIKHMIN"})
+    material, inputs = new_material(case)
+    plane.data.materials.append(material)
+
+    sun_data = bpy.data.lights.new("Sun", type="SUN")
+    sun_data.energy = 100.0
+    sun_data.angle = 0.0
+    sun = bpy.data.objects.new("Sun", sun_data)
+    scene.collection.objects.link(sun)
+    sun.rotation_euler = (0.0, 0.0, 0.0)
+
+    camera_data = bpy.data.cameras.new("Camera")
+    camera_data.type = "ORTHO"
+    camera_data.ortho_scale = ORTHO
+    camera = bpy.data.objects.new("Camera", camera_data)
+    scene.collection.objects.link(camera)
+    camera.location = (0.0, 0.0, 12.0)
+    camera.rotation_euler = (0.0, 0.0, 0.0)
+    scene.camera = camera
+
+    output_prefix = "sheen_ashikhmin_sun"
+    scene.render.filepath = os.path.join(OUT, output_prefix)
+    bpy.ops.wm.save_as_mainfile(filepath=scene.render.filepath + ".blend")
+    bpy.ops.render.render(write_still=True)
+    image = bpy.data.images.load(scene.render.filepath + ".exr", check_existing=False)
+    width, height = image.size[:]
+    pixels = array("f", [0.0]) * (width * height * 4)
+    image.pixels.foreach_get(pixels)
+    probe = {"name": output_prefix, "x": width // 2, "y": height // 2, "patch_radius": 1}
+    totals = [0.0, 0.0, 0.0, 0.0]
+    count = 0
+    for dy in range(-probe["patch_radius"], probe["patch_radius"] + 1):
+        for dx in range(-probe["patch_radius"], probe["patch_radius"] + 1):
+            x, y = probe["x"] + dx, probe["y"] + dy
+            source_index = ((height - 1 - y) * width + x) * 4
+            for channel in range(4):
+                totals[channel] += float(pixels[source_index + channel])
+            count += 1
+    capture = {
+        "blender_version": bpy.app.version_string,
+        "engine": "CYCLES",
+        "resolution": [width, height],
+        "samples": CYCLES_SAMPLES,
+        "seed": SEED,
+        "linear_exr": output_prefix + ".exr",
+        "cases": [{
+            "name": output_prefix,
+            "mode": case[2],
+            "inputs": inputs,
+            "probe": [probe["x"], probe["y"], probe["patch_radius"]],
+            "linear_rgba": [value / count for value in totals],
+        }],
+    }
+    with open(os.path.join(OUT, output_prefix + ".json"), "w", encoding="utf-8") as stream:
+        json.dump(capture, stream, indent=2)
+        stream.write("\n")
+    bpy.data.images.remove(image)
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def make_toon_sun_scenes():
+    canonical_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "path.blend")
+    canonical_sha256 = file_sha256(canonical_path)
+    blender_binary = bpy.app.binary_path
+    regimes = [
+        ("plateau", 0.0),
+        ("mid_smooth", (0.38 + 0.17 * 0.5) * math.pi / 2.0),
+        ("outside", (0.38 + 0.17 + 0.1) * math.pi / 2.0),
+    ]
+    seeds = (31, 43)
+    cases = []
+    for regime, theta in regimes:
+        bpy.ops.wm.open_mainfile(filepath=canonical_path)
+        scene = bpy.context.scene
+        source_obj = bpy.data.objects.get("toon_diffuse")
+        if source_obj is None or not source_obj.data.materials:
+            raise RuntimeError("canonical path.blend has no toon_diffuse material object")
+        material = source_obj.data.materials[0]
+        toon = next((node for node in material.node_tree.nodes
+                     if node.bl_idname == "ShaderNodeBsdfToon"), None)
+        if toon is None or toon.component != "DIFFUSE":
+            raise RuntimeError("canonical Toon Diffuse node is missing or not DIFFUSE")
+        expected_inputs = {
+            "Color": (0.72, 0.31, 0.12, 1.0),
+            "Size": 0.38,
+            "Smooth": 0.17,
+            "Normal": (0.06, 0.02, 0.998),
+        }
+        inputs = {}
+        for name, expected in expected_inputs.items():
+            socket = toon.inputs.get(name)
+            if socket is None:
+                raise RuntimeError(f"canonical Toon Diffuse input {name} is missing")
+            if name == "Normal" and socket.is_linked:
+                raise RuntimeError("canonical Toon Diffuse Normal input must remain unlinked")
+            value = socket.default_value
+            inputs[name] = ([float(channel) for channel in value]
+                            if hasattr(value, "__len__") else float(value))
+            if isinstance(expected, tuple):
+                if any(abs(actual - target) > 1e-6 for actual, target in zip(inputs[name], expected)):
+                    raise RuntimeError(f"canonical Toon Diffuse input {name} differs: {inputs[name]!r}")
+            elif abs(inputs[name] - expected) > 1e-6:
+                raise RuntimeError(f"canonical Toon Diffuse input {name} differs: {inputs[name]!r}")
+
+        for obj in list(bpy.data.objects):
+            bpy.data.objects.remove(obj, do_unlink=True)
+        for old_material in list(bpy.data.materials):
+            if old_material != material:
+                bpy.data.materials.remove(old_material)
+        for old_world in list(bpy.data.worlds):
+            bpy.data.worlds.remove(old_world)
+        world = bpy.data.worlds.new("Diagnostic Black World")
+        world.use_nodes = True
+        world.node_tree.nodes.clear()
+        background = world.node_tree.nodes.new("ShaderNodeBackground")
+        background.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+        background.inputs["Strength"].default_value = 0.0
+        world_output = world.node_tree.nodes.new("ShaderNodeOutputWorld")
+        world.node_tree.links.new(background.outputs["Background"], world_output.inputs["Surface"])
+        scene.world = world
+
+        mesh = bpy.data.meshes.new("Diagnostic Toon Plane Mesh")
+        mesh.from_pydata(
+            [(-4.0, -4.0, 0.0), (4.0, -4.0, 0.0), (4.0, 4.0, 0.0), (-4.0, 4.0, 0.0)],
+            [],
+            [(0, 1, 2, 3)],
+        )
+        mesh.update()
+        plane = bpy.data.objects.new("Diagnostic Toon Plane", mesh)
+        scene.collection.objects.link(plane)
+        plane.data.materials.append(material)
+        sun_data = bpy.data.lights.new("Diagnostic Sun", type="SUN")
+        sun_data.energy = 1.0
+        sun_data.angle = 0.0
+        sun = bpy.data.objects.new("Diagnostic Sun", sun_data)
+        scene.collection.objects.link(sun)
+        sun.rotation_euler = (0.0, theta, 0.0)
+        camera_data = bpy.data.cameras.new("Diagnostic Orthographic Camera")
+        camera_data.type = "ORTHO"
+        camera_data.ortho_scale = 4.0
+        camera = bpy.data.objects.new("Diagnostic Orthographic Camera", camera_data)
+        scene.collection.objects.link(camera)
+        camera.location = (0.0, 0.0, 12.0)
+        camera.rotation_euler = (0.0, 0.0, 0.0)
+        scene.camera = camera
+        bpy.context.view_layer.update()
+
+        scene.name = f"Toon Diffuse Direct SUN {regime}"
+        scene.render.engine = "CYCLES"
+        scene.render.resolution_x = 4
+        scene.render.resolution_y = 4
+        scene.render.resolution_percentage = 100
+        scene.render.film_transparent = False
+        scene.render.image_settings.file_format = "OPEN_EXR"
+        scene.render.image_settings.color_mode = "RGBA"
+        scene.render.image_settings.color_depth = "32"
+        scene.render.image_settings.exr_codec = "ZIP"
+        scene.render.threads_mode = "FIXED"
+        scene.render.threads = 2
+        scene.render.use_file_extension = True
+        scene.view_settings.view_transform = "Standard"
+        scene.view_settings.look = "None"
+        scene.view_settings.exposure = 0.0
+        scene.view_settings.gamma = 1.0
+        scene.cycles.device = "CPU"
+        scene.cycles.samples = 32
+        scene.cycles.seed = seeds[0]
+        scene.cycles.pixel_filter_type = "BOX"
+        scene.cycles.filter_width = 1.0
+        scene.cycles.use_denoising = False
+        scene.cycles.max_bounces = 8
+        scene.cycles.transparent_max_bounces = 8
+        ray = sun.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0))
+        expected_ray = Vector((-math.sin(theta), 0.0, -math.cos(theta)))
+        if (ray - expected_ray).length > 1e-7:
+            raise RuntimeError(f"Sun orientation mismatch for {regime}: {tuple(ray)}")
+        if len(scene.objects) != 3 or sorted(obj.type for obj in scene.objects) != ["CAMERA", "LIGHT", "MESH"]:
+            raise RuntimeError(f"unexpected objects in Toon SUN scene: {[obj.name for obj in scene.objects]}")
+        if tuple(plane.data.polygons[0].normal) != (0.0, 0.0, 1.0):
+            raise RuntimeError("Toon SUN plane normal is not +Z")
+
+        name = f"toon_diffuse_sun_{regime}"
+        blend_name = name + ".blend"
+        blend_path = os.path.join(OUT, blend_name)
+        scene.render.filepath = os.path.join(OUT, name + "_seed31")
+        bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+        seed_captures = []
+        for seed in seeds:
+            scene.cycles.seed = seed
+            exr_name = f"{name}_seed{seed}.exr"
+            exr_path = os.path.join(OUT, exr_name)
+            scene.render.filepath = os.path.join(OUT, name + f"_seed{seed}")
+            bpy.ops.render.render(write_still=True)
+            image = bpy.data.images.load(exr_path, check_existing=False)
+            width, height = image.size[:]
+            pixels = array("f", [0.0]) * (width * height * 4)
+            image.pixels.foreach_get(pixels)
+            rgba = [[float(pixels[index + channel]) for channel in range(4)]
+                    for index in range(0, len(pixels), 4)]
+            mean = [sum(pixel[channel] for pixel in rgba) / len(rgba) for channel in range(4)]
+            field_range = [max(pixel[channel] for pixel in rgba) - min(pixel[channel] for pixel in rgba)
+                           for channel in range(4)]
+            seed_captures.append({
+                "seed": seed,
+                "exr": exr_name,
+                "linear_rgba": mean,
+                "field_range_rgba": field_range,
+            })
+            bpy.data.images.remove(image)
+        cases.append({
+            "name": name,
+            "regime": regime,
+            "theta_radians": theta,
+            "theta_degrees": math.degrees(theta),
+            "mode": {"component": toon.component},
+            "inputs": inputs,
+            "normal_linked": bool(toon.inputs["Normal"].is_linked),
+            "probe": [1, 1, 1],
+            "blend": blend_name,
+            "blend_sha256": file_sha256(blend_path),
+            "seed_captures": seed_captures,
+        })
+
+    metadata = {
+        "blender_version": bpy.app.version_string,
+        "blender_build_hash": (bpy.app.build_hash.decode("ascii")
+                               if isinstance(bpy.app.build_hash, bytes) else str(bpy.app.build_hash)),
+        "blender_binary": blender_binary,
+        "blender_sha256": file_sha256(blender_binary),
+        "generator": "generate.py --toon-sun-only",
+        "engine": "CYCLES",
+        "resolution": [4, 4],
+        "samples": 32,
+        "seeds": list(seeds),
+        "cycles": {
+            "device": "CPU",
+            "threads_mode": "FIXED",
+            "threads": 2,
+            "denoising": False,
+            "pixel_filter": "BOX",
+            "filter_width": 1.0,
+            "max_bounces": 8,
+            "transparent_max_bounces": 8,
+        },
+        "pixel_filter": "BOX",
+        "filter_width": 1.0,
+        "view_transform": "Standard",
+        "look": "None",
+        "exposure": 0.0,
+        "gamma": 1.0,
+        "linear_exr": "32-bit RGBA OpenEXR",
+        "canonical_material_source": {"blend": "path.blend", "sha256": canonical_sha256, "case": "toon_diffuse"},
+        "world": {"background_color": [0.0, 0.0, 0.0, 1.0], "strength": 0.0},
+        "sun": {"type": "SUN", "energy": 1.0, "angular_diameter_radians": 0.0},
+        "camera": {"projection": "ORTHO", "location": [0.0, 0.0, 12.0], "ortho_scale": 4.0},
+        "plane": {"size": [8.0, 8.0], "location": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]},
+        "cases": cases,
+    }
+    with open(os.path.join(OUT, "toon_diffuse_sun.json"), "w", encoding="utf-8") as stream:
+        json.dump(metadata, stream, indent=2)
+        stream.write("\n")
+
+
+def remove_blend_backups(names):
+    for name in names:
+        backup_path = os.path.join(OUT, name + ".blend1")
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+
 
 os.makedirs(OUT, exist_ok=True)
-make_scene("Shader BSDF Path Wave12", CASES, "CYCLES", "path")
-make_scene("Shader BSDF EEVEE Wave12", EEVEE_CASES, "BLENDER_EEVEE", "eevee")
-for backup in ("path.blend1", "eevee.blend1"):
-    backup_path = os.path.join(OUT, backup)
-    if os.path.exists(backup_path):
-        os.remove(backup_path)
+if EEVEE_PREVIEW_ONLY:
+    make_eevee_preview_scene()
+    remove_blend_backups(("eevee_preview",))
+elif EEVEE_SHEEN_ONLY:
+    make_eevee_sheen_scenes()
+    remove_blend_backups(("eevee_sheen_ashikhmin", "eevee_sheen_microfiber"))
+elif SKIN_CROP_ONLY:
+    render_skin_crop()
+elif TOON_SUN_ONLY:
+    make_toon_sun_scenes()
+    remove_blend_backups(("toon_diffuse_sun_plateau", "toon_diffuse_sun_mid_smooth", "toon_diffuse_sun_outside"))
+elif SUN_ONLY:
+    make_sheen_sun_scene()
+else:
+    make_scene("Shader BSDF Path Wave12", CASES, "CYCLES", "path")
+    render_skin_crop()
+    make_scene("Shader BSDF EEVEE Wave12", EEVEE_CASES, "BLENDER_EEVEE", "eevee")
+    make_eevee_sheen_scenes()
+    make_eevee_preview_scene()
+    make_sheen_sun_scene()
+    make_toon_sun_scenes()
+    remove_blend_backups((
+        "path", "eevee", "sheen_ashikhmin_sun", "eevee_sheen_ashikhmin",
+        "eevee_sheen_microfiber", "eevee_preview", "toon_diffuse_sun_plateau",
+        "toon_diffuse_sun_mid_smooth", "toon_diffuse_sun_outside",
+    ))

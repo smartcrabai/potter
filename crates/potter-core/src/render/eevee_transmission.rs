@@ -14,8 +14,9 @@
 //! - `eevee_shader.cc`, `nodetree_thickness`: the thickness is the Material Output's Thickness socket when linked, and
 //!   otherwise the smallest world-space bounds dimension.
 //! - `eevee_deferred_combine.bsl.hh`: a refraction with a thickness takes its colour squared (two events).
-//! - `eevee_lightprobe_sphere.bsl.hh` and the `UFLOAT_11_11_10` colour attachments of the capture (`eevee_shader.cc`):
-//!   the probe radiance is truncated to that format, see [`probe_radiance`].
+//! - `eevee_lightprobe.bsl.hh`, `eevee_deferred_eval.bsl.hh`, and `eevee_deferred_combine.bsl.hh`: filtered sphere-probe
+//!   radiance is stored uncolored in the deferred split-indirect `UFLOAT_11_11_10` target, then multiplied by closure
+//!   color. The probe capture and atlas use `SFLOAT16x4`; see [`probe_radiance`] for the later radiance-store conversion.
 //!
 //! The reflectance and transmittance come from EEVEE's split-sum LUT, so the Fresnel split and the roughness response
 //! follow EEVEE's closures. Measured on Blender 5.2.2 with a white world of 1 and a white glass sphere (IOR 1.45,
@@ -45,7 +46,7 @@ pub(super) fn blend(a: f64, b: f64, t: f64) -> f64 {
 }
 
 /// Blender uploads the utility LUTs as `SFLOAT_16_16_16_16` before shader filtering.
-fn utility_texel(value: f64) -> f64 {
+pub(super) fn utility_texel(value: f64) -> f64 {
     f64::from(exr::prelude::f16::from_f32(value as f32).to_f32())
 }
 
@@ -149,6 +150,34 @@ fn bsdf_channels(ior: f64, roughness: f64, n_dot_v: f64) -> [f64; 3] {
         )
     };
     [0, 1, 2].map(|index| blend(channel(l0, index), channel(l1, index), fl))
+}
+
+/// EEVEE's reflectance component of `bsdf_lut` with `do_multiscatter == false`.
+pub(crate) fn eevee_bsdf_lut_single_scatter(
+    f0: DVec3,
+    f90: DVec3,
+    cos_theta: f64,
+    roughness: f64,
+    ior: f64,
+) -> DVec3 {
+    if ior.partial_cmp(&1.0) == Some(std::cmp::Ordering::Equal) {
+        return DVec3::ZERO;
+    }
+    let f90 = if ior > 1.0 && f90 == DVec3::ONE {
+        DVec3::splat((2.33 / 0.33 * ((ior - 1.0) / (ior + 1.0))).clamp(0.0, 1.0))
+    } else {
+        f90
+    };
+    let channels = if ior > 1.0 {
+        [
+            brdf_channel(0, roughness, cos_theta),
+            brdf_channel(1, roughness, cos_theta),
+        ]
+    } else {
+        let channels = bsdf_channels(ior, roughness, cos_theta);
+        [channels[0], channels[1]]
+    };
+    f0 * channels[0] + f90 * channels[1]
 }
 
 /// The reflectance and transmittance of a GGX glass closure, per channel, as EEVEE's `bsdf_lut` gives them with
@@ -414,9 +443,10 @@ pub(crate) fn transmission_direction(
     dominant_transmission(amended_normal, amended_view, 1.0 / ior, perceived)
 }
 
-/// The radiance a light probe holds: EEVEE captures the world into `UFLOAT_11_11_10` colour attachments, which truncate
-/// the mantissa to 6 bits for red and green and 5 for blue (no rounding). Measured on Blender 5.2.2, a world colour of
-/// 0.6 reads back through a glass sphere as 0.59375, and 0.3 in blue as 0.296875.
+/// A radiance value written to an EEVEE `UFLOAT_11_11_10` target. The sphere-probe capture and atlas use `SFLOAT16x4`;
+/// this conversion belongs at a later radiance-image store, such as deferred split-indirect output, before closure color
+/// is applied. Blender 5.2.2 stores truncate the mantissa to 6 bits for red and green and 5 for blue (no rounding).
+/// A world colour of 0.6 reads back through a glass sphere as 0.59375, and 0.3 in blue as 0.296875.
 pub(crate) fn probe_radiance(radiance: DVec3) -> DVec3 {
     DVec3::new(
         truncate_ufloat(radiance.x, 6),
@@ -434,7 +464,7 @@ pub(crate) fn irradiance_probe_radiance(radiance: DVec3) -> DVec3 {
 }
 
 /// One channel of a `UFLOAT` with `mantissa_bits` mantissa bits, a 5-bit exponent (bias 15) and truncation.
-fn truncate_ufloat(value: f64, mantissa_bits: i32) -> f64 {
+pub(crate) fn truncate_ufloat(value: f64, mantissa_bits: i32) -> f64 {
     if value.is_nan() || value <= 0.0 {
         return 0.0;
     }
@@ -662,11 +692,13 @@ pub(crate) fn glass_light(
         transmission_matrix: sample_glass_matrix(cos_theta, transmission_roughness),
     })
 }
-/// The EEVEE direct-light payload of a standalone Refraction BSDF closure.
+/// The direct-light payload of a standalone Refraction closure after its G-buffer inputs are decoded.
 pub(crate) fn refraction_light(
-    params: &BsdfParams,
     normal: DVec3,
     view: DVec3,
+    color: DVec3,
+    roughness: f64,
+    ior: f64,
     thickness: Thickness,
 ) -> GlassLight {
     let normal = if normal.dot(view) < 0.0 {
@@ -674,17 +706,12 @@ pub(crate) fn refraction_light(
     } else {
         normal
     };
-    let ior = params.ior.max(1.0e-5);
-    let roughness = params.roughness.clamp(0.0, 1.0);
+    let ior = ior.max(1.0e-5);
+    let roughness = roughness.clamp(0.0, 1.0);
     let perceived_roughness = transmission_roughness(roughness, ior);
     let (transmission_normal, cos_theta) =
         transmission_light_normal(normal, view, ior, roughness, thickness);
-    let mut transmission = DVec3::new(
-        params.base_color[0],
-        params.base_color[1],
-        params.base_color[2],
-    )
-    .max(DVec3::ZERO);
+    let mut transmission = color.max(DVec3::ZERO);
     if thickness != Thickness::None {
         transmission *= transmission;
     }
@@ -993,6 +1020,36 @@ mod tests {
         // EEVEE's table at roughness 0 and cos 1: scale 1, bias 0.
         assert!((brdf_channel(0, 0.0, 1.0) - 1.0).abs() < 1.0e-5);
         assert!(brdf_channel(1, 0.0, 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn single_scatter_lut_matches_source_brdf_scale_bias() {
+        assert_eq!(
+            eevee_bsdf_lut_single_scatter(DVec3::splat(0.04), DVec3::ONE, 0.7, 0.3, 1.0,),
+            DVec3::ZERO
+        );
+
+        let f0 = DVec3::new(0.04, 0.12, 0.2);
+        let cosine = 0.73;
+        let roughness = 0.27;
+        let ior = 1.1_f64;
+        let (x0, x1, fx) = texel_weights(roughness);
+        let (y0, y1, fy) = texel_weights(sqrt_one_minus(cosine));
+        let sample_channel = |channel| {
+            let texel =
+                |x, y| utility_texel(super::super::eevee_transmission_tables::brdf(x, y, channel));
+            blend(
+                blend(texel(x0, y0), texel(x1, y0), fx),
+                blend(texel(x0, y1), texel(x1, y1), fx),
+                fy,
+            )
+        };
+        let scale = sample_channel(0);
+        let bias = sample_channel(1);
+        let f90 = DVec3::splat((2.33 / 0.33 * ((ior - 1.0) / (ior + 1.0))).clamp(0.0, 1.0));
+        let expected = f0 * scale + f90 * bias;
+        let actual = eevee_bsdf_lut_single_scatter(f0, DVec3::ONE, cosine, roughness, ior);
+        assert!((actual - expected).max_element().abs() < 1.0e-12);
     }
 
     #[test]

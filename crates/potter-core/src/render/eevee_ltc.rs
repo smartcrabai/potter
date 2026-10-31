@@ -20,7 +20,7 @@ use glam::{DMat3, DVec3};
 
 use super::eevee_transmission_tables::ltc_matrix;
 use super::{
-    eevee_transmission::{blend, texel_weights},
+    eevee_transmission::{blend, texel_weights, utility_texel},
     eevee_transmission_tables::disk_integral,
 };
 
@@ -36,9 +36,10 @@ pub(crate) fn sample_matrix(cos_theta: f64, roughness: f64) -> PackedMatrix {
     let (x0, x1, fx) = texel_weights(roughness);
     let (y0, y1, fy) = texel_weights((1.0 - cos_theta.clamp(0.0, 1.0)).sqrt());
     std::array::from_fn(|channel| {
+        let texel = |x, y| utility_texel(ltc_matrix(x, y, channel));
         blend(
-            blend(ltc_matrix(x0, y0, channel), ltc_matrix(x1, y0, channel), fx),
-            blend(ltc_matrix(x0, y1, channel), ltc_matrix(x1, y1, channel), fx),
+            blend(texel(x0, y0), texel(x1, y0), fx),
+            blend(texel(x0, y1), texel(x1, y1), fx),
             fy,
         )
     })
@@ -90,9 +91,10 @@ fn tangent_basis(normal: DVec3, view: DVec3) -> DMat3 {
 fn diffuse_sphere_integral(avg_dir_z: f64, form_factor: f64) -> f64 {
     let (x0, x1, fx) = texel_weights(avg_dir_z * 0.5 + 0.5);
     let (y0, y1, fy) = texel_weights(form_factor);
+    let texel = |x, y| utility_texel(disk_integral(x, y));
     blend(
-        blend(disk_integral(x0, y0), disk_integral(x1, y0), fx),
-        blend(disk_integral(x0, y1), disk_integral(x1, y1), fx),
+        blend(texel(x0, y0), texel(x1, y0), fx),
+        blend(texel(x0, y1), texel(x1, y1), fx),
         fy,
     )
 }

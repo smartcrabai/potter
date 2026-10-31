@@ -11,6 +11,8 @@ pub(crate) struct CurveHit {
     /// Ray parameter `t` for `ray_origin + t * ray_direction`; metric distance only for unit rays.
     pub(crate) distance: f64,
     pub(crate) u: f64,
+    /// Cycles ribbon coordinate in [-1, 1]; thick curves use zero.
+    pub(crate) v: f64,
     /// Cycles' unnormalized outward geometric normal.
     pub(crate) geometric_normal: DVec3,
 }
@@ -77,6 +79,7 @@ pub(crate) fn linear_curve_intersect(
     Some(CurveHit {
         distance,
         u,
+        v: 0.0,
         geometric_normal,
     })
 }
@@ -203,7 +206,6 @@ const CURVE_JACOBIAN_ITERATIONS: usize = 5;
 const CURVE_FLOAT_MAX: f64 = f32::MAX as f64;
 pub(crate) const CURVE_TYPE_CATMULL_ROM: u8 = 0;
 pub(crate) const CURVE_TYPE_LINEAR: u8 = 1;
-pub(crate) const MAX_NURBS_ORDER: usize = i8::MAX as usize;
 
 fn curve_key_add(a: CurveKey, b: CurveKey) -> CurveKey {
     CurveKey {
@@ -268,9 +270,6 @@ fn catmull_rom_basis_derivative2(curve: &[CurveKey; 4], u: f64) -> CurveKey {
 pub(crate) fn curve_tangent(keys: &[CurveKey; 4], curve_type: u8, u: f64) -> Option<DVec3> {
     let tangent = match curve_type {
         CURVE_TYPE_CATMULL_ROM => catmull_rom_basis_derivative(keys, u).position,
-        CURVE_TYPE_BEZIER => {
-            catmull_rom_basis_derivative(&bezier_to_catmull_keys(*keys), u).position
-        }
         CURVE_TYPE_LINEAR => keys[2].position - keys[1].position,
         _ => return None,
     };
@@ -280,7 +279,6 @@ pub(crate) fn curve_tangent(keys: &[CurveKey; 4], curve_type: u8, u: f64) -> Opt
 pub(crate) fn curve_radius(keys: &[CurveKey; 4], curve_type: u8, u: f64) -> Option<f64> {
     let radius = match curve_type {
         CURVE_TYPE_CATMULL_ROM => catmull_rom_basis_eval(keys, u).radius,
-        CURVE_TYPE_BEZIER => return bezier_radius(*keys, u),
         CURVE_TYPE_LINEAR => mix(keys[1].radius, keys[2].radius, u),
         _ => return None,
     };
@@ -290,32 +288,11 @@ pub(crate) fn curve_radius(keys: &[CurveKey; 4], curve_type: u8, u: f64) -> Opti
 pub(crate) fn curve_position(keys: &[CurveKey; 4], curve_type: u8, u: f64) -> Option<DVec3> {
     let position = match curve_type {
         CURVE_TYPE_CATMULL_ROM => catmull_rom_basis_eval(keys, u).position,
-        CURVE_TYPE_BEZIER => catmull_rom_basis_eval(&bezier_to_catmull_keys(*keys), u).position,
         CURVE_TYPE_LINEAR => keys[1].position.lerp(keys[2].position, u),
         _ => return None,
     };
     position.is_finite().then_some(position)
 }
-pub(crate) const CURVE_TYPE_BEZIER: u8 = 2;
-
-/// Intersects a cubic Bezier hair span without tessellating it.
-pub(crate) fn bezier_curve_intersect(
-    keys: [CurveKey; 4],
-    ray_origin: DVec3,
-    ray_direction: DVec3,
-    ray_t_min: f64,
-    ray_t_max: f64,
-) -> Option<CurveHit> {
-    catmull_rom_curve_intersect(
-        bezier_to_catmull_curve_keys(keys),
-        ray_origin,
-        ray_direction,
-        ray_t_min,
-        ray_t_max,
-    )
-}
-
-/// The Catmull-Rom basis in this module spans exactly the same cubic as these Bezier controls.
 fn bezier_to_catmull_keys(keys: [CurveKey; 4]) -> [CurveKey; 4] {
     [
         curve_key_sub(
@@ -331,66 +308,31 @@ fn bezier_to_catmull_keys(keys: [CurveKey; 4]) -> [CurveKey; 4] {
     ]
 }
 
-fn bezier_to_catmull_curve_keys(keys: [CurveKey; 4]) -> [CurveKey; 4] {
-    let mut curve = bezier_to_catmull_keys(keys);
-    let radius_delta = keys[3].radius - keys[0].radius;
-    curve[0].radius = keys[0].radius - radius_delta;
-    curve[1].radius = keys[0].radius;
-    curve[2].radius = keys[3].radius;
-    curve[3].radius = keys[3].radius + radius_delta;
-    curve
-}
-
 pub(crate) fn bezier_position(keys: [CurveKey; 4], u: f64) -> Option<DVec3> {
     let position = catmull_rom_basis_eval(&bezier_to_catmull_keys(keys), u).position;
     position.is_finite().then_some(position)
 }
 
-pub(crate) fn bezier_tangent(keys: [CurveKey; 4], u: f64) -> Option<DVec3> {
-    let tangent = catmull_rom_basis_derivative(&bezier_to_catmull_keys(keys), u).position;
-    (tangent.is_finite() && tangent.length_squared() > f64::EPSILON).then_some(tangent)
-}
-pub(crate) fn bezier_radius(keys: [CurveKey; 4], u: f64) -> Option<f64> {
-    let radius = mix(keys[0].radius, keys[3].radius, u);
-    (radius.is_finite() && radius >= 0.0).then_some(radius)
-}
-
-/// NURBS control point data for one complete Blender Hair Curves spline.
-#[derive(Clone, Debug)]
-pub(crate) struct NurbsCurve {
-    pub(crate) keys: Vec<CurveKey>,
-    pub(crate) weights: Vec<f64>,
-    pub(crate) knots: Vec<f64>,
-    pub(crate) order: usize,
-    pub(crate) spans: Vec<usize>,
-    pub(crate) cyclic: bool,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) enum HairCurveShape {
-    CatmullRom {
-        keys: Vec<CurveKey>,
-        cyclic: bool,
-    },
-    Linear {
-        keys: Vec<CurveKey>,
-        cyclic: bool,
-    },
-    Bezier {
-        spans: Vec<[CurveKey; 4]>,
-        cyclic: bool,
-    },
-    Nurbs(NurbsCurve),
+    CatmullRom { keys: Vec<CurveKey>, cyclic: bool },
+    Linear { keys: Vec<CurveKey>, cyclic: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HairCurveRenderMode {
+    Ribbon,
+    Thick,
+    ThickLinear,
 }
 
 /// Prepared analytic geometry for one serialized Hair Curves spline.
 #[derive(Clone, Debug)]
 pub(crate) struct HairCurveGeometry {
-    pub(crate) resolution: usize,
-    pub(crate) normal_mode: u8,
-    pub(crate) tilts: Vec<f64>,
-    pub(crate) custom_normals: Option<Vec<DVec3>>,
     pub(crate) shape: HairCurveShape,
+    pub(crate) render_mode: HairCurveRenderMode,
+    /// Raw Cycles subdivision level; CPU Embree uses `clamp(1 << level, 1, 16) + 1`.
+    pub(crate) ribbon_subdivisions: usize,
     pub(crate) object_to_world: glam::DMat4,
     pub(crate) world_to_object: glam::DMat4,
 }
@@ -405,6 +347,49 @@ pub(crate) struct HairCurveSample {
 }
 
 impl HairCurveGeometry {
+    pub(crate) fn is_ribbon(&self) -> bool {
+        self.render_mode == HairCurveRenderMode::Ribbon
+    }
+
+    pub(crate) fn ribbon_shading_normal_world(
+        &self,
+        span_index: usize,
+        u: f64,
+        v: f64,
+        world_direction: DVec3,
+    ) -> Option<DVec3> {
+        if !self.is_ribbon()
+            || !v.is_finite()
+            || !(-1.0..=1.0).contains(&v)
+            || !world_direction.is_finite()
+        {
+            return None;
+        }
+        let tangent = self
+            .sample_local(span_index, u)?
+            .tangent
+            .normalize_or_zero();
+        let direction = self
+            .world_to_object
+            .transform_vector3(world_direction)
+            .normalize_or_zero();
+        let bitangent = tangent.cross(-direction).normalize_or_zero();
+        let normal = tangent.cross(bitangent).normalize_or_zero();
+        let local_normal =
+            (bitangent * v - normal * (1.0 - v * v).max(0.0).sqrt()).normalize_or_zero();
+        if tangent == DVec3::ZERO
+            || direction == DVec3::ZERO
+            || bitangent == DVec3::ZERO
+            || normal == DVec3::ZERO
+            || local_normal == DVec3::ZERO
+        {
+            return None;
+        }
+        curve_normal_to_world(self.world_to_object, local_normal)
+            .map(DVec3::normalize_or_zero)
+            .filter(|normal| *normal != DVec3::ZERO)
+    }
+
     pub(crate) fn closest_hit_world(
         &self,
         origin: DVec3,
@@ -414,41 +399,62 @@ impl HairCurveGeometry {
     ) -> Option<(usize, CurveHit)> {
         let (local_origin, local_direction) =
             affine_ray_to_curve_space(self.world_to_object, origin, direction)?;
-        let local_hit = match &self.shape {
-            HairCurveShape::Bezier { spans, .. } => spans
-                .iter()
-                .enumerate()
-                .filter_map(|(index, keys)| {
-                    bezier_curve_intersect(*keys, local_origin, local_direction, t_min, t_max)
-                        .map(|hit| (index, hit))
-                })
-                .min_by(|left, right| left.1.distance.total_cmp(&right.1.distance)),
-            HairCurveShape::Nurbs(curve) => {
-                let (span, hit) =
-                    nurbs_curve_intersect(curve, local_origin, local_direction, t_min, t_max)?;
-                let index = curve.spans.iter().position(|value| *value == span)?;
-                Some((index, hit))
+        let local_hit = match self.render_mode {
+            HairCurveRenderMode::Ribbon => {
+                let span_count = match &self.shape {
+                    HairCurveShape::CatmullRom { keys, cyclic } => {
+                        if *cyclic {
+                            keys.len()
+                        } else {
+                            keys.len().saturating_sub(1)
+                        }
+                    }
+                    HairCurveShape::Linear { .. } => 0,
+                };
+                (0..span_count)
+                    .filter_map(|span| {
+                        ribbon_curve_intersect(
+                            self,
+                            span,
+                            local_origin,
+                            local_direction,
+                            t_min,
+                            t_max,
+                        )
+                        .map(|hit| (span, hit))
+                    })
+                    .min_by(|left, right| left.1.distance.total_cmp(&right.1.distance))
             }
-            HairCurveShape::CatmullRom { keys, cyclic } => intersect_key_curve(
-                keys,
-                *cyclic,
-                true,
-                local_origin,
-                local_direction,
-                t_min,
-                t_max,
-            ),
-            HairCurveShape::Linear { keys, cyclic } => intersect_key_curve(
-                keys,
-                *cyclic,
-                false,
-                local_origin,
-                local_direction,
-                t_min,
-                t_max,
-            ),
+            HairCurveRenderMode::Thick => match &self.shape {
+                HairCurveShape::CatmullRom { keys, cyclic } => intersect_key_curve(
+                    keys,
+                    *cyclic,
+                    true,
+                    local_origin,
+                    local_direction,
+                    t_min,
+                    t_max,
+                ),
+                HairCurveShape::Linear { .. } => None,
+            },
+            HairCurveRenderMode::ThickLinear => match &self.shape {
+                HairCurveShape::Linear { keys, cyclic } => intersect_key_curve(
+                    keys,
+                    *cyclic,
+                    false,
+                    local_origin,
+                    local_direction,
+                    t_min,
+                    t_max,
+                ),
+                HairCurveShape::CatmullRom { .. } => None,
+            },
         }?;
-        let normal = curve_normal_to_world(self.world_to_object, local_hit.1.geometric_normal)?;
+        let normal = if self.is_ribbon() {
+            -direction
+        } else {
+            curve_normal_to_world(self.world_to_object, local_hit.1.geometric_normal)?
+        };
         Some((
             local_hit.0,
             CurveHit {
@@ -458,28 +464,33 @@ impl HairCurveGeometry {
         ))
     }
     pub(crate) fn sample_local(&self, span_index: usize, u: f64) -> Option<HairCurveSample> {
+        let curve_type = if matches!(&self.shape, HairCurveShape::CatmullRom { .. }) {
+            CURVE_TYPE_CATMULL_ROM
+        } else {
+            CURVE_TYPE_LINEAR
+        };
+        self.sample_local_with_curve_type(span_index, u, curve_type)
+    }
+
+    /// Cycles' curve-shadow bake constructs a synthetic thick primitive even when render geometry is linear.
+    pub(crate) fn sample_local_for_shadow_bake(
+        &self,
+        span_index: usize,
+        u: f64,
+    ) -> Option<HairCurveSample> {
+        self.sample_local_with_curve_type(span_index, u, CURVE_TYPE_CATMULL_ROM)
+    }
+
+    fn sample_local_with_curve_type(
+        &self,
+        span_index: usize,
+        u: f64,
+        curve_type: u8,
+    ) -> Option<HairCurveSample> {
         if !u.is_finite() || !(0.0..=1.0).contains(&u) {
             return None;
         }
         let sample = match &self.shape {
-            HairCurveShape::Bezier { spans, .. } => {
-                let keys = *spans.get(span_index)?;
-                HairCurveSample {
-                    position: bezier_position(keys, u)?,
-                    tangent: bezier_tangent(keys, u)?,
-                    radius: bezier_radius(keys, u)?,
-                }
-            }
-            HairCurveShape::Nurbs(curve) => {
-                let span = *curve.spans.get(span_index)?;
-                let (start, end) = nurbs_span_range(curve, span)?;
-                let evaluation = curve_eval(curve, span, start + (end - start) * u)?;
-                HairCurveSample {
-                    position: evaluation.position,
-                    tangent: evaluation.tangent,
-                    radius: evaluation.radius,
-                }
-            }
             HairCurveShape::CatmullRom { keys, cyclic }
             | HairCurveShape::Linear { keys, cyclic } => {
                 let segment_count = if *cyclic {
@@ -500,11 +511,6 @@ impl HairCurveGeometry {
                     keys[index]
                 };
                 let segment_keys = [key_at(-1), key_at(0), key_at(1), key_at(2)];
-                let curve_type = if matches!(&self.shape, HairCurveShape::CatmullRom { .. }) {
-                    CURVE_TYPE_CATMULL_ROM
-                } else {
-                    CURVE_TYPE_LINEAR
-                };
                 HairCurveSample {
                     position: curve_position(&segment_keys, curve_type, u)?,
                     tangent: curve_tangent(&segment_keys, curve_type, u)?,
@@ -515,6 +521,225 @@ impl HairCurveGeometry {
         (sample.position.is_finite() && sample.tangent.is_finite() && sample.radius.is_finite())
             .then_some(sample)
     }
+}
+
+const MAX_RIBBON_SUBDIVISION_LEVEL: usize = 24;
+const MAX_RIBBON_SUBDIVISIONS: usize = 16;
+const MAX_RIBBON_INTERSECTION_SEGMENTS: usize = MAX_RIBBON_SUBDIVISIONS + 1;
+
+fn ribbon_subdivision_count(level: usize) -> Option<usize> {
+    if level > MAX_RIBBON_SUBDIVISION_LEVEL {
+        None
+    } else {
+        Some((1usize << level).clamp(1, MAX_RIBBON_SUBDIVISIONS))
+    }
+}
+
+fn ribbon_intersection_segment_count(level: usize) -> Option<usize> {
+    ribbon_subdivision_count(level)?.checked_add(1)
+}
+
+#[derive(Clone, Copy)]
+struct RibbonPoint {
+    position: DVec3,
+    tangent: DVec3,
+    radius: f64,
+}
+
+fn ribbon_curve_intersect(
+    geometry: &HairCurveGeometry,
+    span: usize,
+    ray_origin: DVec3,
+    ray_direction: DVec3,
+    ray_t_min: f64,
+    ray_t_max: f64,
+) -> Option<CurveHit> {
+    let subdivisions = ribbon_intersection_segment_count(geometry.ribbon_subdivisions)?;
+    if !ray_origin.is_finite()
+        || !ray_direction.is_finite()
+        || !ray_t_min.is_finite()
+        || ray_t_max.is_nan()
+        || ray_t_min > ray_t_max
+    {
+        return None;
+    }
+
+    let direction_squared = ray_direction.length_squared();
+    if !direction_squared.is_finite() || direction_squared <= 0.0 {
+        return None;
+    }
+    let direction_length = direction_squared.sqrt();
+    let inverse_direction_length = 1.0 / direction_length;
+    if !inverse_direction_length.is_finite() {
+        return None;
+    }
+    let unit_direction = ray_direction * inverse_direction_length;
+    let dx0 = DVec3::new(0.0, unit_direction.z, -unit_direction.y);
+    let dx1 = DVec3::new(-unit_direction.z, 0.0, unit_direction.x);
+    let axis_x = if dx0.length_squared() > dx1.length_squared() {
+        dx0
+    } else {
+        dx1
+    }
+    .normalize_or_zero();
+    let axis_y = unit_direction.cross(axis_x).normalize_or_zero();
+    // This scaled z axis makes ray-space depth equal the original, possibly affine, ray t.
+    let axis_z = unit_direction * inverse_direction_length;
+    if axis_x == DVec3::ZERO || axis_y == DVec3::ZERO || !axis_z.is_finite() {
+        return None;
+    }
+    let to_ray_space = |position: DVec3| {
+        let offset = position - ray_origin;
+        DVec3::new(axis_x.dot(offset), axis_y.dot(offset), axis_z.dot(offset))
+    };
+
+    let mut points = [RibbonPoint {
+        position: DVec3::ZERO,
+        tangent: DVec3::ZERO,
+        radius: 0.0,
+    }; MAX_RIBBON_INTERSECTION_SEGMENTS + 1];
+    let mut scale = 0.0_f64;
+    for (index, point_slot) in points.iter_mut().take(subdivisions + 1).enumerate() {
+        let u = index as f64 / subdivisions as f64;
+        let sample = geometry.sample_local(span, u)?;
+        let point = RibbonPoint {
+            position: to_ray_space(sample.position),
+            tangent: DVec3::new(
+                axis_x.dot(sample.tangent),
+                axis_y.dot(sample.tangent),
+                axis_z.dot(sample.tangent),
+            ),
+            radius: sample.radius,
+        };
+        if !point.position.is_finite()
+            || !point.tangent.is_finite()
+            || !point.radius.is_finite()
+            || point.radius < 0.0
+        {
+            return None;
+        }
+        scale = scale
+            .max(point.position.x.abs())
+            .max(point.position.y.abs())
+            .max(point.position.z.abs())
+            .max(point.radius.abs());
+        *point_slot = point;
+    }
+    let epsilon = 4.0 * FLOAT_EPSILON * scale;
+    if !epsilon.is_finite() {
+        return None;
+    }
+
+    let step_size = 1.0 / subdivisions as f64;
+    for index in 0..subdivisions {
+        let point0 = points[index];
+        let point1 = points[index + 1];
+        let delta = point1.position - point0.position;
+        let radius = point0.radius.max(point1.radius);
+        let culling_numerator = delta.x * point0.position.y - delta.y * point0.position.x;
+        let culling_denominator = delta.x * delta.x + delta.y * delta.y;
+        let culling_left = culling_numerator * culling_numerator;
+        let culling_right = radius * radius * culling_denominator;
+        if !culling_numerator.is_finite()
+            || !culling_denominator.is_finite()
+            || !culling_left.is_finite()
+            || !culling_right.is_finite()
+            || !radius.is_finite()
+            || culling_left > culling_right
+        {
+            continue;
+        }
+
+        let tangent0 = if point0.tangent.abs().max_element() < epsilon {
+            delta
+        } else {
+            point0.tangent
+        };
+        let tangent1 = if point1.tangent.abs().max_element() < epsilon {
+            delta
+        } else {
+            point1.tangent
+        };
+        let width0 = DVec3::new(tangent0.y, -tangent0.x, 0.0).normalize_or_zero() * point0.radius;
+        let width1 = DVec3::new(tangent1.y, -tangent1.x, 0.0).normalize_or_zero() * point1.radius;
+        let Some((u_fraction, v_fraction, distance)) = ribbon_intersect_quad(
+            ray_t_min,
+            ray_t_max,
+            point0.position + width0,
+            point1.position + width1,
+            point1.position - width1,
+            point0.position - width0,
+        ) else {
+            continue;
+        };
+        let self_intersection_limit =
+            2.0 * mix(point0.radius, point1.radius, u_fraction) * inverse_direction_length;
+        if !self_intersection_limit.is_finite() || distance <= self_intersection_limit {
+            continue;
+        }
+
+        let u = index as f64 * step_size + u_fraction * step_size;
+        let v = 2.0 * v_fraction - 1.0;
+        if !u.is_finite() || !v.is_finite() || !inclusive_range(distance, ray_t_min, ray_t_max) {
+            return None;
+        }
+        return Some(CurveHit {
+            distance,
+            u,
+            v,
+            geometric_normal: -ray_direction,
+        });
+    }
+    None
+}
+
+fn ribbon_intersect_quad(
+    ray_t_min: f64,
+    ray_t_max: f64,
+    quad_v0: DVec3,
+    quad_v1: DVec3,
+    quad_v2: DVec3,
+    quad_v3: DVec3,
+) -> Option<(f64, f64, f64)> {
+    if !quad_v0.is_finite() || !quad_v1.is_finite() || !quad_v2.is_finite() || !quad_v3.is_finite()
+    {
+        return None;
+    }
+    let edge_db = quad_v1 - quad_v3;
+    let ww = quad_v3.x * edge_db.y - quad_v3.y * edge_db.x;
+    if !ww.is_finite() {
+        return None;
+    }
+    let (v0, v1, v2) = if ww <= 0.0 {
+        (quad_v0, quad_v1, quad_v3)
+    } else {
+        (quad_v2, quad_v3, quad_v1)
+    };
+    let edge0 = v2 - v0;
+    let edge1 = v0 - v1;
+    let u_edge = v0.x * edge0.y - v0.y * edge0.x;
+    let v_edge = v1.x * edge1.y - v1.y * edge1.x;
+    if !u_edge.is_finite() || !v_edge.is_finite() || u_edge.max(v_edge) > 0.0 {
+        return None;
+    }
+
+    let normal = edge1.cross(edge0);
+    let denominator = normal.z;
+    if !normal.is_finite() || !denominator.is_finite() || denominator == 0.0 {
+        return None;
+    }
+    let inverse_denominator = 1.0 / denominator;
+    let distance = inverse_denominator * v0.dot(normal);
+    if !distance.is_finite() || !inclusive_range(distance, ray_t_min, ray_t_max) {
+        return None;
+    }
+    let mut u = u_edge * inverse_denominator;
+    let mut v = v_edge * inverse_denominator;
+    if ww > 0.0 {
+        u = 1.0 - u;
+        v = 1.0 - v;
+    }
+    (u.is_finite() && v.is_finite()).then_some((u, v, distance))
 }
 
 fn intersect_key_curve(
@@ -557,469 +782,7 @@ fn intersect_key_curve(
     closest
 }
 
-/// Returns the closest Cycles-style swept-curve hit and its non-zero knot-span index.
-///
-/// Geometry and radii are evaluated from the rational B-spline itself. `keys` and `ray` are in
-/// the same space; object transforms must be applied by transforming the ray, not the radius.
-pub(crate) fn nurbs_curve_intersect(
-    curve: &NurbsCurve,
-    ray_origin: DVec3,
-    ray_direction: DVec3,
-    ray_t_min: f64,
-    ray_t_max: f64,
-) -> Option<(usize, CurveHit)> {
-    if curve.order < 2
-        || curve.order > curve.keys.len()
-        || curve.weights.len() != curve.keys.len()
-        || curve.knots.len() != curve.keys.len().checked_add(curve.order)?
-        || curve.keys.iter().zip(&curve.weights).any(|(key, weight)| {
-            !key.position.is_finite()
-                || !key.radius.is_finite()
-                || key.radius < 0.0
-                || !weight.is_finite()
-                || *weight <= 0.0
-        })
-        || curve.knots.iter().any(|knot| !knot.is_finite())
-        || !ray_origin.is_finite()
-        || !ray_direction.is_finite()
-        || !ray_direction.length_squared().is_finite()
-        || ray_direction.length_squared() <= 0.0
-        || !ray_t_min.is_finite()
-        || ray_t_max.is_nan()
-        || ray_t_min > ray_t_max
-    {
-        return None;
-    }
-
-    let mut closest: Option<(usize, CurveHit)> = None;
-    for &span in &curve.spans {
-        let Some((start, end)) = nurbs_span_range(curve, span) else {
-            continue;
-        };
-        if start >= end {
-            continue;
-        }
-        let max_t = closest.map_or(ray_t_max, |(_, hit)| hit.distance.min(ray_t_max));
-        let Some(hit) = nurbs_span_intersect(
-            curve,
-            span,
-            start,
-            end,
-            ray_origin,
-            ray_direction,
-            ray_t_min,
-            max_t,
-        ) else {
-            continue;
-        };
-        if closest.is_none_or(|(_, previous)| hit.distance < previous.distance) {
-            closest = Some((span, hit));
-        }
-    }
-    if !curve.cyclic {
-        let first_span = *curve.spans.first()?;
-        let last_span = *curve.spans.last()?;
-        let (first_start, _) = nurbs_span_range(curve, first_span)?;
-        let (_, last_end) = nurbs_span_range(curve, last_span)?;
-        for (span, parameter, is_start) in [
-            (first_span, first_start, true),
-            (last_span, last_end, false),
-        ] {
-            let evaluation = curve_eval(curve, span, parameter)?;
-            let current_max = closest.map_or(ray_t_max, |(_, hit)| hit.distance.min(ray_t_max));
-            if let Some(hit) = endpoint_cap_intersect(
-                evaluation.position,
-                evaluation.radius,
-                evaluation.tangent,
-                is_start,
-                if is_start { 0.0 } else { 1.0 },
-                ray_origin,
-                ray_direction,
-                ray_t_min,
-                current_max,
-            ) && closest.is_none_or(|(_, previous)| hit.distance < previous.distance)
-            {
-                closest = Some((span, hit));
-            }
-        }
-    }
-    closest
-}
-
-fn endpoint_cap_intersect(
-    center: DVec3,
-    radius: f64,
-    tangent: DVec3,
-    is_start: bool,
-    u: f64,
-    origin: DVec3,
-    direction: DVec3,
-    t_min: f64,
-    t_max: f64,
-) -> Option<CurveHit> {
-    if radius <= 0.0 || !center.is_finite() || !tangent.is_finite() {
-        return None;
-    }
-    let direction_squared = direction.length_squared();
-    let offset = (center - origin).dot(direction) / direction_squared;
-    if !offset.is_finite() {
-        return None;
-    }
-    let local_origin = origin + direction * offset;
-    let to_origin = local_origin - center;
-    let half_b = to_origin.dot(direction);
-    let discriminant =
-        half_b * half_b - direction_squared * (to_origin.length_squared() - radius * radius);
-    if !discriminant.is_finite() || discriminant < 0.0 {
-        return None;
-    }
-    let root = discriminant.sqrt();
-    let mut best = None;
-    for local_distance in [
-        (-half_b - root) / direction_squared,
-        (-half_b + root) / direction_squared,
-    ] {
-        let distance = local_distance + offset;
-        if !distance.is_finite() || distance < t_min || distance > t_max {
-            continue;
-        }
-        let normal = to_origin + direction * local_distance;
-        let facing = normal.dot(tangent);
-        if !facing.is_finite()
-            || (tangent.length_squared() > 0.0
-                && (if is_start { facing > 0.0 } else { facing < 0.0 }))
-        {
-            continue;
-        }
-        if best.is_none_or(|previous: CurveHit| distance < previous.distance) {
-            best = Some(CurveHit {
-                distance,
-                u,
-                geometric_normal: normal,
-            });
-        }
-    }
-    best
-}
-
-pub(crate) fn nurbs_span_range(curve: &NurbsCurve, span: usize) -> Option<(f64, f64)> {
-    let degree = curve.order.checked_sub(1)?;
-    if span < degree || span + 1 >= curve.knots.len() || span >= curve.keys.len() {
-        return None;
-    }
-    let start = curve.knots[span];
-    let end = curve.knots[span + 1];
-    (start.is_finite() && end.is_finite() && start < end).then_some((start, end))
-}
-
-#[derive(Clone, Copy)]
-struct NurbsEvaluation {
-    position: DVec3,
-    tangent: DVec3,
-    second: DVec3,
-    radius: f64,
-    radius_derivative: f64,
-    weight: f64,
-}
-
-fn nurbs_span_intersect(
-    curve: &NurbsCurve,
-    span: usize,
-    start: f64,
-    end: f64,
-    ray_origin: DVec3,
-    ray_direction: DVec3,
-    ray_t_min: f64,
-    ray_t_max: f64,
-) -> Option<CurveHit> {
-    let center = curve.keys[span - (curve.order - 1)..=span]
-        .iter()
-        .map(|key| key.position)
-        .fold(DVec3::ZERO, |sum, position| sum + position)
-        / curve.order as f64;
-    let direction_squared = ray_direction.length_squared();
-    let offset = (center - ray_origin).dot(ray_direction) / direction_squared;
-    if !center.is_finite() || !offset.is_finite() {
-        return None;
-    }
-    let local_origin = ray_origin + ray_direction * offset;
-    let mut best: Option<CurveHit> = None;
-
-    // Multiple deterministic seeds keep the Newton solve on the span whose tube was hit.
-    for seed in 0..=17 {
-        let sample_index = seed / 2;
-        let mut u = start + (end - start) * sample_index as f64 / 8.0;
-        let initial = curve_eval(curve, span, u)?;
-        let projected = (initial.position - local_origin).dot(ray_direction) / direction_squared;
-        let radial_offset = initial.radius / direction_squared.sqrt();
-        let mut t = projected
-            + if seed % 2 == 0 {
-                -radial_offset
-            } else {
-                radial_offset
-            };
-        let mut converged = false;
-        for _ in 0..32 {
-            let evaluation = curve_eval(curve, span, u)?;
-            let delta = local_origin + ray_direction * t - evaluation.position;
-            let f0 = delta.dot(evaluation.tangent);
-            let f1 = delta.length_squared() - evaluation.radius * evaluation.radius;
-            let j00 = ray_direction.dot(evaluation.tangent);
-            let j01 = -evaluation.tangent.length_squared() + delta.dot(evaluation.second);
-            let j10 = 2.0 * delta.dot(ray_direction);
-            let j11 = -2.0 * delta.dot(evaluation.tangent)
-                - 2.0 * evaluation.radius * evaluation.radius_derivative;
-            let determinant = j00 * j11 - j01 * j10;
-            if !determinant.is_finite() || determinant.abs() < 1.0e-24 {
-                break;
-            }
-            let dt = (-f0 * j11 + f1 * j01) / determinant;
-            let du = (-f1 * j00 + f0 * j10) / determinant;
-            if !dt.is_finite() || !du.is_finite() {
-                break;
-            }
-            t += dt;
-            u += du;
-            if dt.abs() <= 1.0e-10 * (1.0 + t.abs()) && du.abs() <= 1.0e-10 * (1.0 + u.abs()) {
-                converged = true;
-                break;
-            }
-        }
-        if !converged || u < start || u > end {
-            continue;
-        }
-        let evaluation = curve_eval(curve, span, u)?;
-        let delta = local_origin + ray_direction * t - evaluation.position;
-        let normal = delta
-            - evaluation.tangent
-                * (delta.dot(evaluation.tangent) / evaluation.tangent.length_squared());
-        let distance = t + offset;
-        if !distance.is_finite()
-            || !normal.is_finite()
-            || distance < ray_t_min
-            || distance > ray_t_max
-        {
-            continue;
-        }
-        let hit = CurveHit {
-            distance,
-            u: (u - start) / (end - start),
-            geometric_normal: normal,
-        };
-        if best.is_none_or(|previous| hit.distance < previous.distance) {
-            best = Some(hit);
-        }
-    }
-    best
-}
-
-fn curve_eval(curve: &NurbsCurve, span: usize, parameter: f64) -> Option<NurbsEvaluation> {
-    let degree = curve.order.checked_sub(1)?;
-    let span = span.min(curve.keys.len() - 1);
-    let ders = nurbs_basis_derivatives(&curve.knots, curve.order, span, parameter)?;
-    let first_control = span.checked_sub(degree)?;
-    let mut position_h = DVec3::ZERO;
-    let mut tangent_h = DVec3::ZERO;
-    let mut second_h = DVec3::ZERO;
-    let mut weight = 0.0;
-    let mut weight_derivative = 0.0;
-    let mut weight_second = 0.0;
-    // `curve_nurbs.cc::interpolate_to_evaluated_rational` weights point attributes by the same basis.
-    let mut radius_h = 0.0;
-    let mut radius_derivative_h = 0.0;
-    for (index, ((basis, basis_derivative), basis_second)) in ders[0][..curve.order]
-        .iter()
-        .zip(&ders[1][..curve.order])
-        .zip(&ders[2][..curve.order])
-        .enumerate()
-    {
-        let control_index = first_control + index;
-        let key = *curve.keys.get(control_index)?;
-        let control_weight = *curve.weights.get(control_index)?;
-        position_h += key.position * (*basis * control_weight);
-        tangent_h += key.position * (*basis_derivative * control_weight);
-        second_h += key.position * (*basis_second * control_weight);
-        weight += *basis * control_weight;
-        weight_derivative += *basis_derivative * control_weight;
-        weight_second += *basis_second * control_weight;
-        radius_h += key.radius * *basis * control_weight;
-        radius_derivative_h += key.radius * *basis_derivative * control_weight;
-    }
-    if !weight.is_finite() || weight <= 0.0 {
-        return None;
-    }
-    let position = position_h / weight;
-    let tangent = (tangent_h - position * weight_derivative) / weight;
-    let second =
-        (second_h - tangent * (2.0 * weight_derivative) - position * weight_second) / weight;
-    let radius = radius_h / weight;
-    let radius_derivative = (radius_derivative_h - radius * weight_derivative) / weight;
-    (position.is_finite()
-        && tangent.is_finite()
-        && second.is_finite()
-        && radius.is_finite()
-        && radius >= 0.0
-        && radius_derivative.is_finite())
-    .then_some(NurbsEvaluation {
-        position,
-        tangent,
-        second,
-        radius,
-        radius_derivative,
-        weight,
-    })
-}
-
-pub(crate) fn nurbs_curve_frame_sample(
-    curve: &NurbsCurve,
-    span: usize,
-    parameter: f64,
-    source_tilts: &[f64],
-    source_normals: Option<&[DVec3]>,
-) -> Option<(DVec3, f64, Option<DVec3>)> {
-    if source_tilts.is_empty()
-        || source_normals.is_some_and(|normals| normals.len() != source_tilts.len())
-    {
-        return None;
-    }
-    let evaluation = curve_eval(curve, span, parameter)?;
-    let basis = nurbs_basis_derivatives(&curve.knots, curve.order, span, parameter)?;
-    let first_control = span.checked_sub(curve.order - 1)?;
-    let mut tilt = 0.0;
-    let mut normal = DVec3::ZERO;
-    for (index, basis_weight) in basis[0][..curve.order].iter().enumerate() {
-        let control_index = first_control + index;
-        let source_index = if curve.cyclic {
-            control_index % source_tilts.len()
-        } else {
-            control_index
-        };
-        let rational_weight =
-            *basis_weight * *curve.weights.get(control_index)? / evaluation.weight;
-        tilt += rational_weight * *source_tilts.get(source_index)?;
-        if let Some(source_normals) = source_normals {
-            normal += rational_weight * *source_normals.get(source_index)?;
-        }
-    }
-    let normal = source_normals.map(|_| {
-        let length = normal.length();
-        if length > 0.0 {
-            normal / length
-        } else {
-            normal
-        }
-    });
-    (tilt.is_finite() && normal.is_none_or(DVec3::is_finite)).then_some((
-        evaluation.position,
-        tilt,
-        normal,
-    ))
-}
-
-fn nurbs_basis_derivatives(
-    knots: &[f64],
-    order: usize,
-    span: usize,
-    parameter: f64,
-) -> Option<[[f64; MAX_NURBS_ORDER]; 3]> {
-    const MAX_ORDER: usize = MAX_NURBS_ORDER;
-    let degree = order.checked_sub(1)?;
-    if order > MAX_ORDER || span + 1 >= knots.len() || !parameter.is_finite() {
-        return None;
-    }
-    let mut previous = [0.0; MAX_ORDER];
-    let mut next = [0.0; MAX_ORDER];
-    let mut lower_basis = [0.0; MAX_ORDER];
-    let mut lower2_basis = [0.0; MAX_ORDER];
-    let mut left = [0.0; MAX_ORDER];
-    let mut right = [0.0; MAX_ORDER];
-    previous[0] = 1.0;
-    lower_basis[0] = 1.0;
-    lower2_basis[0] = 1.0;
-    for j in 1..=degree {
-        left[j] = parameter - knots[span + 1 - j];
-        right[j] = knots[span + j] - parameter;
-        next.fill(0.0);
-        let mut saved = 0.0;
-        for r in 0..j {
-            let denominator = right[r + 1] + left[j - r];
-            let term = if denominator == 0.0 {
-                0.0
-            } else {
-                previous[r] / denominator
-            };
-            next[r] = saved + right[r + 1] * term;
-            saved = left[j - r] * term;
-        }
-        next[j] = saved;
-        if j + 1 == degree {
-            lower_basis = next;
-        }
-        if degree >= 2 && j + 2 == degree {
-            lower2_basis = next;
-        }
-        previous.copy_from_slice(&next);
-    }
-
-    let mut result = [[0.0; MAX_ORDER]; 3];
-    result[0][..order].copy_from_slice(&previous[..order]);
-    if degree == 0 {
-        return Some(result);
-    }
-    for index in 0..order {
-        let left_denominator = knots[span + index] - knots[span + index - degree];
-        let right_denominator = knots[span + index + 1] - knots[span + index + 1 - degree];
-        let left_value = if index == 0 || left_denominator == 0.0 {
-            0.0
-        } else {
-            lower_basis[index - 1] / left_denominator
-        };
-        let right_value = if index >= degree || right_denominator == 0.0 {
-            0.0
-        } else {
-            lower_basis[index] / right_denominator
-        };
-        result[1][index] = degree as f64 * (left_value - right_value);
-    }
-    if degree == 1 {
-        return Some(result);
-    }
-    let mut lower_derivative = [0.0; MAX_ORDER];
-    for index in 0..degree {
-        let left_denominator = knots[span + index] - knots[span + index - (degree - 1)];
-        let right_denominator = knots[span + index + 1] - knots[span + index + 1 - (degree - 1)];
-        let left_value = if index == 0 || left_denominator == 0.0 {
-            0.0
-        } else {
-            (degree - 1) as f64 * lower2_basis[index - 1] / left_denominator
-        };
-        let right_value = if index >= degree - 1 || right_denominator == 0.0 {
-            0.0
-        } else {
-            (degree - 1) as f64 * lower2_basis[index] / right_denominator
-        };
-        lower_derivative[index] = left_value - right_value;
-    }
-    for index in 0..order {
-        let left_denominator = knots[span + index] - knots[span + index - degree];
-        let right_denominator = knots[span + index + 1] - knots[span + index + 1 - degree];
-        let left_value = if index == 0 || left_denominator == 0.0 {
-            0.0
-        } else {
-            lower_derivative[index - 1] / left_denominator
-        };
-        let right_value = if index >= degree || right_denominator == 0.0 {
-            0.0
-        } else {
-            lower_derivative[index] / right_denominator
-        };
-        result[2][index] = degree as f64 * (left_value - right_value);
-    }
-    Some(result)
-}
-
-/// Maps a world ray to curve-local coordinates without normalizing its direction, preserving `t`
-/// under any invertible affine object transform and retaining a circular local hair radius.
+/// Maps a world ray into curve-local space without renormalizing its direction.
 pub(crate) fn affine_ray_to_curve_space(
     world_to_object: glam::DMat4,
     origin: DVec3,
@@ -1540,6 +1303,7 @@ fn catmull_rom_curve_intersect_iterative(
             return Some(CurveHit {
                 distance,
                 u,
+                v: 0.0,
                 geometric_normal,
             });
         }
@@ -1557,34 +1321,6 @@ struct HairBounds {
 }
 
 impl HairBounds {
-    fn from_curve(keys: &[CurveKey; 4], curve_type: u8) -> Option<Self> {
-        if keys
-            .iter()
-            .any(|key| !key.position.is_finite() || !key.radius.is_finite())
-        {
-            return None;
-        }
-        let controls = match curve_type {
-            CURVE_TYPE_CATMULL_ROM => catmull_rom_bezier_controls(*keys),
-            CURVE_TYPE_LINEAR => [keys[1], keys[1], keys[2], keys[2]],
-            CURVE_TYPE_BEZIER => *keys,
-            _ => return None,
-        };
-        // The Catmull-Rom cubic and its interpolated radius stay inside these Bezier control hulls.
-        let mut min = controls[0].position;
-        let mut max = controls[0].position;
-        let mut radius = controls[0].radius.abs();
-        for control in &controls[1..] {
-            min = min.min(control.position);
-            max = max.max(control.position);
-            radius = radius.max(control.radius.abs());
-        }
-        let bounds = Self {
-            min: min - DVec3::splat(radius),
-            max: max + DVec3::splat(radius),
-        };
-        (radius.is_finite() && bounds.min.is_finite() && bounds.max.is_finite()).then_some(bounds)
-    }
     // Transform the control hull to world space and bound its affine-scaled radius.
     fn from_spline(curve: &HairCurveGeometry) -> Option<Self> {
         let mut min = DVec3::splat(f64::INFINITY);
@@ -1635,22 +1371,6 @@ impl HairBounds {
                 let span_count = if *cyclic { keys.len() } else { keys.len() - 1 };
                 for span in 0..span_count {
                     if !include(keys[span]) || !include(keys[(span + 1) % keys.len()]) {
-                        return None;
-                    }
-                }
-            }
-            HairCurveShape::Bezier { spans, .. } => {
-                for span in spans {
-                    for control in span {
-                        if !include(*control) {
-                            return None;
-                        }
-                    }
-                }
-            }
-            HairCurveShape::Nurbs(curve) => {
-                for key in &curve.keys {
-                    if !include(*key) {
                         return None;
                     }
                 }
@@ -1737,7 +1457,7 @@ struct HairNode {
     kind: HairNodeKind,
 }
 
-/// Median-split acceleration structure for thick hair segments and prepared analytic splines.
+/// Median-split acceleration structure for prepared Cycles hair-curve instances.
 #[derive(Debug)]
 pub(crate) struct HairBvh {
     nodes: Vec<HairNode>,
@@ -1747,23 +1467,6 @@ pub(crate) struct HairBvh {
 }
 
 impl HairBvh {
-    pub(crate) fn build(keys: &[[CurveKey; 4]], curve_types: &[u8]) -> Self {
-        if keys.len() != curve_types.len() {
-            return Self {
-                nodes: Vec::new(),
-                curve_indices: Vec::new(),
-                curve_count: keys.len(),
-                root: None,
-            };
-        }
-        let bounds: Vec<Option<HairBounds>> = keys
-            .iter()
-            .zip(curve_types)
-            .map(|(keys, curve_type)| HairBounds::from_curve(keys, *curve_type))
-            .collect();
-        Self::from_bounds(&bounds)
-    }
-
     pub(crate) fn build_splines<'a>(
         curves: impl IntoIterator<Item = &'a HairCurveGeometry>,
     ) -> Self {
@@ -1794,145 +1497,6 @@ impl HairBvh {
         }
     }
 
-    #[expect(
-        clippy::float_cmp,
-        reason = "identical hit parameters use stable curve-index tie-breaking"
-    )]
-    pub(crate) fn closest_hit(
-        &self,
-        keys: &[[CurveKey; 4]],
-        curve_types: &[u8],
-        masks: &[u8],
-        origin: DVec3,
-        direction: DVec3,
-        t_min: f64,
-        t_max: f64,
-        ray_mask: u8,
-    ) -> Option<(usize, CurveHit)> {
-        if keys.len() != self.curve_count
-            || curve_types.len() != self.curve_count
-            || masks.len() != self.curve_count
-            || ray_mask == 0
-            || !origin.is_finite()
-            || !direction.is_finite()
-            || !t_min.is_finite()
-            || t_max.is_nan()
-            || t_min > t_max
-        {
-            return None;
-        }
-        let direction_squared = direction.dot(direction);
-        if !direction_squared.is_finite() || direction_squared <= 0.0 {
-            return None;
-        }
-
-        let mut current = self.root?;
-        let mut stack = [0usize; HAIR_BVH_STACK_CAPACITY];
-        let mut stack_len = 0usize;
-        let mut closest: Option<(usize, CurveHit)> = None;
-
-        loop {
-            let current_max = closest.map_or(t_max, |(_, hit)| hit.distance.min(t_max));
-            let node = self.nodes[current];
-            if node
-                .bounds
-                .entry(origin, direction, t_min, current_max)
-                .is_none()
-            {
-                if stack_len == 0 {
-                    break;
-                }
-                stack_len -= 1;
-                current = stack[stack_len];
-                continue;
-            }
-
-            match node.kind {
-                HairNodeKind::Leaf { start, end } => {
-                    for slot in start..end {
-                        let curve_index = self.curve_indices[slot];
-                        if masks[curve_index] & ray_mask == 0 {
-                            continue;
-                        }
-                        let current_max = closest.map_or(t_max, |(_, hit)| hit.distance.min(t_max));
-                        let hit = match curve_types[curve_index] {
-                            CURVE_TYPE_CATMULL_ROM => catmull_rom_curve_intersect(
-                                keys[curve_index],
-                                origin,
-                                direction,
-                                t_min,
-                                current_max,
-                            ),
-                            CURVE_TYPE_BEZIER => bezier_curve_intersect(
-                                keys[curve_index],
-                                origin,
-                                direction,
-                                t_min,
-                                current_max,
-                            ),
-                            CURVE_TYPE_LINEAR => linear_curve_intersect(
-                                keys[curve_index],
-                                origin,
-                                direction,
-                                t_min,
-                                current_max,
-                            ),
-                            _ => None,
-                        };
-                        let Some(hit) = hit else {
-                            continue;
-                        };
-                        if closest.is_none_or(|(previous_index, previous_hit)| {
-                            hit.distance < previous_hit.distance
-                                || (hit.distance == previous_hit.distance
-                                    && curve_index < previous_index)
-                        }) {
-                            closest = Some((curve_index, hit));
-                        }
-                    }
-                    if stack_len == 0 {
-                        break;
-                    }
-                    stack_len -= 1;
-                    current = stack[stack_len];
-                }
-                HairNodeKind::Branch { left, right } => {
-                    let current_max = closest.map_or(t_max, |(_, hit)| hit.distance.min(t_max));
-                    let left_entry =
-                        self.nodes[left]
-                            .bounds
-                            .entry(origin, direction, t_min, current_max);
-                    let right_entry =
-                        self.nodes[right]
-                            .bounds
-                            .entry(origin, direction, t_min, current_max);
-                    match (left_entry, right_entry) {
-                        (Some(left_entry), Some(right_entry)) => {
-                            let (near, far) = if left_entry <= right_entry {
-                                (left, right)
-                            } else {
-                                (right, left)
-                            };
-                            stack[stack_len] = far;
-                            stack_len += 1;
-                            current = near;
-                        }
-                        (Some(_), None) => current = left,
-                        (None, Some(_)) => current = right,
-                        (None, None) => {
-                            if stack_len == 0 {
-                                break;
-                            }
-                            stack_len -= 1;
-                            current = stack[stack_len];
-                        }
-                    }
-                }
-            }
-        }
-
-        closest
-    }
     /// Traverses spline control-hull bounds and invokes the exact per-curve intersection for candidates.
     #[expect(
         clippy::float_cmp,
@@ -2104,9 +1668,8 @@ mod tests {
         reason = "valid curve fixtures are required for hit assertions"
     )]
     use super::{
-        CurveKey, HairBvh, HairCurveGeometry, HairCurveShape, NurbsCurve,
-        catmull_rom_curve_intersect, curve_eval, linear_curve_intersect, nurbs_curve_frame_sample,
-        nurbs_curve_intersect,
+        CurveKey, HairBvh, HairCurveGeometry, HairCurveRenderMode, HairCurveShape,
+        catmull_rom_curve_intersect, linear_curve_intersect,
     };
     use glam::{DMat4, DVec3};
 
@@ -2181,75 +1744,107 @@ mod tests {
     }
 
     #[test]
-    fn intersects_a_rational_nurbs_span_without_tessellating_it() {
-        let curve = NurbsCurve {
-            keys: vec![
-                CurveKey {
-                    position: DVec3::ZERO,
-                    radius: 1.0,
-                },
-                CurveKey {
-                    position: DVec3::new(0.0, 0.0, 2.0),
-                    radius: 1.0,
-                },
-            ],
-            weights: vec![1.0, 1.0],
-            knots: vec![0.0, 0.0, 1.0, 1.0],
-            order: 2,
-            spans: vec![1],
-            cyclic: false,
+    fn ribbon_intersection_preserves_v_and_shading_normal() {
+        let keys = [
+            CurveKey {
+                position: DVec3::ZERO,
+                radius: 0.2,
+            },
+            CurveKey {
+                position: DVec3::Z / 3.0,
+                radius: 0.2,
+            },
+            CurveKey {
+                position: DVec3::Z * (2.0 / 3.0),
+                radius: 0.2,
+            },
+            CurveKey {
+                position: DVec3::Z,
+                radius: 0.2,
+            },
+        ];
+        let curve = HairCurveGeometry {
+            shape: HairCurveShape::CatmullRom {
+                keys: vec![keys[0], keys[3]],
+                cyclic: false,
+            },
+            render_mode: HairCurveRenderMode::Ribbon,
+            ribbon_subdivisions: 3,
+            object_to_world: DMat4::IDENTITY,
+            world_to_object: DMat4::IDENTITY,
         };
-        let (span, hit) = nurbs_curve_intersect(
-            &curve,
-            DVec3::new(2.0, 0.0, 1.0),
-            DVec3::new(-1.0, 0.0, 0.0),
-            0.0,
-            f64::INFINITY,
-        )
-        .unwrap();
-        assert_eq!(span, 1);
-        assert!((hit.distance - 1.0).abs() < 1.0e-10);
+        assert!(curve.is_ribbon());
+        let (span, hit) = curve
+            .closest_hit_world(DVec3::new(2.0, 0.1, 0.5), -DVec3::X, 0.0, f64::INFINITY)
+            .unwrap();
+        assert_eq!(span, 0);
+        assert!((hit.distance - 2.0).abs() < 1.0e-10);
         assert!((hit.u - 0.5).abs() < 1.0e-10);
-        assert!((hit.geometric_normal - DVec3::X).length() < 1.0e-10);
+        assert!((hit.v - 0.5).abs() < 1.0e-10);
+        assert_eq!(hit.geometric_normal, DVec3::X);
+
+        let shading_normal = curve
+            .ribbon_shading_normal_world(0, hit.u, hit.v, -DVec3::X)
+            .unwrap();
+        let expected = DVec3::X * 0.75_f64.sqrt() + DVec3::Y * 0.5;
+        assert!((shading_normal - expected).length() < 1.0e-10);
+        let scale = DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0));
+        let mut scaled_curve = curve.clone();
+        scaled_curve.object_to_world = scale;
+        scaled_curve.world_to_object = scale.inverse();
+        let transformed_normal = scaled_curve
+            .ribbon_shading_normal_world(0, hit.u, hit.v, -DVec3::X)
+            .unwrap();
+        let expected_transformed =
+            (DVec3::X * (0.75_f64.sqrt() / 2.0) + DVec3::Y * 0.5).normalize();
+        assert!((transformed_normal - expected_transformed).length() < 1.0e-10);
+    }
+    #[test]
+    fn ribbon_subdivision_level_matches_cycles_power_of_two_clamp() {
+        assert_eq!(super::ribbon_subdivision_count(0), Some(1));
+        assert_eq!(super::ribbon_subdivision_count(1), Some(2));
+        assert_eq!(super::ribbon_subdivision_count(2), Some(4));
+        assert_eq!(super::ribbon_intersection_segment_count(2), Some(5));
+        assert_eq!(super::ribbon_subdivision_count(4), Some(16));
+        assert_eq!(super::ribbon_intersection_segment_count(24), Some(17));
+        assert_eq!(super::ribbon_subdivision_count(25), None);
     }
 
     #[test]
-    fn rational_nurbs_weights_apply_to_positions_radius_derivatives_and_attributes() {
-        // Blender 5.2.2 `curve.cc::BKE_nurb_makeCurve` normalizes basis*control_weight and
-        // applies the same weights to radius/tilt; `curve_nurbs.cc` does so for generic attrs.
-        let curve = NurbsCurve {
-            keys: vec![
-                CurveKey {
-                    position: DVec3::ZERO,
-                    radius: 1.0,
-                },
-                CurveKey {
-                    position: DVec3::new(0.0, 0.0, 2.0),
-                    radius: 3.0,
-                },
-            ],
-            weights: vec![1.0, 3.0],
-            knots: vec![0.0, 0.0, 1.0, 1.0],
-            order: 2,
-            spans: vec![1],
-            cyclic: false,
+    fn thick_linear_intersection_keeps_radial_normal_and_zero_v() {
+        let start = CurveKey {
+            position: DVec3::ZERO,
+            radius: 0.2,
         };
-        let evaluation = curve_eval(&curve, 1, 0.5).unwrap();
-        assert!((evaluation.position - DVec3::Z * 1.5).length() < 1.0e-12);
-        assert!((evaluation.tangent - DVec3::Z * 1.5).length() < 1.0e-12);
-        assert!((evaluation.radius - 2.5).abs() < 1.0e-12);
-        assert!((evaluation.radius_derivative - 1.5).abs() < 1.0e-12);
-
-        let (position, tilt, normal) =
-            nurbs_curve_frame_sample(&curve, 1, 0.5, &[0.0, 1.0], Some(&[DVec3::X, DVec3::Y]))
-                .unwrap();
-        assert_eq!(position, evaluation.position);
-        assert!((tilt - 0.75).abs() < 1.0e-12);
-        let expected = (DVec3::X * 0.25 + DVec3::Y * 0.75).normalize();
-        assert!((normal.unwrap() - expected).length() < 1.0e-12);
+        let end = CurveKey {
+            position: DVec3::Z,
+            radius: 0.2,
+        };
+        let curve = HairCurveGeometry {
+            shape: HairCurveShape::Linear {
+                keys: vec![start, end],
+                cyclic: false,
+            },
+            render_mode: HairCurveRenderMode::ThickLinear,
+            ribbon_subdivisions: 3,
+            object_to_world: DMat4::IDENTITY,
+            world_to_object: DMat4::IDENTITY,
+        };
+        assert!(!curve.is_ribbon());
+        let (_, hit) = curve
+            .closest_hit_world(DVec3::new(2.0, 0.1, 0.5), -DVec3::X, 0.0, f64::INFINITY)
+            .unwrap();
+        assert_eq!(hit.v, 0.0);
+        let expected_radial = DVec3::new(0.75_f64.sqrt(), 0.5, 0.0) * 0.2;
+        assert!((hit.geometric_normal - expected_radial).length() < 1.0e-10);
+        assert!(
+            curve
+                .ribbon_shading_normal_world(0, hit.u, hit.v, -DVec3::X)
+                .is_none()
+        );
     }
     #[test]
-    fn affine_bezier_intersection_keeps_local_radius_and_unnormalized_geometric_normal() {
+    fn affine_catmull_rom_intersection_keeps_local_radius_and_unnormalized_geometric_normal() {
         let scale = DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0));
         let keys = [
             CurveKey {
@@ -2270,14 +1865,12 @@ mod tests {
             },
         ];
         let curve = HairCurveGeometry {
-            resolution: 12,
-            normal_mode: 0,
-            tilts: vec![0.0, 0.0],
-            custom_normals: None,
-            shape: HairCurveShape::Bezier {
-                spans: vec![keys],
+            shape: HairCurveShape::CatmullRom {
+                keys: keys.to_vec(),
                 cyclic: false,
             },
+            render_mode: HairCurveRenderMode::Thick,
+            ribbon_subdivisions: 3,
             object_to_world: scale,
             world_to_object: scale.inverse(),
         };
@@ -2290,10 +1883,10 @@ mod tests {
             )
             .unwrap();
         assert!((hit.distance - 2.0).abs() < 1.0e-10);
-        assert!((hit.geometric_normal - DVec3::X * 2.0).length() < 1.0e-10);
+        assert!((hit.geometric_normal - DVec3::X * (2.0 / 9.0)).length() < 1.0e-10);
     }
     #[test]
-    fn spline_bvh_intersects_affine_bezier_with_local_radius() {
+    fn spline_bvh_intersects_affine_catmull_rom_with_local_radius() {
         let transform = DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0));
         let keys = [
             CurveKey {
@@ -2314,14 +1907,12 @@ mod tests {
             },
         ];
         let curve = HairCurveGeometry {
-            resolution: 4,
-            normal_mode: 0,
-            tilts: vec![0.0, 0.0],
-            custom_normals: None,
-            shape: HairCurveShape::Bezier {
-                spans: vec![keys],
+            shape: HairCurveShape::CatmullRom {
+                keys: keys.to_vec(),
                 cyclic: false,
             },
+            render_mode: HairCurveRenderMode::Thick,
+            ribbon_subdivisions: 3,
             object_to_world: transform,
             world_to_object: transform.inverse(),
         };
@@ -2347,7 +1938,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!((closest.0, closest.1), (0, 0));
+        assert_eq!((closest.0, closest.1), (0, 1));
         assert!((closest.2.distance - 0.8).abs() < 1.0e-10);
         assert!(
             bvh.closest_spline_hit(
@@ -2359,6 +1950,41 @@ mod tests {
                 |_, _| None,
             )
             .is_none()
+        );
+    }
+    #[test]
+    fn linear_render_curve_shadow_bake_uses_thick_catmull_frame() {
+        let keys = [
+            CurveKey {
+                position: DVec3::ZERO,
+                radius: 0.1,
+            },
+            CurveKey {
+                position: DVec3::new(1.0, 0.0, 1.0),
+                radius: 0.1,
+            },
+            CurveKey {
+                position: DVec3::new(2.0, 0.0, 0.0),
+                radius: 0.1,
+            },
+        ];
+        let curve = HairCurveGeometry {
+            shape: HairCurveShape::Linear {
+                keys: keys.to_vec(),
+                cyclic: false,
+            },
+            render_mode: HairCurveRenderMode::ThickLinear,
+            ribbon_subdivisions: 1,
+            object_to_world: DMat4::IDENTITY,
+            world_to_object: DMat4::IDENTITY,
+        };
+        assert_eq!(
+            curve.sample_local(1, 0.0).unwrap().tangent,
+            DVec3::new(1.0, 0.0, -1.0)
+        );
+        assert_eq!(
+            curve.sample_local_for_shadow_bake(1, 0.0).unwrap().tangent,
+            DVec3::X
         );
     }
 }

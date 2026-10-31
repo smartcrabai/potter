@@ -129,6 +129,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 excluded_collections: Vec::new(),
             },
         )]),
+        cycles_hair_shadow_groups: None,
         frame_current: 1.0,
         frame_start: 1,
         frame_end: 250,

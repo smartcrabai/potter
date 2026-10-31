@@ -9,7 +9,9 @@
 //!
 //! EEVEE's pixels are the committed macOS arm64 render (`fixtures/native_oracle/eevee_macos/`, made by Blender 5.2.2 on
 //! macOS; see its `MANIFEST.json`), not a live render, so the test has no platform term. Every pixel whose centre lies
-//! within 0.75 of a sphere's radius is compared with the committed pixel at the same UV.
+//! within 0.75 of a sphere's radius is compared with the committed pixel at the same physical location. Blender's EXR
+//! rows are bottom-up; the loaded Potter image uses top-down row storage, so the sampler's V coordinate is flipped.
+//! The Potter render uses the same 64 EEVEE TAA samples as the saved Blender scene; G-buffer closure packing is dithered per sample.
 //!
 //! The tolerance per sphere is the model bound alone: the largest deviation of the transmission model
 //! (`fixtures/native_oracle/eevee_glass_transmission_deviation.py`) from the committed render over the same pixels,
@@ -91,7 +93,7 @@ fn realtime_glass_transmission_matches_eevee() -> TestResult {
         json!([
             {"op": "camera.create", "id": "camera_main", "transform": {"translation": [0.0, 0.0, 10.0]}, "projection": "orthographic", "ortho_scale": ORTHO_SCALE},
             {"op": "scene.update", "target": {"id": active}, "set": {"camera": "camera_main"}},
-            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": SIZE, "resolution_y": SIZE, "samples": 1, "seed": 0}}
+            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": SIZE, "resolution_y": SIZE, "samples": 64, "seed": 0}}
         ]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
@@ -207,12 +209,13 @@ fn worst_deviation(
                 continue;
             }
             count += 1;
-            let uv = [
+            let oracle_uv = [
                 (f64::from(column) + 0.5) / size,
                 (f64::from(row) + 0.5) / size,
             ];
+            let potter_uv = [oracle_uv[0], 1.0 - oracle_uv[1]];
             let wanted = eevee[(row * SIZE + column) as usize];
-            let rgba = sample(data, uv, false);
+            let rgba = sample(data, potter_uv, false);
             let actual = [rgba[0], rgba[1], rgba[2]];
             let deviation = actual
                 .iter()
@@ -222,7 +225,7 @@ fn worst_deviation(
             if deviation > worst.max {
                 worst = Deviation {
                     max: deviation,
-                    uv,
+                    uv: oracle_uv,
                     actual,
                     wanted,
                 };

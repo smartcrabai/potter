@@ -15,18 +15,27 @@ use crate::{
     },
 };
 
-/// Hit-only data used by the Principled Hair closure. `curve_normal` is the interpolated Cycles
-/// `attr_normal` used to orient an elliptical cross-section. `pixel_coverage` is
+/// Hit-only data used by the Principled Hair closure. `ribbon_v` carries Cycles' ribbon coordinate
+/// for ribbon hits; thick curves use the normal-derived cross-section. `curve_normal` is the
+/// interpolated Cycles `attr_normal` used to orient an elliptical cross-section. `pixel_coverage` is
 /// `0.5 * sd->dP / interpolated_curve_radius` for camera hits, and 1 for non-camera hits.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct HairHitData {
+    /// Curve-normal attribute for Huang's ellipse; source point values are interpolated without normalization.
     pub(crate) curve_normal: DVec3,
     pub(crate) pixel_coverage: f64,
+    pub(crate) ribbon_v: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum HairSample {
-    Continuous { direction: DVec3, ray: RayKind },
+    /// Cycles returns the sampled value and density together; the path must not re-evaluate this hair closure.
+    Continuous {
+        direction: DVec3,
+        ray: RayKind,
+        eval: DVec3,
+        pdf: f64,
+    },
     Absorbed,
 }
 
@@ -49,7 +58,7 @@ fn exact_f64_one(value: f64) -> bool {
     value.to_bits() == 1.0_f64.to_bits()
 }
 
-/// Cycles hair eval is a BSDF coefficient: the caller supplies the surface cosine separately.
+/// Hair evaluation is consumed directly by Cycles' path integrator, without an extra surface cosine.
 pub(crate) fn hair_eval(
     params: &BsdfParams,
     incoming: DVec3,
@@ -69,7 +78,8 @@ pub(crate) fn hair_eval(
             match hair.model {
                 HairScatteringModel::Chiang => {
                     let setup = chiang_setup(hair, sigma);
-                    let (value, _) = chiang_eval(setup, incoming, outgoing, tangent, radial_normal);
+                    let (value, _) =
+                        chiang_eval(setup, incoming, outgoing, tangent, radial_normal, hit);
                     value
                 }
                 HairScatteringModel::Huang => {
@@ -89,14 +99,14 @@ pub(crate) fn hair_pdf(
     outgoing: DVec3,
     tangent: DVec3,
     radial_normal: DVec3,
-    _hit: HairHitData,
+    hit: HairHitData,
 ) -> f64 {
     match params.model {
         BsdfModel::Hair(hair) => classic_hair_eval(hair, incoming, outgoing, radial_normal).1,
         BsdfModel::PrincipledHair(hair) => match hair.model {
             HairScatteringModel::Chiang => {
                 let setup = chiang_setup(hair, principled_sigma(params, hair));
-                chiang_eval(setup, incoming, outgoing, tangent, radial_normal).1
+                chiang_eval(setup, incoming, outgoing, tangent, radial_normal, hit).1
             }
             // Cycles sets Huang's PDF to one before all early-outs and uses the same value for
             // emitter and BSDF sampling; its stochastic residual is carried in the value.
@@ -142,13 +152,14 @@ pub(crate) fn hair_sample(
     rng: &mut u32,
 ) -> HairSample {
     match params.model {
-        BsdfModel::Hair(hair) => classic_hair_sample(hair, incoming, random),
+        BsdfModel::Hair(hair) => classic_hair_sample(hair, incoming, closure_color(params), random),
         BsdfModel::PrincipledHair(hair) => match hair.model {
             HairScatteringModel::Chiang => chiang_sample(
                 chiang_setup(hair, principled_sigma(params, hair)),
                 incoming,
                 tangent,
                 radial_normal,
+                hit,
                 random,
             ),
             HairScatteringModel::Huang => {
@@ -280,11 +291,14 @@ fn chiang_frame(
     incoming: DVec3,
     tangent: DVec3,
     radial_normal: DVec3,
+    hit: HairHitData,
 ) -> (DVec3, DVec3, DVec3, f64) {
     let x = tangent.normalize_or_zero();
     let y = x.cross(incoming).normalize_or_zero();
     let z = x.cross(y).normalize_or_zero();
-    let h = radial_normal.normalize_or_zero().cross(x).dot(z);
+    let h = hit
+        .ribbon_v
+        .map_or_else(|| radial_normal.normalize_or_zero().cross(x).dot(z), |v| -v);
     (x, y, z, h)
 }
 
@@ -294,8 +308,9 @@ fn chiang_eval(
     outgoing: DVec3,
     tangent: DVec3,
     radial_normal: DVec3,
+    hit: HairHitData,
 ) -> (DVec3, f64) {
-    let (x, y, z, h) = chiang_frame(incoming, tangent, radial_normal);
+    let (x, y, z, h) = chiang_frame(incoming, tangent, radial_normal, hit);
     let local_o = to_local(incoming, x, y, z);
     let local_i = to_local(outgoing, x, y, z);
     let sin_theta_o = local_o.x;
@@ -356,9 +371,10 @@ fn chiang_sample(
     incoming: DVec3,
     tangent: DVec3,
     radial_normal: DVec3,
+    hit: HairHitData,
     random: [f64; 4],
 ) -> HairSample {
-    let (x, y, z, h) = chiang_frame(incoming, tangent, radial_normal);
+    let (x, y, z, h) = chiang_frame(incoming, tangent, radial_normal, hit);
     let local_o = to_local(incoming, x, y, z);
     let sin_theta_o = local_o.x;
     let cos_theta_o = cos_from_sin(sin_theta_o);
@@ -414,7 +430,8 @@ fn chiang_sample(
         cos_theta_i * phi_i.sin(),
     );
 
-    let direction = to_global(local_i, y, z, x);
+    let direction = to_global(local_i, x, y, z);
+    let (eval, pdf) = chiang_eval(setup, incoming, direction, tangent, radial_normal, hit);
     HairSample::Continuous {
         direction,
         ray: if p == 0 {
@@ -422,6 +439,8 @@ fn chiang_sample(
         } else {
             RayKind::Transmission
         },
+        eval,
+        pdf,
     }
 }
 
@@ -643,6 +662,7 @@ fn classic_hair_eval(
 fn classic_hair_sample(
     hair: crate::shader::HairParameters,
     incoming: DVec3,
+    color: DVec3,
     random: [f64; 4],
 ) -> HairSample {
     let tangent = hair.tangent.normalize_or_zero();
@@ -659,16 +679,26 @@ fn classic_hair_sample(
     let t = roughness1 * (random[0] * (a - b) + b).tan();
     let theta_i = 2.0 * (t + offset) - theta_r;
     let (sin_theta_i, cos_theta_i) = theta_i.sin_cos();
-    let phi = if hair.component == HairComponent::Reflection {
-        2.0 * safe_asin(1.0 - 2.0 * random[1]) * roughness2
+    let (phi, phi_pdf) = if hair.component == HairComponent::Reflection {
+        let phi = 2.0 * safe_asin(1.0 - 2.0 * random[1]) * roughness2;
+        let phi_pdf = (0.5 * phi).cos() * 0.25 / roughness2;
+        (phi, phi_pdf)
     } else {
         let c = 2.0 * (FRAC_PI_2 / roughness2).atan();
-        roughness2 * (c * (random[1] - 0.5)).tan() + PI
+        let p = roughness2 * (c * (random[1] - 0.5)).tan();
+        let phi_pdf = roughness2 / (c * (p * p + roughness2 * roughness2));
+        (p + PI, phi_pdf)
     };
     let (sin_phi, cos_phi) = phi.sin_cos();
     let direction =
         cos_phi * cos_theta_i * locy - sin_phi * cos_theta_i * locx + sin_theta_i * tangent;
-
+    // Keep the source sample PDF: unlike `classic_hair_eval`, it has no cosphi/normal-support rejection.
+    let theta_pdf = roughness1 / (2.0 * (t * t + roughness1 * roughness1) * (a - b) * cos_theta_i);
+    let pdf = if FRAC_PI_2 - theta_i.abs() < 0.001 {
+        0.0
+    } else {
+        (phi_pdf * theta_pdf).abs()
+    };
     HairSample::Continuous {
         direction,
         ray: if hair.component == HairComponent::Reflection {
@@ -676,6 +706,9 @@ fn classic_hair_sample(
         } else {
             RayKind::Transmission
         },
+        // Classic Hair's sample eval is its PDF tinted by Color once; closure weight/alpha are applied by the path.
+        eval: DVec3::splat(pdf) * color,
+        pdf,
     }
 }
 
@@ -717,7 +750,9 @@ fn huang_setup(
 ) -> HuangSetup {
     let y = tangent.normalize_or_zero();
     let x = tangent.cross(incoming).normalize_or_zero();
-    let h = -x.dot(radial_normal.normalize_or_zero());
+    let h = hit
+        .ribbon_v
+        .map_or_else(|| -x.dot(radial_normal.normalize_or_zero()), |v| -v);
     let mut aspect_ratio = hair.aspect_ratio;
     let mut normal = if exact_f64_one(aspect_ratio) {
         x
@@ -1151,18 +1186,20 @@ fn huang_sample(setup: HuangSetup, random: [f64; 4], rng: &mut u32) -> HairSampl
         return HairSample::Absorbed;
     }
     let branch = sample_lobe * total_energy;
-    let local_out = if branch < r {
-        wr
+    let (local_out, eval) = if branch < r {
+        (wr, DVec3::splat(total_energy))
     } else if branch < r + tt_energy {
-        wtt
+        (wtt, tt / tt_energy * total_energy)
     } else if branch < r + tt_energy + trt_energy {
-        wtrt
+        (wtrt, trt / trt_energy * total_energy)
     } else {
-        wtrrt
+        (wtrrt, trrt / trrt_energy * total_energy)
     };
     HairSample::Continuous {
         direction: to_global(local_out, setup.normal, setup.tangent, setup.bitangent),
         ray: RayKind::Glossy,
+        eval,
+        pdf: 1.0,
     }
 }
 
