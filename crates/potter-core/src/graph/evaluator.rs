@@ -3226,7 +3226,6 @@ impl Evaluator<'_> {
         };
         let seed = self.integer_input(id, node, "Seed", 0)?;
         let mesh = distribute_points_mesh(
-            id,
             &surface,
             method,
             &density,
@@ -7610,7 +7609,9 @@ fn infer_instance_data_type(value: &Value) -> Result<String> {
 #[derive(Clone, Copy)]
 struct DistributionTriangle {
     positions: [Vec3; 3],
+    vertices: [usize; 3],
     corners: [usize; 3],
+    face_index: usize,
     area: f32,
 }
 
@@ -7623,7 +7624,6 @@ struct DistributedCandidate {
 }
 
 fn distribute_points_mesh(
-    node_id: &Id,
     surface: &Mesh,
     method: &str,
     density: &Field,
@@ -7682,13 +7682,14 @@ fn distribute_points_mesh(
     let positions_by_id: HashMap<_, _> = surface
         .vertices
         .iter()
-        .map(|vertex| (vertex.id, vertex.co.as_vec3()))
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, (index, vertex.co.as_vec3())))
         .collect();
     let mut triangle_data = Vec::with_capacity(triangles.len());
     let mut triangle_offset = 0_usize;
     let mut corner_offset = 0_usize;
     let mut local_corner_by_vertex = HashMap::new();
-    for face in &surface.faces {
+    for (face_index, face) in surface.faces.iter().enumerate() {
         let triangle_count = face.vertices.len().saturating_sub(2);
         local_corner_by_vertex.clear();
         for (local_corner, vertex_id) in face.vertices.iter().enumerate() {
@@ -7699,12 +7700,15 @@ fn distribute_points_mesh(
                 .get(triangle_offset)
                 .ok_or_else(|| evaluation("surface triangulation result is incomplete"))?;
             let mut positions = [Vec3::ZERO; 3];
+            let mut vertices = [0_usize; 3];
             let mut corners = [0_usize; 3];
             for vertex in 0..3 {
                 let vertex_id = triangle[vertex];
-                positions[vertex] = *positions_by_id
+                let &(vertex_index, position) = positions_by_id
                     .get(&vertex_id)
                     .ok_or_else(|| evaluation("triangle vertex missing"))?;
+                positions[vertex] = position;
+                vertices[vertex] = vertex_index;
                 let local_corner = local_corner_by_vertex
                     .get(&vertex_id)
                     .copied()
@@ -7719,7 +7723,9 @@ fn distribute_points_mesh(
                 * 0.5;
             triangle_data.push(DistributionTriangle {
                 positions,
+                vertices,
                 corners,
+                face_index,
                 area,
             });
             triangle_offset += 1;
@@ -7837,17 +7843,6 @@ fn distribute_points_mesh(
         }
     }
     let point_count = candidates.len();
-    if point_count > 0
-        && let Some(attribute_name) = unpropagated_distribute_attribute(surface)
-    {
-        return Err(unsupported_graph_feature(
-            node_id,
-            "graph.node.distribute_points.attribute_propagation",
-            format!(
-                "Distribute Points on Faces cannot propagate input attribute `{attribute_name}`"
-            ),
-        ));
-    }
     let mut points = Mesh::new();
     let mut ids = Vec::with_capacity(point_count);
     let mut radii = Vec::with_capacity(point_count);
@@ -7869,74 +7864,450 @@ fn distribute_points_mesh(
         "radius".to_owned(),
         json!({"domain":"POINT","data_type":"FLOAT","data":radii}),
     );
+    if point_count > 0 {
+        propagate_distribute_attributes(surface, &triangle_data, &candidates, &mut points)?;
+    }
     Ok(points)
 }
+fn distribute_attribute_is_skipped(name: &str, domain: &str) -> bool {
+    name.starts_with('.')
+        || matches!(name, "position" | "id" | "radius")
+        || domain.eq_ignore_ascii_case("EDGE")
+        || (crate::geom::attribute_keys::is_internal_key(name)
+            && !matches!(name, "uv_layers" | "color_layers" | "vertex_groups"))
+}
 
-fn unpropagated_distribute_attribute(mesh: &Mesh) -> Option<String> {
-    if let Some(entries) = mesh
+fn distribute_attribute_default(data_type: &str) -> Value {
+    match data_type {
+        "BOOLEAN" => json!(false),
+        "INT" | "INT8" | "INT8_2D" | "INT16_2D" | "INT32_2D" => json!(0),
+        "FLOAT" => json!(0.0),
+        "FLOAT2" => json!([0.0, 0.0]),
+        "FLOAT_VECTOR" => json!([0.0, 0.0, 0.0]),
+        "FLOAT_COLOR" | "BYTE_COLOR" => json!([0.0, 0.0, 0.0, 0.0]),
+        "QUATERNION" => json!([0.0, 0.0, 0.0, 1.0]),
+        "STRING" => json!(""),
+        _ => Value::Null,
+    }
+}
+
+fn distribute_attribute_value(
+    data_type: &str,
+    values: [&Value; 3],
+    weights: Vec3,
+) -> Result<Value> {
+    match data_type {
+        "BOOLEAN" => {
+            let values = values
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .map(|value| if value { 1.0 } else { 0.0 })
+                        .ok_or_else(|| evaluation("BOOLEAN mesh attribute value is malformed"))
+                })
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            let mixed = weights.x * values[0] + weights.y * values[1] + weights.z * values[2];
+            Ok(json!(mixed >= 0.5))
+        }
+        "STRING" => Ok(json!("")),
+        "BYTE_COLOR" => {
+            let colors = values
+                .map(|value| {
+                    value
+                        .as_array()
+                        .and_then(|components| match components.as_slice() {
+                            [red, green, blue, alpha] => Some([
+                                red.as_f64()?,
+                                green.as_f64()?,
+                                blue.as_f64()?,
+                                alpha.as_f64()?,
+                            ]),
+                            _ => None,
+                        })
+                        .ok_or_else(|| evaluation("byte color mesh attribute value is malformed"))
+                })
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            let color = crate::geom::color_layers::mix_byte_color(
+                &colors,
+                &[
+                    (0, f64::from(weights.x)),
+                    (1, f64::from(weights.y)),
+                    (2, f64::from(weights.z)),
+                ],
+            );
+            Ok(json!(color))
+        }
+        "INT" | "INT8" | "INT8_2D" => distribute_attribute_components(values, weights, true, true),
+        "INT16_2D" | "INT32_2D" => distribute_attribute_components(values, weights, true, false),
+        _ => distribute_attribute_components(values, weights, false, false),
+    }
+}
+
+fn distribute_attribute_components(
+    values: [&Value; 3],
+    weights: Vec3,
+    integer: bool,
+    round: bool,
+) -> Result<Value> {
+    if let (Some(first), Some(second), Some(third)) =
+        (values[0].as_f64(), values[1].as_f64(), values[2].as_f64())
+    {
+        let mixed =
+            (first as f32) * weights.x + (second as f32) * weights.y + (third as f32) * weights.z;
+        if integer {
+            return Ok(json!(if round {
+                mixed.round() as i64
+            } else {
+                mixed.trunc() as i64
+            }));
+        }
+        return Ok(json!(mixed));
+    }
+    if let (Some(first), Some(second), Some(third)) = (
+        values[0].as_array(),
+        values[1].as_array(),
+        values[2].as_array(),
+    ) {
+        if first.len() != second.len() || first.len() != third.len() {
+            return Err(evaluation("mesh attribute component counts differ"));
+        }
+        return (0..first.len())
+            .map(|index| {
+                distribute_attribute_components(
+                    [&first[index], &second[index], &third[index]],
+                    weights,
+                    integer,
+                    round,
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array);
+    }
+    Err(evaluation("mesh attribute value cannot be interpolated"))
+}
+
+fn distribute_attribute_sample(
+    domain: &str,
+    data_type: &str,
+    values: &[Value],
+    triangle: &DistributionTriangle,
+    barycentric: Vec3,
+) -> Result<Value> {
+    let domain = domain.to_ascii_uppercase();
+    match domain.as_str() {
+        "POINT" | "POINTS" => distribute_attribute_value(
+            data_type,
+            [
+                values
+                    .get(triangle.vertices[0])
+                    .ok_or_else(|| evaluation("point mesh attribute is missing"))?,
+                values
+                    .get(triangle.vertices[1])
+                    .ok_or_else(|| evaluation("point mesh attribute is missing"))?,
+                values
+                    .get(triangle.vertices[2])
+                    .ok_or_else(|| evaluation("point mesh attribute is missing"))?,
+            ],
+            barycentric,
+        ),
+        "CORNER" | "FACE_CORNER" => distribute_attribute_value(
+            data_type,
+            [
+                values
+                    .get(triangle.corners[0])
+                    .ok_or_else(|| evaluation("corner mesh attribute is missing"))?,
+                values
+                    .get(triangle.corners[1])
+                    .ok_or_else(|| evaluation("corner mesh attribute is missing"))?,
+                values
+                    .get(triangle.corners[2])
+                    .ok_or_else(|| evaluation("corner mesh attribute is missing"))?,
+            ],
+            barycentric,
+        ),
+        "FACE" | "FACES" => values
+            .get(triangle.face_index)
+            .cloned()
+            .ok_or_else(|| evaluation("face mesh attribute is missing")),
+        _ => Ok(distribute_attribute_default(data_type)),
+    }
+}
+
+fn distribute_attribute_values(
+    domain: &str,
+    data_type: &str,
+    values: &[Value],
+    triangles: &[DistributionTriangle],
+    candidates: &[DistributedCandidate],
+) -> Result<Vec<Value>> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            let triangle = triangles
+                .get(candidate.triangle_index as usize)
+                .ok_or_else(|| evaluation("distributed point triangle is missing"))?;
+            distribute_attribute_sample(domain, data_type, values, triangle, candidate.barycentric)
+        })
+        .collect()
+}
+
+fn distribute_attribute_domain_count(mesh: &Mesh, domain: &str) -> Result<usize> {
+    let domain = domain.to_ascii_uppercase();
+    let domain = match domain.as_str() {
+        "FACE_CORNER" => "CORNER",
+        "FACES" => "FACE",
+        _ => domain.as_str(),
+    };
+    domain_element_count(mesh, domain)
+}
+
+fn native_attribute_values(mesh: &Mesh, domain: &str, values: &Value) -> Result<Vec<Value>> {
+    if let Some(values) = values.as_array() {
+        return Ok(values.clone());
+    }
+    let values = values
+        .as_object()
+        .ok_or_else(|| evaluation("native mesh attribute values are malformed"))?;
+    let value_for = |prefix: char, id: u32| {
+        values
+            .get(&format!("{prefix}{id}"))
+            .cloned()
+            .ok_or_else(|| evaluation("native mesh attribute value is missing"))
+    };
+    match domain.to_ascii_uppercase().as_str() {
+        "POINT" | "POINTS" => mesh
+            .vertices
+            .iter()
+            .map(|vertex| value_for('v', vertex.id))
+            .collect(),
+        "FACE" | "FACES" => mesh
+            .faces
+            .iter()
+            .map(|face| value_for('f', face.id))
+            .collect(),
+        "CORNER" | "FACE_CORNER" => {
+            let mut corners = Vec::with_capacity(domain_element_count(mesh, "CORNER")?);
+            for face in &mesh.faces {
+                let face_values = value_for('f', face.id)?;
+                let face_values = face_values
+                    .as_array()
+                    .ok_or_else(|| evaluation("native corner mesh attribute is malformed"))?;
+                if face_values.len() != face.vertices.len() {
+                    return Err(evaluation(
+                        "native corner mesh attribute has an invalid length",
+                    ));
+                }
+                corners.extend_from_slice(face_values);
+            }
+            Ok(corners)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn propagate_distribute_attributes(
+    source: &Mesh,
+    triangles: &[DistributionTriangle],
+    candidates: &[DistributedCandidate],
+    points: &mut Mesh,
+) -> Result<()> {
+    let mut attributes = Vec::new();
+    let mut names = HashSet::new();
+    if let Some(entries) = source
         .attributes
         .get("blender_attributes")
         .and_then(Value::as_array)
     {
         for entry in entries {
-            let name = entry.get("name").and_then(Value::as_str)?;
+            let Some(name) = entry.get("name").and_then(Value::as_str) else {
+                continue;
+            };
             let domain = entry
                 .get("domain")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if name.starts_with('.')
-                || matches!(name, "position" | "id" | "radius")
-                || domain.eq_ignore_ascii_case("EDGE")
-                || (crate::geom::attribute_keys::is_internal_key(name)
-                    && !matches!(name, "uv_layers" | "color_layers" | "vertex_groups"))
-            {
+            if distribute_attribute_is_skipped(name, domain) {
                 continue;
             }
-            return Some(name.to_owned());
+            let data_type = entry
+                .get("data_type")
+                .and_then(Value::as_str)
+                .map(normalize_instance_data_type)
+                .ok_or_else(|| evaluation("Blender mesh attribute data type is malformed"))?;
+            let values = entry
+                .get("values")
+                .and_then(Value::as_array)
+                .ok_or_else(|| evaluation("Blender mesh attribute values are malformed"))?;
+            if matches!(
+                domain.to_ascii_uppercase().as_str(),
+                "POINT" | "POINTS" | "CORNER" | "FACE_CORNER" | "FACE" | "FACES"
+            ) && values.len() != distribute_attribute_domain_count(source, domain)?
+            {
+                return Err(evaluation(
+                    "Blender mesh attribute length does not match its domain",
+                ));
+            }
+            let sampled =
+                distribute_attribute_values(domain, &data_type, values, triangles, candidates)?;
+            let mut output = entry.clone();
+            let output = output
+                .as_object_mut()
+                .ok_or_else(|| evaluation("Blender mesh attribute entry is malformed"))?;
+            output.insert("domain".to_owned(), json!("POINT"));
+            output.insert("values".to_owned(), json!(sampled));
+            attributes.push(Value::Object(output.clone()));
+            names.insert(name.to_owned());
         }
     }
-    for (name, attribute) in &mesh.attributes {
-        if (crate::geom::attribute_keys::is_internal_key(name)
-            && !matches!(
-                name.as_str(),
-                "uv_layers" | "color_layers" | "vertex_groups"
-            ))
-            || name.starts_with('.')
-            || matches!(name.as_str(), "position" | "id" | "radius")
-            || attribute
-                .get("domain")
-                .and_then(Value::as_str)
-                .is_some_and(|domain| domain.eq_ignore_ascii_case("EDGE"))
+    let color_data_types = source
+        .attributes
+        .get("blender_metadata")
+        .and_then(|metadata| metadata.get("color_data_types"))
+        .and_then(Value::as_object);
+    for layer in crate::geom::color_layers::read(source).layers {
+        if names.contains(&layer.name)
+            || distribute_attribute_is_skipped(&layer.name, layer.domain.name())
         {
             continue;
         }
-        let values = attribute.get("data").or_else(|| attribute.get("values"));
-        if values
-            .and_then(Value::as_array)
-            .is_some_and(|values| !values.is_empty())
-            || values
-                .and_then(Value::as_object)
-                .is_some_and(|values| !values.is_empty())
-        {
-            return Some(name.clone());
-        }
+        let data_type = color_data_types
+            .and_then(|types| types.get(&layer.name))
+            .and_then(Value::as_str)
+            .map_or_else(|| "FLOAT_COLOR".to_owned(), normalize_instance_data_type);
+        let values = layer
+            .values
+            .iter()
+            .map(|color| json!(color))
+            .collect::<Vec<_>>();
+        let domain = layer.domain.name();
+        let sampled =
+            distribute_attribute_values(domain, &data_type, &values, triangles, candidates)?;
+        names.insert(layer.name.clone());
+        attributes.push(json!({
+            "name": layer.name,
+            "domain": "POINT",
+            "data_type": data_type,
+            "values": sampled,
+        }));
     }
-    for store in ["uv_layers", "color_layers"] {
-        if mesh
+    for layer in crate::geom::uv_layers::read_layers(source) {
+        if names.contains(&layer.name) || distribute_attribute_is_skipped(&layer.name, "CORNER") {
+            continue;
+        }
+        let mut uv_values = Vec::with_capacity(domain_element_count(source, "CORNER")?);
+        for (face_index, face) in source.faces.iter().enumerate() {
+            let face_values = layer.faces.get(face_index).and_then(Option::as_ref);
+            if face_values.is_some_and(|values| values.len() != face.vertices.len()) {
+                return Err(evaluation("UV layer has an invalid corner count"));
+            }
+            for corner in 0..face.vertices.len() {
+                uv_values.push(json!(
+                    face_values
+                        .and_then(|values| values.get(corner))
+                        .copied()
+                        .unwrap_or([0.0, 0.0])
+                ));
+            }
+        }
+        let sampled =
+            distribute_attribute_values("CORNER", "FLOAT2", &uv_values, triangles, candidates)?;
+        names.insert(layer.name.clone());
+        attributes.push(json!({
+            "name": layer.name,
+            "domain": "POINT",
+            "data_type": "FLOAT2",
+            "values": sampled,
+        }));
+    }
+    for (storage_name, attribute) in &source.attributes {
+        let Some(name) = crate::geom::attribute_keys::user_name(storage_name) else {
+            continue;
+        };
+        if distribute_attribute_is_skipped(name, "") || names.contains(name) {
+            continue;
+        }
+        let Some(domain) = attribute.get("domain").and_then(Value::as_str) else {
+            continue;
+        };
+        if distribute_attribute_is_skipped(name, domain) {
+            continue;
+        }
+        let Some(data_type) = attribute
+            .get("type")
+            .or_else(|| attribute.get("data_type"))
+            .and_then(Value::as_str)
+            .map(normalize_instance_data_type)
+        else {
+            continue;
+        };
+        let Some(value_data) = attribute.get("values").or_else(|| attribute.get("data")) else {
+            continue;
+        };
+        let values = native_attribute_values(source, domain, value_data)?;
+        if matches!(
+            domain.to_ascii_uppercase().as_str(),
+            "POINT" | "POINTS" | "CORNER" | "FACE_CORNER" | "FACE" | "FACES"
+        ) && values.len() != distribute_attribute_domain_count(source, domain)?
+        {
+            return Err(evaluation(
+                "native mesh attribute length does not match its domain",
+            ));
+        }
+        let sampled =
+            distribute_attribute_values(domain, &data_type, &values, triangles, candidates)?;
+        attributes.push(json!({
+            "name": name,
+            "domain": "POINT",
+            "data_type": data_type,
+            "values": sampled,
+        }));
+        names.insert(name.to_owned());
+    }
+    if !attributes.is_empty() {
+        points
             .attributes
-            .get(store)
-            .and_then(|store| store.get("layers"))
-            .and_then(Value::as_array)
-            .is_some_and(|layers| !layers.is_empty())
-        {
-            return Some(store.to_owned());
-        }
+            .insert("blender_attributes".to_owned(), Value::Array(attributes));
     }
-    mesh.attributes
+    if let Some(groups) = source
+        .attributes
         .get("vertex_groups")
         .and_then(Value::as_object)
-        .filter(|groups| !groups.is_empty())
-        .map(|_| "vertex_groups".to_owned())
+    {
+        let mut output_groups = Map::new();
+        for (name, assignments) in groups {
+            let Some(assignments) = assignments.as_object() else {
+                continue;
+            };
+            let mut sampled = Map::new();
+            for (index, candidate) in candidates.iter().enumerate() {
+                let triangle = triangles
+                    .get(candidate.triangle_index as usize)
+                    .ok_or_else(|| evaluation("distributed point triangle is missing"))?;
+                let mut weight = 0.0_f32;
+                for corner in 0..3 {
+                    let vertex = source
+                        .vertices
+                        .get(triangle.vertices[corner])
+                        .ok_or_else(|| evaluation("point mesh vertex is missing"))?;
+                    let value = assignments
+                        .get(&format!("v{}", vertex.id))
+                        .and_then(Value::as_f64)
+                        .unwrap_or_default() as f32;
+                    weight += value * candidate.barycentric[corner];
+                }
+                sampled.insert(format!("v{}", points.vertices[index].id), json!(weight));
+            }
+            output_groups.insert(name.clone(), Value::Object(sampled));
+        }
+        if !output_groups.is_empty() {
+            points
+                .attributes
+                .insert("vertex_groups".to_owned(), Value::Object(output_groups));
+        }
+    }
+    Ok(())
 }
 
 fn blender_round_probabilistic(value: f32, rng: &mut BlenderRng) -> Result<usize> {

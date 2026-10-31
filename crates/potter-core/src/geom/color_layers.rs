@@ -499,9 +499,10 @@ pub(crate) fn write(mesh: &mut Mesh, store: &ColorStore) {
     let named = |name: &Option<String>| {
         name.as_ref()
             .and_then(|name| {
-                store.layers.iter().find(|layer| {
-                    layer.name == *name && layer.domain.supports_active_render()
-                })
+                store
+                    .layers
+                    .iter()
+                    .find(|layer| layer.name == *name && layer.domain.supports_active_render())
             })
             .map(|layer| &layer.name)
             .or(fallback)

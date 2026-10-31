@@ -3,11 +3,13 @@ use std::{error::Error, fs, io, path::Path, process::Command};
 use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
     eval::{EvaluationContext, EvaluationPurpose, EvaluationSession, Snapshot},
+    geom::Mesh,
+    graph::{self, GraphKind, GraphLink, GraphNode, NodeGroup},
     model::{Id, ReconstructedPoint, SceneDoc, TrackingMarker},
     ops,
     tracking::{CameraModel, CameraObservation},
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tempfile::tempdir;
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -1970,6 +1972,120 @@ fn blender_geometry_attribute_hair_curve_domains_match_depsgraph() -> TestResult
     eprintln!(
         "Blender 5.2.2 hair Curves Geometry Attribute CLI matrices: import max error {maximum_error:.6e}, .blend export/import max error {roundtrip_error:.6e} across 33 POINT/CURVE, type, index, mix-mode, and adapted-domain cases"
     );
+    Ok(())
+}
+
+#[test]
+fn distribute_points_interpolates_generic_boolean_attributes() -> TestResult {
+    let mut surface =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
+    surface.attributes.insert(
+        "point_boolean".to_owned(),
+        json!({"domain":"point","type":"bool","values":{"v0":false,"v1":true,"v2":false}}),
+    );
+    surface.attributes.insert(
+        "corner_boolean".to_owned(),
+        json!({"domain":"corner","type":"bool","values":{"f0":[false,false,true]}}),
+    );
+    surface.attributes.insert(
+        "face_boolean".to_owned(),
+        json!({"domain":"face","type":"bool","values":{"f0":true}}),
+    );
+
+    let distribute_id = Id::new("distribute")?;
+    let output_id = Id::new("output")?;
+    let mut distribute = GraphNode::new("GeometryNodeDistributePointsOnFaces");
+    distribute.inputs.insert("Density".to_owned(), json!(200.0));
+    distribute.inputs.insert("Seed".to_owned(), json!(17));
+    let mut group = NodeGroup::new("Boolean attribute sampling", GraphKind::Geometry);
+    group.nodes.insert(distribute_id.clone(), distribute);
+    group
+        .nodes
+        .insert(output_id.clone(), GraphNode::new("NodeGroupOutput"));
+    group.links.push(GraphLink {
+        from_node: distribute_id,
+        from_socket: "Points".to_owned(),
+        to_node: output_id,
+        to_socket: "Geometry".to_owned(),
+    });
+
+    let points = graph::evaluate(&group, Some(&surface), &Map::new(), "Geometry")?.mesh;
+    assert_eq!(points.vertices.len(), 100);
+    let attributes = points
+        .attributes
+        .get("blender_attributes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| io::Error::other("distributed BOOLEAN attributes are missing"))?;
+    let point_boolean = attributes
+        .iter()
+        .find(|attribute| attribute["name"] == "point_boolean")
+        .ok_or_else(|| io::Error::other("distributed POINT BOOLEAN attribute is missing"))?;
+    let corner_boolean = attributes
+        .iter()
+        .find(|attribute| attribute["name"] == "corner_boolean")
+        .ok_or_else(|| io::Error::other("distributed CORNER BOOLEAN attribute is missing"))?;
+    let face_boolean = attributes
+        .iter()
+        .find(|attribute| attribute["name"] == "face_boolean")
+        .ok_or_else(|| io::Error::other("distributed FACE BOOLEAN attribute is missing"))?;
+    for attribute in [point_boolean, corner_boolean, face_boolean] {
+        assert_eq!(attribute["domain"], "POINT");
+        assert_eq!(attribute["data_type"], "BOOLEAN");
+        assert_eq!(
+            attribute["values"].as_array().map(Vec::len),
+            Some(points.vertices.len())
+        );
+    }
+
+    let point_values = point_boolean["values"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("distributed POINT values are missing"))?;
+    let corner_values = corner_boolean["values"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("distributed CORNER values are missing"))?;
+    let face_values = face_boolean["values"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("distributed FACE values are missing"))?;
+    assert!(
+        point_values.iter().any(|value| value == &json!(true))
+            && point_values.iter().any(|value| value == &json!(false)),
+        "POINT interpolation did not sample both sides of the boolean threshold"
+    );
+    assert!(
+        corner_values.iter().any(|value| value == &json!(true))
+            && corner_values.iter().any(|value| value == &json!(false)),
+        "CORNER interpolation did not sample both sides of the boolean threshold"
+    );
+    for ((vertex, point_value), (corner_value, face_value)) in points
+        .vertices
+        .iter()
+        .zip(point_values)
+        .zip(corner_values.iter().zip(face_values))
+    {
+        let point_value = point_value
+            .as_bool()
+            .ok_or_else(|| io::Error::other("distributed POINT value is not boolean"))?;
+        let corner_value = corner_value
+            .as_bool()
+            .ok_or_else(|| io::Error::other("distributed CORNER value is not boolean"))?;
+        assert_eq!(
+            point_value,
+            vertex.co.x >= 0.5,
+            "POINT BOOLEAN interpolation differed at {:?}",
+            vertex.co
+        );
+        assert_eq!(
+            corner_value,
+            vertex.co.y >= 0.5,
+            "CORNER BOOLEAN interpolation differed at {:?}",
+            vertex.co
+        );
+        assert_eq!(
+            face_value.as_bool(),
+            Some(true),
+            "FACE BOOLEAN value was not copied to the generated point"
+        );
+    }
     Ok(())
 }
 

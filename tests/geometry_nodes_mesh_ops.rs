@@ -10,6 +10,9 @@ use potter_core::{
 use serde_json::{Map, Value, json};
 
 const ORACLE: &str = include_str!("fixtures/geometry_nodes_mesh_ops/expected.json");
+// Pinned Linux x86_64 Blender uses a separate exact FLOAT4X4 host profile; the macOS oracle stays canonical.
+const LINUX_FLOAT4X4_PROFILE: &str =
+    include_str!("fixtures/geometry_nodes_mesh_ops/linux_float4x4_profile.json");
 
 #[derive(Clone, Copy)]
 struct FieldSpec {
@@ -319,7 +322,128 @@ const OPERATION_CASES: &[&str] = &[
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
 fn fixture() -> TestResult<Value> {
-    Ok(serde_json::from_str(ORACLE)?)
+    let oracle: Value = serde_json::from_str(ORACLE)?;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let oracle = {
+        let mut oracle = oracle;
+        apply_linux_float4x4_profile(&mut oracle)?;
+        oracle
+    };
+    Ok(oracle)
+}
+#[test]
+fn linux_float4x4_profile_is_bound_to_the_canonical_input() -> TestResult<()> {
+    let mut oracle: Value = serde_json::from_str(ORACLE)?;
+    apply_linux_float4x4_profile(&mut oracle)?;
+    Ok(())
+}
+
+fn apply_linux_float4x4_profile(oracle: &mut Value) -> TestResult<()> {
+    let profile: Value = serde_json::from_str(LINUX_FLOAT4X4_PROFILE)?;
+    let source = profile
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or("Linux matrix profile source record is missing")?;
+    assert_eq!(source["blender_build_hash"], "d13f752e3b9c");
+    assert_eq!(source["runtime_platform"], "linux");
+    assert_eq!(source["runtime_machine"], "x86_64");
+    assert_eq!(
+        source["generator_sha256"],
+        "c5cbb71e0e482dbd6ba27e0fdeef19df7807dbe2a9e07594ebc05b767e921573"
+    );
+    assert_eq!(
+        source["canonical_fixture_sha256"],
+        potter_core::hash::sha256(ORACLE.as_bytes())
+            .strip_prefix("sha256:")
+            .ok_or("canonical fixture hash is malformed")?
+    );
+    let input_record = source["canonical_input_records"]
+        .as_array()
+        .and_then(|records| records.first())
+        .ok_or("Linux matrix profile canonical input is missing")?;
+    assert_eq!(input_record["name"], "edge_float4x4");
+    assert_eq!(input_record["domain"], "EDGE");
+    assert_eq!(input_record["data_type"], "FLOAT4X4");
+    let input_attribute = oracle["input"]["attributes"]["blender_attributes"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["name"] == "edge_float4x4")
+        })
+        .ok_or("canonical FLOAT4X4 input attribute is missing")?;
+    assert_eq!(input_attribute["values"], input_record["values"]);
+
+    let mut input_bytes = Vec::with_capacity(832);
+    for matrix in input_record["values"]
+        .as_array()
+        .ok_or("canonical matrices are not an array")?
+    {
+        for row in matrix
+            .as_array()
+            .ok_or("canonical matrix row is not an array")?
+        {
+            for component in row
+                .as_array()
+                .ok_or("canonical matrix row has invalid values")?
+            {
+                let value = component
+                    .as_f64()
+                    .and_then(|value| value.to_f32())
+                    .ok_or("canonical matrix component is not an f32")?;
+                input_bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    assert_eq!(input_bytes.len(), 832);
+    assert_eq!(
+        potter_core::hash::sha256(&input_bytes).strip_prefix("sha256:"),
+        source["canonical_input_float4x4_f32le_sha256"].as_str()
+    );
+
+    let outputs = profile["outputs"]
+        .as_array()
+        .ok_or("Linux matrix profile outputs are missing")?;
+    assert_eq!(profile["record_count"], json!(36));
+    assert_eq!(outputs.len(), 36);
+    assert_eq!(profile["domain_counts"]["EDGE"], json!(36));
+    for record in outputs {
+        assert_eq!(record["name"], "edge_float4x4");
+        assert_eq!(record["domain"], "EDGE");
+        assert_eq!(record["data_type"], "FLOAT4X4");
+        let path = record["path"]
+            .as_str()
+            .ok_or("Linux matrix profile output path is missing")?;
+        let (location, attribute) = path
+            .strip_prefix("$.")
+            .and_then(|path| path.split_once(".attributes.blender_attributes[name="))
+            .ok_or("Linux matrix profile output path has an invalid form")?;
+        let attribute = attribute
+            .strip_suffix(']')
+            .ok_or("Linux matrix profile attribute path is unterminated")?;
+        assert_eq!(attribute, "edge_float4x4");
+        let result = if let Some(operation) = location.strip_prefix("operations.") {
+            &mut oracle["operations"][operation]
+        } else {
+            &mut oracle[location]
+        };
+        let entries = result["attributes"]["blender_attributes"]
+            .as_array_mut()
+            .ok_or("expected FLOAT4X4 output has no Blender attributes")?;
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry["name"] == "edge_float4x4")
+            .ok_or_else(|| format!("expected FLOAT4X4 output is missing at `{path}`"))?;
+        let expected_values = record["values"]
+            .as_array()
+            .ok_or("Linux matrix profile values are not an array")?;
+        let actual_values = entry["values"]
+            .as_array()
+            .ok_or("expected FLOAT4X4 values are not an array")?;
+        assert_eq!(actual_values.len(), expected_values.len(), "{path}");
+        entry["values"] = record["values"].clone();
+    }
+    Ok(())
 }
 
 fn input_mesh(oracle: &Value) -> TestResult<Mesh> {
