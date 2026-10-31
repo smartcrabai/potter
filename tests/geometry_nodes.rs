@@ -801,6 +801,36 @@ fn mesh_to_points_supports_point_edge_face_and_corner_domains() {
     }
 }
 #[test]
+fn joined_mesh_to_points_preserves_nonempty_radius_attributes_and_fields() {
+    let doc = graph_with_nodes(
+        vec![
+            json!({"id":"line_a","type":"GeometryNodeMeshLine","inputs":{"Count":2}}),
+            json!({"id":"line_b","type":"GeometryNodeMeshLine","inputs":{"Count":2}}),
+            json!({"id":"points_a","type":"GeometryNodeMeshToPoints","properties":{"mode":"VERTICES"},"inputs":{"Radius":0.25}}),
+            json!({"id":"points_b","type":"GeometryNodeMeshToPoints","properties":{"mode":"VERTICES"},"inputs":{"Radius":0.75}}),
+            json!({"id":"join","type":"GeometryNodeJoinGeometry"}),
+            json!({"id":"radius","type":"GeometryNodeInputNamedAttribute","properties":{"data_type":"FLOAT"},"inputs":{"Name":"radius"}}),
+            json!({"id":"store","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"FLOAT"},"inputs":{"Name":"joined_radius"}}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"line_a","from_socket":"Mesh","to_node":"points_a","to_socket":"Mesh"}),
+            json!({"from_node":"line_b","from_socket":"Mesh","to_node":"points_b","to_socket":"Mesh"}),
+            json!({"from_node":"points_a","from_socket":"Points","to_node":"join","to_socket":"Geometry"}),
+            json!({"from_node":"points_b","from_socket":"Points","to_node":"join","to_socket":"Geometry"}),
+            json!({"from_node":"join","from_socket":"Geometry","to_node":"store","to_socket":"Geometry"}),
+            json!({"from_node":"radius","from_socket":"Attribute","to_node":"store","to_socket":"Value"}),
+            json!({"from_node":"store","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let mesh = evaluate(&doc).mesh;
+    let expected = json!([0.25, 0.25, 0.75, 0.75]);
+    assert_eq!(mesh.attributes["radius"]["domain"], "POINT");
+    assert_eq!(mesh.attributes["radius"]["data_type"], "FLOAT");
+    assert_eq!(mesh.attributes["radius"]["data"], expected);
+    assert_eq!(mesh.attributes["joined_radius"]["data"], expected);
+}
+#[test]
 fn random_value_boolean_probability_drives_fields() {
     let doc = graph_with_nodes(
         vec![
@@ -820,33 +850,85 @@ fn random_value_boolean_probability_drives_fields() {
     assert!(mesh.vertices.iter().all(|vertex| vertex.co.x == 1.0));
 }
 #[test]
-fn point_distribution_refuses_input_attribute_propagation_until_modeled() {
-    let doc = graph_with_nodes(
-        vec![
-            json!({"id":"points","type":"GeometryNodeDistributePointsOnFaces","properties":{"distribute_method":"RANDOM"},"inputs":{"Density":1.0}}),
-            json!({"id":"output","type":"NodeGroupOutput"}),
-        ],
-        vec![
-            json!({"from_node":"points","from_socket":"Points","to_node":"output","to_socket":"Geometry"}),
-        ],
-    );
+fn point_distribution_stores_boolean_attributes_from_mesh_domains() {
+    let nodes = vec![
+        json!({
+            "id":"points",
+            "type":"GeometryNodeDistributePointsOnFaces",
+            "properties":{"distribute_method":"RANDOM"},
+            "inputs":{"Density":10.0,"Seed":17}
+        }),
+        json!({"id":"point_attr","type":"GeometryNodeInputNamedAttribute","properties":{"data_type":"BOOLEAN"},"inputs":{"Name":"point_flag"}}),
+        json!({"id":"corner_attr","type":"GeometryNodeInputNamedAttribute","properties":{"data_type":"BOOLEAN"},"inputs":{"Name":"corner_flag"}}),
+        json!({"id":"face_attr","type":"GeometryNodeInputNamedAttribute","properties":{"data_type":"BOOLEAN"},"inputs":{"Name":"face_flag"}}),
+        json!({"id":"store_point","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"BOOLEAN"},"inputs":{"Name":"sampled_point_flag"}}),
+        json!({"id":"store_corner","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"BOOLEAN"},"inputs":{"Name":"sampled_corner_flag"}}),
+        json!({"id":"store_face","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"BOOLEAN"},"inputs":{"Name":"sampled_face_flag"}}),
+        json!({"id":"output","type":"NodeGroupOutput"}),
+    ];
+    let links = vec![
+        json!({"from_node":"points","from_socket":"Points","to_node":"store_point","to_socket":"Geometry"}),
+        json!({"from_node":"point_attr","from_socket":"Attribute","to_node":"store_point","to_socket":"Value"}),
+        json!({"from_node":"store_point","from_socket":"Geometry","to_node":"store_corner","to_socket":"Geometry"}),
+        json!({"from_node":"corner_attr","from_socket":"Attribute","to_node":"store_corner","to_socket":"Value"}),
+        json!({"from_node":"store_corner","from_socket":"Geometry","to_node":"store_face","to_socket":"Geometry"}),
+        json!({"from_node":"face_attr","from_socket":"Attribute","to_node":"store_face","to_socket":"Value"}),
+        json!({"from_node":"store_face","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+    ];
+    let doc = graph_with_nodes(nodes, links);
     let mut input = evaluate_primitive_node("GeometryNodeMeshCube", json!({}));
+    let point_flags = (0..input.vertices.len())
+        .map(|index| json!(index % 2 == 0))
+        .collect::<Vec<_>>();
+    let corner_flags = (0..input
+        .faces
+        .iter()
+        .map(|face| face.vertices.len())
+        .sum::<usize>())
+        .map(|index| json!(index % 2 == 0))
+        .collect::<Vec<_>>();
+    let face_flags = (0..input.faces.len())
+        .map(|index| json!(index % 2 == 0))
+        .collect::<Vec<_>>();
     input.attributes.insert(
-        "surface_weight".to_owned(),
-        json!({"domain":"POINT","data_type":"FLOAT","data":vec![1.0; input.vertices.len()]}),
+        "point_flag".to_owned(),
+        json!({"domain":"POINT","data_type":"BOOLEAN","data":point_flags}),
     );
-    let error = graph::evaluate(
+    input.attributes.insert(
+        "corner_flag".to_owned(),
+        json!({"domain":"CORNER","data_type":"BOOLEAN","data":corner_flags}),
+    );
+    input.attributes.insert(
+        "face_flag".to_owned(),
+        json!({"domain":"FACE","data_type":"BOOLEAN","data":face_flags}),
+    );
+    let mesh = graph::evaluate(
         doc.node_groups.get(&Id::new("geo").unwrap()).unwrap(),
         Some(&input),
         &Map::new(),
-        "DistributionAttributeGuard",
+        "DistributionAttributePropagation",
     )
-    .unwrap_err();
-    assert_eq!(error.code, ErrorCode::UnsupportedFeature);
-    assert_eq!(
-        error.details["feature_id"],
-        "graph.node.distribute_points.attribute_propagation"
-    );
+    .unwrap()
+    .mesh;
+    for name in [
+        "sampled_point_flag",
+        "sampled_corner_flag",
+        "sampled_face_flag",
+    ] {
+        let attribute = &mesh.attributes[name];
+        assert_eq!(attribute["domain"], "POINT", "{name} domain");
+        assert_eq!(attribute["data_type"], "BOOLEAN", "{name} type");
+        let values = attribute["data"].as_array().unwrap();
+        assert_eq!(values.len(), mesh.vertices.len(), "{name} length");
+        assert!(
+            values.iter().any(|value| value.as_bool() == Some(true)),
+            "{name} true samples"
+        );
+        assert!(
+            values.iter().any(|value| value.as_bool() == Some(false)),
+            "{name} false samples"
+        );
+    }
 }
 
 #[test]

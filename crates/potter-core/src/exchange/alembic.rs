@@ -573,7 +573,7 @@ fn export_color_layers(faces: &[Vec<usize>], store: ColorStore) -> Result<Vec<Co
         .into_iter()
         .map(|layer| {
             let mut values = match layer.domain {
-                ColorDomain::Point => layer.values,
+                ColorDomain::Point | ColorDomain::Face => layer.values,
                 ColorDomain::Corner => reverse_corner_runs(faces, layer.values)?,
             };
             for [red, green, blue, alpha] in &mut values {
@@ -883,6 +883,7 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
         for (layer_index, layer) in sample.colors.iter().enumerate() {
             let expected = match layer.domain {
                 ColorDomain::Point => sample.positions.len(),
+                ColorDomain::Face => sample.faces.len(),
                 ColorDomain::Corner => sample.faces.iter().map(Vec::len).sum::<usize>(),
             };
             if layer.values.len() != expected {
@@ -970,6 +971,7 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
     for (layer_index, (name, domain)) in color_specs.iter().enumerate() {
         let scope = match domain {
             ColorDomain::Point => "vertex",
+            ColorDomain::Face => "uniform",
             ColorDomain::Corner => "facevarying",
         };
         let mut metadata = geomparam_metadata(scope, "rgba", 4);
@@ -3603,6 +3605,18 @@ fn canonical_color_values(
             }
             Ok((ColorDomain::Corner, point_color_corners(faces, &rgba)?))
         }
+        "facevarying" => {
+            let corner_count = faces
+                .iter()
+                .try_fold(0_usize, |count, face| count.checked_add(face.len()))
+                .ok_or_else(|| import_error("Alembic color corner count overflow"))?;
+            if rgba.len() != corner_count {
+                return Err(import_error(
+                    "Alembic face-varying color count does not match corner count",
+                ));
+            }
+            Ok((ColorDomain::Corner, reverse_corner_runs(faces, rgba)?))
+        }
         "constant" => {
             let value = *rgba
                 .first()
@@ -3614,15 +3628,14 @@ fn canonical_color_values(
                 corner_count.ok_or_else(|| import_error("Alembic color corner count overflow"))?;
             Ok((ColorDomain::Corner, vec![value; corner_count]))
         }
-        "facevarying" => Ok((ColorDomain::Corner, reverse_corner_runs(faces, rgba)?)),
-        "uniform" => Ok((
-            ColorDomain::Corner,
-            faces
-                .iter()
-                .zip(&rgba)
-                .flat_map(|(face, value)| std::iter::repeat_n(*value, face.len()))
-                .collect(),
-        )),
+        "uniform" => {
+            if rgba.len() != faces.len() {
+                return Err(import_error(
+                    "Alembic uniform color count does not match face count",
+                ));
+            }
+            Ok((ColorDomain::Face, rgba))
+        }
         other => Err(unsupported(
             "alembic.geom_scope",
             format!("Alembic color scope `{other}` is unsupported"),

@@ -100,7 +100,10 @@ fn concatenate_inner(
     let mut pieces = Vec::with_capacity(parts.len());
     let mut adaptive_normals = Vec::new();
     let mut has_adaptive_normals = false;
-    for part in parts {
+    // Blender's GeometrySet join omits empty components before collecting attributes.
+    for part in parts.into_iter().filter(|part| {
+        !part.mesh.vertices.is_empty() || !part.mesh.edges.is_empty() || !part.mesh.faces.is_empty()
+    }) {
         let Placed {
             mut mesh,
             uv_layers,
@@ -532,6 +535,10 @@ fn merge_attributes(pieces: &[Piece], mesh: &Mesh) -> Result<Map<String, Value>>
     }
     let mut merged = Map::new();
     for name in names {
+        // Context IDs are evaluator-only and are renewed for the concatenated output snapshot.
+        if name == super::MESH_EVALUATION_CONTEXT_ATTRIBUTE {
+            continue;
+        }
         // Each member keeps its own texture space: the collection join carries Generated per vertex, so the member
         // records are not merged into one mesh-level record (two members with different boxes would conflict).
         if name == super::TEXTURE_SPACE_KEY {
@@ -581,7 +588,7 @@ fn merge_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Result<Va
             value.get("type").and_then(Value::as_str) == Some("color")
                 && matches!(
                     value.get("domain").and_then(Value::as_str),
-                    Some("point" | "corner")
+                    Some("point" | "face" | "corner")
                 )
                 && piece
                     .attributes
@@ -599,12 +606,24 @@ fn merge_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Result<Va
         }
         _ if members
             .iter()
+            .any(|(value, _)| value.is_some_and(is_stored_attribute)) =>
+        {
+            merge_stored_attribute(name, members)
+        }
+        _ if members
+            .iter()
             .any(|(value, _)| value.is_some_and(|value| value.get("values").is_some())) =>
         {
             merge_named(name, members)
         }
         _ => merge_equal(name, members),
     }
+}
+
+fn is_stored_attribute(value: &Value) -> bool {
+    value.get("domain").and_then(Value::as_str).is_some()
+        && value.get("data_type").and_then(Value::as_str).is_some()
+        && value.get("data").and_then(Value::as_array).is_some()
 }
 
 /// Joins typed custom-normal codes and their member-local loop bases without decoding the codes.
@@ -846,15 +865,20 @@ fn header_of(entry: &Value) -> Value {
     )
 }
 
-/// Element count of a `blender_attributes` entry's domain in `piece`; `None` for an unknown domain.
-fn entry_length(entry: &Value, piece: &Piece) -> Option<usize> {
-    match text(entry, "domain") {
+/// Element count for a mesh domain in `piece`.
+fn domain_length(domain: &str, piece: &Piece) -> Option<usize> {
+    match domain {
         "POINT" => Some(piece.vertices),
         "EDGE" => Some(piece.edges),
         "FACE" => Some(piece.faces),
         "CORNER" => Some(piece.corners),
         _ => None,
     }
+}
+
+/// Element count of a `blender_attributes` entry's domain in `piece`; `None` for an unknown domain.
+fn entry_length(entry: &Value, piece: &Piece) -> Option<usize> {
+    domain_length(text(entry, "domain"), piece)
 }
 
 /// The data type two same-named `blender_attributes` entries join as. Byte colors are float colors at
@@ -947,6 +971,80 @@ fn merge_named(name: &str, members: &[Member<'_>]) -> Result<Value> {
     Ok(Value::Object(merged))
 }
 
+fn merge_stored_attribute(name: &str, members: &[Member<'_>]) -> Result<Value> {
+    let mut header: Option<Map<String, Value>> = None;
+    let mut empty_header: Option<Map<String, Value>> = None;
+    for (value, piece) in members {
+        let Some(value) = value else { continue };
+        let object = value.as_object().ok_or_else(|| shape_error(name))?;
+        let values = object
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| shape_error(name))?;
+        let domain = object
+            .get("domain")
+            .and_then(Value::as_str)
+            .ok_or_else(|| shape_error(name))?;
+        let count = domain_length(domain, piece).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!("attribute `{name}` uses a domain that cannot be combined"),
+                json!({"attribute": name}),
+            )
+        })?;
+        if values.len() != count {
+            return Err(shape_error(name));
+        }
+        let fields = object
+            .iter()
+            .filter(|(key, _)| key.as_str() != "data")
+            .map(|(key, field)| (key.clone(), field.clone()))
+            .collect::<Map<String, Value>>();
+        if count == 0 {
+            empty_header.get_or_insert(fields);
+            continue;
+        }
+        match &header {
+            None => header = Some(fields),
+            Some(first) if *first != fields => return Err(conflict_error(name)),
+            Some(_) => {}
+        }
+    }
+    let mut header = header.or(empty_header).ok_or_else(|| shape_error(name))?;
+    let domain = header
+        .get("domain")
+        .and_then(Value::as_str)
+        .ok_or_else(|| shape_error(name))?;
+    let data_type = header
+        .get("data_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| shape_error(name))?;
+    let mut output = Vec::new();
+    for (value, piece) in members {
+        let count = domain_length(domain, piece).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!("attribute `{name}` uses a domain that cannot be combined"),
+                json!({"attribute": name}),
+            )
+        })?;
+        match value {
+            Some(value) => {
+                let values = value
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .filter(|values| values.len() == count)
+                    .ok_or_else(|| shape_error(name))?;
+                output.extend(values.iter().cloned());
+            }
+            None if count == 0 => {}
+            None => output.extend(std::iter::repeat_n(default_value(data_type), count)),
+        }
+    }
+    header.insert("data".to_owned(), Value::Array(output));
+    Ok(Value::Object(header))
+}
+
 /// A member's own `active` or `render` color layer name, read before placement rewrites it.
 fn color_designation(mesh: &Mesh, key: &str) -> Option<String> {
     mesh.attributes
@@ -995,11 +1093,12 @@ fn merge_color_layers(name: &str, members: &[Member<'_>]) -> Result<Value> {
     }))
 }
 
-/// Joins canonical named color attributes, filling absent layers with transparent black. When point and
-/// corner members share a layer name, the joined layer becomes corner-domain without losing point
-/// colors: each source vertex value is expanded to every face corner that references it.
+/// Joins canonical color attributes. FACE values stay on FACE when every member uses that domain;
+/// mixed point/face/corner inputs become CORNER so their distinct values remain representable.
 fn merge_color_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Result<Value> {
     const DEFAULT: [f64; 4] = [0.0, 0.0, 0.0, 0.0];
+    let mut point_domain = false;
+    let mut face_domain = false;
     let mut corner_domain = false;
     for (value, _) in members {
         let Some(value) = value else { continue };
@@ -1007,11 +1106,14 @@ fn merge_color_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Res
             return Err(conflict_error(name));
         }
         match text(value, "domain") {
-            "point" => {}
+            "point" => point_domain = true,
+            "face" => face_domain = true,
             "corner" => corner_domain = true,
             _ => return Err(conflict_error(name)),
         }
     }
+    corner_domain |= face_domain && point_domain;
+    face_domain &= !corner_domain;
     let mut values = Map::new();
     if corner_domain {
         for (attribute, piece) in members {
@@ -1033,6 +1135,12 @@ fn merge_color_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Res
                             .map(|value| color_value(value, name))
                             .collect::<Result<Vec<_>>>()?
                     }
+                    (Some(attribute), Some(fields)) if text(attribute, "domain") == "face" => {
+                        let color = fields
+                            .get(&format!("f{}", face.id))
+                            .map_or(Ok(json!(DEFAULT)), |value| color_value(value, name))?;
+                        vec![color; face.vertices.len()]
+                    }
                     (Some(_), Some(fields)) => face
                         .vertices
                         .iter()
@@ -1046,6 +1154,21 @@ fn merge_color_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Res
                     _ => return Err(shape_error(name)),
                 };
                 values.insert(format!("f{}", face.id), Value::Array(row));
+            }
+        }
+    } else if face_domain {
+        for (attribute, piece) in members {
+            let fields = attribute
+                .and_then(|attribute| attribute.get("values"))
+                .and_then(Value::as_object);
+            if attribute.is_some() && fields.is_none() {
+                return Err(shape_error(name));
+            }
+            for face in &mesh.faces[piece.face_base..piece.face_base + piece.faces] {
+                let color = fields
+                    .and_then(|fields| fields.get(&format!("f{}", face.id)))
+                    .map_or(Ok(json!(DEFAULT)), |value| color_value(value, name))?;
+                values.insert(format!("f{}", face.id), color);
             }
         }
     } else {
@@ -1065,7 +1188,7 @@ fn merge_color_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Res
         }
     }
     Ok(json!({
-        "domain": if corner_domain { "corner" } else { "point" },
+        "domain": if corner_domain { "corner" } else if face_domain { "face" } else { "point" },
         "type": "color",
         "values": values
     }))
@@ -1084,13 +1207,12 @@ fn color_value(value: &Value, name: &str) -> Result<Value> {
         .ok_or_else(|| shape_error(name))
 }
 
-/// `blender_metadata` describes each member's data-block. The joined mesh keeps every member's custom
-/// properties; a key set to different values on two members is refused. `potter.*` keys are bridge
-/// bookkeeping that differs per member, so they are not carried. The data-block's users and fake-user
-/// flags belong to no single joined mesh and are not carried either.
+/// Custom properties are unioned and conflicting values are refused. Color types and matching
+/// active-color names are preserved; bridge metadata and data-block user flags are omitted.
 fn merge_metadata(name: &str, members: &[Member<'_>]) -> Result<Value> {
     let mut custom = Map::new();
     let mut color_types = Map::new();
+    let mut active_color = None;
     for (value, _) in members {
         let Some(value) = *value else { continue };
         if let Some(properties) = value.get("custom_properties").and_then(Value::as_object) {
@@ -1105,6 +1227,16 @@ fn merge_metadata(name: &str, members: &[Member<'_>]) -> Result<Value> {
                         custom.insert(key.clone(), property.clone());
                     }
                 }
+            }
+        }
+        if let Some(active) = value
+            .get("color_active_blender")
+            .filter(|active| !active.is_null())
+        {
+            match &active_color {
+                None => active_color = Some(active.clone()),
+                Some(known) if known != active => return Err(conflict_error(name)),
+                Some(_) => {}
             }
         }
         if let Some(types) = value.get("color_data_types").and_then(Value::as_object) {
@@ -1128,11 +1260,17 @@ fn merge_metadata(name: &str, members: &[Member<'_>]) -> Result<Value> {
             }
         }
     }
-    let mut metadata = json!({ "custom_properties": custom });
-    if !color_types.is_empty() {
-        metadata["color_data_types"] = Value::Object(color_types);
+    let mut metadata = Map::new();
+    if !custom.is_empty() {
+        metadata.insert("custom_properties".to_owned(), Value::Object(custom));
     }
-    Ok(metadata)
+    if !color_types.is_empty() {
+        metadata.insert("color_data_types".to_owned(), Value::Object(color_types));
+    }
+    if let Some(active_color) = active_color {
+        metadata.insert("color_active_blender".to_owned(), active_color);
+    }
+    Ok(Value::Object(metadata))
 }
 
 /// Mesh-level data with no element keys must agree across members.

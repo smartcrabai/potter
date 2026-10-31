@@ -99,8 +99,8 @@ pub(crate) struct ExchangeVertexGroup {
     pub weights: Vec<(usize, f64)>,
 }
 
-/// Converts one canonical color layer to Blender's point-domain lookup result. Corner values are
-/// averaged over every incident face corner; vertices with no incident corners use zero RGBA.
+/// Converts a canonical color layer to Blender's point-domain lookup result. Face and corner values
+/// are averaged over incident faces/corners; vertices with no incident geometry use zero RGBA.
 pub(super) fn point_color_values(
     mesh: &ExchangeMesh,
     layer: &color_layers::ColorLayer,
@@ -125,6 +125,45 @@ pub(super) fn point_color_values(
                 ));
             }
             Ok(layer.values.clone())
+        }
+        color_layers::ColorDomain::Face => {
+            if layer.values.len() != mesh.faces.len() {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "face color layer does not match face count",
+                ));
+            }
+            let mut sums = vec![[0.0_f32; 4]; mesh.positions.len()];
+            let mut counts = vec![0_usize; mesh.positions.len()];
+            for (face, color) in mesh.faces.iter().zip(&layer.values) {
+                for &vertex in face {
+                    let Some(sum) = sums.get_mut(vertex) else {
+                        return Err(PotError::new(
+                            ErrorCode::SceneInvalid,
+                            "face references a missing vertex",
+                        ));
+                    };
+                    for (sum, value) in sum.iter_mut().zip(*color) {
+                        *sum += value as f32;
+                    }
+                    counts[vertex] += 1;
+                }
+            }
+            for (sum, count) in sums.iter_mut().zip(counts) {
+                if count != 0 {
+                    let count = u32::try_from(count).map_err(|_| {
+                        PotError::new(
+                            ErrorCode::LimitExceeded,
+                            "vertex face count exceeds color average range",
+                        )
+                    })?;
+                    let inverse = 1.0_f32 / count as f32;
+                    for value in sum {
+                        *value *= inverse;
+                    }
+                }
+            }
+            Ok(sums.into_iter().map(|sum| sum.map(f64::from)).collect())
         }
         color_layers::ColorDomain::Corner => {
             let corner_count = mesh
@@ -619,12 +658,16 @@ pub(crate) fn element_data_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<
                         "export as usda, usdc, fbx, or alembic to preserve color-layer names",
                     ));
                 }
-                if layer.domain == color_layers::ColorDomain::Corner {
+                if matches!(
+                    layer.domain,
+                    color_layers::ColorDomain::Face | color_layers::ColorDomain::Corner
+                ) {
                     losses.push(element_loss(
                         mesh,
                         "mesh.color_attribute",
                         format!(
-                            "{format} averages CORNER layer `{}` to point colors; per-corner differences are lost",
+                            "{format} averages {} layer `{}` to point colors; face/corner differences are lost",
+                            layer.domain.name().to_ascii_uppercase(),
                             layer.name
                         ),
                         "export as usda, usdc, fbx, or alembic to preserve the color domain",

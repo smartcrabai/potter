@@ -593,6 +593,30 @@ pub(super) fn reorder_positional_attributes(mesh: &mut Mesh, order: &OutputOrder
             }
         }
     }
+    for (key, attribute) in &mut mesh.attributes {
+        if matches!(
+            key.as_str(),
+            "blender_attributes"
+                | "blender_edge_flags"
+                | "blender_polygon_smooth"
+                | "blender_skin_vertices"
+        ) {
+            continue;
+        }
+        let permutation = match attribute.get("domain").and_then(serde_json::Value::as_str) {
+            Some("POINT" | "point" | "VERTEX" | "vertex") => &order.vertices,
+            Some("EDGE" | "edge") => &order.edges,
+            Some("FACE" | "face" | "POLYGON" | "polygon") => &order.faces,
+            _ => continue,
+        };
+        if let Some(values) = attribute
+            .get_mut("data")
+            .and_then(serde_json::Value::as_array_mut)
+            && values.len() == permutation.len()
+        {
+            *values = permute(std::mem::take(values), permutation);
+        }
+    }
     let mut position = vec![0; order.vertices.len()];
     for (new, &old) in order.vertices.iter().enumerate() {
         position[old] = new;
@@ -643,6 +667,10 @@ mod tests {
                 {"name": "short", "domain": "POINT", "data_type": "FLOAT", "values": [7.0]}
             ]),
         );
+        mesh.attributes.insert(
+            "edge_flag".to_owned(),
+            json!({"domain":"EDGE","data_type":"BOOLEAN","data":[false,true]}),
+        );
         let order = OutputOrder {
             vertices: vec![2, 0, 1],
             edges: vec![1, 0],
@@ -657,6 +685,7 @@ mod tests {
         assert_eq!(entries[0]["values"], json!([2.0, 0.0, 1.0]));
         assert_eq!(entries[1]["values"], json!([11.0, 10.0]));
         assert_eq!(entries[2]["values"], json!([20.0]));
+        assert_eq!(mesh.attributes["edge_flag"]["data"], json!([true, false]));
         // Corner rows are permuted by the corner order, not by this function.
         assert_eq!(entries[3]["values"], json!([30.0, 31.0, 32.0, 33.0]));
         // A length that matches no element domain is left as stored.

@@ -5,9 +5,10 @@
 //!
 //! Each layer is a named mesh attribute holding its values once:
 //!
-//! `mesh.attributes[storage_key(name)] = {"domain": "point" | "corner", "type": "color", "values": …}`
+//! `mesh.attributes[storage_key(name)] = {"domain": "point" | "face" | "corner", "type": "color", "values": …}`
 //!
 //! - `point`: `values["v<vertex id>"] = [r, g, b, a]`.
+//! - `face`: `values["f<face id>"] = [r, g, b, a]`.
 //! - `corner`: `values["f<face id>"] = [[r, g, b, a] per face corner]`, in face corner order.
 //!
 //! Values are linear (Blender's `Color Attribute.color`, not `color_srgb`). Nothing clamps them: HDR
@@ -21,9 +22,8 @@
 //! Source encoding (`FLOAT_COLOR` or `BYTE_COLOR`) is Blender-only and lives in
 //! `blender_metadata.color_data_types`, never next to the values.
 //!
-//! [`read`] returns the values in storage order (one entry per vertex for `point`, one per corner
-//! for `corner`), and [`write`] writes them back keyed by persistent ID, so the store survives
-//! element reordering.
+//! [`read`] returns the values in storage order, and [`write`] writes them back keyed by persistent
+//! IDs, so the store survives element reordering.
 
 use std::collections::{HashMap, HashSet};
 
@@ -42,30 +42,36 @@ pub(crate) const COLOR_TYPE: &str = "color";
 pub(crate) enum ColorDomain {
     /// One value per vertex.
     Point,
+    /// One value per face.
+    Face,
     /// One value per face corner.
     Corner,
 }
-
 impl ColorDomain {
     /// Attribute `domain` string.
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Point => "point",
+            Self::Face => "face",
             Self::Corner => "corner",
         }
+    }
+    fn supports_active_render(self) -> bool {
+        matches!(self, Self::Point | Self::Corner)
     }
 
     fn parse(value: &str) -> Option<Self> {
         match value {
             "point" => Some(Self::Point),
+            "face" => Some(Self::Face),
             "corner" => Some(Self::Corner),
             _ => None,
         }
     }
 }
 
-/// One color layer with values in storage order: one entry per vertex for [`ColorDomain::Point`],
-/// one per corner (mesh face order, then corner order) for [`ColorDomain::Corner`].
+/// One color layer with values in storage order: one per vertex, face, or corner for
+/// [`ColorDomain::Point`], [`ColorDomain::Face`], or [`ColorDomain::Corner`], respectively.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ColorLayer {
     pub(crate) name: String,
@@ -385,6 +391,16 @@ fn read_layer(mesh: &Mesh, name: &str) -> Option<ColorLayer> {
                     .unwrap_or(fallback)
             })
             .collect(),
+        ColorDomain::Face => mesh
+            .faces
+            .iter()
+            .map(|face| {
+                values
+                    .get(&corner_key(face.id))
+                    .and_then(color_value)
+                    .unwrap_or(fallback)
+            })
+            .collect(),
         ColorDomain::Corner => mesh
             .faces
             .iter()
@@ -443,6 +459,17 @@ pub(crate) fn write(mesh: &mut Mesh, store: &ColorStore) {
                     values.insert(vertex_key(vertex.id), json!(color));
                 }
             }
+            ColorDomain::Face => {
+                for (face, color) in mesh.faces.iter().zip(
+                    layer
+                        .values
+                        .iter()
+                        .copied()
+                        .chain(std::iter::repeat(fallback)),
+                ) {
+                    values.insert(corner_key(face.id), json!(color));
+                }
+            }
             ColorDomain::Corner => {
                 let mut corner = 0_usize;
                 for face in &mesh.faces {
@@ -464,21 +491,45 @@ pub(crate) fn write(mesh: &mut Mesh, store: &ColorStore) {
         mesh.attributes.remove(ATTRIBUTE);
         return;
     }
+    let fallback = store
+        .layers
+        .iter()
+        .find(|layer| layer.domain.supports_active_render())
+        .map(|layer| &layer.name);
     let named = |name: &Option<String>| {
         name.as_ref()
-            .filter(|name| store.index_of(name).is_some())
-            .or(store.layers.first().map(|layer| &layer.name))
+            .and_then(|name| {
+                store
+                    .layers
+                    .iter()
+                    .find(|layer| layer.name == *name && layer.domain.supports_active_render())
+            })
+            .map(|layer| &layer.name)
+            .or(fallback)
             .cloned()
     };
     let layers: Vec<Value> = store.layers.iter().map(|layer| json!(layer.name)).collect();
+    let active = named(&store.active);
+    let render = named(&store.render);
     mesh.attributes.insert(
         ATTRIBUTE.to_owned(),
         json!({
             "layers": layers,
-            "active": named(&store.active),
-            "render": named(&store.render),
+            "active": active,
+            "render": render,
         }),
     );
+    if let Some(metadata) = mesh
+        .attributes
+        .get_mut("blender_metadata")
+        .and_then(Value::as_object_mut)
+    {
+        if let Some(active) = active {
+            metadata.insert("color_active_blender".to_owned(), json!(active));
+        } else {
+            metadata.remove("color_active_blender");
+        }
+    }
 }
 
 /// Checks the store and every layer it names. Run at load time for every data-block mesh.
@@ -495,7 +546,7 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
         .and_then(Value::as_array)
         .ok_or_else(|| invalid("color_layers.layers must be an array".to_owned()))?;
     let mut seen = HashSet::new();
-    let mut layer_names = Vec::with_capacity(names.len());
+    let mut default_role_names = Vec::with_capacity(names.len());
     for name in names {
         let name = name
             .as_str()
@@ -504,7 +555,6 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
         if !seen.insert(name) {
             return Err(invalid(format!("color layer name `{name}` is not unique")));
         }
-        layer_names.push(name);
         let attribute = mesh
             .attributes
             .get(attribute_keys::storage_key(name).as_ref())
@@ -516,9 +566,12 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
             .and_then(ColorDomain::parse)
             .ok_or_else(|| {
                 invalid(format!(
-                    "color layer `{name}` domain must be point or corner"
+                    "color layer `{name}` domain must be point, face, or corner"
                 ))
             })?;
+        if domain.supports_active_render() {
+            default_role_names.push(name);
+        }
         if attribute.get("type").and_then(Value::as_str) != Some(COLOR_TYPE) {
             return Err(invalid(format!("color layer `{name}` type must be color")));
         }
@@ -539,6 +592,19 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
                         return Err(invalid(format!(
                             "color layer `{name}` has no finite value for vertex {}",
                             vertex.id
+                        )));
+                    }
+                }
+            }
+            ColorDomain::Face => {
+                for face in &mesh.faces {
+                    let value = values
+                        .get(&corner_key(face.id))
+                        .filter(|value| finite(value));
+                    if value.is_none() {
+                        return Err(invalid(format!(
+                            "color layer `{name}` has no finite value for face {}",
+                            face.id
                         )));
                     }
                 }
@@ -567,8 +633,8 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
     for key in ["active", "render"] {
         let value = object.get(key).unwrap_or(&Value::Null);
         let valid = match value {
-            Value::Null => layer_names.is_empty(),
-            Value::String(name) => layer_names.contains(&name.as_str()),
+            Value::Null => default_role_names.is_empty(),
+            Value::String(name) => default_role_names.contains(&name.as_str()),
             _ => false,
         };
         if !valid {

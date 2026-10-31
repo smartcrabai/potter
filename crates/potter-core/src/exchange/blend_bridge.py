@@ -328,7 +328,8 @@ def matrix_rows(matrix):
 def custom_props(block):
     try:
         return {str(key): plain(block[key]) for key in block.keys()
-                if key not in ("potter.object_solver_inverses_json", "potter.root_collection")}
+                if key not in ("potter.object_solver_inverses_json", "potter.root_collection",
+                               "potter.color_active", "potter.color_render")}
     except Exception:
         return {}
 
@@ -2621,8 +2622,10 @@ def mesh_dump(mesh):
             "edges": edges, "polygons": polygons, "uv_layers": uv_layers, "uv_active": uv_active,
             "sharp_face_present": mesh.attributes.get("sharp_face") is not None,
             "uv_render": uv_render, "materials": _material_names(mesh), "attributes": attrs,
-            "color_active": _color_attribute_name(mesh, color_attributes.active_color_index),
-            "color_render": _color_attribute_name(mesh, color_attributes.render_color_index),
+            "color_active": mesh.get("potter.color_active",
+                                     _color_attribute_name(mesh, color_attributes.active_color_index)),
+            "color_render": mesh.get("potter.color_render",
+                                     _color_attribute_name(mesh, color_attributes.render_color_index)),
             "skin_vertices": skin_vertices,
             "shape_keys": _mesh_shape_keys(mesh),
             "descriptor": json.loads(mesh.get("potter.descriptor_json", "null")),
@@ -5808,6 +5811,10 @@ def _apply_native_colors(mesh, attributes, names, vertex_items, face_items, layo
             layer = mesh.color_attributes.new(name=name, type=data_type, domain="POINT")
             for index, vertex in enumerate(vertex_items):
                 layer.data[index].color = values.get("v%d" % vertex["id"], _attribute_default(data_type))
+        elif domain == "face":
+            layer = mesh.attributes.new(name=name, type=data_type, domain="FACE")
+            for index, face in enumerate(face_items):
+                layer.data[index].color = values.get("f%d" % face["id"], _attribute_default(data_type))
         elif domain == "corner":
             layer = mesh.color_attributes.new(name=name, type=data_type, domain="CORNER")
             colors = layout.loops(_flatten_face_rows(values, face_items, "color layer %s" % name,
@@ -6023,19 +6030,31 @@ def _ensure_multires_sculpt_layers(obj):
         view_layer.objects.active = previous_active
 
 
-def _apply_color_designation(mesh, attributes):
+def _apply_color_designation(mesh, attributes, names):
     """Set Blender color designations after native and Blender-only attributes exist."""
     store = attributes.get("color_layers") or {}
     metadata = attributes.get("blender_metadata") or {}
     layer_names = [layer.name for layer in mesh.color_attributes]
-    for field, key, metadata_key in (
-        ("active_color_index", "active", "color_active_blender"),
-        ("render_color_index", "render", "color_render_blender"),
+    face_names = {
+        name
+        for name in store.get("layers", [])
+        if attributes.get(_storage_key(names, name), {}).get("domain") == "face"
+    }
+    for property_name in ("potter.color_active", "potter.color_render"):
+        if property_name in mesh:
+            del mesh[property_name]
+    for field, key, metadata_key, property_name in (
+        ("active_color_index", "active", "color_active_blender", "potter.color_active"),
+        ("render_color_index", "render", "color_render_blender", "potter.color_render"),
     ):
         reference = metadata.get(metadata_key, store.get(key))
         if reference is None:
             continue
         if reference not in layer_names:
+            if reference in face_names:
+                # Blender has no active/render index for a FACE color attribute; retain Potter's role in an internal mesh property.
+                mesh[property_name] = reference
+                continue
             raise ValueError("color layer %s is designated %s but mesh %s has no such layer"
                              % (reference, key, mesh.name))
         setattr(mesh.color_attributes, field, layer_names.index(reference))
@@ -6112,9 +6131,9 @@ def mesh_create(name, raw, block_id):
     _apply_blender_attributes(mesh, attributes, layer_names, layout, edge_of)
     _apply_multires_control_data(mesh, attributes, face_items, layout)
     _apply_texture_space(mesh, attributes.get("texture_space"))
-    _apply_color_designation(mesh, attributes)
     metadata = attributes.get("blender_metadata", {})
     set_props(mesh, metadata.get("custom_properties", {}))
+    _apply_color_designation(mesh, attributes, names)
     if metadata.get("fake_user"):
         mesh.use_fake_user = True
     set_id(mesh, block_id)
@@ -6783,8 +6802,14 @@ def _create_geometry_groups(doc, linked_group_map=None):
                                   group.get("name") or identifier)
         tree_type = {"geometry": "GeometryNodeTree", "shader": "ShaderNodeTree",
                      "compositor": "CompositorNodeTree"}.get(group.get("kind"), "")
-        if identifier not in direct_tree_ids:
-            add_group(name, identifier, tree_type, _model_group_tree(group))
+        if identifier in direct_tree_ids:
+            continue
+        tree_raw = _model_group_tree(group)
+        source = group_sources.get(identifier)
+        if source is None:
+            add_group(name, identifier, tree_type, tree_raw)
+        else:
+            source["tree"] = tree_raw
     return group_map, group_sources
 
 
@@ -10354,6 +10379,7 @@ def export_doc(doc, target, pack, scene_hash, context):
     for collection in (mesh_map, camera_map, light_map, armature_map, grease_pencil_map,
                        hair_curves_map, world_map, material_map, collection_map):
         id_lookup.update({block.name_full: block for block in collection.values()})
+    id_lookup.update(material_map)
     # Objects override same-named data blocks: compatibility references with
     # id_type "Object" must resolve to the Object, not identically-named data.
     id_lookup.update(object_lookup)

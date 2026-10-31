@@ -1976,6 +1976,7 @@ dependencies = [
  "hex",
  "image",
  "jsonschema 0.60.2",
+ "num-traits",
  "png",
  "potter-core",
  "potter-workflow",

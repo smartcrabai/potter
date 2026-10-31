@@ -21,9 +21,33 @@ pub fn is_known_node_type(node_type: &str) -> bool {
             | "GeometryNodeGroup"
             | "GeometryNodeMeshCube"
             | "GeometryNodeMeshIcoSphere"
-            | "GeometryNodeTransform"
             | "GeometryNodeSetPosition"
+            | "GeometryNodeTransform"
             | "GeometryNodeJoinGeometry"
+            | "GeometryNodeExtrudeMesh"
+            | "GeometryNodeSplitEdges"
+            | "GeometryNodeMergeByDistance"
+            | "GeometryNodeFlipFaces"
+            | "GeometryNodeDeleteGeometry"
+            | "GeometryNodeSeparateGeometry"
+            | "GeometryNodeDualMesh"
+            | "GeometryNodeTriangulate"
+            | "GeometryNodeScaleElements"
+            | "GeometryNodeSubdivideMesh"
+            | "GeometryNodeInputMeshEdgeAngle"
+            | "GeometryNodeInputMeshEdgeNeighbors"
+            | "GeometryNodeInputMeshEdgeVertices"
+            | "GeometryNodeInputMeshFaceArea"
+            | "GeometryNodeInputMeshFaceNeighbors"
+            | "GeometryNodeInputMeshVertexNeighbors"
+            | "GeometryNodeCornersOfEdge"
+            | "GeometryNodeCornersOfFace"
+            | "GeometryNodeCornersOfVertex"
+            | "GeometryNodeEdgesOfCorner"
+            | "GeometryNodeEdgesOfVertex"
+            | "GeometryNodeFaceOfCorner"
+            | "GeometryNodeOffsetCornerInFace"
+            | "GeometryNodeVertexOfCorner"
             | "GeometryNodeInstanceOnPoints"
             | "GeometryNodeRealizeInstances"
             | "GeometryNodeDistributePointsOnFaces"
@@ -464,6 +488,135 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
                 ("Offset", "vector"),
             ]),
             sockets(GEOMETRY_OUT),
+        ),
+        "GeometryNodeExtrudeMesh" => (
+            sockets(&[
+                ("Mesh", "geometry"),
+                ("Selection", "boolean"),
+                ("Offset", "vector"),
+                ("Offset Scale", "float"),
+                ("Individual", "boolean"),
+            ]),
+            sockets(&[
+                ("Mesh", "geometry"),
+                ("Top", "boolean"),
+                ("Side", "boolean"),
+            ]),
+        ),
+        "GeometryNodeSplitEdges" | "GeometryNodeFlipFaces" => (
+            sockets(&[("Mesh", "geometry"), ("Selection", "boolean")]),
+            sockets(&[("Mesh", "geometry")]),
+        ),
+        "GeometryNodeMergeByDistance" => (
+            sockets(&[
+                ("Geometry", "geometry"),
+                ("Selection", "boolean"),
+                ("Mode", "menu"),
+                ("Distance", "float"),
+            ]),
+            sockets(&[("Geometry", "geometry")]),
+        ),
+        "GeometryNodeDeleteGeometry" => (
+            sockets(&[("Geometry", "geometry"), ("Selection", "boolean")]),
+            sockets(&[("Geometry", "geometry")]),
+        ),
+        "GeometryNodeSeparateGeometry" => (
+            sockets(&[("Geometry", "geometry"), ("Selection", "boolean")]),
+            sockets(&[("Selection", "geometry"), ("Inverted", "geometry")]),
+        ),
+        "GeometryNodeDualMesh" => (
+            sockets(&[("Mesh", "geometry"), ("Keep Boundaries", "boolean")]),
+            sockets(&[("Dual Mesh", "geometry")]),
+        ),
+        "GeometryNodeTriangulate" => (
+            sockets(&[
+                ("Mesh", "geometry"),
+                ("Selection", "boolean"),
+                ("Quad Method", "menu"),
+                ("N-gon Method", "menu"),
+            ]),
+            sockets(&[("Mesh", "geometry")]),
+        ),
+        "GeometryNodeScaleElements" => (
+            sockets(&[
+                ("Geometry", "geometry"),
+                ("Selection", "boolean"),
+                ("Scale", "float"),
+                ("Center", "vector"),
+                ("Scale Mode", "menu"),
+                ("Axis", "vector"),
+            ]),
+            sockets(&[("Geometry", "geometry")]),
+        ),
+        "GeometryNodeSubdivideMesh" => (
+            sockets(&[("Mesh", "geometry"), ("Level", "integer")]),
+            sockets(&[("Mesh", "geometry")]),
+        ),
+        "GeometryNodeInputMeshEdgeAngle" => (
+            Vec::new(),
+            sockets(&[("Unsigned Angle", "float"), ("Signed Angle", "float")]),
+        ),
+        "GeometryNodeInputMeshEdgeNeighbors" => (Vec::new(), sockets(&[("Face Count", "integer")])),
+        "GeometryNodeInputMeshEdgeVertices" => (
+            Vec::new(),
+            sockets(&[
+                ("Vertex Index 1", "integer"),
+                ("Vertex Index 2", "integer"),
+                ("Position 1", "vector"),
+                ("Position 2", "vector"),
+            ]),
+        ),
+        "GeometryNodeInputMeshFaceArea" => (Vec::new(), sockets(&[("Area", "float")])),
+        "GeometryNodeInputMeshFaceNeighbors" | "GeometryNodeInputMeshVertexNeighbors" => (
+            Vec::new(),
+            sockets(&[("Vertex Count", "integer"), ("Face Count", "integer")]),
+        ),
+        "GeometryNodeCornersOfEdge" => (
+            sockets(&[
+                ("Edge Index", "integer"),
+                ("Weights", "float"),
+                ("Sort Index", "integer"),
+            ]),
+            sockets(&[("Corner Index", "integer"), ("Total", "integer")]),
+        ),
+        "GeometryNodeCornersOfFace" => (
+            sockets(&[
+                ("Face Index", "integer"),
+                ("Weights", "float"),
+                ("Sort Index", "integer"),
+            ]),
+            sockets(&[("Corner Index", "integer"), ("Total", "integer")]),
+        ),
+        "GeometryNodeCornersOfVertex" | "GeometryNodeEdgesOfVertex" => (
+            sockets(&[
+                ("Vertex Index", "integer"),
+                ("Weights", "float"),
+                ("Sort Index", "integer"),
+            ]),
+            if node.node_type == "GeometryNodeCornersOfVertex" {
+                sockets(&[("Corner Index", "integer"), ("Total", "integer")])
+            } else {
+                sockets(&[("Edge Index", "integer"), ("Total", "integer")])
+            },
+        ),
+        "GeometryNodeEdgesOfCorner" => (
+            sockets(&[("Corner Index", "integer")]),
+            sockets(&[
+                ("Next Edge Index", "integer"),
+                ("Previous Edge Index", "integer"),
+            ]),
+        ),
+        "GeometryNodeFaceOfCorner" => (
+            sockets(&[("Corner Index", "integer")]),
+            sockets(&[("Face Index", "integer"), ("Index in Face", "integer")]),
+        ),
+        "GeometryNodeOffsetCornerInFace" => (
+            sockets(&[("Corner Index", "integer"), ("Offset", "integer")]),
+            sockets(&[("Corner Index", "integer")]),
+        ),
+        "GeometryNodeVertexOfCorner" => (
+            sockets(&[("Corner Index", "integer")]),
+            sockets(&[("Vertex Index", "integer")]),
         ),
         "GeometryNodeJoinGeometry" | "GeometryNodeRepeatOutput" => {
             (sockets(GEOMETRY_IN), sockets(GEOMETRY_OUT))

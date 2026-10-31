@@ -1693,7 +1693,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "geometry_nodes.evaluator_subset",
-            "Mesh primitives, geometry editing, random and POISSON point distribution, fields, attributes, repeat zones, and frame-cached simulation zones evaluated with scene frame timing",
+            "Mesh primitives and topology operations (extrude, split, merge, flip, delete, separate, dual mesh, triangulate, scale and subdivide), mesh topology fields, random and POISSON point distribution, fields, attributes, repeat zones, and frame-cached simulation zones evaluated with scene frame timing",
             "GeometryNodeTree",
             &[
                 "graph.create",
@@ -1820,6 +1820,27 @@ pub fn feature_catalog() -> Value {
             "GeometryNodeTree",
             &[],
             "Named Attribute supports FLOAT, FLOAT_VECTOR, FLOAT_COLOR, QUATERNION, INT, and BOOLEAN outputs plus INT-to-FLOAT conversion; other conversions are refused.",
+        ),
+        unsupported(
+            "graph.node.extrude_mesh.face_attribute_type",
+            "Extrude Mesh generated face attribute types not represented by the native mesh evaluator",
+            "GeometryNodeTree",
+            &[],
+            "Generated face attribute values whose data types are not represented by Potter's native Geometry Nodes extrusion attribute mixer are refused instead of silently discarded.",
+        ),
+        unsupported(
+            "graph.node.extrude_mesh.edge_attribute_type",
+            "Extrude Mesh connecting-edge attribute types not supported by the native evaluator",
+            "GeometryNodeTree",
+            &[],
+            "Geometry Nodes region extrusion mixes attributes from selected boundary edges on connecting edges; data types without a native transfer mixer are refused.",
+        ),
+        unsupported(
+            "graph.node.dual_mesh.attribute_domain",
+            "Dual Mesh attributes on unsupported domains",
+            "GeometryNodeTree",
+            &[],
+            "Dual Mesh transfers supported mesh-domain attributes to their corresponding output domains; unsupported source domains are refused.",
         ),
         unsupported(
             "graph.node.random_value.data_type",

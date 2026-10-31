@@ -297,6 +297,19 @@ fn paint_vertex_colors(
                 }
             }
         }
+        ColorDomain::Face => {
+            for (face, value) in mesh.faces.iter().zip(layer.values.iter_mut()) {
+                let amount = face
+                    .vertices
+                    .iter()
+                    .map(|vertex| influence(influences, *vertex))
+                    .sum::<f64>()
+                    / face.vertices.len() as f64;
+                if amount > 0.0 {
+                    changed |= paint_value(value, color, amount, blend);
+                }
+            }
+        }
         ColorDomain::Corner => {
             let corner_vertices = mesh.faces.iter().flat_map(|face| face.vertices.iter());
             for (vertex_id, value) in corner_vertices.zip(layer.values.iter_mut()) {

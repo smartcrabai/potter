@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use glam::{DMat4, DVec2, DVec3, Mat4, Vec3};
+use num_traits::ToPrimitive;
 use serde_json::{Map, Value, json};
 use sha2::Digest as _;
 
@@ -31,7 +32,8 @@ use super::{
     origindex_values,
     provenance::{
         Origin, edge_flags, remap_attributes_staged, remap_attributes_with_basis,
-        remap_attributes_with_edge_identity, remap_attributes_with_edges,
+        remap_attributes_with_default_edge_mixer_from_origins, remap_attributes_with_edge_identity,
+        remap_attributes_with_edges,
     },
     set_origindex, uv_layers,
 };
@@ -1436,6 +1438,79 @@ fn build_topology(
     Ok(result)
 }
 
+fn build_topology_with_edge_order(
+    points: Vec<DVec3>,
+    polygons: Vec<Polygon>,
+    edges: Vec<[usize; 2]>,
+) -> Result<Mesh> {
+    let mut result = Mesh::new();
+    for point in points {
+        result
+            .insert_vertex(point)
+            .map_err(|error| mesh_error(&error))?;
+    }
+    let vertex_ids = result
+        .vertices
+        .iter()
+        .map(|vertex| vertex.id)
+        .collect::<Vec<_>>();
+    let edge_count = edges.len();
+    for [first, second] in edges {
+        let first_id = vertex_ids.get(first).copied().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InvalidArgument,
+                "generated edge index is out of range",
+            )
+        })?;
+        let second_id = vertex_ids.get(second).copied().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InvalidArgument,
+                "generated edge index is out of range",
+            )
+        })?;
+        result
+            .insert_edge([first_id, second_id])
+            .map_err(|error| mesh_error(&error))?;
+    }
+    let faces = polygons.into_iter().map(|(indices, material_index)| {
+        let ids = indices
+            .into_iter()
+            .map(|index| {
+                vertex_ids
+                    .get(index)
+                    .copied()
+                    .ok_or(MeshError::InvalidTopology(
+                        "generated polygon index is out of range",
+                    ))
+            })
+            .collect::<std::result::Result<Vec<_>, MeshError>>()?;
+        Ok((ids, material_index))
+    });
+    result
+        .insert_faces(faces)
+        .map_err(|error| mesh_error(&error))?;
+    if result.edges.len() != edge_count {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "merged edge order does not cover every face boundary",
+        ));
+    }
+    Ok(result)
+}
+
+fn build_mesh_with_edge_order(
+    points: Vec<DVec3>,
+    polygons: Vec<Polygon>,
+    edges: Vec<[usize; 2]>,
+    origin: &Origin,
+    source: &Mesh,
+) -> Result<Mesh> {
+    let mut result = build_topology_with_edge_order(points, polygons, edges)?;
+    remap_attributes_with_default_edge_mixer_from_origins(source, &mut result, origin)?;
+    validated(&result)?;
+    Ok(result)
+}
+
 fn build_mesh(
     points: Vec<DVec3>,
     polygons: Vec<Polygon>,
@@ -2708,6 +2783,7 @@ fn array_provenance_source(mesh: &Mesh, caps: &[&Mesh]) -> Result<Mesh> {
                 .find(|known| known.name == layer.name && known.domain == layer.domain);
             let count = match layer.domain {
                 ColorDomain::Point => cap.vertices.len(),
+                ColorDomain::Face => cap.faces.len(),
                 ColorDomain::Corner => cap.faces.iter().map(|face| face.vertices.len()).sum(),
             };
             if let Some(cap_layer) = cap_layer {
@@ -3285,6 +3361,20 @@ fn subdivision_with_samples(
     Option<Samples>,
     Option<subdivision_limit::LimitSurface>,
 )> {
+    subdivision_with_samples_with_settings(mesh, modifier, context, 5, false)
+}
+
+fn subdivision_with_samples_with_settings(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    context: ModifierEvaluationContext<'_>,
+    max_levels: u64,
+    geometry_nodes_simple: bool,
+) -> Result<(
+    Mesh,
+    Option<Samples>,
+    Option<subdivision_limit::LimitSurface>,
+)> {
     validated(mesh)?;
     let multires_data = if modifier.modifier_type == "multires" {
         multires::read(mesh)?
@@ -3296,13 +3386,13 @@ fn subdivision_with_samples(
     } else {
         "levels"
     };
-    // Subsurf is capped at Blender's 5 levels; multires is bounded by its stored top level.
+    // Modifiers use five levels; Geometry Nodes Subdivide Mesh declares a sixth level.
     let requested_levels = uint_param(modifier, level_name)?;
-    if modifier.modifier_type != "multires" && requested_levels > 5 {
+    if modifier.modifier_type != "multires" && requested_levels > max_levels {
         return Err(invalid_parameter(
             modifier,
             level_name,
-            "an integer between 0 and 5",
+            &format!("an integer between 0 and {max_levels}"),
         ));
     }
     let levels = if let Some(data) = &multires_data {
@@ -3462,7 +3552,7 @@ fn subdivision_with_samples(
         // positions of their endpoints.
         let refined = !use_limit_surface || !source_edges.is_empty();
         let (next, edge_points) = if simple {
-            let (next, next_creases, edge_points) = subdivision_uv::subdivide_simple_once(
+            let (mut next, next_creases, edge_points) = subdivision_uv::subdivide_simple_once(
                 &result,
                 &position,
                 &source_polygons,
@@ -3470,6 +3560,14 @@ fn subdivision_with_samples(
                 &edge_creases,
                 options.use_creases,
             )?;
+            if geometry_nodes_simple {
+                set_geometry_nodes_simple_positions(
+                    &result,
+                    &mut next,
+                    &source_polygons,
+                    &edge_points,
+                )?;
+            }
             edge_creases = next_creases;
             (next, edge_points)
         } else {
@@ -3630,7 +3728,7 @@ fn subdivision_with_samples(
         };
         let limit =
             subdivision_limit::LimitSurface::build(&base, &positions(mesh), &sharpness, isolation);
-        if let Some(samples) = limit_samples {
+        if !geometry_nodes_simple && let Some(samples) = limit_samples {
             let points = limit.evaluate(&samples.vertices);
             for (vertex, point) in result.vertices.iter_mut().zip(points) {
                 if let Some(point) = point {
@@ -6249,7 +6347,7 @@ fn decimate_compact(
     // The edges take Blender's pool order before the provenance remap writes the edge-indexed data.
     let mut result = build_topology(compact_points, polygons, loose)?;
     order_edges(&mut result, &compact_order)?;
-    remap_attributes_with_basis(source, &mut result, &origin, &[], None)?;
+    remap_attributes_with_default_edge_mixer_from_origins(source, &mut result, &origin)?;
     validated(&result)?;
     Ok(result)
 }
@@ -6389,6 +6487,223 @@ fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         ..Default::default()
     };
     let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
+    mark_generated_faces_smooth(&mut result, &generated_face_indices);
+    clnor::transfer_custom_normals(mesh, &mut result, &sources, NormalCodeOptions::default())?;
+    Ok(result)
+}
+
+fn set_geometry_nodes_simple_positions(
+    source: &Mesh,
+    output: &mut Mesh,
+    source_polygons: &[Polygon],
+    edge_points: &BTreeMap<(usize, usize), usize>,
+) -> Result<()> {
+    let source_positions = source
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co.as_vec3())
+        .collect::<Vec<_>>();
+    for (vertex, position) in output.vertices.iter_mut().zip(&source_positions) {
+        vertex.co = DVec3::from(*position);
+    }
+    for (&(first, second), &point) in edge_points {
+        let position = source_positions[first] * 0.5 + source_positions[second] * 0.5;
+        let vertex = output.vertices.get_mut(point).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "Subdivide Mesh edge point is out of range",
+            )
+        })?;
+        vertex.co = DVec3::from(position);
+    }
+    let face_point_start = output
+        .vertices
+        .len()
+        .checked_sub(source_polygons.len())
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "Subdivide Mesh face point range is invalid",
+            )
+        })?;
+    for (face_index, (face, _)) in source_polygons.iter().enumerate() {
+        let count = face.len().to_f32().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "Subdivide Mesh face is too large",
+            )
+        })?;
+        let mut center = Vec3::ZERO;
+        let share = 1.0 / count;
+        for &vertex in face {
+            center += source_positions[vertex] * share;
+        }
+        let face_point = output
+            .vertices
+            .get_mut(face_point_start + face_index)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "Subdivide Mesh face point is missing",
+                )
+            })?;
+        face_point.co = DVec3::from(center);
+    }
+    Ok(())
+}
+
+pub(crate) fn subdivide_mesh_for_geometry_nodes(mesh: &Mesh, level: usize) -> Result<Mesh> {
+    if level == 0 {
+        return Ok(mesh.clone());
+    }
+    if level > 6 {
+        return Err(PotError::invalid_argument(
+            "Geometry Nodes Subdivide Mesh level exceeds Blender's input limit",
+        ));
+    }
+    let modifier = Modifier {
+        id: Id::new("graph_subdivide_mesh")
+            .map_err(|error| PotError::new(ErrorCode::InternalError, error.message))?,
+        modifier_type: "subdivision".to_owned(),
+        name: "Geometry Nodes Subdivide Mesh".to_owned(),
+        enabled: true,
+        show_viewport: true,
+        show_render: true,
+        params: Map::from_iter([
+            ("levels".to_owned(), json!(level)),
+            ("quality".to_owned(), json!(3)),
+            ("subdivision_type".to_owned(), json!("SIMPLE")),
+            ("use_creases".to_owned(), json!(false)),
+            ("use_limit_surface".to_owned(), json!(false)),
+            ("use_custom_normals".to_owned(), json!(false)),
+            ("uv_smooth".to_owned(), json!("NONE")),
+            ("boundary_smooth".to_owned(), json!("PRESERVE_CORNERS")),
+        ]),
+        binding_data: None,
+        baked_ocean_cache: None,
+        runtime: crate::model::ModifierRuntime::default(),
+    };
+    let mut result = subdivision_with_samples_with_settings(
+        mesh,
+        &modifier,
+        ModifierEvaluationContext::default(),
+        6,
+        true,
+    )?
+    .0;
+    result.attributes.remove(OPTIMAL_DISPLAY_EDGES);
+    Ok(result)
+}
+
+pub(crate) fn merge_by_distance_for_geometry_nodes(
+    mesh: &Mesh,
+    threshold: f64,
+    connected: bool,
+    selection: &[bool],
+) -> Result<Mesh> {
+    validated(mesh)?;
+    if threshold < 0.0 || selection.len() != mesh.vertices.len() {
+        return Err(PotError::invalid_argument(
+            "Geometry Nodes merge selection or distance is invalid",
+        ));
+    }
+    if mesh.vertices.len() < 2 || !selection.iter().any(|selected| *selected) {
+        return Ok(mesh.clone());
+    }
+    let points = positions(mesh);
+    let dest = if connected {
+        connected_clusters(mesh, &points, threshold, false, selection)?
+    } else {
+        all_weld_dest_map(&points, threshold, selection)
+    };
+    let Some(dest) = dest else {
+        return Ok(mesh.clone());
+    };
+    let source_polygons = polygons(mesh)?;
+    let mut merged = merge_by_dest_map(
+        &points,
+        source_polygons.clone(),
+        edge_pairs(mesh)?,
+        &dest,
+        true,
+    );
+    for (position, members) in merged.points.iter_mut().zip(&merged.point_members) {
+        let count = members
+            .len()
+            .to_f32()
+            .ok_or_else(|| PotError::invalid_argument("merged point group is too large"))?;
+        let weight = 1.0_f32 / count;
+        let mut average = Vec3::ZERO;
+        for &member in members {
+            average += points[member].as_vec3() * weight;
+        }
+        *position = DVec3::from(average);
+    }
+    let mut corner_offsets = Vec::with_capacity(source_polygons.len());
+    let mut corner_total = 0;
+    for (vertices, _) in &source_polygons {
+        corner_offsets.push(corner_total);
+        corner_total += vertices.len();
+    }
+    let mut sources = Vec::with_capacity(corner_total);
+    let mut corner_origins = Vec::with_capacity(corner_total);
+    let generated_face_indices = merged
+        .generated_polygons
+        .iter()
+        .enumerate()
+        .filter_map(|(index, generated)| generated.then_some(index))
+        .collect::<Vec<_>>();
+    for ((vertices, _), &source) in merged.polygons.iter().zip(&merged.polygon_sources) {
+        for &point in vertices {
+            let members = &merged.point_members[point];
+            let member_corners = source_polygons[source]
+                .0
+                .iter()
+                .enumerate()
+                .filter_map(|(corner, vertex)| {
+                    members
+                        .contains(vertex)
+                        .then_some(corner_offsets[source] + corner)
+                })
+                .collect::<Vec<_>>();
+            sources.push(member_corners.first().copied());
+            let share = if member_corners.is_empty() {
+                0.0
+            } else {
+                1.0 / usize_as_f64(member_corners.len())
+            };
+            corner_origins.push(
+                member_corners
+                    .into_iter()
+                    .map(|corner| (corner, share))
+                    .collect(),
+            );
+        }
+    }
+    let origin = Origin {
+        vertices: merged
+            .point_members
+            .iter()
+            .map(|members| mean_origin(members.iter().map(|&vertex| Some(vertex))))
+            .collect(),
+        source_vertices: Some(
+            merged
+                .point_members
+                .iter()
+                .map(|members| members.first().copied())
+                .collect(),
+        ),
+        faces: merged
+            .polygon_sources
+            .iter()
+            .zip(&merged.generated_polygons)
+            .map(|(&face, &generated)| (!generated).then_some(face))
+            .collect(),
+        corners: Some(corner_origins),
+        ..Default::default()
+    };
+    let mut result =
+        build_mesh_with_edge_order(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
     mark_generated_faces_smooth(&mut result, &generated_face_indices);
     clnor::transfer_custom_normals(mesh, &mut result, &sources, NormalCodeOptions::default())?;
     Ok(result)

@@ -947,6 +947,7 @@ pub(super) fn extract_geometry_with_semantics(
                         .unwrap_or([[0.0, 1.0]; 3]);
                     let layer_colors = triangle_layer_colors(
                         &carried_layers,
+                        face_index,
                         face_corner_base,
                         corners,
                         triangle_vertices,
@@ -2662,10 +2663,10 @@ fn triangle_layer_uvs(
 }
 
 /// Corner colors of `triangle` in each carried color layer, in carried order. Point layers read the
-/// vertex values and corner layers the face's corner values; a value that is not there reads as
-/// opaque black.
+/// vertex values, face layers copy their face value, and corner layers read face-corner values.
 fn triangle_layer_colors(
     layers: &[&ColorLayer],
+    face_index: usize,
     corner_base: usize,
     corners: [Option<usize>; 3],
     vertices: [u32; 3],
@@ -2682,6 +2683,11 @@ fn triangle_layer_colors(
                     .copied()
                     .unwrap_or(BLACK)
             }),
+            ColorDomain::Face => layer
+                .values
+                .get(face_index)
+                .copied()
+                .map_or([BLACK; 3], |color| [color; 3]),
             ColorDomain::Corner => corners.map(|corner| {
                 corner
                     .and_then(|corner| layer.values.get(corner_base + corner))
@@ -4590,6 +4596,7 @@ mod shading_normal_tests {
         let slots = std::collections::BTreeMap::from([(9_u32, 0_usize), (7, 1)]);
         let colors = triangle_layer_colors(
             &[&corner, &point],
+            0,
             3,
             [Some(2), Some(0), Some(1)],
             [9, 7, 7],
@@ -4615,6 +4622,7 @@ mod shading_normal_tests {
         // A corner or vertex with no stored value reads as opaque black.
         let missing = triangle_layer_colors(
             &[&corner, &point],
+            0,
             3,
             [None, Some(0), Some(1)],
             [9, 8, 7],
