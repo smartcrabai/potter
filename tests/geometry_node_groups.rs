@@ -17,6 +17,7 @@ use potter_core::{
     },
     graph::{self, GraphSocket, NodeGroup},
     model::{Id, SceneDoc},
+    ops,
     store::Project,
 };
 use serde_json::{Map, Value, json};
@@ -466,6 +467,13 @@ for name, socket_type in (("Matrix Default", "NodeSocketMatrix"),
     value_defaults[name] = {"socket_type": socket.socket_type,
                             "value": plain(socket.default_value)
                                      if hasattr(socket, "default_value") else None}
+duplicate_id = "gn_resource_defaults_duplicate"
+duplicate = next(group for group in bpy.data.node_groups
+                 if group.get("potter.id") == duplicate_id)
+original = bpy.data.node_groups["GN Resource Defaults"]
+assert original.get("potter.id") != duplicate_id
+subject = bpy.data.objects["GN Group Subject"]
+assert any(mod.type == "NODES" and mod.node_group == duplicate for mod in subject.modifiers)
 with (root / "blender_roundtrip_defaults.json").open("w", encoding="utf-8") as stream:
     json.dump({"resource_defaults": resource_defaults,
                "value_defaults": value_defaults}, stream, sort_keys=True)
@@ -673,20 +681,69 @@ fn blender_geometry_group_rotation_matrix_parity_and_resource_defaults_roundtrip
         json!("nested group default")
     );
 
+    let subject_id = imported
+        .doc
+        .nodes
+        .iter()
+        .find_map(|(id, node)| (node.name == "GN Group Subject").then(|| id.clone()))
+        .ok_or("imported Geometry Nodes subject is missing")?;
+    let duplicate_group_id = "gn_resource_defaults_duplicate";
+    let duplicate_operations = json!([
+        {
+            "op":"graph.create",
+            "id":duplicate_group_id,
+            "name":"GN Resource Defaults",
+            "kind":"geometry"
+        },
+        {
+            "op":"graph.interface_update",
+            "graph":duplicate_group_id,
+            "set":{
+                "inputs":[{"id":"geometry_in","name":"Geometry","socket_type":"geometry"}],
+                "outputs":[{"id":"geometry_out","name":"Geometry","socket_type":"geometry"}]
+            }
+        },
+        {"op":"graph.node_add","graph":duplicate_group_id,"id":"input","type":"NodeGroupInput"},
+        {"op":"graph.node_add","graph":duplicate_group_id,"id":"output","type":"NodeGroupOutput"},
+        {
+            "op":"graph.link",
+            "graph":duplicate_group_id,
+            "from_node":"input",
+            "from_socket":"geometry_in",
+            "to_node":"output",
+            "to_socket":"geometry_out"
+        },
+        {
+            "op":"modifier.create",
+            "target":{"id":subject_id.as_str()},
+            "id":"duplicate_group_modifier",
+            "type":"nodes",
+            "params":{"node_group":duplicate_group_id}
+        }
+    ]);
+    let duplicate_doc = ops::apply_batch(
+        &imported.doc,
+        &json!({
+            "schema_version":1,
+            "base_revision":imported.doc.revision,
+            "operations":duplicate_operations
+        }),
+    )?
+    .doc;
     let mut project = Project::init(root.join("project"))?;
     let asset_blobs = imported
         .assets
         .into_iter()
         .collect::<std::collections::BTreeMap<_, _>>();
     project.commit_import_with_assets(
-        imported.doc.clone(),
+        duplicate_doc.clone(),
         json!({"fixture":"geometry_node_groups"}),
         json!({}),
         &asset_blobs,
     )?;
     let roundtrip_blend = root.join("geometry_node_groups_roundtrip.blend");
     export_blend(
-        &imported.doc,
+        &duplicate_doc,
         &project,
         &roundtrip_blend,
         &ExportOptions {

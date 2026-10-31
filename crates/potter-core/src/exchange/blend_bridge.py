@@ -6805,7 +6805,7 @@ def _create_geometry_groups(doc, linked_group_map=None):
         if identifier in direct_tree_ids:
             continue
         tree_raw = _model_group_tree(group)
-        source = group_sources.get(identifier) or group_sources.get(name)
+        source = group_sources.get(identifier)
         if source is None:
             add_group(name, identifier, tree_type, tree_raw)
         else:
