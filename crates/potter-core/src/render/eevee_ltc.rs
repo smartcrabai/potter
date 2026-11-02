@@ -1,7 +1,7 @@
-//! EEVEE 5.2.2's linearly transformed cosine (LTC) light evaluation, for the glass closures of realtime Beauty.
+//! EEVEE 5.2.2's linearly transformed cosine (LTC) light evaluation for realtime deferred closures.
 //!
-//! EEVEE integrates a GGX closure against a light's shape by mapping the lobe to a clamped cosine with the inverse
-//! matrix that the LUT gives, and integrating that over the emitter's polygon or disk. Sources (Blender v5.2.2):
+//! EEVEE integrates a Lambert or GGX closure against a light's shape by mapping its lobe to a clamped cosine with the
+//! inverse matrix that the LUT gives, and integrating that over the emitter's polygon or disk. Sources (Blender v5.2.2):
 //! - `draw/engines/eevee/shaders/eevee_ltc_lib.bsl.hh`: `evaluate_quad`, `evaluate_disk`, `solve_cubic`,
 //!   `edge_integral_vec`, `tangent_basis`, `diffuse_sphere_integral`.
 //! - `draw/engines/eevee/shaders/eevee_ltc_lut_lib.bsl.hh`: the matrix's LUT coordinates `(roughness, sqrt(1 - cos θ))`
@@ -18,29 +18,24 @@ use std::f64::consts::TAU;
 
 use glam::{DMat3, DVec3};
 
-use super::eevee_transmission_tables::ltc_matrix;
 use super::{
-    eevee_transmission::{blend, texel_weights, utility_texel},
-    eevee_transmission_tables::disk_integral,
+    eevee_transmission::utility_sample_2d,
+    eevee_transmission_tables::{disk_integral, ltc_matrix},
 };
 
 /// The packed inverse LTC matrix `(m11, m13, m31, m33)`, as `eevee::lut::ltc::unpack` reads it.
 pub(crate) type PackedMatrix = [f64; 4];
 
 /// The matrix of the identity: a plain clamped cosine (`eevee::lut::ltc::identity`).
-#[cfg(test)]
-const IDENTITY: PackedMatrix = [1.0, 0.0, 0.0, 1.0];
+pub(crate) const IDENTITY: PackedMatrix = [1.0, 0.0, 0.0, 1.0];
 
 /// EEVEE's `sample_utility_tx` for the GGX matrix: the bilinear sample at `(roughness, sqrt(1 - cos θ))`.
 pub(crate) fn sample_matrix(cos_theta: f64, roughness: f64) -> PackedMatrix {
-    let (x0, x1, fx) = texel_weights(roughness);
-    let (y0, y1, fy) = texel_weights((1.0 - cos_theta.clamp(0.0, 1.0)).sqrt());
     std::array::from_fn(|channel| {
-        let texel = |x, y| utility_texel(ltc_matrix(x, y, channel));
-        blend(
-            blend(texel(x0, y0), texel(x1, y0), fx),
-            blend(texel(x0, y1), texel(x1, y1), fx),
-            fy,
+        utility_sample_2d(
+            roughness,
+            (1.0 - cos_theta.clamp(0.0, 1.0)).sqrt(),
+            |x, y| ltc_matrix(x, y, channel),
         )
     })
 }
@@ -89,14 +84,7 @@ fn tangent_basis(normal: DVec3, view: DVec3) -> DMat3 {
 
 /// `diffuse_sphere_integral`: the tabulated clipped sphere integral at `avg_dir_z` and the form factor.
 fn diffuse_sphere_integral(avg_dir_z: f64, form_factor: f64) -> f64 {
-    let (x0, x1, fx) = texel_weights(avg_dir_z * 0.5 + 0.5);
-    let (y0, y1, fy) = texel_weights(form_factor);
-    let texel = |x, y| utility_texel(disk_integral(x, y));
-    blend(
-        blend(texel(x0, y0), texel(x1, y0), fx),
-        blend(texel(x0, y1), texel(x1, y1), fx),
-        fy,
-    )
+    utility_sample_2d(avg_dir_z * 0.5 + 0.5, form_factor, disk_integral)
 }
 
 /// `solve_cubic`: the three roots of `c0 + c1 x + c2 x² + c3 x³`, in the order EEVEE's extended Cardano solver gives.

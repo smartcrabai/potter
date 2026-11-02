@@ -11558,6 +11558,44 @@ mod tests {
         Ok(())
     }
 
+    /// Points `material` at a standalone Metallic BSDF graph.
+    fn metallic_graph(
+        doc: &mut SceneDoc,
+        material: &str,
+        fresnel_type: &str,
+        base_color: [f64; 4],
+    ) -> TestResult<()> {
+        use crate::graph::{GraphKind, GraphLink, GraphNode, NodeGroup};
+        let mut group = NodeGroup::new("metallic", GraphKind::Shader);
+        let mut output = GraphNode::new("OutputMaterial");
+        output
+            .properties
+            .insert("is_active_output".to_owned(), json!(true));
+        let mut metallic = GraphNode::new("ShaderNodeBsdfMetallic");
+        metallic
+            .properties
+            .insert("fresnel_type".to_owned(), json!(fresnel_type));
+        metallic
+            .inputs
+            .insert("Base Color".to_owned(), json!(base_color));
+        metallic.inputs.insert("Roughness".to_owned(), json!(0.25));
+        group.nodes.insert(crate::model::Id::new("out")?, output);
+        group.nodes.insert(crate::model::Id::new("bsdf")?, metallic);
+        group.links.push(GraphLink {
+            from_node: crate::model::Id::new("bsdf")?,
+            from_socket: "BSDF".to_owned(),
+            to_node: crate::model::Id::new("out")?,
+            to_socket: "Surface".to_owned(),
+        });
+        let graph = crate::model::Id::new(format!("{material}_graph"))?;
+        doc.node_groups.insert(graph.clone(), group);
+        doc.materials
+            .get_mut(&crate::model::Id::new(material)?)
+            .ok_or("material is missing")?
+            .node_tree = Some(graph);
+        Ok(())
+    }
+
     /// Sets the constant Alpha of the Principled BSDF in `material`'s graph (see `read_vertex_color`).
     /// A graph material's alpha comes from its graph, so this is what makes the material translucent.
     fn set_graph_alpha(doc: &mut SceneDoc, material: &str, alpha: f64) -> TestResult<()> {
@@ -11900,6 +11938,66 @@ mod tests {
         let restored = crate::geom::color_layers::read(first_mesh(&imported.doc)?);
         assert_eq!(restored.layers[0].name, "Unassigned");
         assert_eq!(restored.layers[0].values, values);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_metallic_exports_f82_base_color_and_reports_conductor_loss() -> TestResult {
+        let mut doc = scene(&json!([
+            {"op":"material.create","id":"f82"},
+            {"op":"material.create","id":"conductor"},
+            {"op":"node.create","id":"f82_surface","kind":"plane","params":{"size":1.0},"material":"f82"},
+            {"op":"node.create","id":"conductor_surface","kind":"plane","params":{"size":1.0},"material":"conductor"}
+        ]))?;
+        let base_color = [0.12, 0.34, 0.56, 1.0];
+        metallic_graph(&mut doc, "f82", "F82", base_color)?;
+        metallic_graph(
+            &mut doc,
+            "conductor",
+            "PHYSICAL_CONDUCTOR",
+            [0.2, 0.3, 0.4, 1.0],
+        )?;
+
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let losses = crate::commands::export::export_losses(&doc, "gltf", Some(&snapshot));
+        assert!(
+            losses.iter().any(|loss| {
+                loss.feature_id == "material.shader_graph.unrepresentable_surface"
+                    && loss.data_id.as_deref() == Some("f82")
+                    && loss.reason.contains("F82")
+            }),
+            "F82 export remains an explicit approximation: {losses:?}"
+        );
+        assert!(
+            losses.iter().any(|loss| {
+                loss.feature_id == "material.shader_graph.unrepresentable_surface"
+                    && loss.data_id.as_deref() == Some("conductor")
+                    && loss.reason.contains("PHYSICAL_CONDUCTOR")
+            }),
+            "the unsupported physical conductor is an explicit exporter loss: {losses:?}"
+        );
+
+        let (document, _) = export_root_and_binary(&doc)?;
+        let materials = document["materials"]
+            .as_array()
+            .ok_or("exported materials are missing")?;
+        let f82 = materials
+            .iter()
+            .find(|material| material["extras"]["potter"]["id"] == "f82")
+            .ok_or("F82 material is missing")?;
+        assert_eq!(
+            f82["pbrMetallicRoughness"]["baseColorFactor"],
+            json!(base_color)
+        );
+        assert_eq!(f82["pbrMetallicRoughness"]["metallicFactor"], json!(1.0));
+        let conductor = materials
+            .iter()
+            .find(|material| material["extras"]["potter"]["id"] == "conductor")
+            .ok_or("physical-conductor material is missing")?;
+        assert_eq!(
+            conductor["pbrMetallicRoughness"]["baseColorFactor"],
+            json!([1.0, 1.0, 1.0, 1.0])
+        );
         Ok(())
     }
 

@@ -49,6 +49,12 @@ const CYCLES_TRANSPARENT_MAX_BOUNCES: u32 = 8;
 const HOLDOUT_BACKPLATE_WRITES_PER_SAMPLE: u32 = 1;
 const CYCLES_CAPTURE: &str = include_str!("fixtures/native_oracle/shader_bsdf_wave12/path.json");
 const EEVEE_CAPTURE: &str = include_str!("fixtures/native_oracle/shader_bsdf_wave12/eevee.json");
+const EEVEE_SSS_TRANSMISSION_CAPTURE: &str =
+    include_str!("fixtures/native_oracle/shader_bsdf_wave12/eevee_sss_transmission.json");
+const EEVEE_SSS_TRANSMISSION_SIZE: [u32; 2] = [64, 64];
+const EEVEE_REFRACTION_LAYERS_CAPTURE: &str =
+    include_str!("fixtures/native_oracle/shader_bsdf_wave12/eevee_refraction_layers.json");
+const EEVEE_REFRACTION_LAYERS_SIZE: [u32; 2] = [128, 64];
 
 const EEVEE_SHEEN_ASHIKHMIN_CAPTURE: &str =
     include_str!("fixtures/native_oracle/shader_bsdf_wave12/eevee_sheen_ashikhmin.json");
@@ -131,6 +137,8 @@ struct Capture {
     resolution: [u32; 2],
     samples: u32,
     seed: u32,
+    #[serde(default)]
+    blender_build_hash: Option<String>,
     cases: Vec<CaptureCase>,
 }
 
@@ -138,6 +146,10 @@ struct Capture {
 struct CaptureCase {
     name: String,
     probe: [u32; 3],
+    #[serde(default)]
+    corner_probe: Option<[u32; 2]>,
+    #[serde(default)]
+    corner_rgba: Option<[f64; 4]>,
     #[serde(rename = "linear_rgba")]
     associated_rgba: [f64; 4],
     #[serde(default, rename = "neighbor_rgba")]
@@ -146,6 +158,65 @@ struct CaptureCase {
     inputs: serde_json::Value,
     #[serde(default)]
     normal_linked: bool,
+}
+
+#[derive(Deserialize)]
+struct EeveeRefractionLayersCapture {
+    blender_version: String,
+    blender_build_hash: String,
+    blender_binary: String,
+    blender_binary_sha256: String,
+    engine: String,
+    resolution: [u32; 2],
+    samples: u32,
+    seed: u32,
+    linear_exr: String,
+    pixel_format: String,
+    raytracing: EeveeRefractionRaytracing,
+    cases: Vec<EeveeRefractionLayersCase>,
+}
+
+#[derive(Deserialize)]
+struct EeveeRefractionRaytracing {
+    enabled: bool,
+    method: String,
+    resolution_scale: String,
+    screen_trace_quality: f64,
+    screen_trace_thickness: f64,
+    trace_max_roughness: f64,
+}
+
+#[derive(Deserialize)]
+struct EeveeRefractionLayersCase {
+    name: String,
+    probe: [u32; 3],
+    #[serde(rename = "linear_rgba")]
+    associated_rgba: [f64; 4],
+}
+
+fn eevee_refraction_layer_case<'a>(
+    capture: &'a EeveeRefractionLayersCapture,
+    name: &str,
+) -> TestResult<&'a EeveeRefractionLayersCase> {
+    capture
+        .cases
+        .iter()
+        .find(|case| case.name == name)
+        .ok_or_else(|| format!("Blender EEVEE refraction-layer case {name} is missing").into())
+}
+
+fn imported_material_named<'a>(
+    scene: &'a serde_json::Value,
+    name: &str,
+) -> TestResult<(&'a str, &'a serde_json::Value)> {
+    let materials = scene["materials"]
+        .as_object()
+        .ok_or("imported Blender materials are missing")?;
+    let (id, material) = materials
+        .iter()
+        .find(|(_, material)| material["name"].as_str() == Some(name))
+        .ok_or_else(|| format!("imported Blender material {name} is missing"))?;
+    Ok((id, material))
 }
 
 #[derive(Deserialize)]
@@ -761,6 +832,391 @@ fn realtime_standalone_bsdfs_match_eevee_linear_captures() -> TestResult {
             parity_failures.join("\n")
         )
         .into());
+    }
+    Ok(())
+}
+
+#[test]
+fn realtime_eevee_screen_refraction_layers_match_source() -> TestResult {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping EEVEE refraction-layer parity; no executable Blender was found");
+        return Ok(());
+    };
+    let capture: EeveeRefractionLayersCapture =
+        serde_json::from_str(EEVEE_REFRACTION_LAYERS_CAPTURE)?;
+    if capture.blender_version != "5.2.2 LTS"
+        || capture.blender_build_hash != "d13f752e3b9c"
+        || capture.engine != "BLENDER_EEVEE"
+        || capture.resolution != EEVEE_REFRACTION_LAYERS_SIZE
+        || capture.samples != EEVEE_SAMPLES
+        || capture.seed != 17
+        || capture.linear_exr != "eevee_refraction_layers.exr"
+        || capture.pixel_format != "32-bit RGBA OpenEXR ZIP"
+        || capture.blender_binary.is_empty()
+        || capture.blender_binary_sha256.len() != 64
+        || capture.cases.len() != 8
+    {
+        return Err("unexpected Blender EEVEE refraction-layer source metadata".into());
+    }
+    assert!(capture.raytracing.enabled);
+    assert_eq!(capture.raytracing.method, "SCREEN");
+    assert_eq!(capture.raytracing.resolution_scale, "1");
+    assert_eq!(capture.raytracing.screen_trace_quality, 1.0);
+    assert!((capture.raytracing.screen_trace_thickness - 0.1).abs() < 1.0e-6);
+    assert_eq!(capture.raytracing.trace_max_roughness, 0.5);
+
+    let enabled_emission =
+        eevee_refraction_layer_case(&capture, "enabled_glass_over_flagged_emission")?;
+    let enabled_principled =
+        eevee_refraction_layer_case(&capture, "enabled_glass_over_principled_transmission_zero")?;
+    let enabled_sss = eevee_refraction_layer_case(&capture, "enabled_glass_over_resolved_sss")?;
+    let disabled = eevee_refraction_layer_case(&capture, "disabled_glass_uses_world")?;
+    let visible_emission = eevee_refraction_layer_case(&capture, "flagged_emission_visible")?;
+    let visible_principled = eevee_refraction_layer_case(&capture, "flagged_principled_visible")?;
+    let visible_sss = eevee_refraction_layer_case(&capture, "opaque_sss_visible")?;
+    let red_backplate = eevee_refraction_layer_case(&capture, "red_backplate_visible")?;
+    for case in [enabled_emission, enabled_principled] {
+        if case.associated_rgba[0] <= case.associated_rgba[1].max(case.associated_rgba[2]) {
+            return Err(format!(
+                "enabled source refraction must see the red opaque BACK, got {:?}",
+                case.associated_rgba
+            )
+            .into());
+        }
+    }
+    let black_tolerance = f16_ulp_tolerance(0.0, 4.0);
+    if disabled.associated_rgba[..3]
+        .iter()
+        .any(|channel| channel.abs() > black_tolerance)
+        || visible_sss.associated_rgba[2] <= visible_sss.associated_rgba[0]
+        || enabled_sss.associated_rgba[2] <= enabled_sss.associated_rgba[0]
+        || red_backplate.associated_rgba[0]
+            <= red_backplate.associated_rgba[1].max(red_backplate.associated_rgba[2])
+        || !(0..3).any(|channel| {
+            (enabled_emission.associated_rgba[channel] - disabled.associated_rgba[channel]).abs()
+                > f16_ulp_tolerance(enabled_emission.associated_rgba[channel], 4.0)
+        })
+    {
+        return Err(
+            "Blender source refraction-layer captures do not distinguish the required signals"
+                .into(),
+        );
+    }
+
+    let root = tempdir()?;
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
+    let (project, _) = import_blend(
+        &blender,
+        root.path(),
+        "eevee_refraction_layers_project",
+        &fixture_dir.join("eevee_refraction_layers.blend"),
+    )?;
+    let scene = read_scene(&project)?;
+    let active_scene = scene["active_scene"]
+        .as_str()
+        .ok_or("active scene is missing")?;
+    let (enabled_id, enabled_material) =
+        imported_material_named(&scene, "Enabled screen-refraction glass")?;
+    let (disabled_id, disabled_material) =
+        imported_material_named(&scene, "Disabled screen-refraction glass")?;
+    let (emission_id, emission_material) =
+        imported_material_named(&scene, "Flagged emission without transmission")?;
+    let (principled_id, principled_material) =
+        imported_material_named(&scene, "Flagged Principled with zero transmission")?;
+    assert_eq!(enabled_material["use_raytrace_refraction"], true);
+    assert_eq!(disabled_material["use_raytrace_refraction"], false);
+    assert_eq!(emission_material["use_raytrace_refraction"], true);
+    assert_eq!(principled_material["use_raytrace_refraction"], true);
+    assert_eq!(principled_material["transmission"], 0.0);
+
+    let updated = apply_operations(
+        &project,
+        root.path(),
+        json!([{
+            "op": "render.update",
+            "target": {"id": active_scene},
+            "set": {
+                "eevee_use_raytracing": true,
+                "eevee_raytracing_method": "screen",
+                "eevee_raytracing_resolution_scale": 1,
+                "eevee_raytracing_screen_trace_quality": 1.0,
+                "eevee_raytracing_screen_trace_thickness": 0.1,
+                "eevee_raytracing_trace_max_roughness": 0.5
+            }
+        }, {
+            "op": "material.update",
+            "target": {"id": enabled_id},
+            "set": {"use_raytrace_refraction": true}
+        }, {
+            "op": "material.update",
+            "target": {"id": disabled_id},
+            "set": {"use_raytrace_refraction": false}
+        }, {
+            "op": "material.update",
+            "target": {"id": emission_id},
+            "set": {"use_raytrace_refraction": true}
+        }, {
+            "op": "material.update",
+            "target": {"id": principled_id},
+            "set": {"use_raytrace_refraction": true}
+        }]),
+    )?;
+    assert_eq!(updated["ok"], true, "{updated}");
+    configure_render_size(
+        &project,
+        root.path(),
+        capture.seed,
+        capture.samples,
+        capture.resolution,
+    )?;
+    let blender_reference = load_image_file(
+        &project,
+        root.path(),
+        "blender_eevee_refraction_layers",
+        &fixture_dir.join(&capture.linear_exr),
+    )?;
+    let frame = render_frame(&project, root.path(), "eevee_refraction_layers", "realtime")?;
+    if blender_reference.width != capture.resolution[0]
+        || blender_reference.height != capture.resolution[1]
+    {
+        return Err(
+            "Blender source refraction-layer EXR dimensions disagree with its metadata".into(),
+        );
+    }
+    let cases = [
+        enabled_emission,
+        enabled_principled,
+        enabled_sss,
+        disabled,
+        visible_emission,
+        visible_principled,
+        visible_sss,
+        red_backplate,
+    ];
+    let mut parity_failures = Vec::new();
+    for case in cases {
+        let source_patch = patch_mean(&blender_reference, case.probe);
+        for (channel, source) in source_patch.iter().copied().enumerate() {
+            if (source - case.associated_rgba[channel]).abs() > 1.0e-6 {
+                return Err(format!(
+                    "Blender EEVEE refraction case {} channel {channel} {} differs from its raw EXR patch {}",
+                    case.name, case.associated_rgba[channel], source
+                )
+                .into());
+            }
+        }
+        let actual = patch_mean(&frame, case.probe);
+        for (channel, (actual, source)) in actual.iter().zip(&source_patch).enumerate() {
+            let tolerance = patch_ulp_tolerance(&blender_reference, case.probe, channel, |value| {
+                f16_ulp_tolerance(value, 4.0)
+            });
+            if (actual - source).abs() > tolerance {
+                parity_failures.push(format!(
+                    "{} channel {channel}: Potter {} differs from Blender {} by more than the averaged four-per-pixel RGBA16F spacing {tolerance}",
+                    case.name, actual, source
+                ));
+            }
+        }
+    }
+    if !parity_failures.is_empty() {
+        return Err(format!(
+            "EEVEE refraction-layer source parity failures:\n{}",
+            parity_failures.join("\n")
+        )
+        .into());
+    }
+    let unknown = apply_operations(
+        &project,
+        root.path(),
+        json!([{
+            "op": "material.update",
+            "target": {"id": emission_id},
+            "set": {"use_raytrace_refraction": null}
+        }]),
+    )?;
+    assert_eq!(unknown["ok"], true, "{unknown}");
+    let mut render = pot();
+    render
+        .arg("render")
+        .arg(&project)
+        .args(["--engine", "realtime", "--format", "exr", "--out"])
+        .arg(root.path().join("unknown_screen_back"))
+        .arg("--json");
+    let rejected = render.output()?;
+    assert!(
+        !rejected.status.success(),
+        "screen refraction accepted an unknown visible opaque-layer refraction setting: {}",
+        String::from_utf8_lossy(&rejected.stdout)
+    );
+    let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout)?;
+    assert_eq!(rejected["error"]["code"], "UNSUPPORTED_FEATURE");
+    assert_eq!(
+        rejected["error"]["details"]["feature_id"],
+        "render.eevee.ray_tracing.refraction_material"
+    );
+
+    let probe = apply_operations(
+        &project,
+        root.path(),
+        json!([{
+            "op": "render.update",
+            "target": {"id": active_scene},
+            "set": {"eevee_raytracing_method": "probe"}
+        }]),
+    )?;
+    assert_eq!(probe["ok"], true, "{probe}");
+    render_frame(
+        &project,
+        root.path(),
+        "unknown_refraction_probe",
+        "realtime",
+    )?;
+    let no_back = apply_operations(
+        &project,
+        root.path(),
+        json!([{
+            "op": "render.update",
+            "target": {"id": active_scene},
+            "set": {"eevee_raytracing_method": "screen"}
+        }, {
+            "op": "material.update",
+            "target": {"id": enabled_id},
+            "set": {"use_raytrace_refraction": false}
+        }, {
+            "op": "material.update",
+            "target": {"id": principled_id},
+            "set": {"use_raytrace_refraction": false}
+        }]),
+    )?;
+    assert_eq!(no_back["ok"], true, "{no_back}");
+    render_frame(
+        &project,
+        root.path(),
+        "unknown_refraction_without_back",
+        "realtime",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn realtime_eevee_burley_sss_backface_direct_matches_source() -> TestResult {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping EEVEE Burley SSS transmission parity; no executable Blender was found");
+        return Ok(());
+    };
+    let capture: Capture = serde_json::from_str(EEVEE_SSS_TRANSMISSION_CAPTURE)?;
+    if capture.blender_version != "5.2.2 LTS"
+        || capture.blender_build_hash.as_deref() != Some("d13f752e3b9c")
+        || capture.engine != "BLENDER_EEVEE"
+        || capture.resolution != EEVEE_SSS_TRANSMISSION_SIZE
+        || capture.samples != EEVEE_SAMPLES
+    {
+        return Err("unexpected EEVEE SSS source capture metadata".into());
+    }
+    let case = capture
+        .cases
+        .iter()
+        .find(|case| case.name == "burley_sss_backface_direct")
+        .ok_or("Blender EEVEE Burley SSS transmission capture is missing")?;
+    if case.associated_rgba[..3].iter().any(|value| *value <= 0.1) {
+        return Err(format!(
+            "Blender source backface SSS signal must be nonzero in RGB, got {:?}",
+            case.associated_rgba
+        )
+        .into());
+    }
+    let corner_probe = case
+        .corner_probe
+        .ok_or("Blender EEVEE SSS black-corner probe is missing")?;
+    let corner_expected = case
+        .corner_rgba
+        .ok_or("Blender EEVEE SSS black-corner capture is missing")?;
+    if corner_expected[..3]
+        .iter()
+        .any(|value| value.abs() > 1.0e-6)
+    {
+        return Err(
+            format!("Blender EEVEE SSS corner must be black, got {corner_expected:?}").into(),
+        );
+    }
+
+    let root = tempdir()?;
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
+    let (project, _) = import_blend(
+        &blender,
+        root.path(),
+        "eevee_sss_transmission_project",
+        &fixture_dir.join("eevee_sss_transmission.blend"),
+    )?;
+    let blender_reference = load_image_file(
+        &project,
+        root.path(),
+        "blender_eevee_sss_transmission",
+        &fixture_dir.join("eevee_sss_transmission.exr"),
+    )?;
+    configure_render_size(
+        &project,
+        root.path(),
+        capture.seed,
+        capture.samples,
+        capture.resolution,
+    )?;
+    let frame = render_frame(&project, root.path(), "eevee_sss_transmission", "realtime")?;
+    let expected_patch = patch_mean(&blender_reference, case.probe);
+    let actual_patch = patch_mean(&frame, case.probe);
+    for channel in 0..4 {
+        if (expected_patch[channel] - case.associated_rgba[channel]).abs() > 1.0e-6 {
+            return Err(format!(
+                "Blender EEVEE SSS metadata channel {channel} {} differs from its raw EXR patch {}",
+                case.associated_rgba[channel], expected_patch[channel]
+            )
+            .into());
+        }
+        let actual = actual_patch[channel];
+        let tolerance = patch_ulp_tolerance(&blender_reference, case.probe, channel, |value| {
+            f16_ulp_tolerance(value, 4.0)
+        });
+        if (actual - expected_patch[channel]).abs() > tolerance {
+            return Err(format!(
+                "EEVEE Burley SSS backface-direct channel {channel}: Potter {actual} differs from Blender {} by more than the averaged four-per-pixel RGBA16F spacing {tolerance}",
+                expected_patch[channel]
+            )
+            .into());
+        }
+    }
+    let expected_corner = sample_pixel(&blender_reference, corner_probe);
+    if (0..4).any(|channel| (expected_corner[channel] - corner_expected[channel]).abs() > 1.0e-6) {
+        return Err(format!(
+            "Blender EEVEE SSS corner metadata {corner_expected:?} differs from raw EXR {expected_corner:?}"
+        )
+        .into());
+    }
+    let actual_corner = sample_pixel(&frame, corner_probe);
+    let corner_tolerance = patch_ulp_tolerance(
+        &blender_reference,
+        [corner_probe[0], corner_probe[1], 0],
+        0,
+        |value| f16_ulp_tolerance(value, 4.0),
+    );
+    for channel in 0..4 {
+        let tolerance = if channel == 0 {
+            corner_tolerance
+        } else {
+            patch_ulp_tolerance(
+                &blender_reference,
+                [corner_probe[0], corner_probe[1], 0],
+                channel,
+                |value| f16_ulp_tolerance(value, 4.0),
+            )
+        };
+        if (actual_corner[channel] - expected_corner[channel]).abs() > tolerance {
+            return Err(format!(
+                "EEVEE Burley SSS black-corner channel {channel}: Potter {} differs from Blender {} by more than four RGBA16F ULPs {tolerance}",
+                actual_corner[channel], expected_corner[channel]
+            )
+            .into());
+        }
     }
     Ok(())
 }

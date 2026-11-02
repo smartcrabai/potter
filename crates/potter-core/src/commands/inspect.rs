@@ -658,6 +658,7 @@ fn material_item(doc: &SceneDoc, id: &Id, material: &Material) -> Value {
         "metallic":material.metallic,
         "roughness":material.roughness,
         "double_sided":material.double_sided,
+        "use_raytrace_refraction":material.use_raytrace_refraction,
         "use_transparent_shadow":material.use_transparent_shadow,
         "use_bump_map_correction":material.use_bump_map_correction,
         "library":linkage["library"],

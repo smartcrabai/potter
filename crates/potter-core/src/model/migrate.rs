@@ -18,8 +18,12 @@
 //! constraints remain editable.
 //! Version 18 captures Cycles curve shape and subdivisions, recovering a complete pair from the
 //! retained Blender intermediate before marking unavailable imported-hair settings unknown. It
-//! also recovers EEVEE sphere-probe resolution from retained scene metadata and leaves unavailable
-//! Blender realtime values unknown rather than substituting a default.
+//! also recovers EEVEE sphere-probe resolution and `World.sun_threshold` from retained scene
+//! metadata; unavailable imported values remain unknown rather than substituting a default, and
+//! the sun-threshold warning is limited to realtime scenes that reference the affected World.
+//! Version 18 captures `Material.use_raytrace_refraction` from a retained Blender adapter when
+//! available. Ambiguous Blender-appended and Potter-linked materials remain unknown; other missing
+//! settings default to the native false.
 //! Additive `Scene.cycles_hair_shadow_groups` defaults to `None` for legacy/history snapshots and
 //! is not synthesized during checksum-preserving upgrades.
 use std::{
@@ -117,9 +121,14 @@ fn parse_scene_inner(
         || (source_schema_version.is_some_and(|version| version <= 16)
             && has_legacy_mixrgb_alpha_links(&value))
         || (source_schema_version.is_some_and(|version| version <= 17)
-            && has_imported_hair_with_missing_cycles_curve_settings(&value))
-        || (source_schema_version.is_some_and(|version| version <= 17)
-            && has_blender_realtime_scene(&value));
+            && has_materials_missing_raytrace_refraction(&value))
+        || ((source_schema_version.is_some_and(|version| version <= 17)
+            && has_blender_realtime_scene(&value))
+            || (source_schema_version == Some(18)
+                && (has_materials_missing_raytrace_refraction(&value)
+                    || has_imported_blender_world_missing_sun_settings(&value)
+                    || has_imported_blender_eevee_clamp_surface_indirect_missing(&value)
+                    || has_imported_blender_eevee_has_local_volume_probe_grids_missing(&value))));
     let source_hash = if retain_original_hash
         && (legacy
             || has_uninitialized_limit_distance_states(&value)
@@ -643,9 +652,11 @@ fn json_error(error: &serde_json::Error) -> PotError {
 /// version 15 marks Blender-mapped materials without saved pass indices unknown and shader nodes
 /// without stored output defaults. Version 16 migrates `NodeMath` shader state; version 17 restores
 /// Cycles curve settings from the retained Blender intermediate where possible, otherwise marking
-/// unavailable imported-hair settings unknown. `root` is the project directory that holds image
-/// blobs and linked sources, which the version 3 to 4 step reads.
+/// unavailable imported-hair settings unknown. Version 18 captures material refraction settings from
+/// retained raw records when available, otherwise marking the imported value unknown. `root` is the
+/// project directory that holds image blobs and linked sources, which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
+    let source_schema_version = value.get("schema_version").and_then(Value::as_u64);
     let mut warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
         upgrade_v1(value)?
     } else {
@@ -700,6 +711,12 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     if value.get("schema_version").and_then(Value::as_u64) == Some(17) {
         warnings.extend(upgrade_v17(value)?);
     }
+    if source_schema_version == Some(18) {
+        warnings.extend(upgrade_v18_world_sun_settings(value)?);
+        warnings.extend(upgrade_v18_eevee_clamp_surface_indirect(value)?);
+        upgrade_material_raytrace_refraction(value)?;
+        warnings.extend(upgrade_v18_eevee_has_local_volume_probe_grids(value)?);
+    }
     upgrade_scene_gravity_from_blender_metadata(value);
     Ok(warnings)
 }
@@ -736,6 +753,63 @@ fn has_blender_realtime_scene(value: &Value) -> bool {
                         .and_then(|render| render.get("engine"))
                         .and_then(Value::as_str)
                         == Some("realtime")
+                })
+            })
+}
+fn has_imported_blender_world_missing_sun_settings(value: &Value) -> bool {
+    value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .is_some_and(Value::is_object)
+        && value
+            .get("worlds")
+            .and_then(Value::as_object)
+            .is_some_and(|worlds| {
+                worlds.values().any(|world| {
+                    EEVEE_WORLD_SUN_FLOAT_SETTINGS
+                        .iter()
+                        .skip(1)
+                        .any(|(_, target, _)| world.get(*target).is_none_or(Value::is_null))
+                        || EEVEE_WORLD_SUN_BOOL_SETTINGS
+                            .iter()
+                            .any(|(_, target)| world.get(*target).is_none_or(Value::is_null))
+                })
+            })
+}
+fn has_imported_blender_eevee_clamp_surface_indirect_missing(value: &Value) -> bool {
+    value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .is_some_and(Value::is_object)
+        && value
+            .get("scenes")
+            .and_then(Value::as_object)
+            .is_some_and(|scenes| {
+                scenes.values().any(|scene| {
+                    scene
+                        .get("render")
+                        .and_then(Value::as_object)
+                        .is_none_or(|render| {
+                            render
+                                .get("eevee_clamp_surface_indirect")
+                                .is_none_or(Value::is_null)
+                        })
+                })
+            })
+}
+fn has_imported_blender_eevee_has_local_volume_probe_grids_missing(value: &Value) -> bool {
+    value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .is_some_and(Value::is_object)
+        && value
+            .get("scenes")
+            .and_then(Value::as_object)
+            .is_some_and(|scenes| {
+                scenes.values().any(|scene| {
+                    scene
+                        .get("eevee_has_local_volume_probe_grids")
+                        .is_none_or(Value::is_null)
                 })
             })
 }
@@ -793,6 +867,427 @@ fn retained_eevee_gi_cubemap_resolution(value: &Value, scene_id: &str) -> Option
         .contains(&resolution)
         .then_some(resolution)
 }
+const EEVEE_WORLD_SUN_FLOAT_SETTINGS: [(&str, &str, f64); 5] = [
+    ("sun_threshold", "eevee_sun_threshold", f32::MAX as f64),
+    ("sun_angle", "eevee_sun_angle", std::f32::consts::PI as f64),
+    (
+        "sun_shadow_maximum_resolution",
+        "eevee_sun_shadow_maximum_resolution",
+        f32::MAX as f64,
+    ),
+    (
+        "sun_shadow_jitter_overblur",
+        "eevee_sun_shadow_jitter_overblur",
+        100.0,
+    ),
+    (
+        "sun_shadow_filter_radius",
+        "eevee_sun_shadow_filter_radius",
+        f32::MAX as f64,
+    ),
+];
+const EEVEE_WORLD_SUN_BOOL_SETTINGS: [(&str, &str); 2] = [
+    ("use_sun_shadow", "eevee_use_sun_shadow"),
+    ("use_sun_shadow_jitter", "eevee_use_sun_shadow_jitter"),
+];
+fn retained_eevee_world_sun_settings(
+    value: &Value,
+) -> Result<BTreeMap<String, BTreeMap<String, Value>>> {
+    let Some(adapter) = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(raw_scenes) = adapter
+        .get("intermediate")
+        .and_then(|intermediate| intermediate.get("scenes"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let mappings = adapter.get("id_mappings").and_then(Value::as_object);
+    let worlds = value.get("worlds").and_then(Value::as_object);
+    let mut settings = BTreeMap::<String, BTreeMap<String, Value>>::new();
+    for scene in raw_scenes {
+        let Some(world) = scene.get("world").filter(|world| world.is_object()) else {
+            continue;
+        };
+        let name = world
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let world_id = world
+            .get("potter_id")
+            .and_then(Value::as_str)
+            .filter(|id| worlds.is_some_and(|worlds| worlds.contains_key(*id)))
+            .or_else(|| {
+                mappings
+                    .and_then(|mappings| mappings.get(&format!("World:{name}")))
+                    .and_then(Value::as_str)
+                    .filter(|id| worlds.is_some_and(|worlds| worlds.contains_key(*id)))
+            });
+        let Some(world_id) = world_id else {
+            continue;
+        };
+        let retained = settings.entry(world_id.to_owned()).or_default();
+        for (source, target, maximum) in EEVEE_WORLD_SUN_FLOAT_SETTINGS {
+            let Some(raw_value) = world.get(source).filter(|value| !value.is_null()) else {
+                continue;
+            };
+            if !raw_value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=maximum).contains(&number))
+            {
+                return Err(invalid(format!(
+                    "retained Blender World.{source} is invalid"
+                )));
+            }
+            if retained
+                .insert(target.to_owned(), raw_value.clone())
+                .is_some_and(|previous| previous != raw_value.clone())
+            {
+                return Err(invalid(format!(
+                    "retained Blender World.{source} values conflict for one World"
+                )));
+            }
+        }
+        for (source, target) in EEVEE_WORLD_SUN_BOOL_SETTINGS {
+            let Some(raw_value) = world.get(source).filter(|value| !value.is_null()) else {
+                continue;
+            };
+            if !raw_value.is_boolean() {
+                return Err(invalid(format!(
+                    "retained Blender World.{source} is invalid"
+                )));
+            }
+            if retained
+                .insert(target.to_owned(), raw_value.clone())
+                .is_some_and(|previous| previous != raw_value.clone())
+            {
+                return Err(invalid(format!(
+                    "retained Blender World.{source} values conflict for one World"
+                )));
+            }
+        }
+    }
+    Ok(settings)
+}
+fn upgrade_v18_world_sun_settings(value: &mut Value) -> Result<Vec<Value>> {
+    let imported_blender = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .is_some_and(Value::is_object);
+    if !imported_blender {
+        return Ok(Vec::new());
+    }
+    let retained = retained_eevee_world_sun_settings(value)?;
+    let mut unavailable = BTreeMap::<String, Vec<&'static str>>::new();
+    if let Some(worlds) = value.get_mut("worlds").and_then(Value::as_object_mut) {
+        for (world_id, world) in worlds {
+            let world = world
+                .as_object_mut()
+                .ok_or_else(|| invalid("world entry must be an object"))?;
+            let mut missing = Vec::new();
+            for (source, target, _) in EEVEE_WORLD_SUN_FLOAT_SETTINGS.iter().skip(1) {
+                let was_missing = !world.contains_key(*target);
+                if world.get(*target).is_none_or(Value::is_null) {
+                    world.insert(
+                        (*target).to_owned(),
+                        retained
+                            .get(world_id)
+                            .and_then(|settings| settings.get(*target))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                }
+                if was_missing && world.get(*target).is_none_or(Value::is_null) {
+                    missing.push(*source);
+                }
+            }
+            for (source, target) in EEVEE_WORLD_SUN_BOOL_SETTINGS {
+                let was_missing = !world.contains_key(target);
+                if world.get(target).is_none_or(Value::is_null) {
+                    world.insert(
+                        target.to_owned(),
+                        retained
+                            .get(world_id)
+                            .and_then(|settings| settings.get(target))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                }
+                if was_missing && world.get(target).is_none_or(Value::is_null) {
+                    missing.push(source);
+                }
+            }
+            if !missing.is_empty() {
+                unavailable.insert(world_id.clone(), missing);
+            }
+        }
+    }
+    let mut warnings = Vec::new();
+    if let Some(scenes) = value.get("scenes").and_then(Value::as_object) {
+        for (scene_id, scene) in scenes {
+            if scene
+                .get("render")
+                .and_then(|render| render.get("engine"))
+                .and_then(Value::as_str)
+                != Some("realtime")
+            {
+                continue;
+            }
+            let Some(missing) = scene
+                .get("world")
+                .and_then(Value::as_str)
+                .and_then(|world_id| unavailable.get(world_id))
+            else {
+                continue;
+            };
+            let missing = missing
+                .iter()
+                .map(|setting| format!("World.{setting}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            warnings.push(json!({
+                "code":"world.eevee_sun_shadow_settings_unavailable_migrated",
+                "feature_id":"world.eevee.sun_shadow_settings",
+                "message":format!(
+                    "This Blender-imported EEVEE realtime scene uses a World with unavailable sun extraction/shadow settings ({missing}); these values remain unknown, not Blender defaults. Reimport the source .blend to recover the exact settings."
+                ),
+                "scene_id":scene_id,
+            }));
+        }
+    }
+    Ok(warnings)
+}
+
+const EEVEE_RAYTRACING_FIELDS: [&str; 21] = [
+    "eevee_use_raytracing",
+    "eevee_use_fast_gi",
+    "eevee_raytracing_method",
+    "eevee_raytracing_resolution_scale",
+    "eevee_raytracing_screen_trace_quality",
+    "eevee_raytracing_screen_trace_thickness",
+    "eevee_raytracing_trace_max_roughness",
+    "eevee_raytracing_use_backface_hit",
+    "eevee_raytracing_backface_radiance_scale",
+    "eevee_raytracing_use_denoise",
+    "eevee_raytracing_denoise_spatial",
+    "eevee_raytracing_denoise_temporal",
+    "eevee_raytracing_denoise_bilateral",
+    "eevee_fast_gi_bias",
+    "eevee_fast_gi_resolution",
+    "eevee_fast_gi_step_count",
+    "eevee_fast_gi_ray_count",
+    "eevee_fast_gi_quality",
+    "eevee_fast_gi_distance",
+    "eevee_fast_gi_thickness_near",
+    "eevee_fast_gi_method",
+];
+
+fn retained_eevee_raytracing_settings(
+    value: &Value,
+    scene_id: &str,
+) -> Result<BTreeMap<String, Value>> {
+    let Some(render) = retained_blender_scene(value, scene_id)
+        .and_then(|scene| scene.get("render"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let mut settings = BTreeMap::new();
+    for field in EEVEE_RAYTRACING_FIELDS {
+        let Some(value) = render.get(field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let value = match field {
+            "eevee_raytracing_method" => match value.as_str() {
+                Some("PROBE" | "probe") => json!("probe"),
+                Some("SCREEN" | "screen") => json!("screen"),
+                _ => return Err(invalid("retained Blender ray-tracing method is invalid")),
+            },
+            "eevee_fast_gi_method" => match value.as_str() {
+                Some("AMBIENT_OCCLUSION_ONLY" | "ambient_occlusion_only") => {
+                    json!("ambient_occlusion_only")
+                }
+                Some("GLOBAL_ILLUMINATION" | "global_illumination") => {
+                    json!("global_illumination")
+                }
+                _ => return Err(invalid("retained Blender Fast GI method is invalid")),
+            },
+            _ => value.clone(),
+        };
+        settings.insert(field.to_owned(), value);
+    }
+    Ok(settings)
+}
+fn retained_eevee_clamp_surface_indirect(value: &Value, scene_id: &str) -> Result<Option<f64>> {
+    let Some(value) = retained_blender_scene(value, scene_id)
+        .and_then(|scene| scene.get("render"))
+        .and_then(|render| render.get("eevee_clamp_surface_indirect"))
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let clamp = value
+        .as_f64()
+        .filter(|value| value.is_finite() && (0.0..=f64::from(f32::MAX)).contains(value))
+        .ok_or_else(|| invalid("retained Blender SceneEEVEE.clamp_surface_indirect is invalid"))?;
+    Ok(Some(clamp))
+}
+fn retained_eevee_has_local_volume_probe_grids(
+    value: &Value,
+    scene_id: &str,
+) -> Result<Option<bool>> {
+    let Some(value) = retained_blender_scene(value, scene_id)
+        .and_then(|scene| scene.get("eevee_has_local_volume_probe_grids"))
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| invalid("retained Blender Scene has_local_volume_probe_grids is invalid"))
+}
+fn upgrade_v18_eevee_clamp_surface_indirect(value: &mut Value) -> Result<Vec<Value>> {
+    let imported_blender = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .is_some_and(Value::is_object);
+    if !imported_blender {
+        return Ok(Vec::new());
+    }
+    let mut retained = BTreeMap::new();
+    if let Some(scenes) = value.get("scenes").and_then(Value::as_object) {
+        for scene_id in scenes.keys() {
+            if let Some(clamp) = retained_eevee_clamp_surface_indirect(value, scene_id)? {
+                retained.insert(scene_id.clone(), clamp);
+            }
+        }
+    }
+    let mut unavailable = BTreeSet::new();
+    if let Some(scenes) = value.get_mut("scenes").and_then(Value::as_object_mut) {
+        for (scene_id, scene) in scenes {
+            let scene = scene
+                .as_object_mut()
+                .ok_or_else(|| invalid("scene entry must be an object"))?;
+            let render = scene
+                .entry("render".to_owned())
+                .or_insert_with(|| json!({}));
+            let render = render
+                .as_object_mut()
+                .ok_or_else(|| invalid("scene render settings must be an object"))?;
+            let was_missing = !render.contains_key("eevee_clamp_surface_indirect");
+            if render
+                .get("eevee_clamp_surface_indirect")
+                .is_none_or(Value::is_null)
+            {
+                render.insert(
+                    "eevee_clamp_surface_indirect".to_owned(),
+                    retained
+                        .get(scene_id)
+                        .map_or(Value::Null, |clamp| json!(clamp)),
+                );
+            }
+            if was_missing
+                && render
+                    .get("eevee_clamp_surface_indirect")
+                    .is_none_or(Value::is_null)
+            {
+                unavailable.insert(scene_id.clone());
+            }
+        }
+    }
+    let mut warnings = Vec::new();
+    if let Some(scenes) = value.get("scenes").and_then(Value::as_object) {
+        for (scene_id, scene) in scenes {
+            let render = scene.get("render");
+            let realtime = render.is_some_and(|render| {
+                render.get("engine").and_then(Value::as_str) == Some("realtime")
+            });
+            let consumes_clamp = scene.get("world").is_some_and(|world| !world.is_null())
+                || scene
+                    .get("eevee_has_local_volume_probe_grids")
+                    .is_none_or(|value| value.as_bool() != Some(false))
+                || render.is_some_and(|render| {
+                    render.get("eevee_use_raytracing").and_then(Value::as_bool) == Some(true)
+                        || render.get("eevee_use_fast_gi").and_then(Value::as_bool) == Some(true)
+                });
+            if realtime && consumes_clamp && unavailable.contains(scene_id) {
+                warnings.push(json!({
+                    "code":"render.eevee_clamp_surface_indirect_unavailable_migrated",
+                    "feature_id":"render.eevee.clamp_surface_indirect",
+                    "message":"This Blender-imported EEVEE realtime scene may use ray tracing, Fast GI, or world/local light probes but has no retained SceneEEVEE.clamp_surface_indirect value; it remains unknown, not Blender's 10.0 default. Reimport the source .blend to recover the exact setting.",
+                    "scene_id":scene_id,
+                }));
+            }
+        }
+    }
+    Ok(warnings)
+}
+fn upgrade_v18_eevee_has_local_volume_probe_grids(value: &mut Value) -> Result<Vec<Value>> {
+    let imported_blender = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .is_some_and(Value::is_object);
+    if !imported_blender {
+        return Ok(Vec::new());
+    }
+    let mut retained = BTreeMap::new();
+    if let Some(scenes) = value.get("scenes").and_then(Value::as_object) {
+        for scene_id in scenes.keys() {
+            if let Some(has_grids) = retained_eevee_has_local_volume_probe_grids(value, scene_id)? {
+                retained.insert(scene_id.clone(), has_grids);
+            }
+        }
+    }
+    let mut unavailable = BTreeSet::new();
+    if let Some(scenes) = value.get_mut("scenes").and_then(Value::as_object_mut) {
+        for (scene_id, scene) in scenes {
+            let scene = scene
+                .as_object_mut()
+                .ok_or_else(|| invalid("scene entry must be an object"))?;
+            let was_missing = !scene.contains_key("eevee_has_local_volume_probe_grids");
+            if scene
+                .get("eevee_has_local_volume_probe_grids")
+                .is_none_or(Value::is_null)
+            {
+                scene.insert(
+                    "eevee_has_local_volume_probe_grids".to_owned(),
+                    retained
+                        .get(scene_id)
+                        .map_or(Value::Null, |has_grids| json!(has_grids)),
+                );
+            }
+            if was_missing
+                && scene
+                    .get("eevee_has_local_volume_probe_grids")
+                    .is_none_or(Value::is_null)
+            {
+                unavailable.insert(scene_id.clone());
+            }
+        }
+    }
+    let mut warnings = Vec::new();
+    if let Some(scenes) = value.get("scenes").and_then(Value::as_object) {
+        for (scene_id, scene) in scenes {
+            if scene.get("render").is_some_and(|render| {
+                render.get("engine").and_then(Value::as_str) == Some("realtime")
+            }) && unavailable.contains(scene_id)
+            {
+                warnings.push(json!({
+                    "code":"render.eevee.world_probe.local_volume_grids_unavailable_migrated",
+                    "feature_id":"render.eevee.world_probe.local_volume_grids",
+                    "message":"This Blender-imported EEVEE realtime scene has unknown local VOLUME LightProbe presence; Blender's cache is not exposed through RNA. Reimport the source .blend before relying on global World SH.",
+                    "scene_id":scene_id,
+                }));
+            }
+        }
+    }
+    Ok(warnings)
+}
 
 fn validate_present_cycles_curve_settings(render: &Map<String, Value>) -> Result<()> {
     if render.get("cycles_curves_shape").is_some_and(|shape| {
@@ -835,19 +1330,435 @@ fn validate_present_eevee_gi_cubemap_resolution(render: &Map<String, Value>) -> 
     Ok(())
 }
 
-fn has_imported_hair_with_missing_cycles_curve_settings(value: &Value) -> bool {
-    has_blender_hair_curves(value)
-        && value
-            .get("scenes")
-            .and_then(Value::as_object)
-            .is_some_and(|scenes| {
-                scenes.values().any(|scene| {
-                    scene
-                        .get("render")
-                        .and_then(Value::as_object)
-                        .is_none_or(|render| !has_complete_cycles_curve_pair(render))
-                })
+fn validate_present_eevee_raytracing_settings(render: &Map<String, Value>) -> Result<()> {
+    for field in [
+        "eevee_use_raytracing",
+        "eevee_use_fast_gi",
+        "eevee_raytracing_use_backface_hit",
+        "eevee_raytracing_use_denoise",
+        "eevee_raytracing_denoise_spatial",
+        "eevee_raytracing_denoise_temporal",
+        "eevee_raytracing_denoise_bilateral",
+    ] {
+        if render
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_boolean())
+        {
+            return Err(invalid(format!(
+                "scene render {field} must be a boolean or null"
+            )));
+        }
+    }
+    for field in [
+        "eevee_raytracing_screen_trace_quality",
+        "eevee_raytracing_screen_trace_thickness",
+        "eevee_raytracing_trace_max_roughness",
+        "eevee_raytracing_backface_radiance_scale",
+        "eevee_fast_gi_bias",
+        "eevee_fast_gi_quality",
+        "eevee_fast_gi_distance",
+        "eevee_fast_gi_thickness_near",
+        "eevee_clamp_surface_indirect",
+    ] {
+        if render.get(field).is_some_and(|value| {
+            !value.is_null() && value.as_f64().is_none_or(|number| !number.is_finite())
+        }) {
+            return Err(invalid(format!(
+                "scene render {field} must be a finite number or null"
+            )));
+        }
+    }
+    if render
+        .get("eevee_clamp_surface_indirect")
+        .is_some_and(|value| {
+            !value.is_null()
+                && !value
+                    .as_f64()
+                    .is_some_and(|number| (0.0..=f64::from(f32::MAX)).contains(&number))
+        })
+    {
+        return Err(invalid(
+            "scene render eevee_clamp_surface_indirect must be in Blender's 0..=FLT_MAX range or null",
+        ));
+    }
+    for field in [
+        "eevee_raytracing_resolution_scale",
+        "eevee_fast_gi_resolution",
+        "eevee_fast_gi_step_count",
+        "eevee_fast_gi_ray_count",
+    ] {
+        if render.get(field).is_some_and(|value| {
+            !value.is_null()
+                && value
+                    .as_u64()
+                    .and_then(|number| u32::try_from(number).ok())
+                    .is_none()
+        }) {
+            return Err(invalid(format!(
+                "scene render {field} must be a u32 or null"
+            )));
+        }
+    }
+    if render.get("eevee_raytracing_method").is_some_and(|value| {
+        !value.is_null()
+            && !value
+                .as_str()
+                .is_some_and(|method| matches!(method, "probe" | "screen" | "PROBE" | "SCREEN"))
+    }) || render.get("eevee_fast_gi_method").is_some_and(|value| {
+        !value.is_null()
+            && !value.as_str().is_some_and(|method| {
+                matches!(
+                    method,
+                    "ambient_occlusion_only"
+                        | "global_illumination"
+                        | "AMBIENT_OCCLUSION_ONLY"
+                        | "GLOBAL_ILLUMINATION"
+                )
             })
+    }) {
+        return Err(invalid(
+            "scene render EEVEE ray-tracing methods are invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn retained_blender_material_raytrace_refraction(
+    value: &Value,
+) -> Result<BTreeMap<String, Option<bool>>> {
+    let Some(compatibility) = value.get("compatibility").and_then(Value::as_object) else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(materials) = value.get("materials").and_then(Value::as_object) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut retained = BTreeMap::new();
+    if let Some(adapter) = compatibility.get("blender_adapter")
+        && let Some(raw_materials) = adapter
+            .get("intermediate")
+            .and_then(|intermediate| intermediate.get("materials"))
+            .and_then(Value::as_array)
+        && let Some(mappings) = adapter.get("id_mappings").and_then(Value::as_object)
+    {
+        for (mapping_key, mapped_id) in mappings {
+            let Some(material_name) = mapping_key.strip_prefix("Material:") else {
+                continue;
+            };
+            let Some(material_id) = mapped_id
+                .as_str()
+                .filter(|material_id| materials.contains_key(*material_id))
+            else {
+                continue;
+            };
+            let Some(raw_material) = raw_materials
+                .iter()
+                .find(|raw| raw.get("name").and_then(Value::as_str) == Some(material_name))
+            else {
+                continue;
+            };
+            let setting = match raw_material.get("use_raytrace_refraction") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(setting)) => Some(*setting),
+                Some(_) => {
+                    return Err(invalid(
+                        "retained Blender Material.use_raytrace_refraction is invalid",
+                    ));
+                }
+            };
+            if retained
+                .insert(material_id.to_owned(), setting)
+                .is_some_and(|previous| previous != setting)
+            {
+                return Err(invalid(
+                    "retained Blender Material.use_raytrace_refraction values conflict for one material",
+                ));
+            }
+        }
+    }
+
+    for (adapter_key, adapter) in compatibility {
+        let Some(namespace) = adapter_key.strip_suffix("_blender_adapter") else {
+            continue;
+        };
+        if namespace.is_empty() {
+            continue;
+        }
+        let Some(mappings) = adapter.get("id_mappings").and_then(Value::as_object) else {
+            continue;
+        };
+        let source_material_ids = mappings
+            .iter()
+            .filter_map(|(mapping_key, mapped_id)| {
+                mapping_key.strip_prefix("Material:")?;
+                mapped_id
+                    .as_str()
+                    .filter(|id| Id::is_valid(id))
+                    .map(str::to_owned)
+            })
+            .collect::<BTreeSet<_>>();
+        if source_material_ids.is_empty() {
+            continue;
+        }
+        let mut namespace_cache = BTreeMap::new();
+        for material_id in materials.keys() {
+            if is_possible_appended_material_id(
+                namespace,
+                &source_material_ids,
+                material_id,
+                &mut namespace_cache,
+            ) {
+                *retained.entry(material_id.clone()).or_default() = None;
+            }
+        }
+    }
+
+    for material_id in retained_potter_project_material_ids(value, compatibility) {
+        if materials.contains_key(&material_id) {
+            *retained.entry(material_id).or_default() = None;
+        }
+    }
+    Ok(retained)
+}
+
+fn is_possible_appended_material_id(
+    namespace_prefix: &str,
+    source_material_ids: &BTreeSet<String>,
+    material_id: &str,
+    namespace_cache: &mut BTreeMap<(String, usize), bool>,
+) -> bool {
+    if source_material_ids.contains(material_id) {
+        return true;
+    }
+    if !Id::is_valid(material_id) {
+        return false;
+    }
+    let maximum_layers = namespace_prefix.split('_').count();
+    for (separator, _) in material_id.match_indices('_') {
+        if separator == 0 {
+            continue;
+        }
+        let namespace = &material_id[..separator];
+        let body = &material_id[separator + 1..];
+        for suffix_start in 0..=body.len() {
+            let suffix = &body[suffix_start..];
+            let Some(suffix_count) = material_remap_suffix_count(suffix) else {
+                continue;
+            };
+            if suffix_count > maximum_layers {
+                continue;
+            }
+            let chain_key = (namespace.to_owned(), suffix_count);
+            let chain_matches = *namespace_cache.entry(chain_key).or_insert_with(|| {
+                possible_appended_namespace_chain(namespace_prefix, namespace, suffix_count)
+            });
+            if !chain_matches {
+                continue;
+            }
+            let source_prefix = &body[..suffix_start];
+            let available = 63_usize
+                .saturating_sub(namespace.len())
+                .saturating_sub(suffix.len());
+            if source_prefix.len() > available {
+                continue;
+            }
+            if source_prefix.len() < available {
+                if source_material_ids.contains(source_prefix) {
+                    return true;
+                }
+            } else if source_material_ids
+                .range(source_prefix.to_owned()..)
+                .next()
+                .is_some_and(|source_id| source_id.starts_with(source_prefix))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn material_remap_suffix_count(suffixes: &str) -> Option<usize> {
+    let bytes = suffixes.as_bytes();
+    let mut index = 0;
+    let mut count = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'_' {
+            return None;
+        }
+        index += 1;
+        count += 1;
+        if index == bytes.len() {
+            break;
+        }
+        if !bytes[index].is_ascii_digit() || bytes[index] == b'0' {
+            return None;
+        }
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+    }
+    Some(count)
+}
+
+fn possible_appended_namespace_chain(
+    namespace_prefix: &str,
+    combined_namespace: &str,
+    minimum_layers: usize,
+) -> bool {
+    fn matches(
+        prefix_parts: &[&str],
+        namespace_parts: &[&str],
+        prefix_index: usize,
+        namespace_index: usize,
+        remaining_layers: usize,
+        memo: &mut BTreeMap<(usize, usize, usize), bool>,
+    ) -> bool {
+        if namespace_index == namespace_parts.len() {
+            return remaining_layers == 0;
+        }
+        let state = (prefix_index, namespace_index, remaining_layers);
+        if let Some(result) = memo.get(&state) {
+            return *result;
+        }
+        let mut segment_len = 0;
+        for segment_end in namespace_index..namespace_parts.len() {
+            segment_len += namespace_parts[segment_end].len();
+            if segment_end > namespace_index {
+                segment_len += 1;
+            }
+            if segment_len > 48 {
+                break;
+            }
+            if !namespace_parts[namespace_index]
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_lowercase)
+            {
+                continue;
+            }
+            let segment_count = segment_end - namespace_index + 1;
+            let Some(maximum_prefix_start) = prefix_parts.len().checked_sub(segment_count) else {
+                continue;
+            };
+            for prefix_start in prefix_index..=maximum_prefix_start {
+                if prefix_parts[prefix_start..prefix_start + segment_count]
+                    == namespace_parts[namespace_index..=segment_end]
+                    && matches(
+                        prefix_parts,
+                        namespace_parts,
+                        prefix_start + segment_count,
+                        segment_end + 1,
+                        remaining_layers.saturating_sub(1),
+                        memo,
+                    )
+                {
+                    memo.insert(state, true);
+                    return true;
+                }
+            }
+        }
+        memo.insert(state, false);
+        false
+    }
+
+    if combined_namespace.is_empty() {
+        return false;
+    }
+    let prefix_parts = namespace_prefix.split('_').collect::<Vec<_>>();
+    let namespace_parts = combined_namespace.split('_').collect::<Vec<_>>();
+    matches(
+        &prefix_parts,
+        &namespace_parts,
+        0,
+        0,
+        minimum_layers,
+        &mut BTreeMap::new(),
+    )
+}
+
+fn retained_potter_project_material_ids(
+    value: &Value,
+    compatibility: &Map<String, Value>,
+) -> BTreeSet<String> {
+    let Some(libraries) = value.get("libraries").and_then(Value::as_object) else {
+        return BTreeSet::new();
+    };
+    let mut potter_libraries = BTreeSet::new();
+    let mut material_ids = BTreeSet::new();
+    for (library_id, library) in libraries {
+        if library
+            .get("kind")
+            .is_some_and(|kind| kind.as_str() != Some("potter_project"))
+        {
+            continue;
+        }
+        potter_libraries.insert(library_id.as_str());
+        if let Some(linked_ids) = library
+            .get("linked_ids")
+            .and_then(Value::as_object)
+            .and_then(|linked_ids| linked_ids.get("materials"))
+            .and_then(Value::as_array)
+        {
+            material_ids.extend(
+                linked_ids
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned),
+            );
+        }
+        if let Some(items) = library.get("items").and_then(Value::as_object) {
+            material_ids.extend(items.keys().filter_map(|key| {
+                let (registry, material_id) = key.split_once(':')?;
+                (registry == "materials").then(|| material_id.to_owned())
+            }));
+        }
+    }
+    if let Some(linked_ids) = compatibility.get("linked_ids").and_then(Value::as_object) {
+        for (key, metadata) in linked_ids {
+            let Some(("materials", material_id)) = key.split_once(':') else {
+                continue;
+            };
+            let Some(library_id) = metadata.get("library_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if potter_libraries.contains(library_id) {
+                material_ids.insert(material_id.to_owned());
+            }
+        }
+    }
+    material_ids
+}
+
+fn has_materials_missing_raytrace_refraction(value: &Value) -> bool {
+    value
+        .get("materials")
+        .and_then(Value::as_object)
+        .is_some_and(|materials| {
+            materials.values().any(|material| {
+                material
+                    .as_object()
+                    .is_some_and(|material| !material.contains_key("use_raytrace_refraction"))
+            })
+        })
+}
+
+fn upgrade_material_raytrace_refraction(value: &mut Value) -> Result<()> {
+    let retained = retained_blender_material_raytrace_refraction(value)?;
+    if let Some(materials) = value.get_mut("materials").and_then(Value::as_object_mut) {
+        for (material_id, material) in materials {
+            let Some(material) = material.as_object_mut() else {
+                continue;
+            };
+            if !material.contains_key("use_raytrace_refraction") {
+                let setting = retained.get(material_id).copied().unwrap_or(Some(false));
+                material.insert(
+                    "use_raytrace_refraction".to_owned(),
+                    setting.map_or(Value::Null, |setting| json!(setting)),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn upgrade_v17(value: &mut Value) -> Result<Vec<Value>> {
@@ -890,12 +1801,154 @@ fn upgrade_v17(value: &mut Value) -> Result<Vec<Value>> {
     } else {
         BTreeMap::new()
     };
+    let mut retained_raytracing = BTreeMap::new();
+    if imported_blender && let Some(scenes) = value.get("scenes").and_then(Value::as_object) {
+        for scene_id in scenes.keys() {
+            retained_raytracing.insert(
+                scene_id.clone(),
+                retained_eevee_raytracing_settings(value, scene_id)?,
+            );
+        }
+    }
+    let mut retained_clamp_surface_indirect = BTreeMap::new();
+    if imported_blender && let Some(scenes) = value.get("scenes").and_then(Value::as_object) {
+        for scene_id in scenes.keys() {
+            if let Some(clamp) = retained_eevee_clamp_surface_indirect(value, scene_id)? {
+                retained_clamp_surface_indirect.insert(scene_id.clone(), clamp);
+            }
+        }
+    }
+    let mut retained_local_volume_probe_grids = BTreeMap::new();
+    if imported_blender && let Some(scenes) = value.get("scenes").and_then(Value::as_object) {
+        for scene_id in scenes.keys() {
+            if let Some(has_grids) = retained_eevee_has_local_volume_probe_grids(value, scene_id)? {
+                retained_local_volume_probe_grids.insert(scene_id.clone(), has_grids);
+            }
+        }
+    }
+    let retained_world_settings = if imported_blender {
+        retained_eevee_world_sun_settings(value)?
+    } else {
+        BTreeMap::new()
+    };
+    if imported_blender && let Some(worlds) = value.get_mut("worlds").and_then(Value::as_object_mut)
+    {
+        for (world_id, world) in worlds {
+            let world = world
+                .as_object_mut()
+                .ok_or_else(|| invalid("world entry must be an object"))?;
+            for (_, target, _) in EEVEE_WORLD_SUN_FLOAT_SETTINGS {
+                if world.get(target).is_none_or(Value::is_null) {
+                    world.insert(
+                        target.to_owned(),
+                        retained_world_settings
+                            .get(world_id)
+                            .and_then(|settings| settings.get(target))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                }
+            }
+            for (_, target) in EEVEE_WORLD_SUN_BOOL_SETTINGS {
+                if world.get(target).is_none_or(Value::is_null) {
+                    world.insert(
+                        target.to_owned(),
+                        retained_world_settings
+                            .get(world_id)
+                            .and_then(|settings| settings.get(target))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                }
+            }
+        }
+    }
+    let unknown_worlds: BTreeSet<String> = if imported_blender {
+        value
+            .get("worlds")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|worlds| worlds.iter())
+            .filter(|(_, world)| world.get("eevee_sun_threshold").is_none_or(Value::is_null))
+            .map(|(world_id, _)| world_id.clone())
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    let unknown_world_sun_settings: BTreeMap<String, Vec<&'static str>> = if imported_blender {
+        value
+            .get("worlds")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|worlds| worlds.iter())
+            .filter_map(|(world_id, world)| {
+                let mut missing: Vec<_> = EEVEE_WORLD_SUN_FLOAT_SETTINGS
+                    .iter()
+                    .skip(1)
+                    .filter_map(|(source, target, _)| {
+                        world
+                            .get(*target)
+                            .is_none_or(Value::is_null)
+                            .then_some(*source)
+                    })
+                    .collect();
+                missing.extend(EEVEE_WORLD_SUN_BOOL_SETTINGS.iter().filter_map(
+                    |(source, target)| {
+                        world
+                            .get(*target)
+                            .is_none_or(Value::is_null)
+                            .then_some(*source)
+                    },
+                ));
+                if missing.is_empty() {
+                    None
+                } else {
+                    Some((world_id.clone(), missing))
+                }
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     let mut warnings = Vec::new();
     if let Some(scenes) = value.get_mut("scenes").and_then(Value::as_object_mut) {
         for (scene_id, scene) in scenes {
             let scene = scene
                 .as_object_mut()
                 .ok_or_else(|| invalid("scene entry must be an object"))?;
+            if imported_blender
+                && scene
+                    .get("eevee_has_local_volume_probe_grids")
+                    .is_none_or(Value::is_null)
+            {
+                scene.insert(
+                    "eevee_has_local_volume_probe_grids".to_owned(),
+                    retained_local_volume_probe_grids
+                        .get(scene_id)
+                        .map_or(Value::Null, |has_grids| json!(has_grids)),
+                );
+            } else if !imported_blender {
+                // Pre-v18 native documents had no capture but retained the known false default.
+                scene
+                    .entry("eevee_has_local_volume_probe_grids".to_owned())
+                    .or_insert(json!(false));
+            }
+            let world_is_present = scene.get("world").is_some_and(|world| !world.is_null());
+            let local_volume_probe_grids_may_exist = scene
+                .get("eevee_has_local_volume_probe_grids")
+                .is_none_or(|value| value.as_bool() != Some(false));
+            let local_volume_probe_grids_unknown = scene
+                .get("eevee_has_local_volume_probe_grids")
+                .is_none_or(Value::is_null);
+            let world_has_unknown_sun_threshold = scene
+                .get("world")
+                .and_then(Value::as_str)
+                .is_some_and(|world_id| unknown_worlds.contains(world_id));
+            let missing_world_sun_settings = scene
+                .get("world")
+                .and_then(Value::as_str)
+                .and_then(|world_id| unknown_world_sun_settings.get(world_id))
+                .filter(|missing| !missing.is_empty());
             let render = scene
                 .entry("render".to_owned())
                 .or_insert_with(|| json!({}));
@@ -903,6 +1956,116 @@ fn upgrade_v17(value: &mut Value) -> Result<Vec<Value>> {
                 .as_object_mut()
                 .ok_or_else(|| invalid("scene render settings must be an object"))?;
             validate_present_eevee_gi_cubemap_resolution(render)?;
+            validate_present_eevee_raytracing_settings(render)?;
+            let retained = retained_raytracing.get(scene_id);
+            for field in EEVEE_RAYTRACING_FIELDS {
+                render.entry(field.to_owned()).or_insert(Value::Null);
+                if render.get(field).is_none_or(Value::is_null)
+                    && let Some(value) = retained.and_then(|settings| settings.get(field))
+                {
+                    render.insert(field.to_owned(), value.clone());
+                }
+            }
+            if imported_blender {
+                render
+                    .entry("eevee_clamp_surface_indirect".to_owned())
+                    .or_insert(Value::Null);
+                if render
+                    .get("eevee_clamp_surface_indirect")
+                    .is_none_or(Value::is_null)
+                    && let Some(clamp) = retained_clamp_surface_indirect.get(scene_id)
+                {
+                    render.insert("eevee_clamp_surface_indirect".to_owned(), json!(clamp));
+                }
+            }
+            if imported_blender && render.get("engine").and_then(Value::as_str) == Some("realtime")
+            {
+                let mut missing = Vec::new();
+                if render
+                    .get("eevee_use_raytracing")
+                    .and_then(Value::as_bool)
+                    .is_none()
+                {
+                    missing.push("eevee_use_raytracing");
+                } else if render.get("eevee_use_raytracing").and_then(Value::as_bool) == Some(true)
+                {
+                    missing.extend(
+                        EEVEE_RAYTRACING_FIELDS
+                            .iter()
+                            .skip(1)
+                            .copied()
+                            .filter(|field| render.get(*field).is_none_or(Value::is_null)),
+                    );
+                }
+                if !missing.is_empty() {
+                    warnings.push(json!({
+                        "code":"render.eevee_raytracing_settings_unavailable_migrated",
+                        "feature_id":"render.eevee.raytracing.settings",
+                        "message":format!(
+                            "This Blender-imported EEVEE realtime scene has incomplete retained ray-tracing settings ({}); missing values remain unknown, not defaults. Reimport the source .blend to recover them.",
+                            missing.join(", ")
+                        ),
+                        "scene_id":scene_id,
+                    }));
+                }
+            }
+            if imported_blender
+                && render.get("engine").and_then(Value::as_str) == Some("realtime")
+                && (world_is_present
+                    || local_volume_probe_grids_may_exist
+                    || render.get("eevee_use_raytracing").and_then(Value::as_bool) == Some(true)
+                    || render.get("eevee_use_fast_gi").and_then(Value::as_bool) == Some(true))
+                && render
+                    .get("eevee_clamp_surface_indirect")
+                    .is_none_or(Value::is_null)
+            {
+                warnings.push(json!({
+                    "code":"render.eevee_clamp_surface_indirect_unavailable_migrated",
+                    "feature_id":"render.eevee.clamp_surface_indirect",
+                    "message":"This Blender-imported EEVEE realtime scene may use ray tracing, Fast GI, or world/local light probes but has no retained SceneEEVEE.clamp_surface_indirect value; it remains unknown, not Blender's 10.0 default. Reimport the source .blend to recover the exact setting.",
+                    "scene_id":scene_id,
+                }));
+            }
+            if imported_blender
+                && render.get("engine").and_then(Value::as_str) == Some("realtime")
+                && local_volume_probe_grids_unknown
+            {
+                warnings.push(json!({
+                    "code":"render.eevee.world_probe.local_volume_grids_unavailable_migrated",
+                    "feature_id":"render.eevee.world_probe.local_volume_grids",
+                    "message":"This Blender-imported EEVEE realtime scene has unknown local VOLUME LightProbe presence; Blender's cache is not exposed through RNA. Reimport the source .blend before relying on global World SH.",
+                    "scene_id":scene_id,
+                }));
+            }
+            if imported_blender
+                && render.get("engine").and_then(Value::as_str) == Some("realtime")
+                && world_has_unknown_sun_threshold
+            {
+                warnings.push(json!({
+                    "code":"world.eevee_sun_threshold_unavailable_migrated",
+                    "feature_id":"world.eevee.sun_threshold",
+                    "message":"This Blender-imported EEVEE realtime scene uses a World with no retained World.sun_threshold value; it remains unknown, not Blender's 10.0 default. Reimport the source .blend to recover the exact setting.",
+                    "scene_id":scene_id,
+                }));
+            }
+            if imported_blender
+                && render.get("engine").and_then(Value::as_str) == Some("realtime")
+                && let Some(missing) = missing_world_sun_settings
+            {
+                let missing = missing
+                    .iter()
+                    .map(|setting| format!("World.{setting}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                warnings.push(json!({
+                    "code":"world.eevee_sun_shadow_settings_unavailable_migrated",
+                    "feature_id":"world.eevee.sun_shadow_settings",
+                    "message":format!(
+                        "This Blender-imported EEVEE realtime scene uses a World with unavailable sun extraction/shadow settings ({missing}); these values remain unknown, not Blender defaults. Reimport the source .blend to recover the exact settings."
+                    ),
+                    "scene_id":scene_id,
+                }));
+            }
             if imported_blender {
                 if let Some(resolution) = retained_probe_resolutions.get(scene_id) {
                     render.insert("eevee_gi_cubemap_resolution".to_owned(), json!(resolution));
@@ -948,6 +2111,7 @@ fn upgrade_v17(value: &mut Value) -> Result<Vec<Value>> {
             }
         }
     }
+    upgrade_material_raytrace_refraction(value)?;
     value["schema_version"] = json!(18);
     Ok(warnings)
 }
@@ -4430,12 +5594,20 @@ mod tests {
         ))
         .expect("scene document");
         source["schema_version"] = json!(17);
+        source["scenes"]["scene_main"]
+            .as_object_mut()
+            .expect("scene entry")
+            .remove("eevee_has_local_volume_probe_grids");
         let render = source["scenes"]["scene_main"]["render"]
             .as_object_mut()
             .expect("render settings");
         render.remove("cycles_curves_shape");
         render.remove("eevee_gi_cubemap_resolution");
         render.remove("cycles_curves_subdivisions");
+        render.remove("eevee_clamp_surface_indirect");
+        for field in super::EEVEE_RAYTRACING_FIELDS {
+            render.remove(field);
+        }
         if let Some(shape) = shape {
             render.insert("cycles_curves_shape".to_owned(), json!(shape));
         }
@@ -4460,16 +5632,130 @@ mod tests {
     ) -> Value {
         let mut source = schema_seventeen_curve_scene(blender_adapter, false, None, None);
         source["scenes"]["scene_main"]["render"]["engine"] = json!(engine);
+        source["scenes"]["scene_main"]["render"]
+            .as_object_mut()
+            .expect("scene render settings")
+            .remove("eevee_clamp_surface_indirect");
         if blender_adapter {
             source["compatibility"]["blender_adapter"]["id_mappings"] =
                 json!({"Scene:Scene":"scene_main"});
             let mut render = serde_json::Map::new();
+            render.insert("eevee_use_raytracing".to_owned(), json!(false));
+            render.insert("eevee_use_fast_gi".to_owned(), json!(false));
+            render.insert("eevee_raytracing_method".to_owned(), json!("SCREEN"));
+            render.insert("eevee_raytracing_resolution_scale".to_owned(), json!(2));
+            render.insert(
+                "eevee_raytracing_screen_trace_quality".to_owned(),
+                json!(0.25),
+            );
+            render.insert(
+                "eevee_raytracing_screen_trace_thickness".to_owned(),
+                json!(0.1),
+            );
+            render.insert(
+                "eevee_raytracing_trace_max_roughness".to_owned(),
+                json!(0.5),
+            );
+            render.insert("eevee_raytracing_use_backface_hit".to_owned(), json!(true));
+            render.insert(
+                "eevee_raytracing_backface_radiance_scale".to_owned(),
+                json!(0.25),
+            );
+            render.insert("eevee_raytracing_use_denoise".to_owned(), json!(true));
+            render.insert("eevee_raytracing_denoise_spatial".to_owned(), json!(true));
+            render.insert("eevee_raytracing_denoise_temporal".to_owned(), json!(true));
+            render.insert("eevee_raytracing_denoise_bilateral".to_owned(), json!(true));
+            render.insert("eevee_fast_gi_bias".to_owned(), json!(0.05));
+            render.insert("eevee_fast_gi_resolution".to_owned(), json!(2));
+            render.insert("eevee_fast_gi_step_count".to_owned(), json!(8));
+            render.insert("eevee_fast_gi_ray_count".to_owned(), json!(2));
+            render.insert("eevee_fast_gi_quality".to_owned(), json!(0.25));
+            render.insert("eevee_fast_gi_distance".to_owned(), json!(0.0));
+            render.insert("eevee_fast_gi_thickness_near".to_owned(), json!(0.1));
+            render.insert(
+                "eevee_fast_gi_method".to_owned(),
+                json!("GLOBAL_ILLUMINATION"),
+            );
+            render.insert("eevee_clamp_surface_indirect".to_owned(), json!(10.0));
             if let Some(resolution) = retained_resolution {
                 render.insert("eevee_gi_cubemap_resolution".to_owned(), json!(resolution));
             }
-            source["compatibility"]["blender_adapter"]["intermediate"]["scenes"] =
-                json!([{"name":"Scene", "potter_id":null, "render":render}]);
+            source["compatibility"]["blender_adapter"]["intermediate"]["scenes"] = json!([{
+                "name":"Scene",
+                "potter_id":null,
+                "render":render,
+                "eevee_has_local_volume_probe_grids":false
+            }]);
         }
+        source
+    }
+    fn schema_seventeen_raytracing_scene(
+        blender_adapter: bool,
+        engine: &str,
+        retained_raytracing: Option<bool>,
+    ) -> Value {
+        let mut source = schema_seventeen_probe_scene(blender_adapter, engine, Some(512));
+        if blender_adapter {
+            let render =
+                source["compatibility"]["blender_adapter"]["intermediate"]["scenes"][0]["render"]
+                    .as_object_mut()
+                    .expect("retained render settings");
+            if let Some(raytracing) = retained_raytracing {
+                render.insert("eevee_use_raytracing".to_owned(), json!(raytracing));
+            } else {
+                render.remove("eevee_use_raytracing");
+            }
+        }
+        source
+    }
+    fn schema_seventeen_world_scene(
+        engine: &str,
+        world_referenced: bool,
+        retained_threshold: Option<f64>,
+    ) -> Value {
+        let mut source = schema_seventeen_probe_scene(true, engine, Some(512));
+        let mut world =
+            serde_json::to_value(crate::model::World::default()).expect("native world JSON");
+        let world = world.as_object_mut().expect("world object");
+        for field in [
+            "eevee_sun_threshold",
+            "eevee_sun_angle",
+            "eevee_use_sun_shadow",
+            "eevee_sun_shadow_maximum_resolution",
+            "eevee_sun_shadow_jitter_overblur",
+            "eevee_sun_shadow_filter_radius",
+            "eevee_use_sun_shadow_jitter",
+        ] {
+            world.remove(field);
+        }
+        source["worlds"]["world_main"] = serde_json::Value::Object(world.clone());
+        source["compatibility"]["blender_adapter"]["id_mappings"]["World:World"] =
+            json!("world_main");
+        if world_referenced {
+            source["scenes"]["scene_main"]["world"] = json!("world_main");
+        }
+        let mut retained_scene =
+            source["compatibility"]["blender_adapter"]["intermediate"]["scenes"][0].clone();
+        let mut retained_world = json!({
+            "name":"World",
+            "potter_id":null,
+            "sun_angle":0.25,
+            "use_sun_shadow":false,
+            "sun_shadow_maximum_resolution":f64::from(0.004_f32),
+            "sun_shadow_jitter_overblur":37.5,
+            "sun_shadow_filter_radius":2.5,
+            "use_sun_shadow_jitter":true
+        });
+        if let Some(threshold) = retained_threshold {
+            retained_world["sun_threshold"] = json!(threshold);
+        }
+        retained_scene["world"] = if world_referenced {
+            retained_world
+        } else {
+            Value::Null
+        };
+        source["compatibility"]["blender_adapter"]["intermediate"]["scenes"] =
+            json!([retained_scene]);
         source
     }
 
@@ -5459,6 +6745,513 @@ mod tests {
             None
         );
         assert_eq!(warnings, parsed.warnings);
+        Ok(())
+    }
+    #[test]
+    fn schema_seventeen_blender_raytracing_recovers_exact_values_in_scene_and_history() -> TestResult
+    {
+        for value in [true, false] {
+            let source = schema_seventeen_raytracing_scene(true, "realtime", Some(value));
+            let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+            let render = &parsed.doc.scenes[&Id::from_static("scene_main")].render;
+
+            assert!(parsed.legacy);
+            assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+            assert_eq!(render.eevee_use_raytracing, Some(value));
+            assert_eq!(
+                render.eevee_raytracing_method,
+                Some(crate::model::EeveeRayTracingMethod::Screen)
+            );
+            assert_eq!(render.eevee_raytracing_resolution_scale, Some(2));
+            assert_eq!(
+                render.eevee_fast_gi_method,
+                Some(crate::model::EeveeFastGiMethod::GlobalIllumination)
+            );
+            assert_eq!(render.eevee_fast_gi_ray_count, Some(2));
+
+            let history = history_record(&source);
+            let (record, warnings) =
+                parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(
+                record.snapshot.scenes[&Id::from_static("scene_main")]
+                    .render
+                    .eevee_use_raytracing,
+                Some(value)
+            );
+            assert_eq!(
+                record.snapshot.scenes[&Id::from_static("scene_main")]
+                    .render
+                    .eevee_raytracing_screen_trace_quality,
+                Some(0.25)
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn schema_seventeen_world_sun_threshold_recovers_or_stays_unknown_only_when_used() -> TestResult
+    {
+        let threshold = f64::from(1.75_f32);
+        let source = schema_seventeen_world_scene("realtime", true, Some(threshold));
+        let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+        assert_eq!(
+            parsed.doc.worlds[&Id::from_static("world_main")].eevee_sun_threshold,
+            Some(threshold)
+        );
+        let world = &parsed.doc.worlds[&Id::from_static("world_main")];
+        assert_eq!(world.eevee_sun_angle, Some(0.25));
+        assert_eq!(world.eevee_use_sun_shadow, Some(false));
+        assert_eq!(
+            world.eevee_sun_shadow_maximum_resolution,
+            Some(f64::from(0.004_f32))
+        );
+        assert_eq!(world.eevee_sun_shadow_jitter_overblur, Some(37.5));
+        assert_eq!(world.eevee_sun_shadow_filter_radius, Some(2.5));
+        assert_eq!(world.eevee_use_sun_shadow_jitter, Some(true));
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+
+        let history = history_record(&source);
+        let (record, history_warnings) =
+            parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert_eq!(history_warnings, Vec::<Value>::new());
+        assert_eq!(
+            record.snapshot.worlds[&Id::from_static("world_main")].eevee_sun_threshold,
+            Some(threshold)
+        );
+        let world = &record.snapshot.worlds[&Id::from_static("world_main")];
+        assert_eq!(world.eevee_sun_angle, Some(0.25));
+        assert_eq!(world.eevee_use_sun_shadow, Some(false));
+        assert_eq!(
+            world.eevee_sun_shadow_maximum_resolution,
+            Some(f64::from(0.004_f32))
+        );
+        assert_eq!(world.eevee_sun_shadow_jitter_overblur, Some(37.5));
+        assert_eq!(world.eevee_sun_shadow_filter_radius, Some(2.5));
+        assert_eq!(world.eevee_use_sun_shadow_jitter, Some(true));
+
+        let unknown = schema_seventeen_world_scene("realtime", true, None);
+        let parsed = parse_scene(&serde_json::to_vec(&unknown)?, no_assets())?;
+        assert_eq!(
+            parsed.doc.worlds[&Id::from_static("world_main")].eevee_sun_threshold,
+            None
+        );
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        assert_eq!(
+            parsed.warnings[0]["code"],
+            "world.eevee_sun_threshold_unavailable_migrated"
+        );
+        assert!(
+            parsed.warnings[0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("not Blender's 10.0 default"))
+        );
+        let history = history_record(&unknown);
+        let (record, history_warnings) =
+            parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert_eq!(history_warnings, parsed.warnings);
+        assert_eq!(
+            record.snapshot.worlds[&Id::from_static("world_main")].eevee_sun_threshold,
+            None
+        );
+
+        for (engine, world_referenced) in [("path", true), ("realtime", false)] {
+            let unused = schema_seventeen_world_scene(engine, world_referenced, None);
+            let parsed = parse_scene(&serde_json::to_vec(&unused)?, no_assets())?;
+            assert_eq!(
+                parsed.doc.worlds[&Id::from_static("world_main")].eevee_sun_threshold,
+                None
+            );
+            assert!(parsed.warnings.iter().all(|warning| {
+                warning["code"] != "world.eevee_sun_threshold_unavailable_migrated"
+            }));
+        }
+        Ok(())
+    }
+    #[test]
+    fn schema_seventeen_world_sun_shadow_values_remain_unknown_unless_retained() -> TestResult {
+        let mut source = schema_seventeen_world_scene("realtime", true, Some(1.75));
+        let raw_world =
+            &mut source["compatibility"]["blender_adapter"]["intermediate"]["scenes"][0]["world"];
+        for field in [
+            "sun_angle",
+            "use_sun_shadow",
+            "sun_shadow_maximum_resolution",
+            "sun_shadow_jitter_overblur",
+            "sun_shadow_filter_radius",
+            "use_sun_shadow_jitter",
+        ] {
+            raw_world[field] = Value::Null;
+        }
+        let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+        let world = &parsed.doc.worlds[&Id::from_static("world_main")];
+        assert_eq!(world.eevee_sun_angle, None);
+        assert_eq!(world.eevee_use_sun_shadow, None);
+        assert_eq!(world.eevee_sun_shadow_maximum_resolution, None);
+        assert_eq!(world.eevee_sun_shadow_jitter_overblur, None);
+        assert_eq!(world.eevee_sun_shadow_filter_radius, None);
+        assert_eq!(world.eevee_use_sun_shadow_jitter, None);
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        assert_eq!(
+            parsed.warnings[0]["code"],
+            "world.eevee_sun_shadow_settings_unavailable_migrated"
+        );
+        let message = parsed.warnings[0]["message"]
+            .as_str()
+            .ok_or("warning message is not a string")?;
+        for field in [
+            "World.sun_angle",
+            "World.use_sun_shadow",
+            "World.sun_shadow_maximum_resolution",
+            "World.sun_shadow_jitter_overblur",
+            "World.sun_shadow_filter_radius",
+            "World.use_sun_shadow_jitter",
+        ] {
+            assert!(message.contains(field), "{message}");
+        }
+        let history = history_record(&source);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert_eq!(warnings, parsed.warnings);
+        let world = &record.snapshot.worlds[&Id::from_static("world_main")];
+        assert_eq!(world.eevee_sun_angle, None);
+        assert_eq!(world.eevee_use_sun_shadow, None);
+        assert_eq!(world.eevee_sun_shadow_maximum_resolution, None);
+        assert_eq!(world.eevee_sun_shadow_jitter_overblur, None);
+        assert_eq!(world.eevee_sun_shadow_filter_radius, None);
+        assert_eq!(world.eevee_use_sun_shadow_jitter, None);
+
+        for (engine, world_referenced) in [("path", true), ("realtime", false)] {
+            let mut unused = schema_seventeen_world_scene(engine, world_referenced, Some(1.75));
+            let raw_world = &mut unused["compatibility"]["blender_adapter"]["intermediate"]["scenes"]
+                [0]["world"];
+            for field in [
+                "sun_angle",
+                "use_sun_shadow",
+                "sun_shadow_maximum_resolution",
+                "sun_shadow_jitter_overblur",
+                "sun_shadow_filter_radius",
+                "use_sun_shadow_jitter",
+            ] {
+                raw_world[field] = Value::Null;
+            }
+            let parsed = parse_scene(&serde_json::to_vec(&unused)?, no_assets())?;
+            assert!(
+                parsed.warnings.iter().all(|warning| {
+                    warning["code"] != "world.eevee_sun_shadow_settings_unavailable_migrated"
+                }),
+                "{:?}",
+                parsed.warnings
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn schema_eighteen_world_sun_shadow_upgrade_preserves_source_hash_and_history() -> TestResult {
+        let threshold = f64::from(1.75_f32);
+        let mut source = schema_seventeen_world_scene("realtime", true, Some(threshold));
+        source["schema_version"] = json!(18);
+        source["worlds"]["world_main"]["eevee_sun_threshold"] = json!(threshold);
+        let expected_hash = crate::hash::sha256(&crate::hash::canonicalize(&source)?);
+        let parsed = parse_scene_with_original_hash(
+            &serde_json::to_vec(&source)?,
+            no_assets(),
+            no_assets(),
+        )?;
+        assert!(parsed.legacy);
+        assert_eq!(parsed.legacy_hash.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(parsed.doc.schema_version, 18);
+        let world = &parsed.doc.worlds[&Id::from_static("world_main")];
+        assert_eq!(world.eevee_sun_angle, Some(0.25));
+        assert_eq!(world.eevee_use_sun_shadow, Some(false));
+        assert_eq!(
+            world.eevee_sun_shadow_maximum_resolution,
+            Some(f64::from(0.004_f32))
+        );
+        assert_eq!(world.eevee_sun_shadow_jitter_overblur, Some(37.5));
+        assert_eq!(world.eevee_sun_shadow_filter_radius, Some(2.5));
+        assert_eq!(world.eevee_use_sun_shadow_jitter, Some(true));
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+
+        let history = history_record(&source);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let world = &record.snapshot.worlds[&Id::from_static("world_main")];
+        assert_eq!(world.eevee_sun_angle, Some(0.25));
+        assert_eq!(world.eevee_use_sun_shadow, Some(false));
+        assert_eq!(
+            world.eevee_sun_shadow_maximum_resolution,
+            Some(f64::from(0.004_f32))
+        );
+        assert_eq!(world.eevee_sun_shadow_jitter_overblur, Some(37.5));
+        assert_eq!(world.eevee_sun_shadow_filter_radius, Some(2.5));
+        assert_eq!(world.eevee_use_sun_shadow_jitter, Some(true));
+        Ok(())
+    }
+    #[test]
+    fn schema_seventeen_and_eighteen_fast_gi_clamp_migrations_preserve_zero_or_unknown()
+    -> TestResult {
+        let mut known = schema_seventeen_probe_scene(true, "realtime", Some(512));
+        known["compatibility"]["blender_adapter"]["intermediate"]["scenes"][0]["eevee_has_local_volume_probe_grids"] =
+            json!(false);
+        let retained =
+            &mut known["compatibility"]["blender_adapter"]["intermediate"]["scenes"][0]["render"];
+        retained["eevee_use_fast_gi"] = json!(true);
+        retained["eevee_clamp_surface_indirect"] = json!(0.0);
+        let parsed = parse_scene(&serde_json::to_vec(&known)?, no_assets())?;
+        assert_eq!(
+            parsed.doc.scenes[&Id::from_static("scene_main")]
+                .render
+                .eevee_clamp_surface_indirect,
+            Some(0.0)
+        );
+        assert_eq!(
+            parsed.doc.scenes[&Id::from_static("scene_main")].eevee_has_local_volume_probe_grids,
+            Some(false)
+        );
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        let history = history_record(&known);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .render
+                .eevee_clamp_surface_indirect,
+            Some(0.0)
+        );
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .eevee_has_local_volume_probe_grids,
+            Some(false)
+        );
+
+        let mut unknown = schema_seventeen_probe_scene(true, "realtime", Some(512));
+        let retained_scene =
+            &mut unknown["compatibility"]["blender_adapter"]["intermediate"]["scenes"][0];
+        retained_scene["render"]["eevee_use_fast_gi"] = json!(true);
+        retained_scene["render"]
+            .as_object_mut()
+            .expect("retained render settings")
+            .remove("eevee_clamp_surface_indirect");
+        retained_scene["eevee_has_local_volume_probe_grids"] = json!(false);
+        let parsed = parse_scene(&serde_json::to_vec(&unknown)?, no_assets())?;
+        assert_eq!(
+            parsed.doc.scenes[&Id::from_static("scene_main")]
+                .render
+                .eevee_clamp_surface_indirect,
+            None
+        );
+        assert_eq!(
+            parsed.doc.scenes[&Id::from_static("scene_main")].eevee_has_local_volume_probe_grids,
+            Some(false)
+        );
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        assert_eq!(
+            parsed.warnings[0]["code"],
+            "render.eevee_clamp_surface_indirect_unavailable_migrated"
+        );
+        let history = history_record(&unknown);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert_eq!(warnings, parsed.warnings);
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .render
+                .eevee_clamp_surface_indirect,
+            None
+        );
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .eevee_has_local_volume_probe_grids,
+            Some(false)
+        );
+
+        unknown["schema_version"] = json!(18);
+        unknown["scenes"]["scene_main"]["render"]["eevee_use_fast_gi"] = json!(true);
+        let expected_hash = crate::hash::sha256(&crate::hash::canonicalize(&unknown)?);
+        let parsed = parse_scene_with_original_hash(
+            &serde_json::to_vec(&unknown)?,
+            no_assets(),
+            no_assets(),
+        )?;
+        assert_eq!(parsed.legacy_hash.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(
+            parsed.doc.scenes[&Id::from_static("scene_main")]
+                .render
+                .eevee_clamp_surface_indirect,
+            None
+        );
+        assert_eq!(
+            parsed.doc.scenes[&Id::from_static("scene_main")].eevee_has_local_volume_probe_grids,
+            Some(false)
+        );
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        let history = history_record(&unknown);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert_eq!(warnings, parsed.warnings);
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .render
+                .eevee_clamp_surface_indirect,
+            None
+        );
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .eevee_has_local_volume_probe_grids,
+            Some(false)
+        );
+        Ok(())
+    }
+    #[test]
+    fn schema_seventeen_and_eighteen_local_grid_marker_preserves_true_false_and_unknown()
+    -> TestResult {
+        let mut known = schema_seventeen_probe_scene(true, "realtime", Some(512));
+        let raw_scene = &mut known["compatibility"]["blender_adapter"]["intermediate"]["scenes"][0];
+        raw_scene["eevee_has_local_volume_probe_grids"] = json!(true);
+        raw_scene["render"]["eevee_use_fast_gi"] = json!(true);
+        raw_scene["render"]["eevee_clamp_surface_indirect"] = json!(10.0);
+        let parsed = parse_scene(&serde_json::to_vec(&known)?, no_assets())?;
+        let scene = &parsed.doc.scenes[&Id::from_static("scene_main")];
+        assert_eq!(scene.eevee_has_local_volume_probe_grids, Some(true));
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        let history = history_record(&known);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .eevee_has_local_volume_probe_grids,
+            Some(true)
+        );
+
+        let mut unknown = schema_seventeen_probe_scene(true, "realtime", Some(512));
+        let raw_scene =
+            &mut unknown["compatibility"]["blender_adapter"]["intermediate"]["scenes"][0];
+        raw_scene["render"]["eevee_use_fast_gi"] = json!(true);
+        raw_scene["render"]["eevee_clamp_surface_indirect"] = json!(10.0);
+        raw_scene
+            .as_object_mut()
+            .expect("retained Scene settings")
+            .remove("eevee_has_local_volume_probe_grids");
+        let parsed = parse_scene(&serde_json::to_vec(&unknown)?, no_assets())?;
+        assert_eq!(
+            parsed.doc.scenes[&Id::from_static("scene_main")].eevee_has_local_volume_probe_grids,
+            None
+        );
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        assert_eq!(
+            parsed.warnings[0]["feature_id"],
+            "render.eevee.world_probe.local_volume_grids"
+        );
+        assert!(
+            parsed.warnings[0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("cache is not exposed through RNA"))
+        );
+        let history = history_record(&unknown);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert_eq!(warnings, parsed.warnings);
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .eevee_has_local_volume_probe_grids,
+            None
+        );
+
+        unknown["schema_version"] = json!(18);
+        unknown["scenes"]["scene_main"]["render"]["eevee_use_fast_gi"] = json!(true);
+        let expected_hash = crate::hash::sha256(&crate::hash::canonicalize(&unknown)?);
+        let parsed = parse_scene_with_original_hash(
+            &serde_json::to_vec(&unknown)?,
+            no_assets(),
+            no_assets(),
+        )?;
+        assert_eq!(parsed.legacy_hash.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(
+            parsed.doc.scenes[&Id::from_static("scene_main")].eevee_has_local_volume_probe_grids,
+            None
+        );
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        let history = history_record(&unknown);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert_eq!(warnings, parsed.warnings);
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .eevee_has_local_volume_probe_grids,
+            None
+        );
+        let native = schema_seventeen_probe_scene(false, "realtime", None);
+        let parsed = parse_scene(&serde_json::to_vec(&native)?, no_assets())?;
+        assert_eq!(
+            parsed.doc.scenes[&Id::from_static("scene_main")].eevee_has_local_volume_probe_grids,
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_seventeen_unknown_raytracing_stays_unknown_for_blender_and_native_scenes()
+    -> TestResult {
+        let imported = schema_seventeen_raytracing_scene(true, "realtime", None);
+        let parsed = parse_scene(&serde_json::to_vec(&imported)?, no_assets())?;
+        let render = &parsed.doc.scenes[&Id::from_static("scene_main")].render;
+        assert!(parsed.legacy);
+        assert_eq!(render.eevee_use_raytracing, None);
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        assert_eq!(
+            parsed.warnings[0]["code"],
+            "render.eevee_raytracing_settings_unavailable_migrated"
+        );
+        assert!(
+            parsed.warnings[0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Reimport"))
+        );
+        assert_eq!(render.eevee_use_fast_gi, Some(false));
+        assert_eq!(
+            render.eevee_raytracing_method,
+            Some(crate::model::EeveeRayTracingMethod::Screen)
+        );
+        let history = history_record(&imported);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .render
+                .eevee_use_raytracing,
+            None
+        );
+        assert_eq!(warnings, parsed.warnings);
+        let mut incomplete = schema_seventeen_raytracing_scene(true, "realtime", Some(true));
+        incomplete["compatibility"]["blender_adapter"]["intermediate"]["scenes"][0]["render"]
+            .as_object_mut()
+            .expect("retained render settings")
+            .remove("eevee_fast_gi_quality");
+        let parsed = parse_scene(&serde_json::to_vec(&incomplete)?, no_assets())?;
+        let render = &parsed.doc.scenes[&Id::from_static("scene_main")].render;
+        assert_eq!(render.eevee_use_raytracing, Some(true));
+        assert_eq!(render.eevee_fast_gi_quality, None);
+        assert!(parsed.warnings.iter().any(|warning| {
+            warning["code"] == "render.eevee_raytracing_settings_unavailable_migrated"
+                && warning["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("eevee_fast_gi_quality"))
+        }));
+        let history = history_record(&incomplete);
+        let (record, warnings) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .render
+                .eevee_fast_gi_quality,
+            None
+        );
+        assert_eq!(warnings, parsed.warnings);
+
+        let native = schema_seventeen_raytracing_scene(false, "realtime", None);
+        let parsed = parse_scene(&serde_json::to_vec(&native)?, no_assets())?;
+        assert!(!parsed.legacy);
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(
+            parsed.doc.scenes[&Id::from_static("scene_main")]
+                .render
+                .eevee_use_raytracing,
+            None
+        );
         Ok(())
     }
 

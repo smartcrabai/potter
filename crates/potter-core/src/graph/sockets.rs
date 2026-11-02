@@ -116,6 +116,20 @@ pub fn is_known_node_type(node_type: &str) -> bool {
             | "ShaderNodeMixShader"
             | "ShaderNodeBsdfPrincipled"
             | "ShaderNodeBsdfDiffuse"
+            | "ShaderNodeBsdfSheen"
+            | "ShaderNodeSubsurfaceScattering"
+            | "ShaderNodeBsdfTranslucent"
+            | "ShaderNodeBsdfRefraction"
+            | "ShaderNodeBsdfToon"
+            | "ShaderNodeBsdfMetallic"
+            | "ShaderNodeBsdfHair"
+            | "ShaderNodeBsdfHairPrincipled"
+            | "ShaderNodeBsdfRayPortal"
+            | "ShaderNodeHoldout"
+            | "ShaderNodeBsdfTransparent"
+            | "ShaderNodeBsdfGlass"
+            | "ShaderNodeBsdfGlossy"
+            | "ShaderNodeBsdfAnisotropic"
             | "ShaderNodeVolumePrincipled"
             | "ShaderNodeVolumeAbsorption"
             | "ShaderNodeVolumeScatter"
@@ -712,11 +726,81 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
             sockets(&[("Color", "color"), ("Strength", "float")]),
             sockets(&[("Emission", "shader")]),
         ),
-        "ShaderNodeBsdfDiffuse" => (
+        "ShaderNodeBsdfSheen" | "ShaderNodeBsdfDiffuse" => (
             sockets(&[
                 ("Color", "color"),
                 ("Roughness", "float"),
                 ("Normal", "vector"),
+            ]),
+            sockets(&[("BSDF", "shader")]),
+        ),
+        "ShaderNodeSubsurfaceScattering" => subsurface_sockets(node),
+        "ShaderNodeBsdfTranslucent" => (
+            sockets(&[("Color", "color"), ("Normal", "vector")]),
+            sockets(&[("BSDF", "shader")]),
+        ),
+        "ShaderNodeBsdfRefraction" => (
+            sockets(&[
+                ("Color", "color"),
+                ("Roughness", "float"),
+                ("IOR", "float"),
+                ("Normal", "vector"),
+            ]),
+            sockets(&[("BSDF", "shader")]),
+        ),
+        "ShaderNodeBsdfToon" => (
+            sockets(&[
+                ("Color", "color"),
+                ("Size", "float"),
+                ("Smooth", "float"),
+                ("Normal", "vector"),
+            ]),
+            sockets(&[("BSDF", "shader")]),
+        ),
+        "ShaderNodeBsdfMetallic" => metallic_sockets(node),
+        "ShaderNodeBsdfHair" => (
+            sockets(&[
+                ("Color", "color"),
+                ("Offset", "float"),
+                ("RoughnessU", "float"),
+                ("RoughnessV", "float"),
+                ("Tangent", "vector"),
+            ]),
+            sockets(&[("BSDF", "shader")]),
+        ),
+        "ShaderNodeBsdfHairPrincipled" => principled_hair_sockets(node),
+        "ShaderNodeBsdfRayPortal" => (
+            sockets(&[
+                ("Color", "color"),
+                ("Position", "vector"),
+                ("Direction", "vector"),
+            ]),
+            sockets(&[("BSDF", "shader")]),
+        ),
+        "ShaderNodeHoldout" => (Vec::new(), sockets(&[("Holdout", "shader")])),
+        "ShaderNodeBsdfTransparent" => (
+            sockets(&[("Color", "color")]),
+            sockets(&[("BSDF", "shader")]),
+        ),
+        "ShaderNodeBsdfGlass" => (
+            sockets(&[
+                ("Color", "color"),
+                ("Roughness", "float"),
+                ("IOR", "float"),
+                ("Normal", "vector"),
+                ("Thin Film Thickness", "float"),
+                ("Thin Film IOR", "float"),
+            ]),
+            sockets(&[("BSDF", "shader")]),
+        ),
+        "ShaderNodeBsdfGlossy" | "ShaderNodeBsdfAnisotropic" => (
+            sockets(&[
+                ("Color", "color"),
+                ("Roughness", "float"),
+                ("Anisotropy", "float"),
+                ("Rotation", "float"),
+                ("Normal", "vector"),
+                ("Tangent", "vector"),
             ]),
             sockets(&[("BSDF", "shader")]),
         ),
@@ -1336,6 +1420,81 @@ fn socket_type(
     }
     None
 }
+fn subsurface_sockets(node: &super::GraphNode) -> SocketPair {
+    let falloff = property_enum(node, "falloff", "RANDOM_WALK");
+    let mut inputs = sockets(&[("Color", "color"), ("Scale", "float"), ("Radius", "vector")]);
+    if falloff != "BURLEY" {
+        inputs.push(("IOR".to_owned(), "float".to_owned()));
+    }
+    if matches!(falloff.as_str(), "RANDOM_WALK" | "RANDOM_WALK_LEGACY") {
+        inputs.push(("Roughness".to_owned(), "float".to_owned()));
+    }
+    if falloff != "BURLEY" {
+        inputs.push(("Anisotropy".to_owned(), "float".to_owned()));
+    }
+    inputs.push(("Normal".to_owned(), "vector".to_owned()));
+    (inputs, sockets(&[("BSSRDF", "shader")]))
+}
+
+fn metallic_sockets(node: &super::GraphNode) -> SocketPair {
+    let physical_conductor = property_enum(node, "fresnel_type", "F82") == "PHYSICAL_CONDUCTOR";
+    let mut inputs = if physical_conductor {
+        sockets(&[("IOR", "vector"), ("Extinction", "vector")])
+    } else {
+        sockets(&[("Base Color", "color"), ("Edge Tint", "color")])
+    };
+    inputs.extend(sockets(&[
+        ("Roughness", "float"),
+        ("Anisotropy", "float"),
+        ("Rotation", "float"),
+        ("Normal", "vector"),
+        ("Tangent", "vector"),
+        ("Thin Film Thickness", "float"),
+        ("Thin Film IOR", "float"),
+    ]));
+    (inputs, sockets(&[("BSDF", "shader")]))
+}
+
+fn principled_hair_sockets(node: &super::GraphNode) -> SocketPair {
+    let model = property_enum(node, "model", "CHIANG");
+    let parametrization = property_enum(node, "parametrization", "COLOR");
+    let melanin = parametrization == "MELANIN";
+    let mut inputs = Vec::new();
+    match parametrization.as_str() {
+        "COLOR" => inputs.extend(sockets(&[("Color", "color")])),
+        "MELANIN" => inputs.extend(sockets(&[
+            ("Melanin", "float"),
+            ("Melanin Redness", "float"),
+            ("Tint", "color"),
+        ])),
+        "ABSORPTION" => inputs.extend(sockets(&[("Absorption Coefficient", "vector")])),
+        _ => {}
+    }
+    if model == "HUANG" {
+        inputs.push(("Aspect Ratio".to_owned(), "float".to_owned()));
+    }
+    inputs.push(("Roughness".to_owned(), "float".to_owned()));
+    if model == "CHIANG" {
+        inputs.extend(sockets(&[("Radial Roughness", "float"), ("Coat", "float")]));
+    }
+    inputs.extend(sockets(&[("IOR", "float"), ("Offset", "float")]));
+    if melanin {
+        inputs.push(("Random Color".to_owned(), "float".to_owned()));
+    }
+    inputs.extend(sockets(&[
+        ("Random Roughness", "float"),
+        ("Random", "float"),
+    ]));
+    if model == "HUANG" {
+        inputs.extend(sockets(&[
+            ("R lobe", "float"),
+            ("TT lobe", "float"),
+            ("TRT lobe", "float"),
+        ]));
+    }
+    (inputs, sockets(&[("BSDF", "shader")]))
+}
+
 fn procedural_texture_input_available(node: &super::GraphNode, socket: &str) -> bool {
     match node.node_type.as_str() {
         "ShaderNodeTexWhiteNoise" => {

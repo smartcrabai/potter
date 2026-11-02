@@ -2,7 +2,10 @@ use serde_json::{Map, Value};
 
 use crate::{
     error::{ErrorCode, Result},
-    model::{CyclesCurveShape, EEVEE_GI_CUBEMAP_RESOLUTIONS, PixelFilterType},
+    model::{
+        CyclesCurveShape, EEVEE_GI_CUBEMAP_RESOLUTIONS, EEVEE_RAYTRACING_RESOLUTION_SCALES,
+        EeveeFastGiMethod, EeveeRayTracingMethod, PixelFilterType,
+    },
 };
 
 use super::{ChangeKind, Engine, check_fields, operation_pointer, parse_id, pointer_escape};
@@ -32,7 +35,29 @@ const SET_FIELDS: &[&str] = &[
     "max_subdivisions",
     "cycles_curves_shape",
     "cycles_curves_subdivisions",
+    "eevee_clamp_surface_indirect",
     "eevee_gi_cubemap_resolution",
+    "eevee_use_raytracing",
+    "eevee_use_fast_gi",
+    "eevee_raytracing_method",
+    "eevee_raytracing_resolution_scale",
+    "eevee_raytracing_screen_trace_quality",
+    "eevee_raytracing_screen_trace_thickness",
+    "eevee_raytracing_trace_max_roughness",
+    "eevee_raytracing_use_backface_hit",
+    "eevee_raytracing_backface_radiance_scale",
+    "eevee_raytracing_use_denoise",
+    "eevee_raytracing_denoise_spatial",
+    "eevee_raytracing_denoise_temporal",
+    "eevee_raytracing_denoise_bilateral",
+    "eevee_fast_gi_bias",
+    "eevee_fast_gi_resolution",
+    "eevee_fast_gi_step_count",
+    "eevee_fast_gi_ray_count",
+    "eevee_fast_gi_quality",
+    "eevee_fast_gi_distance",
+    "eevee_fast_gi_thickness_near",
+    "eevee_fast_gi_method",
     "offscreen_dicing_scale",
     "eevee_use_volumetric_shadows",
     "eevee_volumetric_tile_size",
@@ -247,6 +272,129 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
             Ok(Some(resolution))
         })
         .transpose()?;
+    let eevee_use_raytracing = optional_nullable_bool(engine, set, "eevee_use_raytracing")?;
+    let eevee_use_fast_gi = optional_nullable_bool(engine, set, "eevee_use_fast_gi")?;
+    let eevee_raytracing_method = set
+        .get("eevee_raytracing_method")
+        .map(|value| {
+            if value.is_null() {
+                return Ok(None);
+            }
+            match value.as_str() {
+                Some("probe") => Ok(Some(EeveeRayTracingMethod::Probe)),
+                Some("screen") => Ok(Some(EeveeRayTracingMethod::Screen)),
+                _ => Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    "eevee_raytracing_method must be null, probe, or screen",
+                    &operation_pointer(engine.operation_index, "set/eevee_raytracing_method"),
+                )),
+            }
+        })
+        .transpose()?;
+    let eevee_raytracing_resolution_scale =
+        optional_nullable_u32(engine, set, "eevee_raytracing_resolution_scale", 1, 16)?;
+    if matches!(
+        eevee_raytracing_resolution_scale,
+        OptionalUpdate::Set(value) if !EEVEE_RAYTRACING_RESOLUTION_SCALES.contains(&value)
+    ) {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "eevee_raytracing_resolution_scale must be 1, 2, 4, 8, or 16",
+            &operation_pointer(
+                engine.operation_index,
+                "set/eevee_raytracing_resolution_scale",
+            ),
+        ));
+    }
+    let eevee_raytracing_screen_trace_quality = optional_nullable_f64(
+        engine,
+        set,
+        "eevee_raytracing_screen_trace_quality",
+        0.0,
+        1.0,
+    )?;
+    let eevee_raytracing_screen_trace_thickness = optional_nullable_f64(
+        engine,
+        set,
+        "eevee_raytracing_screen_trace_thickness",
+        1e-6,
+        f32::MAX as f64,
+    )?;
+    let eevee_raytracing_trace_max_roughness = optional_nullable_f64(
+        engine,
+        set,
+        "eevee_raytracing_trace_max_roughness",
+        0.0,
+        1.0,
+    )?;
+    let eevee_raytracing_use_backface_hit =
+        optional_nullable_bool(engine, set, "eevee_raytracing_use_backface_hit")?;
+    let eevee_raytracing_backface_radiance_scale = optional_nullable_f64(
+        engine,
+        set,
+        "eevee_raytracing_backface_radiance_scale",
+        0.0,
+        1.0,
+    )?;
+    let eevee_raytracing_use_denoise =
+        optional_nullable_bool(engine, set, "eevee_raytracing_use_denoise")?;
+    let eevee_raytracing_denoise_spatial =
+        optional_nullable_bool(engine, set, "eevee_raytracing_denoise_spatial")?;
+    let eevee_raytracing_denoise_temporal =
+        optional_nullable_bool(engine, set, "eevee_raytracing_denoise_temporal")?;
+    let eevee_raytracing_denoise_bilateral =
+        optional_nullable_bool(engine, set, "eevee_raytracing_denoise_bilateral")?;
+    let eevee_fast_gi_bias = optional_nullable_f64(engine, set, "eevee_fast_gi_bias", 0.0, 1.0)?;
+    let eevee_fast_gi_resolution =
+        optional_nullable_u32(engine, set, "eevee_fast_gi_resolution", 1, 16)?;
+    if matches!(
+        eevee_fast_gi_resolution,
+        OptionalUpdate::Set(value) if !EEVEE_RAYTRACING_RESOLUTION_SCALES.contains(&value)
+    ) {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "eevee_fast_gi_resolution must be 1, 2, 4, 8, or 16",
+            &operation_pointer(engine.operation_index, "set/eevee_fast_gi_resolution"),
+        ));
+    }
+    let eevee_fast_gi_step_count =
+        optional_nullable_u32(engine, set, "eevee_fast_gi_step_count", 1, 64)?;
+    let eevee_fast_gi_ray_count =
+        optional_nullable_u32(engine, set, "eevee_fast_gi_ray_count", 1, 16)?;
+    let eevee_fast_gi_quality =
+        optional_nullable_f64(engine, set, "eevee_fast_gi_quality", 0.0, 1.0)?;
+    let eevee_fast_gi_distance =
+        optional_nullable_f64(engine, set, "eevee_fast_gi_distance", 0.0, 100_000.0)?;
+    let eevee_fast_gi_thickness_near =
+        optional_nullable_f64(engine, set, "eevee_fast_gi_thickness_near", 0.0, 100_000.0)?;
+    let eevee_fast_gi_method = set
+        .get("eevee_fast_gi_method")
+        .map(|value| {
+            if value.is_null() {
+                return Ok(None);
+            }
+            match value.as_str() {
+                Some("ambient_occlusion_only") => {
+                    Ok(Some(EeveeFastGiMethod::AmbientOcclusionOnly))
+                }
+                Some("global_illumination") => {
+                    Ok(Some(EeveeFastGiMethod::GlobalIllumination))
+                }
+                _ => Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    "eevee_fast_gi_method must be null, ambient_occlusion_only, or global_illumination",
+                    &operation_pointer(engine.operation_index, "set/eevee_fast_gi_method"),
+                )),
+            }
+        })
+        .transpose()?;
+    let eevee_clamp_surface_indirect = optional_nullable_f64(
+        engine,
+        set,
+        "eevee_clamp_surface_indirect",
+        0.0,
+        f32::MAX as f64,
+    )?;
     let offscreen_dicing_scale =
         optional_f64(engine, set, "offscreen_dicing_scale", 1.0, f32::MAX as f64)?;
     let dicing_camera = set
@@ -515,6 +663,41 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         if let Some(value) = eevee_gi_cubemap_resolution {
             scene.render.eevee_gi_cubemap_resolution = value;
         }
+        eevee_use_raytracing.apply_to(&mut scene.render.eevee_use_raytracing);
+        eevee_use_fast_gi.apply_to(&mut scene.render.eevee_use_fast_gi);
+        if let Some(value) = eevee_raytracing_method {
+            scene.render.eevee_raytracing_method = value;
+        }
+        eevee_raytracing_resolution_scale
+            .apply_to(&mut scene.render.eevee_raytracing_resolution_scale);
+        eevee_raytracing_screen_trace_quality
+            .apply_to(&mut scene.render.eevee_raytracing_screen_trace_quality);
+        eevee_raytracing_screen_trace_thickness
+            .apply_to(&mut scene.render.eevee_raytracing_screen_trace_thickness);
+        eevee_raytracing_trace_max_roughness
+            .apply_to(&mut scene.render.eevee_raytracing_trace_max_roughness);
+        eevee_raytracing_use_backface_hit
+            .apply_to(&mut scene.render.eevee_raytracing_use_backface_hit);
+        eevee_raytracing_backface_radiance_scale
+            .apply_to(&mut scene.render.eevee_raytracing_backface_radiance_scale);
+        eevee_raytracing_use_denoise.apply_to(&mut scene.render.eevee_raytracing_use_denoise);
+        eevee_raytracing_denoise_spatial
+            .apply_to(&mut scene.render.eevee_raytracing_denoise_spatial);
+        eevee_raytracing_denoise_temporal
+            .apply_to(&mut scene.render.eevee_raytracing_denoise_temporal);
+        eevee_raytracing_denoise_bilateral
+            .apply_to(&mut scene.render.eevee_raytracing_denoise_bilateral);
+        eevee_fast_gi_bias.apply_to(&mut scene.render.eevee_fast_gi_bias);
+        eevee_fast_gi_resolution.apply_to(&mut scene.render.eevee_fast_gi_resolution);
+        eevee_fast_gi_step_count.apply_to(&mut scene.render.eevee_fast_gi_step_count);
+        eevee_fast_gi_ray_count.apply_to(&mut scene.render.eevee_fast_gi_ray_count);
+        eevee_fast_gi_quality.apply_to(&mut scene.render.eevee_fast_gi_quality);
+        eevee_fast_gi_distance.apply_to(&mut scene.render.eevee_fast_gi_distance);
+        eevee_fast_gi_thickness_near.apply_to(&mut scene.render.eevee_fast_gi_thickness_near);
+        eevee_clamp_surface_indirect.apply_to(&mut scene.render.eevee_clamp_surface_indirect);
+        if let Some(value) = eevee_fast_gi_method {
+            scene.render.eevee_fast_gi_method = value;
+        }
         if let Some(value) = offscreen_dicing_scale {
             scene.render.offscreen_dicing_scale = value;
         }
@@ -586,6 +769,96 @@ fn optional_f64(
         .transpose()
 }
 
+#[derive(Clone, Copy)]
+enum OptionalUpdate<T> {
+    Unchanged,
+    Clear,
+    Set(T),
+}
+
+impl<T> OptionalUpdate<T> {
+    fn apply_to(self, target: &mut Option<T>) {
+        match self {
+            Self::Unchanged => {}
+            Self::Clear => *target = None,
+            Self::Set(value) => *target = Some(value),
+        }
+    }
+}
+
+fn optional_nullable_bool(
+    engine: &Engine<'_>,
+    set: &Map<String, Value>,
+    key: &str,
+) -> Result<OptionalUpdate<bool>> {
+    let Some(value) = set.get(key) else {
+        return Ok(OptionalUpdate::Unchanged);
+    };
+    if value.is_null() {
+        return Ok(OptionalUpdate::Clear);
+    }
+    value.as_bool().map(OptionalUpdate::Set).ok_or_else(|| {
+        engine.error(
+            ErrorCode::InvalidOperation,
+            format!("{key} must be a boolean or null"),
+            &operation_pointer(engine.operation_index, &format!("set/{key}")),
+        )
+    })
+}
+
+fn optional_nullable_f64(
+    engine: &Engine<'_>,
+    set: &Map<String, Value>,
+    key: &str,
+    minimum: f64,
+    maximum: f64,
+) -> Result<OptionalUpdate<f64>> {
+    let Some(value) = set.get(key) else {
+        return Ok(OptionalUpdate::Unchanged);
+    };
+    if value.is_null() {
+        return Ok(OptionalUpdate::Clear);
+    }
+    value
+        .as_f64()
+        .filter(|number| number.is_finite() && (minimum..=maximum).contains(number))
+        .map(OptionalUpdate::Set)
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                format!("{key} must be finite, null, or in {minimum}..={maximum}"),
+                &operation_pointer(engine.operation_index, &format!("set/{key}")),
+            )
+        })
+}
+
+fn optional_nullable_u32(
+    engine: &Engine<'_>,
+    set: &Map<String, Value>,
+    key: &str,
+    minimum: u32,
+    maximum: u32,
+) -> Result<OptionalUpdate<u32>> {
+    let Some(value) = set.get(key) else {
+        return Ok(OptionalUpdate::Unchanged);
+    };
+    if value.is_null() {
+        return Ok(OptionalUpdate::Clear);
+    }
+    value
+        .as_u64()
+        .and_then(|number| u32::try_from(number).ok())
+        .filter(|number| (minimum..=maximum).contains(number))
+        .map(OptionalUpdate::Set)
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                format!("{key} must be null or an integer in {minimum}..={maximum}"),
+                &operation_pointer(engine.operation_index, &format!("set/{key}")),
+            )
+        })
+}
+
 fn optional_positive_f64(
     engine: &Engine<'_>,
     set: &Map<String, Value>,
@@ -609,12 +882,11 @@ fn optional_positive_f64(
 
 #[cfg(test)]
 mod tests {
-    #![expect(clippy::expect_used, reason = "render operation tests")]
     use serde_json::json;
 
     use crate::{
         error::ErrorCode,
-        model::{CyclesCurveShape, Id, SceneDoc},
+        model::{CyclesCurveShape, EeveeFastGiMethod, EeveeRayTracingMethod, Id, SceneDoc},
         ops::apply_batch,
     };
 
@@ -660,20 +932,24 @@ mod tests {
         assert_eq!(render.cycles_curves_shape, None);
         assert_eq!(render.cycles_curves_subdivisions, None);
 
-        let error = apply_batch(
-            &doc,
-            &json!({
-                "schema_version": 1,
-                "base_revision": 0,
-                "operations": [{
-                    "op": "render.update",
-                    "target": {"id": "scene_main"},
-                    "set": {"cycles_curves_subdivisions": 25}
-                }]
-            }),
-        )
-        .expect_err("subdivisions beyond Blender's RNA range must be rejected");
-        assert_eq!(error.code, ErrorCode::InvalidOperation);
+        assert!(
+            matches!(
+                apply_batch(
+                    &doc,
+                    &json!({
+                        "schema_version": 1,
+                        "base_revision": 0,
+                        "operations": [{
+                            "op": "render.update",
+                            "target": {"id": "scene_main"},
+                            "set": {"cycles_curves_subdivisions": 25}
+                        }]
+                    }),
+                ),
+                Err(error) if error.code == ErrorCode::InvalidOperation
+            ),
+            "subdivisions beyond Blender's RNA range must be rejected"
+        );
         Ok(())
     }
     #[test]
@@ -719,7 +995,78 @@ mod tests {
             None
         );
 
-        let error = apply_batch(
+        assert!(
+            matches!(
+                apply_batch(
+                    &doc,
+                    &json!({
+                        "schema_version": 1,
+                        "base_revision": 0,
+                        "operations": [{
+                            "op": "render.update",
+                            "target": {"id": "scene_main"},
+                            "set": {"eevee_gi_cubemap_resolution": 2049}
+                        }]
+                    }),
+                ),
+                Err(error) if error.code == ErrorCode::InvalidOperation
+            ),
+            "unsupported Blender enum values must be rejected"
+        );
+        Ok(())
+    }
+    #[test]
+    fn eevee_raytracing_render_update_sets_clears_and_validates() -> crate::error::Result<()> {
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let scene_id = Id::from_static("scene_main");
+        for (value, expected) in [
+            (json!(true), Some(true)),
+            (json!(false), Some(false)),
+            (json!(null), None),
+        ] {
+            let updated = apply_batch(
+                &doc,
+                &json!({
+                    "schema_version": 1,
+                    "base_revision": 0,
+                    "operations": [{
+                        "op": "render.update",
+                        "target": {"id": "scene_main"},
+                        "set": {"eevee_use_raytracing": value}
+                    }]
+                }),
+            )?;
+            assert_eq!(
+                updated.doc.scenes[&scene_id].render.eevee_use_raytracing,
+                expected
+            );
+        }
+
+        assert!(
+            matches!(
+                apply_batch(
+                    &doc,
+                    &json!({
+                        "schema_version": 1,
+                        "base_revision": 0,
+                        "operations": [{
+                            "op": "render.update",
+                            "target": {"id": "scene_main"},
+                            "set": {"eevee_use_raytracing": 1}
+                        }]
+                    }),
+                ),
+                Err(error) if error.code == ErrorCode::InvalidOperation
+            ),
+            "non-boolean raytracing values must be rejected"
+        );
+        Ok(())
+    }
+    #[test]
+    fn eevee_raytracing_and_fast_gi_render_update_sets_clears_and_validates()
+    -> crate::error::Result<()> {
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let updated = apply_batch(
             &doc,
             &json!({
                 "schema_version": 1,
@@ -727,12 +1074,101 @@ mod tests {
                 "operations": [{
                     "op": "render.update",
                     "target": {"id": "scene_main"},
-                    "set": {"eevee_gi_cubemap_resolution": 2049}
+                    "set": {
+                        "eevee_use_raytracing": true,
+                        "eevee_use_fast_gi": false,
+                        "eevee_raytracing_method": "screen",
+                        "eevee_raytracing_resolution_scale": 4,
+                        "eevee_raytracing_screen_trace_quality": 0.4,
+                        "eevee_raytracing_screen_trace_thickness": 0.25,
+                        "eevee_raytracing_trace_max_roughness": 0.75,
+                        "eevee_raytracing_use_backface_hit": false,
+                        "eevee_raytracing_backface_radiance_scale": 0.4,
+                        "eevee_raytracing_use_denoise": true,
+                        "eevee_raytracing_denoise_spatial": false,
+                        "eevee_raytracing_denoise_temporal": true,
+                        "eevee_raytracing_denoise_bilateral": false,
+                        "eevee_fast_gi_bias": 0.2,
+                        "eevee_fast_gi_resolution": 8,
+                        "eevee_fast_gi_step_count": 32,
+                        "eevee_fast_gi_ray_count": 5,
+                        "eevee_fast_gi_quality": 0.7,
+                        "eevee_fast_gi_distance": 200.0,
+                        "eevee_fast_gi_thickness_near": 0.3,
+                        "eevee_fast_gi_method": "ambient_occlusion_only"
+                    }
                 }]
             }),
-        )
-        .expect_err("unsupported Blender enum values must be rejected");
-        assert_eq!(error.code, ErrorCode::InvalidOperation);
+        )?;
+        let render = &updated.doc.scenes[&Id::from_static("scene_main")].render;
+        assert_eq!(render.eevee_use_raytracing, Some(true));
+        assert_eq!(render.eevee_use_fast_gi, Some(false));
+        assert_eq!(
+            render.eevee_raytracing_method,
+            Some(EeveeRayTracingMethod::Screen)
+        );
+        assert_eq!(render.eevee_raytracing_resolution_scale, Some(4));
+        assert_eq!(
+            render.eevee_fast_gi_method,
+            Some(EeveeFastGiMethod::AmbientOcclusionOnly)
+        );
+        assert_eq!(render.eevee_fast_gi_ray_count, Some(5));
+        let omitted = apply_batch(
+            &updated.doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": updated.doc.revision,
+                "operations": [{
+                    "op": "render.update",
+                    "target": {"id": "scene_main"},
+                    "set": {"eevee_fast_gi_method": "global_illumination"}
+                }]
+            }),
+        )?;
+        let render = &omitted.doc.scenes[&Id::from_static("scene_main")].render;
+        assert_eq!(render.eevee_use_raytracing, Some(true));
+        assert_eq!(render.eevee_raytracing_resolution_scale, Some(4));
+        assert_eq!(render.eevee_fast_gi_bias, Some(0.2));
+
+        let cleared = apply_batch(
+            &updated.doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": updated.doc.revision,
+                "operations": [{
+                    "op": "render.update",
+                    "target": {"id": "scene_main"},
+                    "set": {
+                        "eevee_use_raytracing": null,
+                        "eevee_raytracing_resolution_scale": null,
+                        "eevee_fast_gi_method": null
+                    }
+                }]
+            }),
+        )?;
+        let render = &cleared.doc.scenes[&Id::from_static("scene_main")].render;
+        assert_eq!(render.eevee_use_raytracing, None);
+        assert_eq!(render.eevee_raytracing_resolution_scale, None);
+        assert_eq!(render.eevee_fast_gi_method, None);
+
+        assert!(
+            matches!(
+                apply_batch(
+                    &doc,
+                    &json!({
+                        "schema_version": 1,
+                        "base_revision": 0,
+                        "operations": [{
+                            "op": "render.update",
+                            "target": {"id": "scene_main"},
+                            "set": {"eevee_raytracing_resolution_scale": 3}
+                        }]
+                    }),
+                ),
+                Err(error) if error.code == ErrorCode::InvalidOperation
+            ),
+            "unsupported ray-tracing resolutions must be rejected"
+        );
         Ok(())
     }
 }

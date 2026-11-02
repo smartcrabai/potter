@@ -1498,10 +1498,6 @@ impl HairBvh {
     }
 
     /// Traverses spline control-hull bounds and invokes the exact per-curve intersection for candidates.
-    #[expect(
-        clippy::float_cmp,
-        reason = "identical hit parameters use stable curve-and-span tie-breaking"
-    )]
     pub(crate) fn closest_spline_hit(
         &self,
         curve_count: usize,
@@ -1557,7 +1553,7 @@ impl HairBvh {
                         };
                         if closest.is_none_or(|(previous_curve, previous_span, previous_hit)| {
                             hit.distance < previous_hit.distance
-                                || (hit.distance == previous_hit.distance
+                                || (crate::float::equal_f64(hit.distance, previous_hit.distance)
                                     && (curve_index, span_index) < (previous_curve, previous_span))
                         }) {
                             closest = Some((curve_index, span_index, hit));
@@ -1663,10 +1659,6 @@ fn build_hair_node(
 
 #[cfg(test)]
 mod tests {
-    #![expect(
-        clippy::unwrap_used,
-        reason = "valid curve fixtures are required for hit assertions"
-    )]
     use super::{
         CurveKey, HairBvh, HairCurveGeometry, HairCurveRenderMode, HairCurveShape,
         catmull_rom_curve_intersect, linear_curve_intersect,
@@ -1674,7 +1666,7 @@ mod tests {
     use glam::{DMat4, DVec3};
 
     #[test]
-    fn intersects_segment_center_and_start_cap() {
+    fn intersects_segment_center_and_start_cap() -> Result<(), &'static str> {
         let start = CurveKey {
             position: DVec3::ZERO,
             radius: 1.0,
@@ -1692,7 +1684,7 @@ mod tests {
             0.0,
             f64::INFINITY,
         )
-        .unwrap();
+        .ok_or("expected center intersection")?;
         assert!((center.distance - 1.0).abs() < 1.0e-12);
         assert!((center.u - 0.5).abs() < 1.0e-12);
         assert!((center.geometric_normal - DVec3::X).length() < 1.0e-12);
@@ -1704,14 +1696,15 @@ mod tests {
             0.0,
             f64::INFINITY,
         )
-        .unwrap();
+        .ok_or("expected start-cap intersection")?;
         assert!((cap.distance - (2.0 - 0.75_f64.sqrt())).abs() < 1.0e-12);
         assert_eq!(cap.u, 0.0);
         assert!((cap.geometric_normal - DVec3::new(0.75_f64.sqrt(), 0.0, -0.5)).length() < 1.0e-12);
+        Ok(())
     }
 
     #[test]
-    fn intersects_catmull_rom_center() {
+    fn intersects_catmull_rom_center() -> Result<(), &'static str> {
         let keys = [
             CurveKey {
                 position: DVec3::new(0.0, 0.0, -1.0),
@@ -1737,14 +1730,15 @@ mod tests {
             0.0,
             f64::INFINITY,
         )
-        .unwrap();
+        .ok_or("expected Catmull-Rom intersection")?;
         assert!((hit.distance - 1.0).abs() < 1.0e-3);
         assert!((hit.u - 0.5).abs() < 1.0e-3);
         assert!((hit.geometric_normal - DVec3::X).length() < 1.0e-3);
+        Ok(())
     }
 
     #[test]
-    fn ribbon_intersection_preserves_v_and_shading_normal() {
+    fn ribbon_intersection_preserves_v_and_shading_normal() -> Result<(), &'static str> {
         let keys = [
             CurveKey {
                 position: DVec3::ZERO,
@@ -1776,7 +1770,7 @@ mod tests {
         assert!(curve.is_ribbon());
         let (span, hit) = curve
             .closest_hit_world(DVec3::new(2.0, 0.1, 0.5), -DVec3::X, 0.0, f64::INFINITY)
-            .unwrap();
+            .ok_or("expected ribbon intersection")?;
         assert_eq!(span, 0);
         assert!((hit.distance - 2.0).abs() < 1.0e-10);
         assert!((hit.u - 0.5).abs() < 1.0e-10);
@@ -1785,7 +1779,7 @@ mod tests {
 
         let shading_normal = curve
             .ribbon_shading_normal_world(0, hit.u, hit.v, -DVec3::X)
-            .unwrap();
+            .ok_or("expected ribbon shading normal")?;
         let expected = DVec3::X * 0.75_f64.sqrt() + DVec3::Y * 0.5;
         assert!((shading_normal - expected).length() < 1.0e-10);
         let scale = DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0));
@@ -1794,10 +1788,11 @@ mod tests {
         scaled_curve.world_to_object = scale.inverse();
         let transformed_normal = scaled_curve
             .ribbon_shading_normal_world(0, hit.u, hit.v, -DVec3::X)
-            .unwrap();
+            .ok_or("expected transformed ribbon shading normal")?;
         let expected_transformed =
             (DVec3::X * (0.75_f64.sqrt() / 2.0) + DVec3::Y * 0.5).normalize();
         assert!((transformed_normal - expected_transformed).length() < 1.0e-10);
+        Ok(())
     }
     #[test]
     fn ribbon_subdivision_level_matches_cycles_power_of_two_clamp() {
@@ -1811,7 +1806,7 @@ mod tests {
     }
 
     #[test]
-    fn thick_linear_intersection_keeps_radial_normal_and_zero_v() {
+    fn thick_linear_intersection_keeps_radial_normal_and_zero_v() -> Result<(), &'static str> {
         let start = CurveKey {
             position: DVec3::ZERO,
             radius: 0.2,
@@ -1833,7 +1828,7 @@ mod tests {
         assert!(!curve.is_ribbon());
         let (_, hit) = curve
             .closest_hit_world(DVec3::new(2.0, 0.1, 0.5), -DVec3::X, 0.0, f64::INFINITY)
-            .unwrap();
+            .ok_or("expected thick-linear intersection")?;
         assert_eq!(hit.v, 0.0);
         let expected_radial = DVec3::new(0.75_f64.sqrt(), 0.5, 0.0) * 0.2;
         assert!((hit.geometric_normal - expected_radial).length() < 1.0e-10);
@@ -1842,9 +1837,11 @@ mod tests {
                 .ribbon_shading_normal_world(0, hit.u, hit.v, -DVec3::X)
                 .is_none()
         );
+        Ok(())
     }
     #[test]
-    fn affine_catmull_rom_intersection_keeps_local_radius_and_unnormalized_geometric_normal() {
+    fn affine_catmull_rom_intersection_keeps_local_radius_and_unnormalized_geometric_normal()
+    -> Result<(), &'static str> {
         let scale = DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0));
         let keys = [
             CurveKey {
@@ -1881,12 +1878,13 @@ mod tests {
                 0.0,
                 f64::INFINITY,
             )
-            .unwrap();
+            .ok_or("expected affine Catmull-Rom intersection")?;
         assert!((hit.distance - 2.0).abs() < 1.0e-10);
         assert!((hit.geometric_normal - DVec3::X * (2.0 / 9.0)).length() < 1.0e-10);
+        Ok(())
     }
     #[test]
-    fn spline_bvh_intersects_affine_catmull_rom_with_local_radius() {
+    fn spline_bvh_intersects_affine_catmull_rom_with_local_radius() -> Result<(), &'static str> {
         let transform = DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0));
         let keys = [
             CurveKey {
@@ -1937,7 +1935,7 @@ mod tests {
                         .flatten()
                 },
             )
-            .unwrap();
+            .ok_or("expected affine Catmull-Rom BVH intersection")?;
         assert_eq!((closest.0, closest.1), (0, 1));
         assert!((closest.2.distance - 0.8).abs() < 1.0e-10);
         assert!(
@@ -1951,9 +1949,10 @@ mod tests {
             )
             .is_none()
         );
+        Ok(())
     }
     #[test]
-    fn linear_render_curve_shadow_bake_uses_thick_catmull_frame() {
+    fn linear_render_curve_shadow_bake_uses_thick_catmull_frame() -> Result<(), &'static str> {
         let keys = [
             CurveKey {
                 position: DVec3::ZERO,
@@ -1979,12 +1978,19 @@ mod tests {
             world_to_object: DMat4::IDENTITY,
         };
         assert_eq!(
-            curve.sample_local(1, 0.0).unwrap().tangent,
+            curve
+                .sample_local(1, 0.0)
+                .ok_or("expected local sample")?
+                .tangent,
             DVec3::new(1.0, 0.0, -1.0)
         );
         assert_eq!(
-            curve.sample_local_for_shadow_bake(1, 0.0).unwrap().tangent,
+            curve
+                .sample_local_for_shadow_bake(1, 0.0)
+                .ok_or("expected shadow-bake local sample")?
+                .tangent,
             DVec3::X
         );
+        Ok(())
     }
 }

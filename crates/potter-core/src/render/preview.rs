@@ -25,7 +25,8 @@ use super::{
         rasterize_with_lines,
     },
     scene::{
-        Geometry, extract_geometry_with_semantics, surface_shader, surface_shader_with_semantics,
+        Geometry, extract_geometry_with_semantics, scene_shader_with_semantics, surface_shader,
+        surface_shader_with_semantics,
     },
     wireframe,
 };
@@ -387,19 +388,23 @@ pub(crate) fn render_camera_frame(
     };
     let camera = stored_camera(doc, &snapshot, camera_id, engine_for_camera)?;
     let view = ViewBasis::from_camera(&camera.camera)?;
-    let shader = surface_shader_with_semantics(
-        doc,
-        &snapshot,
-        &images,
-        &geometry,
-        mode,
-        &view,
-        if engine == "realtime" && matches!(mode, Mode::Beauty) {
-            crate::node_kernels::MathSemantics::Eevee
-        } else {
-            crate::node_kernels::MathSemantics::Cycles
-        },
-    );
+    let is_realtime_beauty = engine == "realtime" && matches!(mode, Mode::Beauty);
+    let shader_math_semantics = if is_realtime_beauty {
+        crate::node_kernels::MathSemantics::Eevee
+    } else {
+        crate::node_kernels::MathSemantics::Cycles
+    };
+    let realtime_scene_shader = is_realtime_beauty.then(|| {
+        scene_shader_with_semantics(
+            doc,
+            &snapshot,
+            &images,
+            &geometry,
+            mode,
+            &view,
+            shader_math_semantics,
+        )
+    });
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)
@@ -434,16 +439,29 @@ pub(crate) fn render_camera_frame(
             )
         }
     });
-    let realtime_volume_transport = if engine == "realtime" && matches!(mode, Mode::Beauty) {
+    let realtime_volume_transport = if is_realtime_beauty {
         super::path::prepare_realtime_volume_transport(
             doc,
             &snapshot,
             &geometry,
             &images,
             &geometry.shader_warnings,
+            realtime_scene_shader.as_ref(),
         )?
     } else {
         None
+    };
+    let shader = match realtime_scene_shader {
+        Some(scene_shader) => scene_shader.into_surface_shader(),
+        None => surface_shader_with_semantics(
+            doc,
+            &snapshot,
+            &images,
+            &geometry,
+            mode,
+            &view,
+            shader_math_semantics,
+        ),
     };
     let realtime_camera_lights = if engine == "realtime" && matches!(mode, Mode::Beauty) {
         Some(super::path::prepare_realtime_camera_light_context(

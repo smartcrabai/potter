@@ -64,6 +64,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "emission_color",
             "emission_strength",
             "transmission",
+            "use_raytrace_refraction",
             "ior",
             "thickness_mode",
             "graph",
@@ -214,6 +215,13 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     if let Some(value) = operation.get("transmission") {
         material.transmission = read_unit_interval(engine, value, "transmission")?;
     }
+    if let Some(value) = operation.get("use_raytrace_refraction") {
+        material.use_raytrace_refraction = read_nullable_bool(
+            engine,
+            value,
+            &operation_pointer(engine.operation_index, "use_raytrace_refraction"),
+        )?;
+    }
     if let Some(value) = operation.get("thickness_mode") {
         material.thickness_mode = parse_thickness_mode(
             engine,
@@ -306,6 +314,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "emission_color",
             "emission_strength",
             "transmission",
+            "use_raytrace_refraction",
             "ior",
             "thickness_mode",
             "base_color_texture",
@@ -401,6 +410,16 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     let transmission = set
         .get("transmission")
         .map(|value| read_unit_interval(engine, value, "set/transmission"))
+        .transpose()?;
+    let use_raytrace_refraction = set
+        .get("use_raytrace_refraction")
+        .map(|value| {
+            read_nullable_bool(
+                engine,
+                value,
+                &operation_pointer(engine.operation_index, "set/use_raytrace_refraction"),
+            )
+        })
         .transpose()?;
     let ior = set
         .get("ior")
@@ -619,6 +638,12 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 && !crate::float::equal_f64(material.transmission, value)
             {
                 material.transmission = value;
+                item_changed = true;
+            }
+            if let Some(value) = use_raytrace_refraction
+                && material.use_raytrace_refraction != value
+            {
+                material.use_raytrace_refraction = value;
                 item_changed = true;
             }
             if let Some(value) = thickness_mode
@@ -1191,6 +1216,17 @@ fn parse_volume_interpolation(
         _ => Err(engine.error(
             ErrorCode::InvalidOperation,
             "volume_interpolation must be linear or cubic",
+            pointer,
+        )),
+    }
+}
+fn read_nullable_bool(engine: &Engine<'_>, value: &Value, pointer: &str) -> Result<Option<bool>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Bool(value) => Ok(Some(*value)),
+        _ => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "use_raytrace_refraction must be a boolean or null",
             pointer,
         )),
     }

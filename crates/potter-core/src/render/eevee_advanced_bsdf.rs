@@ -23,6 +23,43 @@ const SSS_SAMPLE_COUNT: usize = 16;
 const SSS_BURLEY_TRUNCATE_CDF: f64 = 0.996_379_009_370_832_8;
 const SSS_BURLEY_TRUNCATE: f32 = 16.0;
 const SSS_MIN_RADIUS: f32 = 1.0e-4;
+const SSS_TRANSMIT_LUT_RADIUS: f32 = 2.0;
+const SSS_TRANSMIT_LUT_SIZE: f32 = 64.0;
+const SSS_TRANSMIT_LUT_SCALE: f32 = 63.0 / SSS_TRANSMIT_LUT_SIZE;
+const SSS_TRANSMIT_LUT_BIAS: f32 = 0.5 / SSS_TRANSMIT_LUT_SIZE;
+const EEVEE_BURLEY_SSS_TRANSMITTANCE_PROFILE: [f32; 64] = [
+    1.000_000, 0.957_576, 0.890_814, 0.813_161, 0.732_056, 0.652_729, 0.578_802, 0.512_565,
+    0.455_203, 0.407_017, 0.365_151, 0.326_306, 0.291_256, 0.259_690, 0.231_309, 0.205_831,
+    0.182_989, 0.162_537, 0.144_246, 0.127_905, 0.113_320, 0.100_316, 0.088_730, 0.078_418,
+    0.069_247, 0.061_096, 0.053_858, 0.047_435, 0.041_740, 0.036_693, 0.032_225, 0.028_272,
+    0.024_776, 0.021_688, 0.018_961, 0.016_556, 0.014_436, 0.012_569, 0.010_926, 0.009_482,
+    0.008_213, 0.007_100, 0.006_124, 0.005_270, 0.004_523, 0.003_871, 0.003_302, 0.002_806,
+    0.002_375, 0.002_002, 0.001_678, 0.001_398, 0.001_156, 0.000_948, 0.000_770, 0.000_617,
+    0.000_487, 0.000_376, 0.000_283, 0.000_204, 0.000_138, 0.000_083, 0.000_037, 0.000_000,
+];
+
+/// Blender's utility-texture SSS transmittance for a stored G-buffer radius and thickness.
+pub(crate) fn eevee_subsurface_transmission(radii: [f32; 3], thickness: f32) -> [f32; 3] {
+    std::array::from_fn(|channel| {
+        let radius = radii[channel] * SSS_TRANSMIT_LUT_RADIUS;
+        if !matches!(radius.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater)) {
+            return 0.0;
+        }
+        let coordinate =
+            (thickness / radius).clamp(0.0, 1.0) * SSS_TRANSMIT_LUT_SCALE + SSS_TRANSMIT_LUT_BIAS;
+        let position = coordinate * SSS_TRANSMIT_LUT_SIZE - 0.5;
+        let low = position.floor() as usize;
+        let high = (low + 1).min(EEVEE_BURLEY_SSS_TRANSMITTANCE_PROFILE.len() - 1);
+        let blend = position - low as f32;
+        let low = super::eevee_transmission::utility_texel(f64::from(
+            EEVEE_BURLEY_SSS_TRANSMITTANCE_PROFILE[low],
+        )) as f32;
+        let high = super::eevee_transmission::utility_texel(f64::from(
+            EEVEE_BURLEY_SSS_TRANSMITTANCE_PROFILE[high],
+        )) as f32;
+        low + (high - low) * blend
+    })
+}
 const RADIANCE_MANTISSA_BITS: [u32; 3] = [6, 6, 5];
 
 /// EEVEE's closure data needed by the screen-space subsurface pass.
@@ -198,16 +235,9 @@ pub(crate) fn eevee_metallic_brdf(
 }
 
 fn metallic_brdf_channel(channel: usize, roughness: f64, n_dot_v: f64) -> f64 {
-    use super::eevee_transmission::{blend, texel_weights, utility_texel};
-
-    let (x0, x1, fx) = texel_weights(roughness);
-    let (y0, y1, fy) = texel_weights((1.0 - n_dot_v).sqrt());
-    let texel = |x, y| utility_texel(super::eevee_transmission_tables::brdf(x, y, channel));
-    blend(
-        blend(texel(x0, y0), texel(x1, y0), fx),
-        blend(texel(x0, y1), texel(x1, y1), fx),
-        fy,
-    )
+    super::eevee_transmission::utility_sample_2d(roughness, (1.0 - n_dot_v).sqrt(), |x, y| {
+        super::eevee_transmission_tables::brdf(x, y, channel)
+    })
 }
 
 /// `fresnel_conductor` from `gpu_shader_material_metallic.glsl`.
@@ -375,7 +405,7 @@ fn gbuffer_dither_noise(component: usize, context: EeveeGBufferContext) -> f32 {
         context.frag_coord[1] + seed * (17.0 * 0.695),
     ];
     let noise = (0.067_110_56 * pixel[0] + 0.005_837_15 * pixel[1]).fract();
-    (context.sample_offset[component] + 52.982_92 * noise).fract()
+    (context.sample_offset[component] + 52.982_918 * noise).fract()
 }
 
 fn ior_pack(value: f32) -> f32 {
@@ -608,7 +638,6 @@ fn resolve_subsurface_closure(
     };
     add_radiance(center, closure, radiance, sample_color);
 }
-
 fn eye_for_column(x: usize, width: usize, split: Option<usize>) -> Option<(usize, usize, usize)> {
     if let Some(split) = split {
         if split == 0 || split >= width {

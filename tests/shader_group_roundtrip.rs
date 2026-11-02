@@ -12,7 +12,8 @@ mod process;
 use std::{fs, path::Path};
 
 use native_oracle::{
-    TestResult, assert_close, export, import_blend, losses, read_scene, run_blender, write_script,
+    TestResult, assert_close, export, import_blend, import_blend_allow_lossy, losses, read_scene,
+    run_blender, write_script,
 };
 use potter_core::{
     model::SceneDoc,
@@ -71,6 +72,34 @@ material.node_tree.links.new(root_group.outputs["Shader"], material_output.input
 bpy.ops.mesh.primitive_plane_add(size=2.0)
 bpy.context.object.data.materials.append(material)
 bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
+"#;
+const BSDF_ENUM_IMPORT_FIXTURE: &str = r#"
+import bpy
+import os
+import sys
+
+root = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
+for label, active_distribution in (("valid", "GGX"), ("unsupported", "MULTI_GGX")):
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    material = bpy.data.materials.new("Refraction Material")
+    material.use_nodes = True
+    tree = material.node_tree
+    tree.nodes.clear()
+    active = tree.nodes.new("ShaderNodeBsdfRefraction")
+    active.name = "Active Refraction"
+    active.distribution = active_distribution
+    output = tree.nodes.new("ShaderNodeOutputMaterial")
+    tree.links.new(active.outputs["BSDF"], output.inputs["Surface"])
+    if label == "valid":
+        unused = tree.nodes.new("ShaderNodeBsdfRefraction")
+        unused.name = "Unused Refraction"
+        unused.distribution = "MULTI_GGX"
+    bpy.ops.mesh.primitive_plane_add(size=2.0)
+    bpy.context.object.data.materials.append(material)
+    bpy.ops.wm.save_as_mainfile(
+        filepath=os.path.join(root, label + ".blend"),
+        check_existing=False,
+    )
 "#;
 
 const READ_GROUPS: &str = r#"
@@ -286,6 +315,59 @@ fn shader_group_interface_defaults_and_nested_links_survive_blend_round_trip() -
         "Group Output",
         "Shader"
     ));
+    Ok(())
+}
+
+#[test]
+fn blend_import_reports_refraction_multi_ggx_only_when_active() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let script = write_script(
+        root.path(),
+        "build_bsdf_enum_import.py",
+        BSDF_ENUM_IMPORT_FIXTURE,
+    )?;
+    run_blender(&blender, &script, None, root.path())?;
+
+    let feature_id = "shader.node.ShaderNodeBsdfRefraction.distribution";
+    let (_, valid_report) = import_blend(
+        &blender,
+        root.path(),
+        "valid_project",
+        &root.path().join("valid.blend"),
+    )?;
+    let valid_losses = losses(&valid_report)
+        .into_iter()
+        .filter(|loss| loss["feature_id"] == json!(feature_id))
+        .collect::<Vec<_>>();
+    assert!(
+        valid_losses.is_empty(),
+        "a valid active GGX mode or unreachable MULTI_GGX mode reported a loss: {valid_losses:?}"
+    );
+
+    let (_, unsupported_report) = import_blend_allow_lossy(
+        &blender,
+        root.path(),
+        "unsupported_project",
+        &root.path().join("unsupported.blend"),
+    )?;
+    let unsupported_losses = losses(&unsupported_report)
+        .into_iter()
+        .filter(|loss| loss["feature_id"] == json!(feature_id))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        unsupported_losses.len(),
+        1,
+        "active Refraction MULTI_GGX must report one import loss: {unsupported_report}"
+    );
+    assert!(
+        unsupported_losses[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("MULTI_GGX")),
+        "the loss should identify the refused mode: {unsupported_losses:?}"
+    );
     Ok(())
 }
 

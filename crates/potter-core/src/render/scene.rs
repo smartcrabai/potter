@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use glam::{DMat3, DMat4, DVec3};
+use glam::{DMat3, DMat4, DVec3, Mat3, Vec3};
 use serde::Serialize;
 
 use crate::{
@@ -19,7 +19,8 @@ use crate::{
     image::ImageData,
     model::{
         CyclesCurveShape, CyclesHairShadowGeometryKey, CyclesHairShadowGroup,
-        CyclesHairShadowMember, Id, Material, Node, RayKind, RayVisibility, SceneDoc,
+        CyclesHairShadowMember, Id, LightData, LightType, Material, Node, RayKind, RayVisibility,
+        SceneDoc, World,
     },
     shader::{
         BsdfModel, BsdfParams, EeveeGBufferBin, EeveeGBufferCandidate, EeveeGBufferLayout,
@@ -37,8 +38,11 @@ use super::eevee_advanced_bsdf::{
     eevee_gbuffer_ior, eevee_gbuffer_normal, eevee_gbuffer_roughness, eevee_holdout_weight,
     eevee_metallic_brdf, eevee_subsurface_gbuffer_profile, eevee_subsurface_radius,
 };
+use super::eevee_fast_gi::FastGiSh;
+use super::eevee_raytrace::EeveeRayTracingSettings;
+use super::eevee_raytrace_generate::{RayGenerateInput, RayLobe, RayThickness, ThicknessMode};
 use super::hair_intersect::{HairBvh, HairCurveRenderMode};
-use super::world_probe::{WorldProbe, WorldProbeMode};
+use super::world_probe::{EeveeWorldSun, WorldProbe, WorldProbeMode};
 use super::{
     bvh::{Bvh, BvhHit, WalkRay},
     eevee_ltc::Emitter,
@@ -54,8 +58,9 @@ use super::{
         thin_subsurface_transmission_weight, without_subsurface,
     },
     raster::{
-        AlphaMode, Line, Mode, SurfaceHit, SurfaceSample, SurfaceShader, SurfaceShaderWorker,
-        Triangle, ViewBasis, ambient_visibility, blend_color, blend_corner_normals, blend_uv,
+        AlphaMode, EeveeDitherSample, EeveeRaytraceBin, EeveeRaytraceFeedback, EeveeRaytraceSample,
+        Line, Mode, SurfaceHit, SurfaceSample, SurfaceShader, SurfaceShaderWorker, Triangle,
+        ViewBasis, ambient_visibility, blend_color, blend_corner_normals, blend_uv,
     },
     studio,
     wireframe::{PointSphere, WireEdge, WireEdgeBuilder, WirePoint},
@@ -1181,6 +1186,14 @@ fn bake_cycles_hair_shadow_group(
     Ok(shadow_transparency)
 }
 
+fn eevee_world_volume_absorption_refusal(scene_id: &Id) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        "EEVEE World.Volume is not evaluated, so its absorption cannot be checked for WorldSun extraction; reimport without a World.Volume connection",
+        serde_json::json!({"feature_id":"render.world.volume_absorption","scene_id":scene_id.as_str()}),
+    )
+}
+
 pub(super) fn extract_geometry(
     doc: &SceneDoc,
     snapshot: &Snapshot,
@@ -1210,6 +1223,12 @@ pub(super) fn extract_geometry_with_semantics(
         .scenes
         .get(&snapshot.scene_id)
         .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
+    if matches!(mode, Mode::Beauty)
+        && math_semantics == crate::node_kernels::MathSemantics::Eevee
+        && super::path::scene_has_world_volume(doc, &snapshot.scene_id)
+    {
+        return Err(eevee_world_volume_absorption_refusal(&snapshot.scene_id));
+    }
 
     let blender_imported = doc.compatibility.contains_key("blender_adapter");
     let curve_render_mode = match scene.render.cycles_curves_shape.as_ref() {
@@ -1978,7 +1997,10 @@ pub(super) fn extract_geometry_with_semantics(
                                 shadow: None,
                                 object_thickness: thickness,
                                 world: None,
+                                world_sun: None,
                                 gbuffer: None,
+                                eevee_raytrace_feedback: EeveeRaytraceFeedback::default(),
+                                material_refraction: Some(false),
                             })?
                         };
                     let triangle = Triangle {
@@ -2006,8 +2028,7 @@ pub(super) fn extract_geometry_with_semantics(
                                 _ => match material.alpha_mode.as_str() {
                                     "blend" => AlphaMode::Blend,
                                     "clip" => AlphaMode::Clip,
-                                    // Potter keeps the DITHERED graph's expected coverage in the existing opacity/tint
-                                    // model while retaining its separate depth-writing class for camera light shapes.
+                                    // EEVEE DITHERED graph materials use the source per-sample hashed depth-prepass coverage.
                                     "opaque"
                                         if matches!(mode, Mode::Beauty)
                                             && material.node_tree.is_some() =>
@@ -3873,6 +3894,134 @@ struct SceneShaderWorker<'a> {
     core: SceneShaderCore<'a>,
 }
 
+struct EeveeWorldSunLight {
+    light: LightData,
+    volume_energy: f64,
+    matrix: DMat4,
+    ray_visibility: RayVisibility,
+    use_shadows: bool,
+    shadow_radius: Option<f64>,
+}
+#[derive(Clone, Copy)]
+pub(super) struct EeveeWorldSunVolumeLight {
+    pub(super) radiance: DVec3,
+    pub(super) matrix: DMat4,
+    pub(super) volume_energy: f64,
+    pub(super) use_sun_shadow: bool,
+    pub(super) shadow_radius: Option<f64>,
+}
+
+#[derive(Default)]
+struct EeveeWorldSunState {
+    light: Option<EeveeWorldSunLight>,
+    unsupported_shadow_map_settings: bool,
+}
+
+fn eevee_world_sun_settings_refusal(scene_id: &Id, setting: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!(
+            "EEVEE extracted WorldSun needs source setting `{setting}`; reimport the Blender scene or set it explicitly"
+        ),
+        serde_json::json!({
+            "feature_id":"render.eevee.world_sun.settings",
+            "scene_id":scene_id.as_str(),
+            "setting":setting,
+        }),
+    )
+}
+pub(super) fn ensure_eevee_global_world_probe_available(
+    scene_id: &Id,
+    local_volume_probe_grids: Option<bool>,
+) -> Result<()> {
+    if local_volume_probe_grids == Some(false) {
+        return Ok(());
+    }
+    let message = if local_volume_probe_grids == Some(true) {
+        "EEVEE global World SH cannot substitute for visible local VOLUME probe grids; local volume-probe irradiance is not represented"
+    } else {
+        "EEVEE world-probe irradiance cannot be used because source participation in local VOLUME probe grids is unknown; reimport the Blender scene to recover it"
+    };
+    Err(PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        message,
+        serde_json::json!({
+            "feature_id":"render.eevee.world_probe.local_volume_grids",
+            "scene_id":scene_id.as_str(),
+            "setting":"eevee_has_local_volume_probe_grids",
+        }),
+    ))
+}
+
+// Transform::operator float4x4 reconstructs the Duff basis columns from the BSL's transposed rows.
+fn eevee_world_sun_matrix(direction: Vec3) -> DMat4 {
+    let z_sign = if direction.z >= 0.0 { 1.0 } else { -1.0 };
+    let a = -1.0 / (z_sign + direction.z);
+    let b = direction.x * direction.y * a;
+    let basis = Mat3::from_cols(
+        Vec3::new(
+            1.0 + z_sign * direction.x * direction.x * a,
+            z_sign * b,
+            -z_sign * direction.x,
+        ),
+        Vec3::new(b, z_sign + direction.y * direction.y * a, -direction.y),
+        direction,
+    );
+    let to_double =
+        |axis: Vec3| DVec3::new(f64::from(axis.x), f64::from(axis.y), f64::from(axis.z));
+    DMat4::from_cols(
+        to_double(basis.x_axis).extend(0.0),
+        to_double(basis.y_axis).extend(0.0),
+        to_double(basis.z_axis).extend(0.0),
+        DVec3::ZERO.extend(1.0),
+    )
+}
+fn eevee_world_sun_light(
+    world: &World,
+    source: EeveeWorldSun,
+) -> std::result::Result<EeveeWorldSunLight, &'static str> {
+    let sun_angle = world.eevee_sun_angle.ok_or("eevee_sun_angle")?;
+    let use_shadows = world.eevee_use_sun_shadow.ok_or("eevee_use_sun_shadow")?;
+    let shadow_radius = if use_shadows {
+        let jitter = world
+            .eevee_use_sun_shadow_jitter
+            .ok_or("eevee_use_sun_shadow_jitter")?;
+        let overblur = if jitter {
+            world
+                .eevee_sun_shadow_jitter_overblur
+                .ok_or("eevee_sun_shadow_jitter_overblur")?
+                / 100.0
+        } else {
+            1.0
+        };
+        let half_angle = sun_angle.min(179.9_f64.to_radians()) * 0.5;
+        let shadow_angle = if half_angle > 0.0 {
+            (half_angle * overblur).max(1.0e-8)
+        } else {
+            0.0
+        };
+        Some(shadow_angle.tan())
+    } else {
+        None
+    };
+    let mut ray_visibility = RayVisibility::default();
+    ray_visibility.set(RayKind::Camera, false);
+    Ok(EeveeWorldSunLight {
+        light: LightData {
+            light_type: LightType::Sun,
+            color: source.radiance.to_array().map(f64::from),
+            energy: std::f64::consts::FRAC_1_PI * (1.0 + 1.0 / sun_disc_radius(sun_angle).powi(2)),
+            sun_angle,
+            ..LightData::default()
+        },
+        matrix: eevee_world_sun_matrix(source.direction),
+        ray_visibility,
+        volume_energy: 1.0,
+        use_shadows,
+        shadow_radius,
+    })
+}
+
 struct SceneShaderCore<'a> {
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
@@ -3880,11 +4029,17 @@ struct SceneShaderCore<'a> {
     geometry: super::path::SharedGeometry<'a>,
     mode: Mode,
     math_semantics: crate::node_kernels::MathSemantics,
+    /// Captured Blender EEVEE settings, or a precise refusal when imported state is unknown.
+    eevee_raytracing_settings: Result<Option<EeveeRayTracingSettings>>,
+    /// Forward EEVEE chooses RGB transparency targets scene-wide from compiled material flags.
+    eevee_colored_transparency: bool,
     /// The camera's view space, in which Solid's studio lights are fixed.
     view: &'a ViewBasis,
     evaluator_workspace: RefCell<EvaluatorWorkspace>,
     /// Lazily populated once per render and shared by the serial pass and all band workers.
     world_probe: Arc<OnceLock<Result<Option<Arc<WorldProbe>>>>>,
+    /// Source `WorldSun` as an ephemeral native direct light, shared by the render workers.
+    world_sun: Arc<OnceLock<Result<EeveeWorldSunState>>>,
 }
 
 /// The per-pixel shader for `mode`, or `None` when the raster outputs unlit or per-triangle colour.
@@ -3922,7 +4077,41 @@ pub(super) fn surface_shader_with_semantics<'a>(
         Mode::Beauty if geometry.shadows.is_some() => {}
         _ => return None,
     }
-    Some(Box::new(SceneShader {
+    scene_shader_with_semantics(doc, snapshot, images, geometry, mode, view, math_semantics)
+        .into_surface_shader()
+}
+
+pub(super) fn scene_shader_with_semantics<'a>(
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    images: &'a BTreeMap<String, ImageData>,
+    geometry: &'a Geometry,
+    mode: Mode,
+    view: &'a ViewBasis,
+    math_semantics: crate::node_kernels::MathSemantics,
+) -> SceneShader<'a> {
+    let eevee_colored_transparency = math_semantics == crate::node_kernels::MathSemantics::Eevee
+        && geometry_uses_eevee_colored_transparency(geometry);
+    let eevee_raytracing_settings = doc
+        .scenes
+        .get(&snapshot.scene_id)
+        .map_or(Ok(None), |scene| {
+            if !matches!(mode, Mode::Beauty)
+                || math_semantics != crate::node_kernels::MathSemantics::Eevee
+            {
+                return Ok(None);
+            }
+            let blender_imported = doc
+                .compatibility
+                .get("blender_adapter")
+                .is_some_and(serde_json::Value::is_object);
+            EeveeRayTracingSettings::from_render_settings(
+                &scene.render,
+                blender_imported,
+                snapshot.scene_id.as_str(),
+            )
+        });
+    SceneShader {
         core: SceneShaderCore {
             doc,
             snapshot,
@@ -3930,12 +4119,36 @@ pub(super) fn surface_shader_with_semantics<'a>(
             geometry: super::path::SharedGeometry::of(geometry),
             mode,
             math_semantics,
+            eevee_colored_transparency,
+            eevee_raytracing_settings,
             view,
             evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
             world_probe: Arc::new(OnceLock::new()),
+            world_sun: Arc::new(OnceLock::new()),
         },
         warnings: &geometry.shader_warnings,
-    }))
+    }
+}
+
+impl<'a> SceneShader<'a> {
+    pub(super) fn into_surface_shader(self) -> Option<Box<dyn SurfaceShader + 'a>> {
+        match self.core.mode {
+            Mode::Solid => Some(Box::new(self)),
+            Mode::Beauty if self.core.geometry.shadows.is_some() => Some(Box::new(self)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn eevee_world_sun_volume_light(&self) -> Result<Option<EeveeWorldSunVolumeLight>> {
+        let sun = self.core.world_sun(self.warnings)?.light.as_ref();
+        Ok(sun.map(|sun| EeveeWorldSunVolumeLight {
+            radiance: DVec3::from_array(sun.light.color),
+            matrix: sun.matrix,
+            volume_energy: sun.volume_energy,
+            use_sun_shadow: sun.use_shadows,
+            shadow_radius: sun.shadow_radius,
+        }))
+    }
 }
 
 impl SurfaceShader for SceneShader<'_> {
@@ -3945,6 +4158,21 @@ impl SurfaceShader for SceneShader<'_> {
     fn needs_eevee_gbuffer_context(&self) -> bool {
         matches!(self.core.mode, Mode::Beauty)
             && self.core.math_semantics == crate::node_kernels::MathSemantics::Eevee
+    }
+    fn eevee_raytracing_settings(&self) -> Result<Option<EeveeRayTracingSettings>> {
+        self.core.eevee_raytracing_settings.clone()
+    }
+    fn eevee_raytrace_probe_radiance(
+        &self,
+        sample: &EeveeRaytraceSample,
+        bin: EeveeRaytraceBin,
+        world_direction: DVec3,
+    ) -> Result<DVec3> {
+        self.core
+            .eevee_raytrace_probe_radiance(sample, bin, world_direction)
+    }
+    fn eevee_fast_gi_volume_irradiance(&self, _point: DVec3) -> Result<Option<FastGiSh>> {
+        self.core.eevee_fast_gi_volume_irradiance()
     }
 
     fn worker(&self) -> Result<Option<Box<dyn SurfaceShaderWorker + Send + '_>>> {
@@ -3958,12 +4186,35 @@ impl SurfaceShader for SceneShader<'_> {
     }
 }
 
-/// The transparent tint the Beauty composite applies to a surface. EEVEE keeps a Transparent closure's colour per channel
-/// only for a BLENDED material (`ForwardPipeline::use_colored_transparency`, `GPU_MATFLAG_TRANSPARENT_MAYBE_COLORED`).
-/// A DITHERED material stores one alpha, `1 - average(transmittance)` (`eevee_surf_deferred.bsl.hh`, `out_color.a`), so
-/// its tint is the channel mean. `alpha_mode` `blend` is BLENDED; `opaque` and `clip` are DITHERED
-/// (`blend_bridge.py`, `surface_render_method`).
-fn beauty_tint(material: Option<&Material>, tint: [f64; 3]) -> [f64; 3] {
+/// Whether a camera-visible BLENDED surface submitted to EEVEE's forward pass enables RGB transparency targets.
+fn geometry_uses_eevee_colored_transparency(geometry: &Geometry) -> bool {
+    let enables_rgb_transparency = |material_index: usize| {
+        geometry
+            .materials
+            .get(material_index)
+            .zip(geometry.prepared.get(material_index))
+            .is_some_and(|(material, prepared)| {
+                material.alpha_mode == "blend"
+                    && (prepared.eevee_transparent_maybe_colored() || prepared.eevee_has_holdout())
+            })
+    };
+    geometry.triangles.iter().any(|triangle| {
+        triangle.ray_mask & RayKind::Camera.bit() != 0
+            && enables_rgb_transparency(triangle.material_index)
+    }) || geometry.hair_curve_instances.iter().any(|curve| {
+        curve.ray_mask & RayKind::Camera.bit() != 0
+            && enables_rgb_transparency(curve.material_index)
+    })
+}
+
+/// The transparent tint the Beauty composite applies to a surface. EEVEE DITHERED uses mean transmittance; BLENDED
+/// forward uses the scene-wide target choice (`eevee_surf_forward.bsl.hh`): red-only when monochromatic, full RGB when
+/// `ForwardPipeline::use_colored_transparency` is enabled.
+fn beauty_tint(
+    material: Option<&Material>,
+    tint: [f64; 3],
+    eevee_monochromatic_transparency: bool,
+) -> [f64; 3] {
     // A transmittance is a fraction of the light: EEVEE clamps the Color at zero and saturates the result
     // (`gpu_shader_material_transparent.glsl`, `eevee_surf_deferred.bsl.hh`), so a tint above one or below zero is cut to
     // [0, 1] before it can amplify or invert the background.
@@ -3973,6 +4224,7 @@ fn beauty_tint(material: Option<&Material>, tint: [f64; 3]) -> [f64; 3] {
             let mean = (tint[0] + tint[1] + tint[2]) / 3.0;
             [mean; 3]
         }
+        Some(_) if eevee_monochromatic_transparency => [tint[0]; 3],
         _ => tint,
     }
 }
@@ -3985,10 +4237,13 @@ impl SceneShaderCore<'_> {
             images: self.images,
             geometry: self.geometry,
             mode: self.mode,
-            view: self.view,
             math_semantics: self.math_semantics,
+            eevee_colored_transparency: self.eevee_colored_transparency,
+            eevee_raytracing_settings: self.eevee_raytracing_settings.clone(),
+            view: self.view,
             evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
-            world_probe: Arc::clone(&self.world_probe),
+            world_probe: self.world_probe.clone(),
+            world_sun: self.world_sun.clone(),
         }
     }
 
@@ -4001,6 +4256,21 @@ impl SceneShaderCore<'_> {
             let world = scene
                 .and_then(|scene| scene.world.as_ref())
                 .and_then(|id| self.doc.worlds.get(id));
+            if self.math_semantics == crate::node_kernels::MathSemantics::Eevee
+                && super::path::scene_has_world_volume(self.doc, &self.snapshot.scene_id)
+            {
+                return Err(eevee_world_volume_absorption_refusal(
+                    &self.snapshot.scene_id,
+                ));
+            }
+            let local_volume_probe_grids =
+                scene.and_then(|scene| scene.eevee_has_local_volume_probe_grids);
+            if self.math_semantics == crate::node_kernels::MathSemantics::Eevee {
+                ensure_eevee_global_world_probe_available(
+                    &self.snapshot.scene_id,
+                    local_volume_probe_grids,
+                )?;
+            }
             world
                 .map(|world| {
                     let mode = if self.math_semantics == crate::node_kernels::MathSemantics::Eevee {
@@ -4011,8 +4281,18 @@ impl SceneShaderCore<'_> {
                                     &self.snapshot.scene_id,
                                 )
                             })?;
+                        let surface_indirect_clamp = scene
+                            .and_then(|scene| scene.render.eevee_clamp_surface_indirect)
+                            .ok_or_else(|| {
+                                PotError::with_details(
+                                    ErrorCode::UnsupportedFeature,
+                                    "EEVEE realtime world lighting needs the source clamp_surface_indirect setting; reimport the Blender scene to recover it",
+                                    serde_json::json!({"feature_id":"render.eevee.clamp_surface_indirect","scene_id":self.snapshot.scene_id.as_str()}),
+                                )
+                            })?;
                         WorldProbeMode::Eevee {
                             cubemap_resolution: resolution,
+                            surface_indirect_clamp: surface_indirect_clamp as f32,
                         }
                     } else {
                         WorldProbeMode::Path
@@ -4024,6 +4304,107 @@ impl SceneShaderCore<'_> {
         match cached {
             Ok(probe) => Ok(probe.as_deref()),
             Err(error) => Err(error.clone()),
+        }
+    }
+    fn eevee_fast_gi_volume_irradiance(&self) -> Result<Option<FastGiSh>> {
+        let probe = self.world_probe()?;
+        Ok(match probe {
+            Some(probe) => probe.fast_gi_sh(),
+            None if self.math_semantics == crate::node_kernels::MathSemantics::Eevee => {
+                Some(FastGiSh::ZERO)
+            }
+            None => None,
+        })
+    }
+
+    fn world_sun(&self, warnings: &RefCell<Vec<serde_json::Value>>) -> Result<&EeveeWorldSunState> {
+        let cached = self.world_sun.get_or_init(|| {
+            let state = self.build_world_sun()?;
+            if state.unsupported_shadow_map_settings {
+                let warning = serde_json::json!({
+                    "code":"UNSUPPORTED_FEATURE",
+                    "feature_id":"render.eevee.world_sun.shadow_map_settings",
+                    "message":"Native WorldSun shadows use the scene BVH; World.sun_shadow_maximum_resolution and World.sun_shadow_filter_radius are not represented.",
+                });
+                let mut recorded = warnings.borrow_mut();
+                if !recorded.contains(&warning) {
+                    recorded.push(warning);
+                }
+            }
+            Ok(state)
+        });
+
+        match cached {
+            Ok(state) => Ok(state),
+            Err(error) => Err(error.clone()),
+        }
+    }
+    fn build_world_sun(&self) -> Result<EeveeWorldSunState> {
+        if !matches!(self.mode, Mode::Beauty)
+            || self.math_semantics != crate::node_kernels::MathSemantics::Eevee
+        {
+            return Ok(EeveeWorldSunState::default());
+        }
+        let Some(scene) = self.doc.scenes.get(&self.snapshot.scene_id) else {
+            return Ok(EeveeWorldSunState::default());
+        };
+        let Some(world) = scene
+            .world
+            .as_ref()
+            .and_then(|world_id| self.doc.worlds.get(world_id))
+        else {
+            return Ok(EeveeWorldSunState::default());
+        };
+        if !world
+            .eevee_sun_threshold
+            .is_some_and(|threshold| threshold > 0.0)
+        {
+            return Ok(EeveeWorldSunState::default());
+        }
+        let Some(probe) = self.world_probe()? else {
+            return Ok(EeveeWorldSunState::default());
+        };
+        let Some(source_sun) = probe.world_sun() else {
+            return Ok(EeveeWorldSunState::default());
+        };
+        let light = eevee_world_sun_light(world, source_sun).map_err(|setting| {
+            eevee_world_sun_settings_refusal(&self.snapshot.scene_id, setting)
+        })?;
+        let unsupported_shadow_map_settings = light.use_shadows;
+        Ok(EeveeWorldSunState {
+            light: Some(light),
+            unsupported_shadow_map_settings,
+        })
+    }
+    fn eevee_raytrace_probe_radiance(
+        &self,
+        sample: &EeveeRaytraceSample,
+        bin: EeveeRaytraceBin,
+        world_direction: DVec3,
+    ) -> Result<DVec3> {
+        let Some(world) = self.world_probe()? else {
+            return Ok(DVec3::ZERO);
+        };
+        match bin.input.lobe {
+            RayLobe::Diffuse | RayLobe::BurleyBssrdf => Ok(prefiltered_world(
+                world,
+                sample.normal,
+                1.0,
+                irradiance_probe_radiance,
+            )),
+            RayLobe::Translucent
+                if bin.input.thickness.mode == ThicknessMode::Sphere
+                    && bin.input.thickness.value != 0.0 =>
+            {
+                Ok(world.average_irradiance())
+            }
+            RayLobe::Translucent => Ok(prefiltered_world(
+                world,
+                -sample.normal,
+                1.0,
+                irradiance_probe_radiance,
+            )),
+            _ => eevee_deferred_indirect_world(world, world_direction, f64::from(bin.roughness)),
         }
     }
 
@@ -4044,6 +4425,8 @@ impl SceneShaderCore<'_> {
                 transparent_tint: [1.0; 3],
                 holdout_weight: 0.0,
                 subsurface: None,
+                eevee_raytrace: None,
+                eevee_dither: None,
             });
         }
         let graph_shading = if triangle.lit_per_pixel {
@@ -4174,7 +4557,26 @@ impl SceneShaderCore<'_> {
         });
         let thickness = object_for_index(self.geometry.objects, triangle.object_index)
             .map_or(0.0, |object| object.thickness);
-        let world = self.world_probe()?;
+        let needs_world_probe = self.math_semantics != crate::node_kernels::MathSemantics::Eevee
+            || closures.iter().any(|closure| {
+                let features = closure.params.eevee_gbuffer_features();
+                features.has_diffuse()
+                    || features.has_reflection()
+                    || features.has_refraction()
+                    || features.has_subsurface()
+                    || features.has_translucent()
+                    || features.has_clearcoat()
+            });
+        let world = if needs_world_probe {
+            self.world_probe()?
+        } else {
+            None
+        };
+        let world_sun = if needs_world_probe {
+            self.world_sun(warnings)?.light.as_ref()
+        } else {
+            None
+        };
         let mut color = shade(&SurfaceShadeContext {
             doc: self.doc,
             snapshot: self.snapshot,
@@ -4190,7 +4592,11 @@ impl SceneShaderCore<'_> {
             shadow,
             object_thickness: thickness,
             world,
+            world_sun,
             gbuffer: gbuffer_route.as_ref(),
+            eevee_raytrace_feedback: hit.eevee_raytrace_feedback,
+            material_refraction: material
+                .map_or(Some(false), |material| material.use_raytrace_refraction),
         })?;
         let holdout_weight = eevee_holdout_weight(closures);
         if gbuffer_route.is_none() {
@@ -4211,22 +4617,49 @@ impl SceneShaderCore<'_> {
                 hit.view,
                 closures,
                 gbuffer_route.as_ref(),
+                Some(&hit.eevee_raytrace_feedback),
                 shadow,
                 thickness,
                 world,
+                world_sun,
                 triangle.object_index,
                 camera_matrices,
+                material.map_or(Some(false), |material| material.use_raytrace_refraction),
             )?
         } else {
             None
         };
+        let eevee_raytrace = self
+            .eevee_raytracing_settings
+            .as_ref()
+            .is_ok_and(Option::is_some)
+            .then(|| {
+                eevee_raytrace_sample(
+                    gbuffer_route.as_ref(),
+                    closures,
+                    hit,
+                    thickness,
+                    material.map_or(Some(false), |material| material.use_raytrace_refraction),
+                )
+            })
+            .transpose()?;
         occluders.finish()?;
         Ok(SurfaceSample {
             color,
             has_surface: true,
-            transparent_tint: beauty_tint(material, surface_tint(closures)),
+            transparent_tint: beauty_tint(
+                material,
+                surface_tint(closures),
+                self.math_semantics == crate::node_kernels::MathSemantics::Eevee
+                    && !self.eevee_colored_transparency,
+            ),
             holdout_weight,
+            eevee_dither: gbuffer_route.as_ref().map(|route| EeveeDitherSample {
+                transparency: route.gbuffer_transparency,
+                alpha_reciprocal: route.gbuffer_alpha_reciprocal,
+            }),
             subsurface,
+            eevee_raytrace,
         })
     }
 
@@ -4310,6 +4743,21 @@ impl SurfaceShaderWorker for SceneShaderWorker<'_> {
     fn needs_eevee_gbuffer_context(&self) -> bool {
         matches!(self.core.mode, Mode::Beauty)
             && self.core.math_semantics == crate::node_kernels::MathSemantics::Eevee
+    }
+    fn eevee_raytracing_settings(&self) -> Result<Option<EeveeRayTracingSettings>> {
+        self.core.eevee_raytracing_settings.clone()
+    }
+    fn eevee_raytrace_probe_radiance(
+        &self,
+        sample: &EeveeRaytraceSample,
+        bin: EeveeRaytraceBin,
+        world_direction: DVec3,
+    ) -> Result<DVec3> {
+        self.core
+            .eevee_raytrace_probe_radiance(sample, bin, world_direction)
+    }
+    fn eevee_fast_gi_volume_irradiance(&self, _point: DVec3) -> Result<Option<FastGiSh>> {
+        self.core.eevee_fast_gi_volume_irradiance()
     }
 }
 /// EEVEE's default refraction thickness of an object: the smallest dimension of its bounds, in world units. EEVEE takes
@@ -4871,7 +5319,9 @@ fn eevee_gbuffer_candidates(
     let mut candidates = Vec::with_capacity(closures.len().saturating_mul(5));
     for (source_closure_index, closure) in closures.iter().enumerate() {
         let params = &closure.params;
-        let weight = closure.weight * params.alpha.clamp(0.0, 1.0);
+        // EEVEE Hair preview's GPU Weight can be sourced from Secondary Reflection; graph weight still governs coverage.
+        let weight =
+            params.eevee_diffuse_weight.unwrap_or(closure.weight) * params.alpha.clamp(0.0, 1.0);
         if params.standalone_glass {
             if let Some(glass) = eevee_transmission::glass_closures(
                 params,
@@ -4928,12 +5378,14 @@ fn eevee_gbuffer_candidates(
                 view,
             ),
             BsdfModel::Metallic(_) => {
-                let color = eevee_metallic_brdf(params, normal, view).ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::EvaluationFailed,
-                        "EEVEE metallic closure has no conductor Fresnel inputs",
-                    )
-                })?;
+                let metallic_normal = normalize_fallback(params.normal, normal);
+                let color =
+                    eevee_metallic_brdf(params, metallic_normal, view).ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::EvaluationFailed,
+                            "EEVEE metallic closure has no conductor Fresnel inputs",
+                        )
+                    })?;
                 push_eevee_gbuffer_candidate(
                     &mut candidates,
                     source_closure_index,
@@ -5217,7 +5669,7 @@ fn normalize_fallback(value: DVec3, fallback: DVec3) -> DVec3 {
         normalized
     }
 }
-fn eevee_gbuffer_alpha(closures: &[ShaderClosure]) -> (f32, f32) {
+fn eevee_gbuffer_alpha(closures: &[ShaderClosure]) -> (f32, f32, f32) {
     let mut transmittance = [0.0_f32; 3];
     for closure in closures {
         let params = &closure.params;
@@ -5244,13 +5696,14 @@ fn eevee_gbuffer_alpha(closures: &[ShaderClosure]) -> (f32, f32) {
             *sum += (channel as f32 * pass) * weight;
         }
     }
-    let alpha = 1.0 - (transmittance[0] + transmittance[1] + transmittance[2]) / 3.0;
+    let transparency = (transmittance[0] + transmittance[1] + transmittance[2]) / 3.0;
+    let alpha = 1.0 - transparency;
     let alpha_reciprocal = if alpha.is_finite() && alpha != 0.0 {
         alpha.recip()
     } else {
         0.0
     };
-    (alpha, alpha_reciprocal)
+    (transparency, alpha, alpha_reciprocal)
 }
 
 struct EeveeGBufferRoute {
@@ -5260,6 +5713,7 @@ struct EeveeGBufferRoute {
     sample_offset: [f32; 3],
     normal: DVec3,
     view: DVec3,
+    gbuffer_transparency: f32,
     gbuffer_alpha: f32,
     gbuffer_alpha_reciprocal: f32,
 }
@@ -5305,7 +5759,8 @@ fn eevee_gbuffer_route(
             "EEVEE shading requires the raster G-buffer closure random value",
         )
     })?;
-    let (gbuffer_alpha, gbuffer_alpha_reciprocal) = eevee_gbuffer_alpha(closures);
+    let (gbuffer_transparency, gbuffer_alpha, gbuffer_alpha_reciprocal) =
+        eevee_gbuffer_alpha(closures);
     let normal = if hit.back_facing {
         -hit.normal
     } else {
@@ -5340,6 +5795,7 @@ fn eevee_gbuffer_route(
         sample_offset,
         normal,
         view: hit.view,
+        gbuffer_transparency,
         gbuffer_alpha,
         gbuffer_alpha_reciprocal,
     })
@@ -5446,6 +5902,142 @@ fn decode_eevee_gbuffer_bin<'a>(
         ior,
     })
 }
+fn eevee_raytrace_sample(
+    route: Option<&EeveeGBufferRoute>,
+    closures: &[ShaderClosure],
+    hit: &SurfaceHit<'_>,
+    object_thickness: f64,
+    material_refraction: Option<bool>,
+) -> Result<EeveeRaytraceSample> {
+    let mut bins = [None; 3];
+    if let Some(route) = route {
+        let world_to_view = hit
+            .camera_matrices
+            .map(|matrices| matrices.1)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "EEVEE ray tracing requires the sample camera view transform",
+                )
+            })?;
+        for bin in route
+            .layout
+            .bins
+            .iter()
+            .take(route.layout.bin_count)
+            .flatten()
+            .copied()
+        {
+            let decoded = decode_eevee_gbuffer_bin(route, closures, bin)?;
+            let params = &decoded.closure.params;
+            let lobe = match bin.mode {
+                EeveeGBufferMode::Diffuse => RayLobe::Diffuse,
+                EeveeGBufferMode::Reflection | EeveeGBufferMode::ReflectionColorless => {
+                    RayLobe::GgxReflection
+                }
+                EeveeGBufferMode::Refraction | EeveeGBufferMode::RefractionColorless => {
+                    RayLobe::GgxRefraction
+                }
+                EeveeGBufferMode::ThinRefraction | EeveeGBufferMode::ThinRefractionColorless => {
+                    RayLobe::ThinGlassTransmission
+                }
+                EeveeGBufferMode::Translucent => RayLobe::Translucent,
+                EeveeGBufferMode::Subsurface => RayLobe::BurleyBssrdf,
+            };
+            let view_normal = world_to_view.transform_vector3(decoded.normal);
+            let view_incident = world_to_view.transform_vector3(hit.view);
+            let roughness = decoded.roughness.unwrap_or(1.0) as f32;
+            let input = RayGenerateInput {
+                lobe,
+                normal: Vec3::new(
+                    view_normal.x as f32,
+                    view_normal.y as f32,
+                    view_normal.z as f32,
+                ),
+                view: Vec3::new(
+                    view_incident.x as f32,
+                    view_incident.y as f32,
+                    view_incident.z as f32,
+                ),
+                roughness,
+                ior: decoded.ior.unwrap_or(1.0) as f32,
+                thickness: RayThickness {
+                    mode: if params.thickness_slab {
+                        ThicknessMode::Slab
+                    } else {
+                        ThicknessMode::Sphere
+                    },
+                    value: params.thickness.unwrap_or(object_thickness).max(0.0) as f32,
+                },
+            };
+            let source_thickness = Thickness::new(
+                params.thickness.unwrap_or(object_thickness),
+                params.thickness_slab,
+            );
+            let dominant_direction = match bin.lobe {
+                EeveeGBufferLobe::Diffuse | EeveeGBufferLobe::Subsurface => decoded.normal,
+                EeveeGBufferLobe::Translucent => {
+                    if matches!(source_thickness, Thickness::Sphere(value) if value != 0.0) {
+                        DVec3::ZERO
+                    } else {
+                        -decoded.normal
+                    }
+                }
+                EeveeGBufferLobe::Reflection | EeveeGBufferLobe::Clearcoat => {
+                    eevee_transmission::reflection_direction(
+                        decoded.normal,
+                        route.view,
+                        f64::from(roughness),
+                    )
+                }
+                EeveeGBufferLobe::ThinRefraction => {
+                    let oriented_normal = if decoded.normal.dot(route.view) < 0.0 {
+                        -decoded.normal
+                    } else {
+                        decoded.normal
+                    };
+                    eevee_transmission::reflection_direction(
+                        -oriented_normal,
+                        eevee_transmission::reflect(route.view, oriented_normal),
+                        f64::from(roughness),
+                    )
+                }
+                EeveeGBufferLobe::Refraction => {
+                    let ior = decoded.ior.unwrap_or(1.0);
+                    super::eevee_advanced_bsdf::eevee_refraction_probe_direction(
+                        decoded.normal,
+                        route.view,
+                        ior,
+                        f64::from(roughness),
+                        source_thickness,
+                    )
+                }
+            };
+            let Some(storage_bin) = bins.get_mut(bin.storage_layer) else {
+                return Err(PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "EEVEE ray-tracing G-buffer layer exceeds the source closure count",
+                ));
+            };
+            *storage_bin = Some(EeveeRaytraceBin {
+                input,
+                dominant_direction,
+                transmission: matches!(
+                    lobe,
+                    RayLobe::GgxRefraction | RayLobe::ThinGlassTransmission | RayLobe::Translucent
+                ),
+                roughness,
+            });
+        }
+    }
+    Ok(EeveeRaytraceSample {
+        point: hit.point,
+        normal: route.map_or(hit.normal, |route| route.normal),
+        has_gbuffer_route: route.is_some(),
+        screen_refraction: material_refraction,
+        bins,
+    })
+}
 
 fn standalone_eevee_lighting(
     context: &SurfaceShadeContext<'_>,
@@ -5502,9 +6094,14 @@ fn standalone_eevee_lighting(
                     ray_visibility: light_node.resolved_ray_visibility(),
                     shadow,
                     point_shadow: None,
+                    sun_shadow_radius: None,
                 };
                 result +=
                     translucent_direct_contribution(&direct_context, color, thickness) * influence;
+            }
+            if let Some(sun) = context.world_sun {
+                let direct_context = world_sun_direct_context(sun, receiver, normal, shadow);
+                result += translucent_direct_contribution(&direct_context, color, thickness);
             }
         }
         BsdfModel::Refraction(_) => {
@@ -5571,18 +6168,19 @@ fn standalone_eevee_lighting(
                 + glass.transmission * rgb9e5_roundtrip(direct_radiance.1);
         }
         BsdfModel::Metallic(_) => {
-            let Some(reflectance) = eevee_metallic_brdf(params, normal, receiver.view) else {
+            let metallic_normal = normalize_fallback(params.normal, normal);
+            let Some(reflectance) = eevee_metallic_brdf(params, metallic_normal, receiver.view)
+            else {
                 return Ok(None);
             };
             let roughness = params.roughness.clamp(0.0, 1.0);
             if let Some(world) = world {
                 let direction = super::eevee_advanced_bsdf::eevee_metallic_probe_direction(
-                    normal,
+                    metallic_normal,
                     receiver.view,
                     roughness,
                 );
-                result +=
-                    eevee_prefiltered_world(world, direction, roughness)? * reflectance * ambient;
+                result += eevee_prefiltered_world(world, direction, roughness)? * reflectance;
             }
             for (id, light_node) in &doc.nodes {
                 let Some(evaluated) = snapshot.nodes.get(id) else {
@@ -5606,13 +6204,19 @@ fn standalone_eevee_lighting(
                     light,
                     matrix,
                     receiver,
-                    normal,
+                    normal: metallic_normal,
                     ray_visibility: light_node.resolved_ray_visibility(),
                     shadow,
                     point_shadow: shadow.and_then(|scene| scene.point_maps.get(id)),
+                    sun_shadow_radius: None,
                 };
                 result += metallic_direct_contribution(&direct_context, roughness, reflectance)
                     * influence;
+            }
+            if let Some(sun) = context.world_sun {
+                let direct_context =
+                    world_sun_direct_context(sun, receiver, metallic_normal, shadow);
+                result += metallic_direct_contribution(&direct_context, roughness, reflectance);
             }
         }
         _ => return Ok(None),
@@ -5630,7 +6234,10 @@ struct SurfaceShadeContext<'a> {
     shadow: ShadowContext<'a>,
     object_thickness: f64,
     world: Option<&'a WorldProbe>,
+    world_sun: Option<&'a EeveeWorldSunLight>,
     gbuffer: Option<&'a EeveeGBufferRoute>,
+    eevee_raytrace_feedback: EeveeRaytraceFeedback,
+    material_refraction: Option<bool>,
 }
 
 fn shade_eevee_gbuffer(
@@ -5657,6 +6264,8 @@ fn shade_eevee_gbuffer(
     // decoded normals at this receiver.
     let mut ambient_cache: [Option<(DVec3, f64)>; 3] = [None; 3];
     let mut ambient_cache_len = 0;
+    let material_uses_refraction_layer = context.eevee_raytrace_feedback.refraction_active
+        && context.material_refraction == Some(true);
 
     for bin in route
         .layout
@@ -5667,6 +6276,22 @@ fn shade_eevee_gbuffer(
         .copied()
     {
         let decoded = decode_eevee_gbuffer_bin(route, closures, bin)?;
+        let feedback_radiance = if material_uses_refraction_layer {
+            &context.eevee_raytrace_feedback.refraction_radiance
+        } else {
+            &context.eevee_raytrace_feedback.radiance
+        };
+        let raytrace_radiance = feedback_radiance
+            .get(bin.storage_layer)
+            .copied()
+            .flatten()
+            .map(|radiance| {
+                DVec3::new(
+                    f64::from(radiance[0]),
+                    f64::from(radiance[1]),
+                    f64::from(radiance[2]),
+                )
+            });
         let params = &decoded.closure.params;
         let lobe_normal = decoded.normal;
         let color = decoded.color;
@@ -5676,10 +6301,11 @@ fn shade_eevee_gbuffer(
         );
         // EEVEE's deferred light-probe path has no geometric-AO multiplier; evaluate local ambient visibility only
         // for diffuse-family closures that consume it, and only once per identical receiver/normal input.
-        let ambient = if matches!(
-            bin.lobe,
-            EeveeGBufferLobe::Diffuse | EeveeGBufferLobe::Subsurface
-        ) {
+        let ambient = if context.world.is_some()
+            && matches!(
+                bin.lobe,
+                EeveeGBufferLobe::Diffuse | EeveeGBufferLobe::Subsurface
+            ) {
             if let Some(cached) = ambient_cache[..ambient_cache_len]
                 .iter()
                 .flatten()
@@ -5718,28 +6344,26 @@ fn shade_eevee_gbuffer(
                 if bin.lobe == EeveeGBufferLobe::Diffuse
                     || !matches!(params.model, BsdfModel::Subsurface)
                 {
-                    let direct = eevee_gbuffer_diffuse_direct(
-                        context,
-                        params,
-                        lobe_normal,
-                        view,
-                        thickness,
-                        light_threshold,
-                    );
-                    let indirect = context.world.map_or(DVec3::ZERO, |world| {
-                        prefiltered_world(world, lobe_normal, 1.0, irradiance_probe_radiance)
-                            * ambient
+                    let direct =
+                        eevee_gbuffer_diffuse_direct(context, lobe_normal, view, light_threshold);
+                    let indirect = raytrace_radiance.unwrap_or_else(|| {
+                        context.world.map_or(DVec3::ZERO, |world| {
+                            prefiltered_world(world, lobe_normal, 1.0, irradiance_probe_radiance)
+                                * ambient
+                        })
                     });
                     reflected += (direct + indirect) * color;
                 }
             }
             EeveeGBufferLobe::Translucent => {
-                let environment = context.world.map_or(DVec3::ZERO, |world| {
-                    if matches!(thickness, Thickness::Sphere(value) if value != 0.0) {
-                        world.average_irradiance()
-                    } else {
-                        prefiltered_world(world, -lobe_normal, 1.0, irradiance_probe_radiance)
-                    }
+                let environment = raytrace_radiance.unwrap_or_else(|| {
+                    context.world.map_or(DVec3::ZERO, |world| {
+                        if matches!(thickness, Thickness::Sphere(value) if value != 0.0) {
+                            world.average_irradiance()
+                        } else {
+                            prefiltered_world(world, -lobe_normal, 1.0, irradiance_probe_radiance)
+                        }
+                    })
                 });
                 let translucent_color = if thickness == Thickness::None {
                     color
@@ -5773,12 +6397,22 @@ fn shade_eevee_gbuffer(
                         ray_visibility: light_node.resolved_ray_visibility(),
                         shadow: context.shadow,
                         point_shadow: context.shadow.and_then(|shadow| shadow.point_maps.get(id)),
+                        sun_shadow_radius: None,
                     };
                     lobe += translucent_direct_contribution(
                         &direct_context,
                         translucent_color,
                         thickness,
                     ) * influence;
+                }
+                if let Some(sun) = context.world_sun {
+                    let direct_context =
+                        world_sun_direct_context(sun, receiver, lobe_normal, context.shadow);
+                    lobe += translucent_direct_contribution(
+                        &direct_context,
+                        translucent_color,
+                        thickness,
+                    );
                 }
                 reflected += lobe;
             }
@@ -5791,10 +6425,15 @@ fn shade_eevee_gbuffer(
                 })?;
                 let direction =
                     eevee_transmission::reflection_direction(lobe_normal, view, roughness);
-                let environment = context.world.map_or(Ok(DVec3::ZERO), |world| {
-                    eevee_deferred_indirect_world(world, direction, roughness)
-                })?;
+                let environment = if let Some(radiance) = raytrace_radiance {
+                    radiance
+                } else {
+                    context.world.map_or(Ok(DVec3::ZERO), |world| {
+                        eevee_deferred_indirect_world(world, direction, roughness)
+                    })?
+                };
                 let mut lobe = environment * color;
+                let mut direct_radiance = DVec3::ZERO;
                 for (id, light_node) in &doc.nodes {
                     let Some(evaluated) = snapshot.nodes.get(id) else {
                         continue;
@@ -5821,10 +6460,22 @@ fn shade_eevee_gbuffer(
                         ray_visibility: light_node.resolved_ray_visibility(),
                         shadow: context.shadow,
                         point_shadow: context.shadow.and_then(|shadow| shadow.point_maps.get(id)),
+                        sun_shadow_radius: None,
                     };
-                    lobe +=
-                        metallic_direct_contribution(&direct_context, roughness, color) * influence;
+                    let contribution =
+                        metallic_direct_contribution(&direct_context, roughness, DVec3::ONE)
+                            * influence;
+                    direct_radiance += contribution;
                 }
+                if let Some(sun) = context.world_sun {
+                    let direct_context =
+                        world_sun_direct_context(sun, receiver, lobe_normal, context.shadow);
+                    let contribution =
+                        metallic_direct_contribution(&direct_context, roughness, DVec3::ONE);
+                    direct_radiance += contribution;
+                }
+                let direct_store = rgb9e5_roundtrip(direct_radiance);
+                lobe += color * direct_store;
                 reflected += lobe;
             }
             EeveeGBufferLobe::Refraction | EeveeGBufferLobe::ThinRefraction => {
@@ -5888,9 +6539,13 @@ fn shade_eevee_gbuffer(
                         eevee_transmission::transmission_roughness(roughness, ior),
                     )
                 };
-                let environment = context.world.map_or(Ok(DVec3::ZERO), |world| {
-                    eevee_deferred_indirect_world(world, direction, probe_roughness)
-                })?;
+                let environment = if let Some(radiance) = raytrace_radiance {
+                    radiance
+                } else {
+                    context.world.map_or(Ok(DVec3::ZERO), |world| {
+                        eevee_deferred_indirect_world(world, direction, probe_roughness)
+                    })?
+                };
                 let mut lobe = environment * glass.transmission;
                 let mut direct_radiance = DVec3::ZERO;
                 for (id, light_node) in &doc.nodes {
@@ -5924,7 +6579,9 @@ fn shade_eevee_gbuffer(
                     );
                     direct_radiance += transmission * influence;
                 }
-                lobe += glass.transmission * rgb9e5_roundtrip(direct_radiance);
+                let direct_store = rgb9e5_roundtrip(direct_radiance);
+                let direct_color = glass.transmission * direct_store;
+                lobe += direct_color;
 
                 reflected += lobe;
             }
@@ -5960,63 +6617,111 @@ fn shade_eevee_gbuffer(
 
 fn eevee_gbuffer_diffuse_direct(
     context: &SurfaceShadeContext<'_>,
-    source_params: &BsdfParams,
     normal: DVec3,
     view: DVec3,
-    thickness: Thickness,
     light_threshold: f64,
 ) -> DVec3 {
-    let mut params = *source_params;
-    params.model = BsdfModel::Principled;
-    params.base_color = [1.0; 4];
-    params.alpha = 1.0;
-    params.metallic = 0.0;
-    params.roughness = 1.0;
-    params.transmission = 0.0;
-    params.subsurface_weight = 0.0;
-    params.reflectance = 1.0;
-    params.specular_ior_level = 0.0;
-    params.sheen_weight = 0.0;
-    params.coat_weight = 0.0;
-    params.thin_wall = false;
-    params.anisotropy = 0.0;
-    params.anisotropic_tangent = None;
-    params.normal = normal;
-    params.coat_normal = None;
-    let layers = principled_layers(&params, normal, view);
+    eevee_diffuse_direct(
+        context.doc,
+        context.snapshot,
+        Receiver {
+            view,
+            ..context.receiver
+        },
+        normal,
+        context.shadow,
+        context.world_sun,
+        light_threshold,
+    )
+}
+
+fn eevee_diffuse_direct(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    receiver: Receiver,
+    normal: DVec3,
+    shadow: ShadowContext<'_>,
+    world_sun: Option<&EeveeWorldSunLight>,
+    light_threshold: f64,
+) -> DVec3 {
+    eevee_direct_lighting(
+        doc,
+        snapshot,
+        receiver,
+        normal,
+        shadow,
+        world_sun,
+        light_threshold,
+        diffuse_direct_contribution,
+    )
+}
+
+fn eevee_subsurface_transmission_direct(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    receiver: Receiver,
+    normal: DVec3,
+    thickness: Thickness,
+    shadow: ShadowContext<'_>,
+    world_sun: Option<&EeveeWorldSunLight>,
+    light_threshold: f64,
+) -> DVec3 {
+    eevee_direct_lighting(
+        doc,
+        snapshot,
+        receiver,
+        normal,
+        shadow,
+        world_sun,
+        light_threshold,
+        |context| transmission_direct_contribution(context, DVec3::ONE, thickness, false),
+    )
+}
+
+fn eevee_direct_lighting(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    receiver: Receiver,
+    normal: DVec3,
+    shadow: ShadowContext<'_>,
+    world_sun: Option<&EeveeWorldSunLight>,
+    light_threshold: f64,
+    mut evaluate: impl FnMut(&DirectLightContext<'_>) -> DVec3,
+) -> DVec3 {
     let mut result = DVec3::ZERO;
-    for (id, light_node) in &context.doc.nodes {
-        let Some(evaluated) = context.snapshot.nodes.get(id) else {
+    for (id, light_node) in &doc.nodes {
+        let Some(evaluated) = snapshot.nodes.get(id) else {
             continue;
         };
         let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
             light_node
                 .data
                 .as_ref()
-                .and_then(|data_id| context.doc.data_blocks.get(data_id))
+                .and_then(|data_id| doc.data_blocks.get(data_id))
                 .and_then(|block| block.light.as_ref())
         }) else {
             continue;
         };
         let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
-        let influence = light_influence_at(light, matrix, context.receiver.point, light_threshold);
+        let influence = light_influence_at(light, matrix, receiver.point, light_threshold);
         if influence <= 0.0 {
             continue;
         }
-        result += light_contribution(
+        let direct = DirectLightContext {
             light,
             matrix,
-            context.receiver.point,
-            context.receiver.shadow_point,
+            receiver,
             normal,
-            context.receiver.geometric,
-            &params,
-            &layers,
-            context.shadow,
-            context.shadow.and_then(|shadow| shadow.point_maps.get(id)),
-            light_node.resolved_ray_visibility(),
-            thickness,
-        ) * influence;
+            ray_visibility: light_node.resolved_ray_visibility(),
+            shadow,
+            point_shadow: shadow.and_then(|scene| scene.point_maps.get(id)),
+            sun_shadow_radius: None,
+        };
+        result += evaluate(&direct) * influence;
+    }
+    if let Some(sun) = world_sun {
+        let direct = world_sun_direct_context(sun, receiver, normal, shadow);
+        result += evaluate(&direct);
     }
     result
 }
@@ -6053,35 +6758,44 @@ fn shade(context: &SurfaceShadeContext<'_>) -> Result<[f64; 4]> {
         view,
         ..*surface_receiver
     };
-    // The diffuse environment depends on the normal alone, so every closure shares it.
-    let diffuse_environment =
-        world.map(|world| prefiltered_world(world, normal, 1.0, irradiance_probe_radiance));
-    // Ambient occlusion attenuates the environment (indirect) light only, as EEVEE's horizon scan does; EEVEE's direct
-    // light is never occluded by it. The hemisphere is the one the raster's occlusion pass casts (`ambient_visibility`).
-    let ambient = shadow.map_or(1.0, |scene| {
-        let facing = if geometric.dot(view) < 0.0 {
-            -geometric
-        } else {
-            geometric
-        };
-        ambient_visibility(
-            scene.bvh,
-            scene.triangles,
-            scene.prepared_materials,
-            point,
-            facing,
-            normal,
-            1.0,
-            scene.has_volume_only,
-        )
-    });
-    // A closure's reflective share is its weight times its alpha. The raster composite multiplies a straight colour
-    // by the opaque share (`render/raster.rs`, `composite_sample`), so the premultiplied sums are divided by it below.
+    // Ambient visibility modulates only diffuse-family indirect light; pure reflection/refraction and worldless
+    // materials have no consumer for this hemisphere query.
+    let needs_ambient = world.is_some()
+        && closures.iter().any(|closure| {
+            !matches!(closure.params.model, BsdfModel::Subsurface) && {
+                let features = closure.params.eevee_gbuffer_features();
+                features.has_diffuse() || features.has_subsurface() || features.has_translucent()
+            }
+        });
+    let ambient = if needs_ambient {
+        shadow.map_or(1.0, |scene| {
+            let facing = if geometric.dot(view) < 0.0 {
+                -geometric
+            } else {
+                geometric
+            };
+            ambient_visibility(
+                scene.bvh,
+                scene.triangles,
+                scene.prepared_materials,
+                point,
+                facing,
+                normal,
+                1.0,
+                scene.has_volume_only,
+            )
+        })
+    } else {
+        1.0
+    };
+    // EEVEE Hair preview may source diffuse radiance weight separately; raster coverage remains based on graph weights.
+    // `share` scales radiance and emission, while `opaque_share` independently supplies physical/film coverage.
     let mut reflected = DVec3::ZERO;
     let mut emitted = DVec3::ZERO;
     for closure in closures {
         let params = &closure.params;
-        let share = closure.weight * params.alpha.clamp(0.0, 1.0);
+        let share =
+            params.eevee_diffuse_weight.unwrap_or(closure.weight) * params.alpha.clamp(0.0, 1.0);
         if matches!(params.model, BsdfModel::Holdout | BsdfModel::Subsurface) {
             continue;
         }
@@ -6113,7 +6827,9 @@ fn shade(context: &SurfaceShadeContext<'_>) -> Result<[f64; 4]> {
             let mut lobes = DVec3::ZERO;
             // EEVEE packs each glass closure's summed direct radiance before multiplying its closure colour.
             let mut glass_direct_radiance = (DVec3::ZERO, DVec3::ZERO);
-            if let (Some(world), Some(diffuse_environment)) = (world, diffuse_environment) {
+            if let Some(world) = world {
+                let diffuse_environment =
+                    prefiltered_world(world, normal, 1.0, irradiance_probe_radiance);
                 let diffuse_albedo = if params.thin_wall {
                     let subsurface = params.subsurface_weight.clamp(0.0, 1.0);
                     let reflection =
@@ -6122,13 +6838,12 @@ fn shade(context: &SurfaceShadeContext<'_>) -> Result<[f64; 4]> {
                 } else {
                     albedo
                 };
-                let mut environment = diffuse_albedo * diffuse_environment * dielectric * lower;
+                lobes += diffuse_albedo * diffuse_environment * dielectric * lower * ambient;
                 let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
                 let specular_environment = eevee_prefiltered_world(world, reflection, roughness)?;
                 let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
                 let f0 = albedo * metallic + DVec3::splat(specular_f0 * dielectric);
-                environment += specular_environment * f0 * (1.0_f64 - roughness).powi(2) * lower;
-                lobes += environment * ambient;
+                lobes += specular_environment * f0 * (1.0_f64 - roughness).powi(2) * lower;
                 if params.thin_wall && params.subsurface_weight > 0.0 {
                     let sphere_thickness =
                         matches!(thickness, Thickness::Sphere(value) if value > 0.0);
@@ -6186,6 +6901,7 @@ fn shade(context: &SurfaceShadeContext<'_>) -> Result<[f64; 4]> {
                     point_shadow,
                     ray_visibility,
                     thickness,
+                    None,
                 ) * influence;
                 if let Some(glass) = &glass {
                     let (reflection, transmission) = glass_direct_contribution(
@@ -6201,6 +6917,11 @@ fn shade(context: &SurfaceShadeContext<'_>) -> Result<[f64; 4]> {
                     glass_direct_radiance.0 += reflection * influence;
                     glass_direct_radiance.1 += transmission * influence;
                 }
+            }
+            if let Some(sun) = context.world_sun {
+                lobes += world_sun_light_contribution(
+                    sun, receiver, normal, geometric, &lobe, &shading, shadow, thickness,
+                );
             }
             if let Some(glass) = &glass {
                 let reflection = rgb9e5_roundtrip(glass_direct_radiance.0);
@@ -6291,11 +7012,14 @@ fn eevee_subsurface_sample(
     view: DVec3,
     closures: &[ShaderClosure],
     route: Option<&EeveeGBufferRoute>,
+    raytrace_feedback: Option<&EeveeRaytraceFeedback>,
     shadow: ShadowContext<'_>,
     object_thickness: f64,
     world: Option<&WorldProbe>,
+    world_sun: Option<&EeveeWorldSunLight>,
     object_index: u32,
     camera_matrices: Option<(&DMat4, &DMat4)>,
+    material_refraction: Option<bool>,
 ) -> Result<Option<EeveeSubsurfaceSample>> {
     let Some(route) = route else {
         return Ok(None);
@@ -6367,79 +7091,104 @@ fn eevee_subsurface_sample(
         radius: profile_radius,
     });
 
-    let mut diffuse = *params;
-    diffuse.model = BsdfModel::Principled;
-    diffuse.base_color = [1.0; 4];
-    diffuse.alpha = 1.0;
-    diffuse.metallic = 0.0;
-    diffuse.roughness = 1.0;
-    diffuse.transmission = 0.0;
-    diffuse.subsurface_weight = 0.0;
-    diffuse.reflectance = 1.0;
-    diffuse.specular_ior_level = 0.0;
-    diffuse.sheen_weight = 0.0;
-    diffuse.coat_weight = 0.0;
-    diffuse.thin_wall = false;
-    let layers = principled_layers(&diffuse, shading_normal, view);
     let thickness = Thickness::new(
         params.thickness.unwrap_or(object_thickness),
         params.thickness_slab,
     );
-    let mut direct = DVec3::ZERO;
-    for (id, light_node) in &doc.nodes {
-        let Some(evaluated) = snapshot.nodes.get(id) else {
-            continue;
-        };
-        let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
-            light_node
-                .data
-                .as_ref()
-                .and_then(|data_id| doc.data_blocks.get(data_id))
-                .and_then(|block| block.light.as_ref())
-        }) else {
-            continue;
-        };
-        let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
-        let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
-        let influence = light_influence_at(light, matrix, point, light_threshold);
-        if influence <= 0.0 {
-            continue;
-        }
-        direct += light_contribution(
-            light,
-            matrix,
-            point,
-            shadow_point,
+    let receiver = Receiver {
+        point,
+        shadow_point,
+        geometric,
+        view,
+    };
+    let direct_front = eevee_diffuse_direct(
+        doc,
+        snapshot,
+        receiver,
+        shading_normal,
+        shadow,
+        world_sun,
+        light_threshold,
+    );
+    let transmission = super::eevee_advanced_bsdf::eevee_subsurface_transmission(
+        profile_radius,
+        thickness.value() as f32,
+    )
+    .map(f64::from);
+    let direct_back = if transmission.iter().any(|value| *value > 0.0) {
+        eevee_subsurface_transmission_direct(
+            doc,
+            snapshot,
+            receiver,
             shading_normal,
-            geometric,
-            &diffuse,
-            &layers,
-            shadow,
-            point_shadow,
-            light_node.resolved_ray_visibility(),
             thickness,
-        ) * influence;
-    }
-    let ambient = shadow.map_or(1.0, |scene| {
-        let facing = if geometric.dot(view) < 0.0 {
-            -geometric
-        } else {
-            geometric
-        };
-        ambient_visibility(
-            scene.bvh,
-            scene.triangles,
-            scene.prepared_materials,
-            point,
-            facing,
-            shading_normal,
-            1.0,
-            scene.has_volume_only,
+            shadow,
+            world_sun,
+            light_threshold,
         )
-    });
-    let indirect = world.map_or(DVec3::ZERO, |world| {
-        prefiltered_world(world, shading_normal, 1.0, irradiance_probe_radiance) * ambient
-    });
+    } else {
+        DVec3::ZERO
+    };
+    let direct = direct_front + direct_back * DVec3::from_array(transmission);
+    let ambient = if world.is_some() {
+        shadow.map_or(1.0, |scene| {
+            let facing = if geometric.dot(view) < 0.0 {
+                -geometric
+            } else {
+                geometric
+            };
+            ambient_visibility(
+                scene.bvh,
+                scene.triangles,
+                scene.prepared_materials,
+                point,
+                facing,
+                shading_normal,
+                1.0,
+                scene.has_volume_only,
+            )
+        })
+    } else {
+        1.0
+    };
+    let indirect = raytrace_feedback
+        .and_then(|feedback| {
+            let radiance = if feedback.refraction_active && material_refraction == Some(true) {
+                &feedback.refraction_radiance
+            } else {
+                &feedback.radiance
+            };
+            radiance.get(selected_bin.storage_layer).copied().flatten()
+        })
+        .map_or_else(
+            || {
+                world.map_or(DVec3::ZERO, |world| {
+                    let Some(sh) = world.fast_gi_sh() else {
+                        return DVec3::ZERO;
+                    };
+                    let transmission = super::eevee_advanced_bsdf::eevee_subsurface_transmission(
+                        profile_radius,
+                        thickness.value() as f32,
+                    )
+                    .map(f64::from);
+                    let normal = shading_normal.as_vec3();
+                    let front = sh
+                        .evaluate_lambert(normal)
+                        .truncate()
+                        .to_array()
+                        .map(f64::from);
+                    let back = sh
+                        .evaluate_lambert(-normal)
+                        .truncate()
+                        .to_array()
+                        .map(f64::from);
+                    (DVec3::from_array(front)
+                        + DVec3::from_array(back) * DVec3::from_array(transmission))
+                        * ambient
+                })
+            },
+            |radiance| DVec3::from_array(radiance.map(f64::from)),
+        );
     Ok(Some(EeveeSubsurfaceSample {
         closures: profiles,
         direct: direct.to_array().map(|value| value as f32),
@@ -6539,6 +7288,7 @@ fn light_contribution(
     point_shadow: Option<&PointShadowMap>,
     lobes: RayVisibility,
     thickness: Thickness,
+    sun_shadow_radius: Option<f64>,
 ) -> DVec3 {
     let color = DVec3::from_array(light.color).max(DVec3::ZERO);
     let energy = light.energy.max(0.0);
@@ -6561,6 +7311,7 @@ fn light_contribution(
                 color,
                 light,
                 lobes,
+                sun_shadow_radius,
             )
         }
         crate::model::LightType::Point => {
@@ -6686,7 +7437,9 @@ fn light_contribution(
         && params.subsurface_weight > 0.0
         && lobes.mask() & RayKind::Diffuse.bit() != 0
     {
-        let Some(direct) = direct_emitter(light, matrix, point) else {
+        let Some(direct) =
+            direct_emitter_with_sun_shadow_radius(light, matrix, point, sun_shadow_radius)
+        else {
             return contribution;
         };
         let origin = transmission_origin(
@@ -6909,6 +7662,37 @@ fn sun_disc_directions(direction: DVec3, radius: f64) -> impl Iterator<Item = DV
     })
 }
 
+/// Keeps the direct-light disc and its independently jittered shadow disc on the same spiral samples.
+fn sun_disc_direction_pairs(
+    direction: DVec3,
+    shape_radius: f64,
+    shadow_radius: f64,
+) -> impl Iterator<Item = (DVec3, DVec3)> {
+    let (tangent, bitangent) = make_orthonormals(direction);
+    let golden_angle = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+    (0..SUN_DISC_SAMPLES).map(move |index| {
+        let radial = ((index as f64 + 0.5) / SUN_DISC_SAMPLES as f64).sqrt();
+        let angle = index as f64 * golden_angle;
+        let (cosine, sine) = (angle.cos(), angle.sin());
+        let sample = |radius: f64| {
+            (direction
+                + tangent * (radial * radius * cosine)
+                + bitangent * (radial * radius * sine))
+                .normalize_or_zero()
+        };
+        let shape = sample(shape_radius);
+        let shadow = if shape_radius
+            .partial_cmp(&shadow_radius)
+            .is_some_and(std::cmp::Ordering::is_eq)
+        {
+            shape
+        } else {
+            sample(shadow_radius)
+        };
+        (shape, shadow)
+    })
+}
+
 /// A sun's visibility at a receiver: the mean over rays from the receiver to the sun's disc, each blocked by an opaque
 /// occluder (`ray_transmittance`).
 fn sun_disc_visibility(
@@ -6993,6 +7777,15 @@ fn direct_emitter(
     matrix: DMat4,
     point: DVec3,
 ) -> Option<DirectEmitter> {
+    direct_emitter_with_sun_shadow_radius(light, matrix, point, None)
+}
+
+fn direct_emitter_with_sun_shadow_radius(
+    light: &crate::model::LightData,
+    matrix: DMat4,
+    point: DVec3,
+    sun_shadow_radius: Option<f64>,
+) -> Option<DirectEmitter> {
     let color = DVec3::from_array(light.color).max(DVec3::ZERO);
     let energy = light.energy.max(0.0);
     let position = matrix.transform_point3(DVec3::ZERO);
@@ -7000,6 +7793,7 @@ fn direct_emitter(
     match light.light_type {
         crate::model::LightType::Sun => {
             let radius = sun_disc_radius(light.sun_angle);
+            let shadow_radius = sun_shadow_radius.unwrap_or(radius);
             // `shape_radiance_get` for a sun: `(1 + 1 / r²) / π` per unit of irradiance.
             let inv_sin_squared = 1.0 + 1.0 / (radius * radius);
             Some(DirectEmitter {
@@ -7014,7 +7808,7 @@ fn direct_emitter(
                 axis,
                 area: None,
                 sun: true,
-                sun_radius: radius,
+                sun_radius: shadow_radius,
             })
         }
         crate::model::LightType::Point | crate::model::LightType::Spot => {
@@ -7320,6 +8114,56 @@ struct DirectLightContext<'a> {
     ray_visibility: RayVisibility,
     shadow: ShadowContext<'a>,
     point_shadow: Option<&'a PointShadowMap>,
+    sun_shadow_radius: Option<f64>,
+}
+
+fn world_sun_shadow<'a>(sun: &EeveeWorldSunLight, shadow: ShadowContext<'a>) -> ShadowContext<'a> {
+    if sun.use_shadows { shadow } else { None }
+}
+
+fn world_sun_direct_context<'a>(
+    sun: &'a EeveeWorldSunLight,
+    receiver: Receiver,
+    normal: DVec3,
+    shadow: ShadowContext<'a>,
+) -> DirectLightContext<'a> {
+    DirectLightContext {
+        light: &sun.light,
+        matrix: sun.matrix,
+        receiver,
+        normal,
+        ray_visibility: sun.ray_visibility,
+        shadow: world_sun_shadow(sun, shadow),
+        point_shadow: None,
+        sun_shadow_radius: sun.shadow_radius,
+    }
+}
+
+fn world_sun_light_contribution(
+    sun: &EeveeWorldSunLight,
+    receiver: Receiver,
+    normal: DVec3,
+    geometric: DVec3,
+    params: &BsdfParams,
+    shading: &Layers,
+    shadow: ShadowContext<'_>,
+    thickness: Thickness,
+) -> DVec3 {
+    light_contribution(
+        &sun.light,
+        sun.matrix,
+        receiver.point,
+        receiver.shadow_point,
+        normal,
+        geometric,
+        params,
+        shading,
+        world_sun_shadow(sun, shadow),
+        None,
+        sun.ray_visibility,
+        thickness,
+        sun.shadow_radius,
+    )
 }
 
 fn translucent_direct_contribution(
@@ -7327,14 +8171,30 @@ fn translucent_direct_contribution(
     color: DVec3,
     thickness: Thickness,
 ) -> DVec3 {
+    transmission_direct_contribution(context, color, thickness, true)
+}
+
+/// BSSRDF transmission uses a back-facing `LIGHT_DIFFUSE` lobe while retaining the material thickness for shadow origin.
+fn transmission_direct_contribution(
+    context: &DirectLightContext<'_>,
+    color: DVec3,
+    thickness: Thickness,
+    is_translucent_with_thickness: bool,
+) -> DVec3 {
     // EEVEE's translucent direct closure uses LIGHT_DIFFUSE power, including the thick-sphere variant.
     if !context.ray_visibility.allows(RayKind::Diffuse) {
         return DVec3::ZERO;
     }
-    let Some(direct) = direct_emitter(context.light, context.matrix, context.receiver.point) else {
+    let Some(direct) = direct_emitter_with_sun_shadow_radius(
+        context.light,
+        context.matrix,
+        context.receiver.point,
+        context.sun_shadow_radius,
+    ) else {
         return DVec3::ZERO;
     };
-    let sphere = matches!(thickness, Thickness::Sphere(value) if value != 0.0);
+    let sphere = is_translucent_with_thickness
+        && matches!(thickness, Thickness::Sphere(value) if value != 0.0);
     let lobe_normal = if sphere {
         direct.direction
     } else {
@@ -7392,15 +8252,49 @@ fn translucent_direct_contribution(
             * thickness_scale)
 }
 
+fn diffuse_direct_contribution(context: &DirectLightContext<'_>) -> DVec3 {
+    ltc_direct_contribution(
+        context,
+        super::eevee_ltc::IDENTITY,
+        DVec3::ONE,
+        RayKind::Diffuse,
+    )
+}
+
 fn metallic_direct_contribution(
     context: &DirectLightContext<'_>,
     roughness: f64,
     color: DVec3,
 ) -> DVec3 {
-    if !context.ray_visibility.allows(RayKind::Glossy) {
+    ltc_direct_contribution(
+        context,
+        super::eevee_ltc::sample_matrix(context.normal.dot(context.receiver.view), roughness),
+        color,
+        RayKind::Glossy,
+    )
+}
+
+fn ltc_direct_contribution(
+    context: &DirectLightContext<'_>,
+    matrix: super::eevee_ltc::PackedMatrix,
+    color: DVec3,
+    ray_kind: RayKind,
+) -> DVec3 {
+    if !context.ray_visibility.allows(ray_kind) {
         return DVec3::ZERO;
     }
-    let Some(direct) = direct_emitter(context.light, context.matrix, context.receiver.point) else {
+    let factors = LightFactors::of(context.light);
+    let light_factor = match ray_kind {
+        RayKind::Diffuse => factors.diffuse,
+        RayKind::Glossy => factors.specular,
+        _ => return DVec3::ZERO,
+    };
+    let Some(direct) = direct_emitter_with_sun_shadow_radius(
+        context.light,
+        context.matrix,
+        context.receiver.point,
+        context.sun_shadow_radius,
+    ) else {
         return DVec3::ZERO;
     };
     let facing = facing_attenuation(
@@ -7435,21 +8329,14 @@ fn metallic_direct_contribution(
             direct.sun_radius,
         ),
     };
-    let matrix =
-        super::eevee_ltc::sample_matrix(context.normal.dot(context.receiver.view), roughness);
     let form = direct.emitter.form_factor(
         context.normal,
         context.receiver.view,
         matrix,
         direct.to_centre,
     );
-    color
-        * direct.radiance
-        * (direct.attenuation
-            * facing
-            * visibility
-            * form
-            * LightFactors::of(context.light).specular)
+    let unshadowed = direct.radiance * (direct.attenuation * facing * form * light_factor);
+    color * unshadowed * visibility
 }
 
 /// A sun's direct light, integrated over the sun's disc as EEVEE's sun is. The diffuse class is flat over the disc, so its
@@ -7466,6 +8353,7 @@ fn sun_lighting(
     color: DVec3,
     light: &crate::model::LightData,
     lobes: RayVisibility,
+    sun_shadow_radius: Option<f64>,
 ) -> DVec3 {
     let front_params = if params.thin_wall {
         *params
@@ -7476,17 +8364,20 @@ fn sun_lighting(
     let sphere_thickness =
         !params.thickness_slab && params.thickness.is_some_and(|value| value > 0.0);
     let factors = LightFactors::of(light);
-    let radius = sun_disc_radius(light.sun_angle);
+    let shape_radius = sun_disc_radius(light.sun_angle);
+    let shadow_radius = sun_shadow_radius.unwrap_or(shape_radius);
     let weight = energy / SUN_DISC_SAMPLES as f64;
     let mut mean_visibility = 0.0;
     let mut specular = DVec3::ZERO;
     let mut translucent = DVec3::ZERO;
-    for sample in sun_disc_directions(toward_light, radius) {
+    for (sample, shadow_sample) in
+        sun_disc_direction_pairs(toward_light, shape_radius, shadow_radius)
+    {
         let visibility = match shadow {
             Some(shadow) => ray_transmittance(
                 shadow,
-                shadow_origin(shadow_point, geometric, sample),
-                sample,
+                shadow_origin(shadow_point, geometric, shadow_sample),
+                shadow_sample,
                 f64::INFINITY,
                 true,
             ),
@@ -7617,7 +8508,7 @@ mod shading_normal_tests {
     use crate::render::principled_bsdf::{
         diffuse_coefficient, layers as principled_layers, specular_coefficient,
     };
-    use crate::render::raster::{Camera, Projection, StereoMode, ViewBasis};
+    use crate::render::raster::{Camera, EeveeRaytraceFeedback, Projection, StereoMode, ViewBasis};
     use crate::shader::BsdfParams;
     use crate::{
         eval::{EvaluationContext, Snapshot},
@@ -8020,6 +8911,7 @@ mod shading_normal_tests {
                     gbuffer_sample_offset: None,
                     gbuffer_closure_random: None,
                     view: DVec3::Z,
+                    eevee_raytrace_feedback: EeveeRaytraceFeedback::default(),
                 },
             )?
             .color;
@@ -8481,7 +9373,7 @@ mod beauty_tint_tests {
     #[test]
     fn blended_material_keeps_each_channel() {
         assert_eq!(
-            beauty_tint(Some(&material("blend")), [0.2, 0.8, 0.4]),
+            beauty_tint(Some(&material("blend")), [0.2, 0.8, 0.4], false),
             [0.2, 0.8, 0.4]
         );
     }
@@ -8491,7 +9383,7 @@ mod beauty_tint_tests {
     fn dithered_material_takes_the_channel_mean() {
         let mean = (0.2 + 0.8 + 0.4) / 3.0;
         for alpha_mode in ["opaque", "clip"] {
-            for channel in beauty_tint(Some(&material(alpha_mode)), [0.2, 0.8, 0.4]) {
+            for channel in beauty_tint(Some(&material(alpha_mode)), [0.2, 0.8, 0.4], false) {
                 assert!((channel - mean).abs() < 1.0e-12, "{alpha_mode}: {channel}");
             }
         }
@@ -8502,16 +9394,16 @@ mod beauty_tint_tests {
     #[test]
     fn tints_are_clamped_before_use() {
         assert_eq!(
-            beauty_tint(Some(&material("blend")), [2.0, -1.0, 0.5]),
+            beauty_tint(Some(&material("blend")), [2.0, -1.0, 0.5], false),
             [1.0, 0.0, 0.5]
         );
-        let dithered = beauty_tint(Some(&material("clip")), [2.0, -1.0, 0.5]);
+        let dithered = beauty_tint(Some(&material("clip")), [2.0, -1.0, 0.5], false);
         assert!((dithered[0] - 0.5).abs() < 1.0e-12, "{dithered:?}");
     }
 
     #[test]
     fn no_material_keeps_the_tint_clamped() {
-        assert_eq!(beauty_tint(None, [0.5, 1.5, -0.2]), [0.5, 1.0, 0.0]);
+        assert_eq!(beauty_tint(None, [0.5, 1.5, -0.2], false), [0.5, 1.0, 0.0]);
     }
 
     /// Mix(0.5) of a Transparent (colour (0.2, 0.8, 0.4)) and an opaque Principled. The transparent closure passes
@@ -8597,10 +9489,10 @@ mod eevee_gbuffer_candidate_tests {
 
     use crate::{
         model::Material,
-        shader::{BsdfModel, BsdfParams, EeveeGBufferLobe, ShaderClosure},
+        shader::{BsdfModel, BsdfParams, EeveeGBufferFeatures, EeveeGBufferLobe, ShaderClosure},
     };
 
-    use super::{eevee_gbuffer_alpha, eevee_gbuffer_candidates};
+    use super::{beauty_tint, eevee_gbuffer_alpha, eevee_gbuffer_candidates, opaque_share};
 
     #[test]
     fn gbuffer_alpha_reciprocal_uses_raw_transmittance_and_excludes_holdout() {
@@ -8620,8 +9512,10 @@ mod eevee_gbuffer_candidate_tests {
                 params: holdout,
             },
         ];
-        let (alpha, alpha_reciprocal) = eevee_gbuffer_alpha(&closures);
-        let expected = 1.0_f32 - (0.4_f32 + 0.2 + 0.1) / 3.0;
+        let (transparency, alpha, alpha_reciprocal) = eevee_gbuffer_alpha(&closures);
+        let expected_transparency = (0.4_f32 + 0.2 + 0.1) / 3.0;
+        assert_eq!(transparency.to_bits(), expected_transparency.to_bits());
+        let expected = 1.0_f32 - expected_transparency;
         assert_eq!(alpha.to_bits(), expected.to_bits());
         assert_eq!(alpha_reciprocal.to_bits(), expected.recip().to_bits());
     }
@@ -8640,6 +9534,205 @@ mod eevee_gbuffer_candidate_tests {
         assert_eq!(reflection.source_closure_index, 0);
         assert_eq!(reflection.lobe, EeveeGBufferLobe::Reflection);
         assert_eq!(reflection.weight, 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn blended_eevee_transparency_uses_the_scene_color_target() {
+        let material = Material {
+            alpha_mode: "blend".to_owned(),
+            ..Material::default()
+        };
+        let tint = [0.92, 0.87, 0.73];
+        assert_eq!(beauty_tint(Some(&material), tint, true), [0.92; 3]);
+        assert_eq!(beauty_tint(Some(&material), tint, false), tint);
+
+        let dithered = Material::default();
+        let mean = (tint[0] + tint[1] + tint[2]) / 3.0;
+        assert_eq!(beauty_tint(Some(&dithered), tint, true), [mean; 3]);
+    }
+
+    #[test]
+    fn principled_hair_gpu_weight_changes_radiance_without_changing_mix_coverage()
+    -> Result<(), String> {
+        let hair = |weight| {
+            let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+            params.model = BsdfModel::Principled;
+            params.base_color = [0.34, 0.12, 0.07, 1.0];
+            params.eevee_gbuffer_features = EeveeGBufferFeatures::diffuse_only();
+            params.eevee_diffuse_weight = Some(weight);
+            ShaderClosure {
+                weight: 0.5,
+                params,
+            }
+        };
+        let mut black_params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        black_params.model = BsdfModel::Principled;
+        black_params.base_color = [0.0; 4];
+        black_params.eevee_gbuffer_features = EeveeGBufferFeatures::diffuse_only();
+        let black = ShaderClosure {
+            weight: 0.5,
+            params: black_params,
+        };
+
+        for (gpu_weight, expected) in [(0.62, 0.62_f32), (0.31, 0.31_f32)] {
+            let closures = [hair(gpu_weight), black];
+            assert_eq!(opaque_share(&closures), 1.0);
+            let candidates = eevee_gbuffer_candidates(&closures, DVec3::Z, DVec3::Z)
+                .map_err(|error| format!("{error:?}"))?;
+            let hair_candidate = candidates
+                .iter()
+                .find(|candidate| candidate.source_closure_index == 0)
+                .ok_or_else(|| "Hair diffuse G-buffer candidate is missing".to_owned())?;
+            assert_eq!(hair_candidate.lobe, EeveeGBufferLobe::Diffuse);
+            assert_eq!(hair_candidate.weight, expected);
+        }
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod eevee_world_sun_tests {
+    use glam::{DVec3, Vec3};
+
+    use crate::{
+        eval::{EvaluationContext, Snapshot},
+        model::{Material, SceneDoc, World},
+        render::raster::Mode,
+        shader::{BsdfModel, BsdfParams, ShaderClosure},
+    };
+
+    use super::{
+        EeveeRaytraceFeedback, EeveeWorldSun, Receiver, SurfaceShadeContext, eevee_world_sun_light,
+        shade,
+    };
+
+    #[test]
+    fn extracted_world_sun_uses_native_surface_lighting_and_separate_shadow_angle()
+    -> Result<(), String> {
+        let world = World {
+            eevee_sun_angle: Some(0.4),
+            eevee_use_sun_shadow: Some(true),
+            eevee_use_sun_shadow_jitter: Some(true),
+            eevee_sun_shadow_jitter_overblur: Some(50.0),
+            ..World::default()
+        };
+        let sun = eevee_world_sun_light(
+            &world,
+            EeveeWorldSun {
+                radiance: Vec3::splat(2.0),
+                direction: Vec3::Z,
+            },
+        )
+        .map_err(str::to_owned)?;
+        assert!((sun.light.sun_angle - 0.4).abs() < f64::EPSILON);
+        let sun_radius = (0.4_f64 * 0.5).tan().clamp(0.001, 20.0);
+        let expected_surface_energy =
+            std::f64::consts::FRAC_1_PI * (1.0 + 1.0 / sun_radius.powi(2));
+        assert_eq!(sun.light.energy, expected_surface_energy);
+        let shadow_angle = 0.4_f64 * 0.5 * 0.5;
+        let shadow_radius = sun
+            .shadow_radius
+            .ok_or_else(|| "enabled source Sun shadow radius is missing".to_owned())?;
+        assert!((shadow_radius - shadow_angle.tan()).abs() < 1.0e-15);
+        assert!(sun.ray_visibility.allows(crate::model::RayKind::Diffuse));
+        assert!(sun.ray_visibility.allows(crate::model::RayKind::Glossy));
+        assert!(!sun.ray_visibility.allows(crate::model::RayKind::Camera));
+        assert!(
+            sun.ray_visibility
+                .allows(crate::model::RayKind::Transmission)
+        );
+        assert!(
+            sun.ray_visibility
+                .allows(crate::model::RayKind::VolumeScatter)
+        );
+        assert_eq!(sun.volume_energy, 1.0);
+
+        let no_shadow_world = World {
+            eevee_sun_angle: Some(0.0),
+            eevee_use_sun_shadow: Some(false),
+            ..World::default()
+        };
+        let sun = eevee_world_sun_light(
+            &no_shadow_world,
+            EeveeWorldSun {
+                radiance: Vec3::splat(2.0),
+                direction: Vec3::Z,
+            },
+        )
+        .map_err(str::to_owned)?;
+        let doc = SceneDoc::new("world_sun_scene".to_owned());
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())
+            .map_err(|error| format!("{error:?}"))?;
+        let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        params.model = BsdfModel::Principled;
+        params.base_color = [1.0; 4];
+        params.reflectance = 1.0;
+        let closures = [ShaderClosure {
+            weight: 1.0,
+            params,
+        }];
+
+        let receiver = Receiver {
+            point: DVec3::ZERO,
+            shadow_point: DVec3::ZERO,
+            geometric: DVec3::Z,
+            view: DVec3::Z,
+        };
+        let lit = shade(&SurfaceShadeContext {
+            doc: &doc,
+            snapshot: &snapshot,
+            receiver,
+            normal: DVec3::Z,
+            closures: &closures,
+            mode: Mode::Beauty,
+            shadow: None,
+            object_thickness: 0.0,
+            world: None,
+            world_sun: Some(&sun),
+            gbuffer: None,
+            eevee_raytrace_feedback: EeveeRaytraceFeedback::default(),
+            material_refraction: Some(false),
+        })
+        .map_err(|error| format!("{error:?}"))?;
+        let unlit = shade(&SurfaceShadeContext {
+            doc: &doc,
+            snapshot: &snapshot,
+            receiver,
+            normal: DVec3::Z,
+            closures: &closures,
+            mode: Mode::Beauty,
+            shadow: None,
+            object_thickness: 0.0,
+            world: None,
+            world_sun: None,
+            gbuffer: None,
+            eevee_raytrace_feedback: EeveeRaytraceFeedback::default(),
+            material_refraction: Some(false),
+        })
+        .map_err(|error| format!("{error:?}"))?;
+        assert!(lit[0] > unlit[0]);
+        assert!(lit[1] > unlit[1]);
+        assert!(lit[2] > unlit[2]);
+        Ok(())
+    }
+    #[test]
+    fn extracted_world_sun_matrix_matches_native_duff_basis() -> Result<(), String> {
+        let world = World {
+            eevee_sun_angle: Some(0.0),
+            eevee_use_sun_shadow: Some(false),
+            ..World::default()
+        };
+        let sun = eevee_world_sun_light(
+            &world,
+            EeveeWorldSun {
+                radiance: Vec3::ONE,
+                direction: Vec3::X,
+            },
+        )
+        .map_err(str::to_owned)?;
+        assert_eq!(sun.matrix.x_axis.truncate(), -DVec3::Z);
+        assert_eq!(sun.matrix.y_axis.truncate(), DVec3::Y);
+        assert_eq!(sun.matrix.z_axis.truncate(), DVec3::X);
         Ok(())
     }
 }

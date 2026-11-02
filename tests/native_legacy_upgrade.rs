@@ -28,7 +28,7 @@ use std::{
 
 use native_oracle::{
     FLOAT_TOLERANCE, StoredCorner, TestResult, apply_operations, attribute, build_oracle,
-    import_blend, mesh_of_node, node_id, normal_code_rows, pot, pot_json, read_scene,
+    export_raw, import_blend, mesh_of_node, node_id, normal_code_rows, pot, pot_json, read_scene,
     run_blender_arguments, value_at, write_script,
 };
 use serde_json::{Map, Value, json};
@@ -187,6 +187,486 @@ fn copy_tree(from: &Path, to: &Path) -> TestResult {
 
 fn read_json(path: &Path) -> TestResult<Value> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn write_legacy_refraction_project(
+    root: &Path,
+    schema_version: u32,
+) -> TestResult<(PathBuf, String)> {
+    let project = root.join(format!("legacy-refraction-{schema_version}"));
+    pot_json(|command| {
+        command.arg("init").arg(&project);
+    })?;
+
+    let scene_path = project.join("scene.json");
+    let mut document = read_json(&scene_path)?;
+    document["schema_version"] = json!(schema_version);
+    document["revision"] = json!(1);
+    document["materials"] = json!({
+        "glass":{"name":"Glass"},
+        "native_legacy":{"name":"Native legacy"}
+    });
+    document["compatibility"] = json!({
+        "blender_adapter": {
+            "id_mappings": {"Material:Glass":"glass"},
+            "intermediate": {"materials":[{"name":"Glass"}]}
+        }
+    });
+
+    let mut snapshot = document.clone();
+    snapshot["history"] = json!({"head":null,"undo":[],"redo":[]});
+    let snapshot_hash = potter_core::hash::sha256(&potter_core::hash::canonicalize(&snapshot)?);
+    let record = json!({
+        "record_version": 1,
+        "parent": null,
+        "kind": "init",
+        "revision": 1,
+        "scene_hash": snapshot_hash,
+        "operations": [],
+        "changes": {},
+        "target": null,
+        "snapshot": snapshot,
+    });
+    let record_bytes = serde_json::to_vec(&record)?;
+    let digest = hex::encode(Sha256::digest(&record_bytes));
+    let blob_directory = project.join("history/sha256").join(&digest);
+    fs::create_dir_all(&blob_directory)?;
+    fs::write(blob_directory.join("blob.json"), record_bytes)?;
+    document["history"] = json!({
+        "head": format!("sha256:{digest}"),
+        "undo": [],
+        "redo": []
+    });
+    let source_hash = potter_core::hash::sha256(&potter_core::hash::canonicalize(&document)?);
+    fs::write(&scene_path, serde_json::to_vec_pretty(&document)?)?;
+    Ok((project, source_hash))
+}
+
+const APPEND_REFRACTION_BLEND: &str = r#"
+import bpy
+import sys
+
+if bpy.app.version != (5, 2, 2):
+    raise RuntimeError("legacy append fixture requires Blender 5.2.2")
+
+output = sys.argv[sys.argv.index("--") + 1]
+bpy.ops.wm.read_factory_settings(use_empty=True)
+scene = bpy.context.scene
+for name, potter_id in (("Glass Long", "a" * 64), ("Clear", "clear")):
+    material = bpy.data.materials.new(name)
+    material["potter.id"] = potter_id
+    material.use_nodes = True
+    material.use_raytrace_refraction = True
+    mesh = bpy.data.meshes.new(name + " Mesh")
+    mesh.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
+    obj = bpy.data.objects.new(name + " Object", mesh)
+    scene.collection.objects.link(obj)
+    mesh.materials.append(material)
+bpy.ops.wm.save_as_mainfile(filepath=output)
+"#;
+
+fn appended_material_id(namespace: &str, source_id: &str, suffix: usize) -> String {
+    let suffix = if suffix == 0 {
+        String::new()
+    } else {
+        format!("_{suffix}")
+    };
+    let available = 63_usize
+        .saturating_sub(namespace.len())
+        .saturating_sub(suffix.len());
+    let id_part = source_id.chars().take(available).collect::<String>();
+    format!("{namespace}_{id_part}{suffix}")
+}
+
+fn blender_material_id(document: &Value, name: &str) -> TestResult<String> {
+    let mapping_key = format!("Material:{name}");
+    document["compatibility"]["blender_adapter"]["id_mappings"]
+        .as_object()
+        .and_then(|mappings| mappings.get(&mapping_key))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("Blender material `{name}` has no retained ID mapping").into())
+}
+
+fn remove_legacy_refraction_fields(document: &mut Value) {
+    if let Some(materials) = document.get_mut("materials").and_then(Value::as_object_mut) {
+        for material in materials.values_mut().filter_map(Value::as_object_mut) {
+            material.remove("use_raytrace_refraction");
+        }
+    }
+    if let Some(compatibility) = document
+        .get_mut("compatibility")
+        .and_then(Value::as_object_mut)
+    {
+        for (key, adapter) in compatibility {
+            if !key.ends_with("_blender_adapter") {
+                continue;
+            }
+            if let Some(raw_materials) = adapter
+                .get_mut("intermediate")
+                .and_then(|intermediate| intermediate.get_mut("materials"))
+                .and_then(Value::as_array_mut)
+            {
+                for material in raw_materials.iter_mut().filter_map(Value::as_object_mut) {
+                    material.remove("use_raytrace_refraction");
+                }
+            }
+        }
+    }
+}
+
+fn write_legacy_history_snapshot(
+    project: &Path,
+    mut document: Value,
+    schema_version: u32,
+) -> TestResult<String> {
+    document["schema_version"] = json!(schema_version);
+    document["revision"] = json!(1);
+    document["history"] = json!({"head":null,"undo":[],"redo":[]});
+    let snapshot = document.clone();
+    let snapshot_hash = potter_core::hash::sha256(&potter_core::hash::canonicalize(&snapshot)?);
+    let record = json!({
+        "record_version": 1,
+        "parent": null,
+        "kind": "init",
+        "revision": 1,
+        "scene_hash": snapshot_hash,
+        "operations": [],
+        "changes": {},
+        "target": null,
+        "snapshot": snapshot,
+    });
+    let record_bytes = serde_json::to_vec(&record)?;
+    let digest = hex::encode(Sha256::digest(&record_bytes));
+    let blob_directory = project.join("history/sha256").join(&digest);
+    fs::create_dir_all(&blob_directory)?;
+    fs::write(blob_directory.join("blob.json"), record_bytes)?;
+    document["history"] = json!({
+        "head": format!("sha256:{digest}"),
+        "undo": [],
+        "redo": []
+    });
+    let source_hash = potter_core::hash::sha256(&potter_core::hash::canonicalize(&document)?);
+    fs::write(
+        project.join("scene.json"),
+        serde_json::to_vec_pretty(&document)?,
+    )?;
+    Ok(source_hash)
+}
+
+fn assert_unknown_material_ids(document: &Value, material_ids: &[String], phase: &str) {
+    for material_id in material_ids {
+        assert_eq!(
+            document["materials"][material_id]["use_raytrace_refraction"],
+            Value::Null,
+            "{phase}: legacy Blender candidate `{material_id}` must remain unknown"
+        );
+    }
+}
+
+fn assert_legacy_provenance_is_unmodified(project: &Path, source_hash: &str) -> TestResult {
+    let original_scene = fs::read(project.join("scene.json"))?;
+    let inspected = pot_json(|command| {
+        command.arg("inspect").arg(project);
+    })?;
+    assert_eq!(inspected["ok"], true, "{inspected}");
+    assert_eq!(inspected["scene"]["hash"], source_hash);
+    assert_eq!(
+        fs::read(project.join("scene.json"))?,
+        original_scene,
+        "opening legacy provenance must not rewrite its original bytes"
+    );
+    Ok(())
+}
+
+fn apply_legacy_refraction_upgrade(
+    project: &Path,
+    root: &Path,
+    unknown_material_ids: &[String],
+) -> TestResult<Value> {
+    let applied = apply_operations(
+        project,
+        root,
+        json!([{"op":"material.create","id":"native_after_upgrade","name":"Native after upgrade"}]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+    let upgraded = read_json(&project.join("scene.json"))?;
+    assert_eq!(upgraded["schema_version"], 18);
+    assert_unknown_material_ids(&upgraded, unknown_material_ids, "upgrade");
+    assert_eq!(
+        upgraded["materials"]["native_legacy"]["use_raytrace_refraction"],
+        json!(false)
+    );
+    assert_eq!(
+        upgraded["materials"]["native_after_upgrade"]["use_raytrace_refraction"],
+        json!(false)
+    );
+    Ok(upgraded)
+}
+
+fn assert_legacy_refraction_strict_loss(
+    project: &Path,
+    root: &Path,
+    blender: &Path,
+    label: &str,
+    unknown_material_ids: &[String],
+) -> TestResult {
+    let strict_output = root.join(format!("strict-{label}.blend"));
+    let rejected = export_raw(blender, project, "blend", &strict_output, false)?;
+    assert!(
+        !rejected.status.success(),
+        "{label}: strict export accepted unknown"
+    );
+    let rejected: Value = serde_json::from_slice(&rejected.stdout)?;
+    assert_eq!(
+        rejected["error"]["code"], "UNREPRESENTABLE_FEATURE",
+        "{rejected}"
+    );
+    let losses = rejected["error"]["details"]["losses"]
+        .as_array()
+        .or_else(|| rejected["error"]["details"]["result"]["losses"].as_array())
+        .ok_or("strict export has no loss list")?;
+    for material_id in unknown_material_ids {
+        assert!(
+            losses.iter().any(|loss| {
+                loss["feature_id"] == "blender.material.use_raytrace_refraction"
+                    && loss["data_id"].as_str() == Some(material_id)
+            }),
+            "{label}: strict export did not identify unknown material `{material_id}`: {losses:?}"
+        );
+    }
+    assert!(
+        !strict_output.exists(),
+        "{label}: refused strict export must not write a Blender file"
+    );
+    Ok(())
+}
+
+fn assert_legacy_refraction_history_roundtrip(
+    project: &Path,
+    upgraded: &Value,
+    label: &str,
+    unknown_material_ids: &[String],
+) -> TestResult {
+    let undo_target = upgraded["history"]["undo"]
+        .as_array()
+        .and_then(|undo| undo.last())
+        .and_then(Value::as_str)
+        .ok_or("apply did not add an undo record")?;
+    let digest = undo_target
+        .strip_prefix("sha256:")
+        .ok_or("undo target is not a sha256 digest")?;
+    let history_blob = project
+        .join("history/sha256")
+        .join(digest)
+        .join("blob.json");
+    assert_eq!(
+        potter_core::hash::sha256(&fs::read(&history_blob)?),
+        undo_target,
+        "history address must hash the untouched raw record bytes"
+    );
+    let revision = upgraded["revision"].as_u64().ok_or("revision is missing")?;
+    let undone = history(project, "undo", revision)?;
+    assert_eq!(undone["ok"], true, "{undone}");
+    let undone_document = read_json(&project.join("scene.json"))?;
+    assert_unknown_material_ids(&undone_document, unknown_material_ids, "undo");
+    assert_eq!(
+        undone_document["materials"]["native_legacy"]["use_raytrace_refraction"],
+        json!(false)
+    );
+    assert_eq!(
+        undone["scene"]["hash"],
+        potter_core::hash::sha256(&potter_core::hash::canonicalize(&undone_document)?)
+    );
+
+    let revision = revision_of(project)?;
+    let redone = history(project, "redo", revision)?;
+    assert_eq!(redone["ok"], true, "{redone}");
+    let redone_document = read_json(&project.join("scene.json"))?;
+    assert_unknown_material_ids(&redone_document, unknown_material_ids, "redo");
+    assert_eq!(
+        redone_document["materials"]["native_legacy"]["use_raytrace_refraction"],
+        json!(false)
+    );
+    assert_eq!(
+        redone_document["materials"]["native_after_upgrade"]["use_raytrace_refraction"],
+        json!(false)
+    );
+    assert_eq!(
+        redone["scene"]["hash"],
+        potter_core::hash::sha256(&potter_core::hash::canonicalize(&redone_document)?),
+        "{label}: redo scene hash"
+    );
+    Ok(())
+}
+
+fn exercise_legacy_refraction_provenance(
+    project: &Path,
+    root: &Path,
+    blender: &Path,
+    label: &str,
+    unknown_material_ids: &[String],
+    source_hash: &str,
+) -> TestResult {
+    assert_legacy_provenance_is_unmodified(project, source_hash)?;
+    let upgraded = apply_legacy_refraction_upgrade(project, root, unknown_material_ids)?;
+    assert_legacy_refraction_strict_loss(project, root, blender, label, unknown_material_ids)?;
+    assert_legacy_refraction_history_roundtrip(project, &upgraded, label, unknown_material_ids)?;
+    Ok(())
+}
+
+fn build_appended_legacy_project(
+    root: &Path,
+    blender: &Path,
+    blend: &Path,
+    long_id: &str,
+    clear_id: &str,
+) -> TestResult<(PathBuf, Vec<String>, String)> {
+    let namespace = "refraction_append_source";
+    let collision_id = appended_material_id(namespace, long_id, 0);
+    let expected_appended_id = appended_material_id(namespace, long_id, 1);
+    let project = root.join("legacy-append-target");
+    let initialized = pot_json(|command| {
+        command.arg("init").arg(&project);
+    })?;
+    assert_eq!(initialized["ok"], true, "{initialized}");
+    let created = apply_operations(
+        &project,
+        root,
+        json!([
+            {"op":"material.create","id":long_id,"name":"Native collision"},
+            {"op":"material.create","id":collision_id,"name":"Native remap collision"},
+            {"op":"material.create","id":"native_legacy","name":"Native legacy"}
+        ]),
+    )?;
+    assert_eq!(created["ok"], true, "{created}");
+    let base_revision = revision_of(&project)?;
+    let appended = pot_json(|command| {
+        command
+            .arg("import")
+            .arg(&project)
+            .arg("--file")
+            .arg(blend)
+            .args(["--format", "blend", "--mode", "append", "--base-revision"])
+            .arg(base_revision.to_string())
+            .arg("--blender")
+            .arg(blender);
+    })?;
+    assert_eq!(appended["ok"], true, "{appended}");
+    let mappings = appended["result"]["id_mappings"]["append"]["materials"]
+        .as_object()
+        .ok_or("append import has no material remapping")?;
+    let appended_id = mappings
+        .get(long_id)
+        .and_then(Value::as_str)
+        .ok_or("append import has no remapping for the colliding material")?;
+    assert_eq!(
+        appended_id, expected_appended_id,
+        "append must use the source namespaced ID plus the first available suffix"
+    );
+    assert_eq!(
+        mappings.get(clear_id).and_then(Value::as_str),
+        Some(clear_id),
+        "an uncollided appended material keeps its source ID"
+    );
+
+    let adapter_key = format!("{namespace}_blender_adapter");
+    let mut document = read_json(&project.join("scene.json"))?;
+    assert_eq!(
+        document["compatibility"]
+            .get(&adapter_key)
+            .and_then(|adapter| adapter.get("id_mappings"))
+            .and_then(Value::as_object)
+            .and_then(|mappings| mappings.get("Material:Glass Long")),
+        Some(&json!(long_id))
+    );
+    remove_legacy_refraction_fields(&mut document);
+    let source_hash = write_legacy_history_snapshot(&project, document, 17)?;
+    Ok((
+        project,
+        vec![
+            long_id.to_owned(),
+            collision_id,
+            appended_id.to_owned(),
+            clear_id.to_owned(),
+        ],
+        source_hash,
+    ))
+}
+
+fn build_project_library_legacy_project(root: &Path) -> TestResult<(PathBuf, String)> {
+    let (library_source, _) = write_legacy_refraction_project(root, 17)?;
+    let project = root.join("legacy-library-target");
+    let initialized = pot_json(|command| {
+        command.arg("init").arg(&project);
+    })?;
+    assert_eq!(initialized["ok"], true, "{initialized}");
+    let source_uri = library_source.to_string_lossy().into_owned();
+    let linked = apply_operations(
+        &project,
+        root,
+        json!([
+            {"op":"material.create","id":"native_legacy","name":"Native legacy"},
+            {"op":"library.link","id":"legacy_library","uri":source_uri,"items":[{"registry":"materials","id":"glass"}]}
+        ]),
+    )?;
+    assert_eq!(linked["ok"], true, "{linked}");
+    let mut document = read_json(&project.join("scene.json"))?;
+    assert_eq!(
+        document["libraries"]["legacy_library"]["kind"],
+        "potter_project"
+    );
+    assert_eq!(
+        document["libraries"]["legacy_library"]["linked_ids"]["materials"][0],
+        "glass"
+    );
+    remove_legacy_refraction_fields(&mut document);
+    let source_hash = write_legacy_history_snapshot(&project, document, 17)?;
+    Ok((project, source_hash))
+}
+
+#[test]
+fn schema_seventeen_append_and_project_library_materials_remain_unknown() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = TempDir::new()?;
+    let blend = root.path().join("refraction_append_source.blend");
+    let script = write_script(
+        root.path(),
+        "refraction_append_source.py",
+        APPEND_REFRACTION_BLEND,
+    )?;
+    run_blender_arguments(&blender, &script, None, &[&blend])?;
+    let (probe_project, _) =
+        import_blend(&blender, root.path(), "refraction-append-probe", &blend)?;
+    let probe = read_json(&probe_project.join("scene.json"))?;
+    let long_id = blender_material_id(&probe, "Glass Long")?;
+    let clear_id = blender_material_id(&probe, "Clear")?;
+    assert_eq!(long_id, "a".repeat(64));
+    assert_eq!(clear_id, "clear");
+
+    let (append_project, append_unknown_ids, append_hash) =
+        build_appended_legacy_project(root.path(), &blender, &blend, &long_id, &clear_id)?;
+    exercise_legacy_refraction_provenance(
+        &append_project,
+        root.path(),
+        &blender,
+        "appended",
+        &append_unknown_ids,
+        &append_hash,
+    )?;
+
+    let (library_project, library_hash) = build_project_library_legacy_project(root.path())?;
+    exercise_legacy_refraction_provenance(
+        &library_project,
+        root.path(),
+        &blender,
+        "library-linked",
+        &["glass".to_owned()],
+        &library_hash,
+    )?;
+    Ok(())
 }
 
 fn revision_of(project: &Path) -> TestResult<u64> {
@@ -870,6 +1350,108 @@ fn schema_v2_history_record_is_verified_before_it_is_upgraded() -> TestResult {
     let refused: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(refused["ok"], false, "{refused}");
     assert_eq!(refused["error"]["code"], "INTERNAL_ERROR", "{refused}");
+    Ok(())
+}
+
+#[test]
+fn schema_seventeen_and_eighteen_history_upgrades_preserve_refraction_and_hashes() -> TestResult {
+    let root = TempDir::new()?;
+    for schema_version in [17, 18] {
+        exercise_legacy_refraction_history_upgrade(root.path(), schema_version)?;
+    }
+    Ok(())
+}
+
+fn exercise_legacy_refraction_history_upgrade(root: &Path, schema_version: u32) -> TestResult {
+    let (legacy, source_hash) = write_legacy_refraction_project(root, schema_version)?;
+    let original_scene = fs::read(legacy.join("scene.json"))?;
+    let inspected = pot_json(|command| {
+        command.arg("inspect").arg(&legacy);
+    })?;
+    assert_eq!(inspected["ok"], true, "{inspected}");
+    assert_eq!(inspected["scene"]["hash"], source_hash);
+    assert_eq!(
+        fs::read(legacy.join("scene.json"))?,
+        original_scene,
+        "opening schema {schema_version} must not rewrite its original bytes"
+    );
+
+    let applied = apply_operations(
+        &legacy,
+        root,
+        json!([{"op":"material.create","id":"native","name":"Native"}]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+    let upgraded = read_json(&legacy.join("scene.json"))?;
+    assert_eq!(upgraded["schema_version"], 18);
+    assert_eq!(
+        upgraded["materials"]["glass"]["use_raytrace_refraction"],
+        Value::Null
+    );
+    assert_eq!(
+        upgraded["materials"]["native"]["use_raytrace_refraction"],
+        json!(false)
+    );
+    assert_eq!(
+        upgraded["materials"]["native_legacy"]["use_raytrace_refraction"],
+        json!(false)
+    );
+    let upgraded_hash = potter_core::hash::sha256(&potter_core::hash::canonicalize(&upgraded)?);
+    assert_ne!(upgraded_hash, source_hash);
+    let upgraded_inspection = pot_json(|command| {
+        command.arg("inspect").arg(&legacy);
+    })?;
+    assert_eq!(upgraded_inspection["scene"]["hash"], upgraded_hash);
+
+    let undo_target = upgraded["history"]["undo"]
+        .as_array()
+        .and_then(|undo| undo.last())
+        .and_then(Value::as_str)
+        .ok_or("apply did not add an undo record")?;
+    let digest = undo_target
+        .strip_prefix("sha256:")
+        .ok_or("undo target is not a sha256 digest")?;
+    let history_blob = legacy.join("history/sha256").join(digest).join("blob.json");
+    assert_eq!(
+        potter_core::hash::sha256(&fs::read(&history_blob)?),
+        undo_target,
+        "history address must hash the untouched raw record bytes"
+    );
+    let revision = upgraded["revision"].as_u64().ok_or("revision is missing")?;
+    let undone = history(&legacy, "undo", revision)?;
+    assert_eq!(undone["ok"], true, "{undone}");
+    assert_eq!(
+        read_json(&legacy.join("scene.json"))?["materials"]["glass"]["use_raytrace_refraction"],
+        Value::Null,
+        "loading the verified schema {schema_version} history snapshot must preserve unknown"
+    );
+    let undone_document = read_json(&legacy.join("scene.json"))?;
+    assert_eq!(
+        undone_document["materials"]["native_legacy"]["use_raytrace_refraction"],
+        json!(false)
+    );
+    assert_eq!(
+        undone["scene"]["hash"],
+        potter_core::hash::sha256(&potter_core::hash::canonicalize(&undone_document)?)
+    );
+    assert_ne!(undone["scene"]["hash"], source_hash);
+
+    let revision = revision_of(&legacy)?;
+    let redone = history(&legacy, "redo", revision)?;
+    assert_eq!(redone["ok"], true, "{redone}");
+    let redone_document = read_json(&legacy.join("scene.json"))?;
+    assert_eq!(
+        redone_document["materials"]["glass"]["use_raytrace_refraction"],
+        Value::Null
+    );
+    assert_eq!(
+        redone_document["materials"]["native_legacy"]["use_raytrace_refraction"],
+        json!(false)
+    );
+    assert_eq!(
+        redone["scene"]["hash"],
+        potter_core::hash::sha256(&potter_core::hash::canonicalize(&redone_document)?)
+    );
     Ok(())
 }
 

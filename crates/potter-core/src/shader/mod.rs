@@ -8,6 +8,8 @@ mod world;
 
 mod evaluator;
 
+#[cfg(test)]
+pub(crate) use evaluator::RayPortalParameters;
 pub(crate) use evaluator::{
     AnisotropyModel, BsdfModel, GeometryAttribute, GeometryAttributeValues, GlassDistribution,
     HairComponent, HairParameters, HairParametrization, HairScatteringModel, MetallicFresnel,

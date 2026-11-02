@@ -4,12 +4,14 @@
 //! from that stored cube, matching Blender's bilinear atlas sampling, GGX convolution, roughness-to-LOD mapping,
 //! and mip mix. Its world graph is evaluated only during the capture, not for every surface lookup.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::OnceLock};
 
-use glam::{DVec3, Vec3};
+use glam::{DVec3, Vec3, Vec4};
+
+use super::eevee_fast_gi::FastGiSh;
 
 use crate::{
-    error::Result,
+    error::{ErrorCode, PotError, Result},
     graph::NodeGroup,
     image::ImageData,
     model::{Registry, World},
@@ -26,22 +28,37 @@ const EEVEE_PROBE_MIP_MAX_ROUGHNESS: f32 = 0.7;
 const EEVEE_PROBE_MIP_SAMPLE_COUNT: u32 = 196;
 
 /// Path keeps its existing raw cube; EEVEE uses the scene's source cubemap resolution.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum WorldProbeMode {
     Path,
-    Eevee { cubemap_resolution: u32 },
+    Eevee {
+        cubemap_resolution: u32,
+        surface_indirect_clamp: f32,
+    },
 }
 
 /// `SphereProbeModule::probe_render_extent()` in Blender 5.2.2.
 fn eevee_probe_face_texels(cubemap_resolution: u32) -> usize {
     (cubemap_resolution / 2) as usize
 }
+fn eevee_probe_sun_threshold(world: &World) -> Result<f32> {
+    let threshold = world.eevee_sun_threshold.ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "EEVEE world probe lighting needs the source World.sun_threshold; reimport the Blender scene to recover it",
+            serde_json::json!({"feature_id":"world.eevee.sun_threshold"}),
+        )
+    })? as f32;
+    Ok(if threshold == 0.0 { 1.0e20 } else { threshold })
+}
 
 impl WorldProbeMode {
     fn face_texels(self) -> usize {
         match self {
             Self::Path => FACE_TEXELS,
-            Self::Eevee { cubemap_resolution } => eevee_probe_face_texels(cubemap_resolution),
+            Self::Eevee {
+                cubemap_resolution, ..
+            } => eevee_probe_face_texels(cubemap_resolution),
         }
     }
 }
@@ -50,7 +67,18 @@ type EeveeProbeTexel = [exr::prelude::f16; 4];
 
 enum WorldProbeRadiance {
     Path(Vec<DVec3>),
-    Eevee(Vec<EeveeProbeTexel>),
+    Eevee {
+        cubemap: Vec<EeveeProbeTexel>,
+        sun_threshold: f32,
+        surface_indirect_clamp: f32,
+    },
+}
+/// The GPU-extracted EEVEE world Sun radiance and safe-normalized source direction.
+/// CPU World settings separately supply the UI-derived surface shape and volume-power placeholder.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct EeveeWorldSun {
+    pub radiance: Vec3,
+    pub direction: Vec3,
 }
 /// The world's radiance by direction, sampled at the centre of each cube-map texel.
 pub(super) struct WorldProbe {
@@ -60,6 +88,10 @@ pub(super) struct WorldProbe {
     eevee_prefiltered: Option<[Vec<EeveeProbeTexel>; EEVEE_PROBE_MIPMAP_LEVELS]>,
     /// EEVEE's non-directional spherical-harmonic L0 for sphere-thickness and isotropic volume lighting.
     average_irradiance: DVec3,
+    /// Source sphere-probe excess radiance reduced to its world Sun.
+    world_sun: Option<EeveeWorldSun>,
+    /// Source-basis SH, projected on demand from the captured EEVEE SFLOAT16 world cube.
+    fast_gi_sh: OnceLock<FastGiSh>,
 }
 
 impl WorldProbe {
@@ -71,26 +103,55 @@ impl WorldProbe {
         mode: WorldProbeMode,
     ) -> Result<Self> {
         let face_texels = mode.face_texels();
-        let (radiance, eevee_prefiltered, average_irradiance) = match mode {
+        let (radiance, eevee_prefiltered, average_irradiance, world_sun) = match mode {
             WorldProbeMode::Path => {
                 let mut radiance = Vec::with_capacity(6 * face_texels * face_texels);
                 let average_irradiance =
                     sample_world_probe(world, groups, images, face_texels, |value| {
                         radiance.push(value);
+                        value
                     })?;
-                (WorldProbeRadiance::Path(radiance), None, average_irradiance)
+                (
+                    WorldProbeRadiance::Path(radiance),
+                    None,
+                    average_irradiance,
+                    None,
+                )
             }
-            WorldProbeMode::Eevee { .. } => {
+            WorldProbeMode::Eevee {
+                surface_indirect_clamp,
+                ..
+            } => {
+                let sun_threshold = eevee_probe_sun_threshold(world)?;
+                let surface_indirect_clamp =
+                    eevee_probe_clamp_surface_indirect(surface_indirect_clamp);
                 let mut radiance = Vec::with_capacity(6 * face_texels * face_texels);
                 let average_irradiance =
                     sample_world_probe(world, groups, images, face_texels, |value| {
-                        radiance.push(store_eevee_probe_texel(value));
+                        let texel = store_eevee_probe_texel(value);
+                        radiance.push(texel);
+                        brightness_clamp_max(load_eevee_probe_texel(texel), sun_threshold)
+                            .as_dvec3()
                     })?;
-                let eevee_prefiltered = build_eevee_prefiltered_atlas(&radiance, face_texels);
+                let extract_sun = world
+                    .eevee_sun_threshold
+                    .is_some_and(|threshold| threshold as f32 > 0.0);
+                let (eevee_prefiltered, world_sun) = build_eevee_prefiltered_atlas(
+                    &radiance,
+                    face_texels,
+                    sun_threshold,
+                    surface_indirect_clamp,
+                    extract_sun,
+                );
                 (
-                    WorldProbeRadiance::Eevee(radiance),
+                    WorldProbeRadiance::Eevee {
+                        cubemap: radiance,
+                        surface_indirect_clamp,
+                        sun_threshold,
+                    },
                     Some(eevee_prefiltered),
                     average_irradiance,
+                    world_sun,
                 )
             }
         };
@@ -99,9 +160,11 @@ impl WorldProbe {
             face_texels,
             eevee_prefiltered,
             average_irradiance,
+            world_sun,
+            fast_gi_sh: OnceLock::new(),
         })
     }
-    /// The radiance of the cube-map texel that `direction` falls in, without filtering.
+    /// Samples the captured cube without spatial filtering; EEVEE applies its source sun threshold.
     pub(super) fn radiance(&self, direction: DVec3) -> DVec3 {
         let (face, s, t) = cube_coordinates(direction);
         let column = texel_at(s, self.face_texels);
@@ -110,10 +173,20 @@ impl WorldProbe {
             WorldProbeRadiance::Path(cubemap) => {
                 cubemap[(face * self.face_texels + row) * self.face_texels + column]
             }
-            WorldProbeRadiance::Eevee(cubemap) => load_eevee_probe_texel(
-                cubemap[(face * self.face_texels + row) * self.face_texels + column],
-            )
-            .as_dvec3(),
+            WorldProbeRadiance::Eevee {
+                cubemap,
+                sun_threshold,
+                surface_indirect_clamp,
+            } => {
+                let radiance = load_eevee_probe_texel(
+                    cubemap[(face * self.face_texels + row) * self.face_texels + column],
+                );
+                brightness_clamp_max(
+                    brightness_clamp_max(radiance, *sun_threshold),
+                    *surface_indirect_clamp,
+                )
+                .as_dvec3()
+            }
         }
     }
 
@@ -138,9 +211,43 @@ impl WorldProbe {
         Some((low_sample * (1.0 - blend) + high_sample * blend).as_dvec3())
     }
 
-    /// EEVEE's non-directional world-probe SH L0.
+    /// Path's captured average stays raw; EEVEE applies its source indirect clamp after sampling.
     pub(super) fn average_irradiance(&self) -> DVec3 {
-        self.average_irradiance
+        match &self.radiance {
+            WorldProbeRadiance::Path(_) => self.average_irradiance,
+            WorldProbeRadiance::Eevee {
+                surface_indirect_clamp,
+                ..
+            } => brightness_clamp_max(
+                Vec3::new(
+                    self.average_irradiance.x as f32,
+                    self.average_irradiance.y as f32,
+                    self.average_irradiance.z as f32,
+                ),
+                *surface_indirect_clamp,
+            )
+            .as_dvec3(),
+        }
+    }
+    /// EEVEE's source-extracted world Sun, absent when the threshold produces no excess light.
+    pub(super) fn world_sun(&self) -> Option<EeveeWorldSun> {
+        self.world_sun
+    }
+    /// Returns cached source-order SH when requested; Path probes have no EEVEE coefficients.
+    pub(super) fn fast_gi_sh(&self) -> Option<FastGiSh> {
+        let WorldProbeRadiance::Eevee {
+            cubemap,
+            sun_threshold,
+            ..
+        } = &self.radiance
+        else {
+            return None;
+        };
+        Some(
+            *self
+                .fast_gi_sh
+                .get_or_init(|| extract_eevee_world_sh(cubemap, self.face_texels, *sun_threshold)),
+        )
     }
 }
 
@@ -160,25 +267,101 @@ fn store_eevee_probe_texel(value: DVec3) -> EeveeProbeTexel {
 fn load_eevee_probe_texel(texel: EeveeProbeTexel) -> Vec3 {
     Vec3::new(texel[0].to_f32(), texel[1].to_f32(), texel[2].to_f32())
 }
+fn brightness_clamp_max(radiance: Vec3, threshold: f32) -> Vec3 {
+    let brightness = radiance.max_element();
+    if brightness > threshold {
+        radiance * (threshold / brightness)
+    } else {
+        radiance
+    }
+}
+fn eevee_probe_clamp_surface_indirect(value: f32) -> f32 {
+    if value > 0.0 { value } else { 1.0e20 }
+}
 
 fn build_eevee_prefiltered_atlas(
     cubemap: &[EeveeProbeTexel],
     face_texels: usize,
-) -> [Vec<EeveeProbeTexel>; EEVEE_PROBE_MIPMAP_LEVELS] {
+    sun_threshold: f32,
+    surface_indirect_clamp: f32,
+    extract_sun: bool,
+) -> (
+    [Vec<EeveeProbeTexel>; EEVEE_PROBE_MIPMAP_LEVELS],
+    Option<EeveeWorldSun>,
+) {
     let mut mips = std::array::from_fn(|mip| {
         let extent = eevee_probe_mip_extent(face_texels, mip);
         vec![store_eevee_probe_texel(DVec3::ZERO); extent * extent]
     });
     let extent = eevee_probe_mip_extent(face_texels, 0);
-    let denominator = (extent - 2) as f32;
-    for row in 0..extent {
-        for column in 0..extent {
-            let direction =
-                octahedral_direction(column as f32 / denominator, row as f32 / denominator);
-            let radiance = sample_world_cubemap(cubemap, face_texels, direction);
-            mips[0][row * extent + column] = store_eevee_probe_texel(radiance.as_dvec3());
+    let groups_per_axis = extent.div_ceil(SPHERE_PROBE_REMAP_GROUP_SIZE);
+    let group_count = groups_per_axis * groups_per_axis;
+    debug_assert!(group_count <= SPHERE_PROBE_MAX_HARMONIC);
+    let mut thread_radiance = [Vec3::ZERO; SPHERE_PROBE_SH_GROUP_SIZE];
+    let mut thread_direction = [Vec4::ZERO; SPHERE_PROBE_SH_GROUP_SIZE];
+    for group_y in 0..groups_per_axis {
+        for group_x in 0..groups_per_axis {
+            let mut local_radiance = [Vec3::ZERO; SPHERE_PROBE_REMAP_TEXELS_PER_GROUP];
+            let mut local_direction = [Vec4::ZERO; SPHERE_PROBE_REMAP_TEXELS_PER_GROUP];
+            for local_index in 0..SPHERE_PROBE_REMAP_TEXELS_PER_GROUP {
+                let column = group_x * SPHERE_PROBE_REMAP_GROUP_SIZE
+                    + local_index % SPHERE_PROBE_REMAP_GROUP_SIZE;
+                let row = group_y * SPHERE_PROBE_REMAP_GROUP_SIZE
+                    + local_index / SPHERE_PROBE_REMAP_GROUP_SIZE;
+                if column >= extent || row >= extent {
+                    continue;
+                }
+                let direction = octahedral_direction(
+                    column as f32 / (extent - 2) as f32,
+                    row as f32 / (extent - 2) as f32,
+                );
+                let radiance = sample_world_cubemap(cubemap, face_texels, direction);
+                let thresholded_radiance = brightness_clamp_max(radiance, sun_threshold);
+                let stored_radiance =
+                    brightness_clamp_max(thresholded_radiance, surface_indirect_clamp);
+                mips[0][row * extent + column] =
+                    store_eevee_probe_texel(stored_radiance.as_dvec3());
+
+                if extract_sun {
+                    let weight = octahedral_texel_solid_angle(column, row, extent);
+                    let excess = radiance - thresholded_radiance;
+                    let excess_length = excess.length();
+                    local_radiance[local_index] = excess * weight;
+                    local_direction[local_index] =
+                        direction.normalize().extend(1.0) * weight * excess_length;
+                }
+            }
+            if extract_sun {
+                let mut stride = SPHERE_PROBE_REMAP_TEXELS_PER_GROUP / 2;
+                while stride != 0 {
+                    for index in 0..stride {
+                        local_radiance[index] += local_radiance[index + stride];
+                        local_direction[index] += local_direction[index + stride];
+                    }
+                    stride /= 2;
+                }
+                let group = group_y * groups_per_axis + group_x;
+                let thread = group % SPHERE_PROBE_SH_GROUP_SIZE;
+                thread_radiance[thread] += local_radiance[0];
+                thread_direction[thread] += local_direction[0];
+            }
         }
     }
+
+    let world_sun = if extract_sun {
+        let mut stride = SPHERE_PROBE_SH_GROUP_SIZE / 2;
+        while stride != 0 {
+            for index in 0..stride {
+                thread_radiance[index] += thread_radiance[index + stride];
+                thread_direction[index] += thread_direction[index + stride];
+            }
+            stride /= 2;
+        }
+        eevee_world_sun_from_reduction(thread_radiance[0], thread_direction[0])
+    } else {
+        None
+    };
+
     for mip in 1..EEVEE_PROBE_MIPMAP_LEVELS {
         let read_extent = eevee_probe_mip_extent(face_texels, mip - 1);
         let write_extent = eevee_probe_mip_extent(face_texels, mip);
@@ -191,7 +374,23 @@ fn build_eevee_prefiltered_atlas(
             mip - 1,
         );
     }
-    mips
+    (mips, world_sun)
+}
+fn eevee_world_sun_from_reduction(radiance: Vec3, direction_sum: Vec4) -> Option<EeveeWorldSun> {
+    if radiance.max_element() <= 0.0 {
+        return None;
+    }
+    let direction_input = direction_sum.truncate() / direction_sum.w;
+    let length_squared = direction_input.length_squared();
+    let direction = if length_squared > 1.0e-35 {
+        direction_input / length_squared.sqrt()
+    } else {
+        Vec3::X
+    };
+    Some(EeveeWorldSun {
+        radiance,
+        direction,
+    })
 }
 
 fn sample_world_cubemap(cubemap: &[EeveeProbeTexel], face_texels: usize, direction: Vec3) -> Vec3 {
@@ -424,7 +623,7 @@ pub(super) fn volume_ambient_l0(
                 let radiance_rgb = [
                     radiance[0].to_f32(),
                     radiance[1].to_f32(),
-                    radiance[2].to_f32()
+                    radiance[2].to_f32(),
                 ];
                 if let Some(first) = first_radiance {
                     nonuniform |= first.map(f32::to_bits) != radiance_rgb.map(f32::to_bits);
@@ -566,6 +765,94 @@ fn octahedral_texel_solid_angle(column: usize, row: usize, extent: usize) -> f32
     area
 }
 
+const SPHERE_PROBE_MAX_HARMONIC: usize = (1 << 12) * (1 << 12) / 32 / 32;
+const SPHERE_PROBE_REMAP_TEXELS_PER_GROUP: usize =
+    SPHERE_PROBE_REMAP_GROUP_SIZE * SPHERE_PROBE_REMAP_GROUP_SIZE;
+
+/// Mirrors the sphere-probe remap SH path over captured SFLOAT16 radiance and source clamp.
+fn extract_eevee_world_sh(
+    cubemap: &[EeveeProbeTexel],
+    face_texels: usize,
+    sun_threshold: f32,
+) -> FastGiSh {
+    let extent = 2 * face_texels;
+    let groups_per_axis = extent / SPHERE_PROBE_REMAP_GROUP_SIZE;
+    let mut sums_by_thread = [FastGiSh::ZERO; SPHERE_PROBE_SH_GROUP_SIZE];
+    let mut samples = [Vec4::ZERO; SPHERE_PROBE_REMAP_GROUP_SIZE * SPHERE_PROBE_REMAP_GROUP_SIZE];
+    let denominator = (extent - 2) as f32;
+
+    for group_y in 0..groups_per_axis {
+        for group_x in 0..groups_per_axis {
+            for local_y in 0..SPHERE_PROBE_REMAP_GROUP_SIZE {
+                for local_x in 0..SPHERE_PROBE_REMAP_GROUP_SIZE {
+                    let local_index = local_y * SPHERE_PROBE_REMAP_GROUP_SIZE + local_x;
+                    let column = group_x * SPHERE_PROBE_REMAP_GROUP_SIZE + local_x;
+                    let row = group_y * SPHERE_PROBE_REMAP_GROUP_SIZE + local_y;
+                    let weight = octahedral_texel_solid_angle(column, row, extent);
+                    if weight == 0.0 {
+                        samples[local_index] = Vec4::ZERO;
+                        continue;
+                    }
+                    let direction =
+                        octahedral_direction(column as f32 / denominator, row as f32 / denominator);
+                    let radiance = brightness_clamp_max(
+                        Vec3::from_array(cube_probe_sample(cubemap, face_texels, direction)),
+                        sun_threshold,
+                    );
+                    samples[local_index] =
+                        Vec4::new(radiance.x, radiance.y, radiance.z, radiance.z) * weight;
+                }
+            }
+
+            let mut stride = samples.len() / 2;
+            while stride != 0 {
+                for index in 0..stride {
+                    samples[index] += samples[index + stride];
+                }
+                stride /= 2;
+            }
+
+            let min_direction = octahedral_direction(
+                (group_x * SPHERE_PROBE_REMAP_GROUP_SIZE) as f32 / denominator,
+                (group_y * SPHERE_PROBE_REMAP_GROUP_SIZE) as f32 / denominator,
+            )
+            .normalize();
+            let max_direction = octahedral_direction(
+                ((group_x + 1) * SPHERE_PROBE_REMAP_GROUP_SIZE) as f32 / denominator,
+                ((group_y + 1) * SPHERE_PROBE_REMAP_GROUP_SIZE) as f32 / denominator,
+            )
+            .normalize();
+            let direction = (min_direction + max_direction).normalize();
+            let signal = samples[0];
+            let encoded = FastGiSh {
+                l0_m0: signal * 0.282_094_8,
+                l1_mn1: signal * (-0.488_602_52 * direction.y),
+                l1_m0: signal * (0.488_602_52 * direction.z),
+                l1_mp1: signal * (-0.488_602_52 * direction.x),
+            };
+            let group_index = group_y * groups_per_axis + group_x;
+            let thread_sum = &mut sums_by_thread[group_index % SPHERE_PROBE_SH_GROUP_SIZE];
+            thread_sum.l0_m0 += encoded.l0_m0;
+            thread_sum.l1_mn1 += encoded.l1_mn1;
+            thread_sum.l1_m0 += encoded.l1_m0;
+            thread_sum.l1_mp1 += encoded.l1_mp1;
+        }
+    }
+
+    let mut stride = SPHERE_PROBE_SH_GROUP_SIZE / 2;
+    while stride != 0 {
+        for index in 0..stride {
+            let source = sums_by_thread[index + stride];
+            sums_by_thread[index].l0_m0 += source.l0_m0;
+            sums_by_thread[index].l1_mn1 += source.l1_mn1;
+            sums_by_thread[index].l1_m0 += source.l1_m0;
+            sums_by_thread[index].l1_mp1 += source.l1_mp1;
+        }
+        stride /= 2;
+    }
+    sums_by_thread[0]
+}
+
 fn cube_probe_sample(cubemap: &[EeveeProbeTexel], face_texels: usize, direction: Vec3) -> [f32; 3] {
     let extent = face_texels as f32;
     let (face, s, t) = cube_coordinates(direction.as_dvec3());
@@ -618,7 +905,7 @@ fn sample_world_probe(
     groups: &Registry<NodeGroup>,
     images: &BTreeMap<String, ImageData>,
     face_texels: usize,
-    mut capture_radiance: impl FnMut(DVec3),
+    mut capture_radiance: impl FnMut(DVec3) -> DVec3,
 ) -> Result<DVec3> {
     let mut workspace = EvaluatorWorkspace::default();
     let mut average_irradiance = DVec3::ZERO;
@@ -640,10 +927,10 @@ fn sample_world_probe(
                     &mut workspace,
                 )?;
                 let solid_angle = cube_texel_solid_angle_at(column, row, face_texels);
+                let radiance = capture_radiance(radiance);
                 average_irradiance +=
                     super::eevee_transmission::irradiance_probe_radiance(radiance) * solid_angle;
                 total_solid_angle += solid_angle;
-                capture_radiance(radiance);
             }
         }
     }
@@ -804,7 +1091,7 @@ mod tests {
         let cubemap = vec![stored_radiance; 6 * FACE_TEXELS * FACE_TEXELS];
         let expected = load_eevee_probe_texel(stored_radiance).as_dvec3();
         assert_eq!(stored_radiance[3].to_f32(), 1.0);
-        let mips = build_eevee_prefiltered_atlas(&cubemap, FACE_TEXELS);
+        let (mips, _) = build_eevee_prefiltered_atlas(&cubemap, FACE_TEXELS, 10.0, 1.0e20, false);
         for (lod, mip) in mips.iter().enumerate() {
             let extent = eevee_probe_mip_extent(FACE_TEXELS, lod);
             assert_eq!(mip.len(), extent * extent);
@@ -820,6 +1107,16 @@ mod tests {
         }
     }
     #[test]
+    fn eevee_prefilter_applies_surface_indirect_clamp_after_world_sun_threshold() {
+        let cubemap =
+            vec![store_eevee_probe_texel(DVec3::splat(100.0)); 6 * FACE_TEXELS * FACE_TEXELS];
+        let (mips, _) = build_eevee_prefiltered_atlas(&cubemap, FACE_TEXELS, 50.0, 5.0, false);
+        let center = eevee_probe_mip_extent(FACE_TEXELS, 0) / 2;
+        let stored = load_eevee_probe_texel(mips[0][center * center + center]);
+        assert_eq!(stored, Vec3::splat(5.0));
+        assert_eq!(eevee_probe_clamp_surface_indirect(0.0), 1.0e20);
+    }
+    #[test]
     fn eevee_prefilter_mixes_the_source_roughness_lods() -> Result<(), String> {
         let face_texels = FACE_TEXELS;
         let mips = std::array::from_fn(|mip| {
@@ -827,10 +1124,16 @@ mod tests {
             vec![store_eevee_probe_texel(DVec3::splat(mip as f64)); extent * extent]
         });
         let probe = WorldProbe {
-            radiance: WorldProbeRadiance::Eevee(Vec::new()),
+            radiance: WorldProbeRadiance::Eevee {
+                cubemap: Vec::new(),
+                sun_threshold: 10.0,
+                surface_indirect_clamp: 1.0e20,
+            },
             face_texels,
             eevee_prefiltered: Some(mips),
             average_irradiance: DVec3::ZERO,
+            world_sun: None,
+            fast_gi_sh: OnceLock::new(),
         };
         let roughness = 0.35_f64;
         let source_lod =
@@ -850,6 +1153,7 @@ mod tests {
     fn eevee_capture_extents_follow_the_scene_resolution() {
         let mode = WorldProbeMode::Eevee {
             cubemap_resolution: 512,
+            surface_indirect_clamp: 10.0,
         };
         let face_texels = mode.face_texels();
         assert_eq!(face_texels, 256);
@@ -860,6 +1164,72 @@ mod tests {
             [512, 256, 128, 64, 32]
         );
         assert_eq!(WorldProbeMode::Path.face_texels(), FACE_TEXELS);
+    }
+
+    #[test]
+    fn eevee_world_sun_uses_thresholded_captured_radiance() -> Result<(), String> {
+        let build_probe = |color, threshold, surface_indirect_clamp| {
+            let world = World {
+                color: [color; 3],
+                eevee_sun_threshold: Some(threshold),
+                ..World::default()
+            };
+            WorldProbe::build(
+                &world,
+                &Registry::default(),
+                &BTreeMap::new(),
+                WorldProbeMode::Eevee {
+                    cubemap_resolution: 128,
+                    surface_indirect_clamp,
+                },
+            )
+        };
+        let bright = build_probe(12.0, 10.0, 10.0).map_err(|error| error.to_string())?;
+        let sun = bright.world_sun().ok_or_else(|| {
+            "bright world radiance above threshold should extract a WorldSun".to_owned()
+        })?;
+        let expected = 8.0 * std::f32::consts::PI;
+        assert!((sun.radiance - Vec3::splat(expected)).abs().max_element() < 1.0e-2);
+        assert!(sun.direction.is_finite());
+        let limited = build_probe(12.0, 10.0, 5.0).map_err(|error| error.to_string())?;
+        let limited_sun = limited.world_sun().ok_or_else(|| {
+            "surface indirect clamp should not prevent extracting a WorldSun".to_owned()
+        })?;
+        assert_eq!(limited_sun.radiance, sun.radiance);
+        assert!(limited.average_irradiance().max_element() <= 5.0);
+        assert!(
+            limited
+                .prefiltered_radiance(DVec3::Z, 0.0)
+                .is_some_and(|radiance| radiance.max_element() <= 5.0)
+        );
+        assert!(
+            build_probe(9.0, 10.0, 10.0)
+                .map_err(|error| error.to_string())?
+                .world_sun()
+                .is_none()
+        );
+        assert!(
+            build_probe(12.0, 0.0, 10.0)
+                .map_err(|error| error.to_string())?
+                .world_sun()
+                .is_none()
+        );
+        Ok(())
+    }
+    #[test]
+    fn eevee_world_sun_keeps_excess_with_safe_direction_fallback() -> Result<(), String> {
+        for direction_sum in [
+            Vec4::ZERO,
+            Vec4::new(0.0, 0.0, 0.0, 1.0),
+            Vec4::new(1.0e-18, 0.0, 0.0, 1.0),
+            Vec4::new(f32::NAN, 0.0, 0.0, 1.0),
+        ] {
+            let sun = eevee_world_sun_from_reduction(Vec3::splat(2.0), direction_sum)
+                .ok_or_else(|| "positive excess radiance should produce a WorldSun".to_owned())?;
+            assert_eq!(sun.radiance, Vec3::splat(2.0));
+            assert_eq!(sun.direction, Vec3::X);
+        }
+        Ok(())
     }
 
     #[test]
@@ -896,10 +1266,16 @@ mod tests {
                 .collect()
         });
         let probe = WorldProbe {
-            radiance: WorldProbeRadiance::Eevee(Vec::new()),
+            radiance: WorldProbeRadiance::Eevee {
+                cubemap: Vec::new(),
+                sun_threshold: 10.0,
+                surface_indirect_clamp: 1.0e20,
+            },
             face_texels,
             eevee_prefiltered: Some(mips),
             average_irradiance: DVec3::ZERO,
+            fast_gi_sh: OnceLock::new(),
+            world_sun: None,
         };
         let from_left = probe
             .prefiltered_radiance(DVec3::new(-1.0e-5, 1.0, -1.0), 0.0)

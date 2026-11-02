@@ -67,7 +67,7 @@ use super::{
         ray_for_sample_in_frame, smooth_shadow_origin,
     },
     scene::{
-        ElementRecord, Geometry, HitPose, LayerTables, ObjectRecord, layered_context,
+        ElementRecord, Geometry, HitPose, LayerTables, ObjectRecord, SceneShader, layered_context,
         object_info_color, object_info_pass_index, object_space,
     },
 };
@@ -104,6 +104,8 @@ struct PointLight {
     /// Blender's `volume_factor` (`Light.volume_fac`), which EEVEE multiplies the light's volume in-scatter by
     /// (`eevee_light.cc`, `power[LIGHT_VOLUME]`). The path tracer does not apply it, as Cycles does not.
     volume_factor: f64,
+    /// `World.use_sun_shadow` on the synthetic `WorldSun`; `None` leaves authored lights on the scene-wide switch.
+    use_sun_shadow: Option<bool>,
     /// The squared radius of the light's volume influence (`light_attenuation_volume`), infinite for a sun. The realtime
     /// in-scatter fades with it; the path tracer does not.
     volume_radius_squared: f64,
@@ -267,7 +269,17 @@ impl HitClosure {
                     params.base_color[1],
                     params.base_color[2],
                 );
-                (color.element_sum() / 3.0).abs()
+                // Cycles tests the graph-weighted RGB closure value before allocating a Portal closure.
+                let graph_weight = weight as f32;
+                let weighted_mean = (graph_weight * params.base_color[0] as f32
+                    + graph_weight * params.base_color[1] as f32
+                    + graph_weight * params.base_color[2] as f32)
+                    / 3.0;
+                if weighted_mean.abs() < 1.0e-5 {
+                    0.0
+                } else {
+                    (color.element_sum() / 3.0).abs()
+                }
             }
             BsdfModel::Holdout => 0.0,
             BsdfModel::Principled => 1.0,
@@ -2856,6 +2868,7 @@ mod camera_light_shape_tests {
             spread: None,
             use_mis: true,
             volume_factor: 0.0,
+            use_sun_shadow: None,
             volume_radius_squared: 0.0,
             ray_mask: RayKind::Camera.bit(),
             camera_shape_eligible: true,
@@ -2995,6 +3008,7 @@ mod camera_light_shape_tests {
             spread: Some(spread),
             use_mis: true,
             volume_factor: 0.0,
+            use_sun_shadow: None,
             volume_radius_squared: 0.0,
             ray_mask: RayKind::Camera.bit(),
             camera_shape_eligible: true,
@@ -3095,7 +3109,7 @@ fn realtime_volume_depth_bounds(
 
     (depth_min.is_finite() && depth_max.is_finite()).then_some((depth_min, depth_max))
 }
-fn scene_has_world_volume(doc: &SceneDoc, scene_id: &Id) -> bool {
+pub(super) fn scene_has_world_volume(doc: &SceneDoc, scene_id: &Id) -> bool {
     let Some(scene) = doc.scenes.get(scene_id) else {
         return false;
     };
@@ -4443,6 +4457,7 @@ pub(super) fn prepare_realtime_volume_transport<'a>(
     geometry: &'a Geometry,
     images: &'a BTreeMap<String, ImageData>,
     warnings: &RefCell<Vec<serde_json::Value>>,
+    scene_shader: Option<&SceneShader<'_>>,
 ) -> Result<Option<RealtimeVolumeTransport<'a>>> {
     let scene = doc
         .scenes
@@ -4493,6 +4508,10 @@ pub(super) fn prepare_realtime_volume_transport<'a>(
         .as_ref()
         .and_then(|world_id| doc.worlds.get(world_id))
     {
+        super::scene::ensure_eevee_global_world_probe_available(
+            &snapshot.scene_id,
+            scene.eevee_has_local_volume_probe_grids,
+        )?;
         let cubemap_resolution = scene
             .render
             .eevee_gi_cubemap_resolution
@@ -4512,7 +4531,51 @@ pub(super) fn prepare_realtime_volume_transport<'a>(
     {
         return Err(realtime_world_probe_l1_refusal());
     }
-    let (lights, camera_light_prepared) = collect_lights_with_camera_data(doc, snapshot);
+    let (mut lights, mut camera_light_prepared) = collect_lights_with_camera_data(doc, snapshot);
+    if let Some(sun) = scene_shader
+        .map(SceneShader::eevee_world_sun_volume_light)
+        .transpose()?
+        .flatten()
+    {
+        if scene.render.eevee_use_volumetric_shadows
+            && sun.use_sun_shadow
+            && sun.shadow_radius.is_some_and(|radius| radius > 0.0)
+        {
+            let warning = serde_json::json!({
+                "code": "UNSUPPORTED_FEATURE",
+                "feature_id": "render.eevee.world_sun.volume_shadow_radius",
+                "message": "Realtime WorldSun volume shadows use directional rays; World.sun_angle and shadow jitter overblur are not represented.",
+            });
+            let mut recorded = warnings.borrow_mut();
+            if !recorded.contains(&warning) {
+                recorded.push(warning);
+            }
+        }
+        lights.push(PointLight {
+            position: sun.matrix.transform_point3(DVec3::ZERO),
+            direction: sun.matrix.transform_vector3(-DVec3::Z).normalize_or_zero(),
+            world_transform: sun.matrix,
+            kind: LightType::Sun,
+            color: sun.radiance,
+            energy: sun.volume_energy,
+            radius: 0.0,
+            soft_falloff: false,
+            spot_size: 0.0,
+            spot_blend: 0.0,
+            area: None,
+            spread: None,
+            use_mis: false,
+            volume_factor: 1.0,
+            use_sun_shadow: Some(sun.use_sun_shadow),
+            volume_radius_squared: f64::INFINITY,
+            ray_mask: RayKind::VolumeScatter.bit(),
+            camera_shape_eligible: false,
+        });
+        camera_light_prepared.push(CameraLightPrepared {
+            influence_radius_max: 0.0,
+            area_display: None,
+        });
+    }
     Ok(Some(RealtimeVolumeTransport {
         doc,
         snapshot,
@@ -5040,7 +5103,9 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
                             let Some(sample) = sample_light(light, point, self.rng) else {
                                 continue;
                             };
-                            let visibility = if self.query.transport.volumetric_shadows {
+                            let visibility = if self.query.transport.volumetric_shadows
+                                && light.use_sun_shadow.unwrap_or(true)
+                            {
                                 march_volumes_with_budget(
                                     &self.query.transport.volumes,
                                     point,
@@ -5071,7 +5136,9 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
                     let Some(sample) = eevee_volume_light_sample(light, point) else {
                         continue;
                     };
-                    let visibility = if self.query.transport.volumetric_shadows {
+                    let visibility = if self.query.transport.volumetric_shadows
+                        && light.use_sun_shadow.unwrap_or(true)
+                    {
                         shadow_transmittance_with_volumetric_shadows(
                             scene,
                             media,
@@ -5226,7 +5293,9 @@ fn realtime_voxel_integral(
                         let Some(sample) = sample_light(light, point, rng) else {
                             continue;
                         };
-                        let visibility = if transport.volumetric_shadows {
+                        let visibility = if transport.volumetric_shadows
+                            && light.use_sun_shadow.unwrap_or(true)
+                        {
                             march_volumes_with_budget(
                                 &transport.volumes,
                                 point,
@@ -5509,6 +5578,11 @@ fn camera_scatter_phase(
         }
     }
     scatter * transmittance
+}
+
+/// The pinned Cycles path cannot allocate or continue a Portal at terminal or ordinary bounce limits.
+fn portal_continuation_allowed(terminal: bool, bounce: u32, max_bounces: u32) -> bool {
+    !terminal && bounce < max_bounces
 }
 
 #[cfg(test)]
@@ -6273,7 +6347,9 @@ fn trace_path_with_temperatures(
                     surface.closures.items[index].params.model,
                     BsdfModel::RayPortal(_)
                 );
-                if terminal && !is_portal {
+                if (terminal && !is_portal)
+                    || (is_portal && !portal_continuation_allowed(terminal, bounce, max_bounces))
+                {
                     break;
                 }
                 let draw = surface
@@ -6759,6 +6835,7 @@ mod overlay_tests {
             spread: None,
             use_mis: true,
             volume_factor: 0.0,
+            use_sun_shadow: None,
             volume_radius_squared: 0.0,
             ray_mask: RayKind::Camera.bit(),
             camera_shape_eligible: true,
@@ -7824,13 +7901,9 @@ fn make_hair_surface(
         } else {
             normal
         };
-        let mut item = HitClosure::new(
-            closure.weight,
-            &params,
-            -direction,
-            geometric_normal,
-            material.use_bump_map_correction,
-        );
+        // Cycles source curve primitives bypass specular-normal correction and bump shadowing regardless of material settings.
+        let mut item =
+            HitClosure::new(closure.weight, &params, -direction, geometric_normal, false);
         item.hair_tangent = params.anisotropic_tangent.or(Some(tangent));
         item.hair_ribbon_v = hit.ribbon_v;
         item.hair_pixel_coverage = if ray_kind == RayKind::Camera && radius > 0.0 {
@@ -7858,12 +7931,7 @@ fn make_hair_surface(
         normal: shading_normal,
         geometric_normal,
         shadow_point: point,
-        closures: Closures::new(
-            items,
-            normal,
-            geometric_normal,
-            material.use_bump_map_correction,
-        ),
+        closures: Closures::new(items, normal, geometric_normal, false),
         volume_boundary: prepared.is_volume_only(),
         media: surface_media(hit.object_index, &shading.volume),
         object_index: hit.object_index,
@@ -9094,7 +9162,7 @@ fn sample_lobes(
                 params.base_color[2],
             );
             let sample_weight = (color.element_sum() / 3.0).abs();
-            if sample_weight < 1.0e-5 {
+            if sample_weight == 0.0 || model_selection_weight <= 0.0 {
                 return LobeDraw::Absorbed;
             }
             let direction = if portal.direction.length_squared() == 0.0 {
@@ -9678,6 +9746,7 @@ fn collect_lights_impl(
                 spread: Spread::new(data.spread),
                 use_mis: data.use_multiple_importance_sampling,
                 volume_factor: data.volume_factor.max(0.0),
+                use_sun_shadow: None,
                 volume_radius_squared,
                 ray_mask: node.resolved_ray_visibility().mask(),
                 camera_shape_eligible,
@@ -11994,6 +12063,7 @@ mod volume_extinction_tests {
             soft_falloff: false,
             use_mis: false,
             volume_factor: 1.0,
+            use_sun_shadow: None,
             volume_radius_squared: f64::INFINITY,
             ray_mask: crate::model::RayVisibility::default().mask(),
             camera_shape_eligible: true,
@@ -12041,6 +12111,7 @@ mod volume_extinction_tests {
             soft_falloff: false,
             use_mis: false,
             volume_factor: 1.0,
+            use_sun_shadow: None,
             volume_radius_squared: f64::INFINITY,
             ray_mask: crate::model::RayVisibility::default().mask(),
             camera_shape_eligible: true,
@@ -12075,6 +12146,7 @@ mod volume_extinction_tests {
             soft_falloff: false,
             use_mis: false,
             volume_factor: 1.0,
+            use_sun_shadow: None,
             volume_radius_squared: f64::INFINITY,
             ray_mask: crate::model::RayVisibility::default().mask(),
             camera_shape_eligible: true,
@@ -12551,6 +12623,7 @@ mod sampling_tests {
                 area: None,
                 use_mis: true,
                 volume_factor: 1.0,
+                use_sun_shadow: None,
                 volume_radius_squared: f64::INFINITY,
                 ray_mask: crate::model::RayVisibility::default().mask(),
                 camera_shape_eligible: true,
@@ -12664,6 +12737,7 @@ mod sampling_tests {
                     camera_shape_eligible: true,
                     use_mis: true,
                     volume_factor: 1.0,
+                    use_sun_shadow: None,
                     volume_radius_squared: f64::INFINITY,
                 };
                 for receiver in [
@@ -12747,6 +12821,7 @@ mod sampling_tests {
             camera_shape_eligible: true,
             use_mis: true,
             volume_factor: 1.0,
+            use_sun_shadow: None,
             volume_radius_squared: f64::INFINITY,
         };
         let mut rng = Pcg32::for_sample(0x5e0, 0, 0, 0);
@@ -12785,6 +12860,7 @@ mod sampling_tests {
                 area,
                 use_mis: true,
                 volume_factor: 1.0,
+                use_sun_shadow: None,
                 volume_radius_squared: f64::INFINITY,
                 ray_mask: crate::model::RayVisibility::default().mask(),
                 camera_shape_eligible: true,
@@ -12860,6 +12936,7 @@ mod sampling_tests {
             }),
             use_mis: true,
             volume_factor: 1.0,
+            use_sun_shadow: None,
             volume_radius_squared: f64::INFINITY,
             ray_mask: crate::model::RayVisibility::default().mask(),
             camera_shape_eligible: true,
@@ -13037,7 +13114,6 @@ mod band_tests {
 }
 #[cfg(test)]
 mod cycles_hair_path_tests {
-    #![expect(clippy::unwrap_used, reason = "small analytic hair path fixture")]
 
     use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 
@@ -13046,20 +13122,183 @@ mod cycles_hair_path_tests {
 
     use super::{
         PathHit, PathPrimitiveId, SharedGeometry, TraceGeometry, closest_hair_hit,
-        closest_hit_excluding, hair_surface_hit, path_primitive_id,
+        closest_hit_excluding, hair_surface_hit, make_hair_surface, path_primitive_id,
     };
     use crate::{
-        model::{HairCurve, HairCurveAttribute, HairCurvesData, RayKind},
+        error::PotError,
+        model::{HairCurve, HairCurveAttribute, HairCurvesData, Material, RayKind, SceneDoc},
         render::{
             bvh::Bvh,
-            hair_geometry::{HairCurveShadowTransparency, prepare_cycles_hair_curve_geometry},
+            hair_geometry::{
+                HairCurveShadowTransparency, PreparedHairCurve, prepare_cycles_hair_curve_geometry,
+            },
             hair_intersect::{HairBvh, HairCurveRenderMode, HairCurveShape},
-            scene::HairCurveInstance,
+            scene::{HairCurveInstance, ObjectRecord},
         },
+        shader::{EvaluatorWorkspace, PreparedMaterial},
     };
 
+    fn prepare_first_hair_curve(
+        curves: &HairCurvesData,
+        object_to_world: DMat4,
+        render_mode: HairCurveRenderMode,
+    ) -> crate::error::Result<PreparedHairCurve> {
+        let prepared = prepare_cycles_hair_curve_geometry(curves, object_to_world, render_mode, 2)
+            .map_err(|error| {
+                PotError::invalid_argument(format!(
+                    "hair path fixture should prepare valid geometry: {error:?}"
+                ))
+            })?;
+        prepared
+            .into_iter()
+            .next()
+            .ok_or_else(|| PotError::invalid_argument("hair path fixture should prepare one curve"))
+    }
+
     #[test]
-    fn affine_poly_curve_reaches_path_hit_with_point_normal_attribute() {
+    fn analytic_curve_surface_bypasses_material_normal_and_bump_correction()
+    -> crate::error::Result<()> {
+        let radius = f64::from(0.11_f32);
+        let point = |x: f32, y: f32, z: f32| [f64::from(x), f64::from(y), f64::from(z)];
+        let curves = HairCurvesData {
+            curves: vec![HairCurve {
+                points: vec![
+                    point(-0.38, 0.0, 0.30),
+                    point(-0.14, 0.05, 0.48),
+                    point(0.14, -0.03, 0.52),
+                    point(0.38, 0.0, 0.30),
+                ],
+                radius,
+            }],
+            attributes: BTreeMap::from([
+                (
+                    "curve_type".to_owned(),
+                    HairCurveAttribute {
+                        domain: "CURVE".to_owned(),
+                        data_type: "INT8".to_owned(),
+                        values: vec![json!(0)],
+                    },
+                ),
+                (
+                    "radius".to_owned(),
+                    HairCurveAttribute {
+                        domain: "POINT".to_owned(),
+                        data_type: "FLOAT".to_owned(),
+                        values: vec![json!(radius); 4],
+                    },
+                ),
+                (
+                    "normal_mode".to_owned(),
+                    HairCurveAttribute {
+                        domain: "CURVE".to_owned(),
+                        data_type: "INT8".to_owned(),
+                        values: vec![json!(2)],
+                    },
+                ),
+                (
+                    "custom_normal".to_owned(),
+                    HairCurveAttribute {
+                        domain: "POINT".to_owned(),
+                        data_type: "FLOAT_VECTOR".to_owned(),
+                        values: vec![json!([0.0, 1.0, 0.0]); 4],
+                    },
+                ),
+            ]),
+            ..HairCurvesData::default()
+        };
+        let object_to_world = DMat4::from_translation(DVec3::new(-3.125, -1.25, 0.0));
+        let prepared_curve =
+            prepare_first_hair_curve(&curves, object_to_world, HairCurveRenderMode::Ribbon)?;
+        let instances = vec![HairCurveInstance {
+            curve: prepared_curve.curve,
+            point_normals: prepared_curve.point_normals,
+            shadow_transparency: Arc::new(HairCurveShadowTransparency::new(None, false)),
+            material_index: 0,
+            object_index: 1,
+            element_index: 1,
+            curve_random: None,
+            ray_mask: RayKind::Camera.bit(),
+        }];
+        let hair_curve_bvh = HairBvh::build_splines(instances.iter().map(|curve| &curve.curve));
+        let material = Material {
+            use_bump_map_correction: true,
+            ..Material::default()
+        };
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let prepared_material = PreparedMaterial::new(&material, &doc.node_groups);
+        let mut object: ObjectRecord = serde_json::from_value(json!({
+            "index": 1,
+            "node_id": "curve_object",
+            "data_id": null,
+            "instance_path": [],
+        }))
+        .map_err(|error| {
+            PotError::invalid_argument(format!("object fixture should deserialize: {error}"))
+        })?;
+        object.object_to_world = object_to_world;
+        object.world_to_local = Some(object_to_world.inverse());
+        let objects = vec![object];
+        let prepared = vec![prepared_material];
+        let warnings = RefCell::new(Vec::new());
+        let geometry = TraceGeometry::with_warnings(
+            SharedGeometry {
+                hair_curve_bvh: &hair_curve_bvh,
+                hair_curve_instances: &instances,
+                triangles: &[],
+                materials: std::slice::from_ref(&material),
+                prepared: &prepared,
+                objects: &objects,
+                elements: &[],
+                shadows: None,
+            },
+            &warnings,
+        );
+        let origin = DVec3::new(-3.145_812_988_281_25, -1.270_812_988_281_25, 12.0);
+        let direction = -DVec3::Z;
+        let path_hit = closest_hair_hit(
+            &geometry,
+            origin,
+            direction,
+            0.0,
+            f64::INFINITY,
+            RayKind::Camera.bit(),
+        )
+        .ok_or_else(|| {
+            PotError::invalid_argument("analytic curve fixture should produce a path hit")
+        })?;
+        let hit = hair_surface_hit(&geometry, path_hit, origin, direction)?;
+        let mut evaluator_workspace = EvaluatorWorkspace::default();
+        let surface = make_hair_surface(
+            &doc,
+            &geometry,
+            path_hit,
+            origin,
+            direction,
+            &BTreeMap::new(),
+            0.0,
+            None,
+            RayKind::Camera,
+            &mut evaluator_workspace,
+        )?;
+        assert_eq!(surface.closures.items.len(), 1);
+        let closure = &surface.closures.items[0];
+        assert_eq!(closure.params.normal, hit.normal);
+        assert_eq!(closure.layers.specular, hit.normal);
+        assert!(!surface.closures.bump_correction);
+        let corrected = super::layers_at(
+            &closure.params,
+            closure.params.normal,
+            -direction,
+            hit.geometric_normal,
+            material.use_bump_map_correction,
+        );
+        assert_ne!(closure.layers.specular, corrected.specular);
+        Ok(())
+    }
+
+    #[test]
+    fn affine_poly_curve_reaches_path_hit_with_point_normal_attribute() -> crate::error::Result<()>
+    {
         let curves = HairCurvesData {
             curves: vec![HairCurve {
                 points: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
@@ -13094,14 +13333,8 @@ mod cycles_hair_path_tests {
             ..HairCurvesData::default()
         };
         let object_to_world = DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0));
-        let prepared = prepare_cycles_hair_curve_geometry(
-            &curves,
-            object_to_world,
-            HairCurveRenderMode::Ribbon,
-            2,
-        )
-        .unwrap()
-        .remove(0);
+        let prepared =
+            prepare_first_hair_curve(&curves, object_to_world, HairCurveRenderMode::Ribbon)?;
         assert_eq!(prepared.curve.render_mode, HairCurveRenderMode::ThickLinear);
         assert!(matches!(
             &prepared.curve.shape,
@@ -13147,8 +13380,10 @@ mod cycles_hair_path_tests {
             f64::INFINITY,
             RayKind::Camera.bit(),
         )
-        .unwrap();
-        let surface = hair_surface_hit(&geometry, hit, origin, direction).unwrap();
+        .ok_or_else(|| {
+            PotError::invalid_argument("poly curve fixture should produce a path hit")
+        })?;
+        let surface = hair_surface_hit(&geometry, hit, origin, direction)?;
         assert!((surface.distance - 0.8).abs() < 1.0e-10);
         assert!((surface.radius - 0.1 * 2.0_f64.sqrt()).abs() < 1.0e-12);
         assert!((surface.tangent.normalize() - DVec3::Z).length() < 1.0e-12);
@@ -13159,10 +13394,12 @@ mod cycles_hair_path_tests {
         let expected_attribute_normal = DVec3::X.lerp(DVec3::Y, curve_hit.u);
         assert_eq!(surface.curve_attribute_normal, expected_attribute_normal);
         assert_eq!(surface.curve_random, Some(0.25));
+        Ok(())
     }
 
     #[test]
-    fn nurbs_authoring_data_uses_cycles_raw_key_basis_and_source_point_normals() {
+    fn nurbs_authoring_data_uses_cycles_raw_key_basis_and_source_point_normals()
+    -> crate::error::Result<()> {
         let curves = HairCurvesData {
             curves: vec![HairCurve {
                 points: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 2.0]],
@@ -13196,14 +13433,8 @@ mod cycles_hair_path_tests {
             ]),
             ..HairCurvesData::default()
         };
-        let prepared = prepare_cycles_hair_curve_geometry(
-            &curves,
-            DMat4::IDENTITY,
-            HairCurveRenderMode::Thick,
-            2,
-        )
-        .unwrap()
-        .remove(0);
+        let prepared =
+            prepare_first_hair_curve(&curves, DMat4::IDENTITY, HairCurveRenderMode::Thick)?;
         assert_eq!(prepared.curve.render_mode, HairCurveRenderMode::Thick);
         assert!(matches!(
             &prepared.curve.shape,
@@ -13213,15 +13444,31 @@ mod cycles_hair_path_tests {
             } if keys.len() == 3
         ));
         assert_eq!(
-            prepared.curve.sample_local(0, 0.0).unwrap().position,
+            prepared
+                .curve
+                .sample_local(0, 0.0)
+                .ok_or_else(|| {
+                    PotError::invalid_argument("NURBS start sample should be valid")
+                })?
+                .position,
             DVec3::ZERO
         );
         assert_eq!(
-            prepared.curve.sample_local(1, 0.0).unwrap().position,
+            prepared
+                .curve
+                .sample_local(1, 0.0)
+                .ok_or_else(|| {
+                    PotError::invalid_argument("NURBS middle sample should be valid")
+                })?
+                .position,
             DVec3::Z
         );
         assert_eq!(
-            prepared.curve.sample_local(1, 1.0).unwrap().position,
+            prepared
+                .curve
+                .sample_local(1, 1.0)
+                .ok_or_else(|| { PotError::invalid_argument("NURBS end sample should be valid") })?
+                .position,
             DVec3::Z * 2.0
         );
         let point_normals = prepared.point_normals;
@@ -13261,7 +13508,7 @@ mod cycles_hair_path_tests {
             f64::INFINITY,
             RayKind::Camera.bit(),
         )
-        .unwrap();
+        .ok_or_else(|| PotError::invalid_argument("NURBS fixture should produce a path hit"))?;
         let PathHit::SplineHair {
             span_index,
             hit: curve_hit,
@@ -13270,15 +13517,16 @@ mod cycles_hair_path_tests {
         else {
             panic!("NURBS authoring data should produce a raw-key Cycles spline hit")
         };
-        let surface = hair_surface_hit(&geometry, hit, origin, direction).unwrap();
+        let surface = hair_surface_hit(&geometry, hit, origin, direction)?;
         let expected_attribute_normal = instances[0]
             .point_normals
             .at(span_index, curve_hit.u)
-            .unwrap();
+            .ok_or_else(|| PotError::invalid_argument("NURBS hit should have point-normal data"))?;
         assert_eq!(surface.curve_attribute_normal, expected_attribute_normal);
+        Ok(())
     }
     #[test]
-    fn ribbon_camera_hit_matches_blender_522_primitive_inputs() {
+    fn ribbon_camera_hit_matches_blender_522_primitive_inputs() -> crate::error::Result<()> {
         let radius = f64::from(0.11_f32);
         let point = |x: f32, y: f32, z: f32| [f64::from(x), f64::from(y), f64::from(z)];
         let curves = HairCurvesData {
@@ -13312,14 +13560,8 @@ mod cycles_hair_path_tests {
             ..HairCurvesData::default()
         };
         let object_to_world = DMat4::from_translation(DVec3::new(-3.125, -1.25, 0.0));
-        let prepared = prepare_cycles_hair_curve_geometry(
-            &curves,
-            object_to_world,
-            HairCurveRenderMode::Ribbon,
-            2,
-        )
-        .unwrap()
-        .remove(0);
+        let prepared =
+            prepare_first_hair_curve(&curves, object_to_world, HairCurveRenderMode::Ribbon)?;
         let point_normals = prepared.point_normals;
         let curve = prepared.curve;
         let instances = vec![HairCurveInstance {
@@ -13357,7 +13599,9 @@ mod cycles_hair_path_tests {
             f64::INFINITY,
             RayKind::Camera.bit(),
         )
-        .unwrap();
+        .ok_or_else(|| {
+            PotError::invalid_argument("Cycles ribbon fixture should produce a path hit")
+        })?;
         let PathHit::SplineHair {
             span_index,
             hit: curve_hit,
@@ -13380,7 +13624,7 @@ mod cycles_hair_path_tests {
             curve_hit.v
         );
 
-        let surface = hair_surface_hit(&geometry, hit, origin, direction).unwrap();
+        let surface = hair_surface_hit(&geometry, hit, origin, direction)?;
         let blender_normal = DVec3::new(
             -0.288_462_877_273_559_57,
             -0.253_468_692_302_703_86,
@@ -13405,9 +13649,10 @@ mod cycles_hair_path_tests {
             (surface.curve_attribute_normal - expected_curve_attribute_normal).length() < 1.0e-4,
             "point-domain curve attribute normal should remain a raw key interpolation"
         );
+        Ok(())
     }
     #[test]
-    fn authored_bezier_uses_cycles_raw_key_taper_for_radial_normal() {
+    fn authored_bezier_uses_cycles_raw_key_taper_for_radial_normal() -> crate::error::Result<()> {
         let curves = HairCurvesData {
             curves: vec![HairCurve {
                 points: vec![
@@ -13438,14 +13683,11 @@ mod cycles_hair_path_tests {
             ]),
             ..HairCurvesData::default()
         };
-        let prepared = prepare_cycles_hair_curve_geometry(
+        let prepared = prepare_first_hair_curve(
             &curves,
             DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0)),
             HairCurveRenderMode::Thick,
-            2,
-        )
-        .unwrap()
-        .remove(0);
+        )?;
         assert!(matches!(
             &prepared.curve.shape,
             HairCurveShape::CatmullRom {
@@ -13490,7 +13732,9 @@ mod cycles_hair_path_tests {
             f64::INFINITY,
             RayKind::Camera.bit(),
         )
-        .unwrap();
+        .ok_or_else(|| {
+            PotError::invalid_argument("authored Bezier fixture should produce a path hit")
+        })?;
         let PathHit::SplineHair { hit: curve_hit, .. } = hit else {
             panic!("authored Bezier data should produce the Cycles raw-key spline hit")
         };
@@ -13498,13 +13742,15 @@ mod cycles_hair_path_tests {
             (curve_hit.geometric_normal.normalize() - DVec3::X).length() > 0.05,
             "taper contributes to the unnormalized culling normal"
         );
-        let surface = hair_surface_hit(&geometry, hit, origin, direction).unwrap();
+        let surface = hair_surface_hit(&geometry, hit, origin, direction)?;
         assert!((surface.radius - 0.2 * 2.0_f64.sqrt()).abs() < 1.0e-12);
         assert!((surface.normal - DVec3::X).length() < 1.0e-12);
+        Ok(())
     }
 
     #[test]
-    fn source_curve_self_id_excludes_one_whole_curve_but_not_its_sibling() {
+    fn source_curve_self_id_excludes_one_whole_curve_but_not_its_sibling()
+    -> crate::error::Result<()> {
         let curves = HairCurvesData {
             curves: vec![
                 HairCurve {
@@ -13538,21 +13784,29 @@ mod cycles_hair_path_tests {
             HairCurveRenderMode::Thick,
             2,
         )
-        .unwrap();
+        .map_err(|error| {
+            PotError::invalid_argument(format!(
+                "source curve fixture should prepare geometry: {error:?}"
+            ))
+        })?;
         let instances: Vec<_> = prepared
             .into_iter()
             .enumerate()
-            .map(|(curve_index, prepared)| HairCurveInstance {
-                curve: prepared.curve,
-                point_normals: prepared.point_normals,
-                shadow_transparency: Arc::new(HairCurveShadowTransparency::new(None, false)),
-                material_index: 0,
-                object_index: 1,
-                element_index: u32::try_from(curve_index + 1).unwrap(),
-                curve_random: None,
-                ray_mask: RayKind::Camera.bit(),
+            .map(|(curve_index, prepared)| {
+                Ok(HairCurveInstance {
+                    curve: prepared.curve,
+                    point_normals: prepared.point_normals,
+                    shadow_transparency: Arc::new(HairCurveShadowTransparency::new(None, false)),
+                    material_index: 0,
+                    object_index: 1,
+                    element_index: u32::try_from(curve_index + 1).map_err(|_| {
+                        PotError::invalid_argument("source curve fixture index should fit in u32")
+                    })?,
+                    curve_random: None,
+                    ray_mask: RayKind::Camera.bit(),
+                })
             })
-            .collect();
+            .collect::<crate::error::Result<Vec<_>>>()?;
         let hair_curve_bvh =
             HairBvh::build_splines(instances.iter().map(|instance| &instance.curve));
         let warnings = RefCell::new(Vec::new());
@@ -13569,7 +13823,7 @@ mod cycles_hair_path_tests {
             },
             &warnings,
         );
-        let mesh_bvh = Bvh::build(&[]).unwrap();
+        let mesh_bvh = Bvh::build(&[])?;
         let origin = DVec3::new(2.0, 0.5, 1.0);
         let direction = -DVec3::X;
         let first_hit = closest_hair_hit(
@@ -13580,12 +13834,16 @@ mod cycles_hair_path_tests {
             f64::INFINITY,
             RayKind::Camera.bit(),
         )
-        .unwrap();
+        .ok_or_else(|| {
+            PotError::invalid_argument("source curve fixture should produce a first hit")
+        })?;
         assert!(matches!(
             first_hit,
             PathHit::SplineHair { curve_index: 0, .. }
         ));
-        let excluded = path_primitive_id(&geometry, first_hit).unwrap();
+        let excluded = path_primitive_id(&geometry, first_hit).ok_or_else(|| {
+            PotError::invalid_argument("source curve hit should have a primitive id")
+        })?;
         assert_eq!(
             excluded,
             PathPrimitiveId::HairCurve {
@@ -13602,7 +13860,9 @@ mod cycles_hair_path_tests {
             f64::INFINITY,
             RayKind::Camera.bit(),
         )
-        .unwrap();
+        .ok_or_else(|| {
+            PotError::invalid_argument("source curve fixture should produce a later hit")
+        })?;
         assert!(
             matches!(
                 later_same_curve_hit,
@@ -13621,7 +13881,7 @@ mod cycles_hair_path_tests {
             RayKind::Camera,
             excluded,
         )
-        .unwrap();
+        .ok_or_else(|| PotError::invalid_argument("sibling curve should remain hittable"))?;
         assert!(matches!(
             next_hit,
             PathHit::SplineHair { curve_index: 1, .. }
@@ -13633,10 +13893,12 @@ mod cycles_hair_path_tests {
                 element_index: 2,
             })
         );
+        Ok(())
     }
 
     #[test]
-    fn source_instance_self_id_distinguishes_members_of_the_same_curve() {
+    fn source_instance_self_id_distinguishes_members_of_the_same_curve() -> crate::error::Result<()>
+    {
         let curves = HairCurvesData {
             curves: vec![HairCurve {
                 points: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]],
@@ -13653,17 +13915,10 @@ mod cycles_hair_path_tests {
             ..HairCurvesData::default()
         };
         let prepare_member = |object_to_world: DMat4| {
-            prepare_cycles_hair_curve_geometry(
-                &curves,
-                object_to_world,
-                HairCurveRenderMode::Thick,
-                2,
-            )
-            .unwrap()
-            .remove(0)
+            prepare_first_hair_curve(&curves, object_to_world, HairCurveRenderMode::Thick)
         };
-        let first = prepare_member(DMat4::IDENTITY);
-        let second = prepare_member(DMat4::from_translation(DVec3::new(-0.5, 0.0, 0.0)));
+        let first = prepare_member(DMat4::IDENTITY)?;
+        let second = prepare_member(DMat4::from_translation(DVec3::new(-0.5, 0.0, 0.0)))?;
         let instances = vec![
             HairCurveInstance {
                 curve: first.curve,
@@ -13702,7 +13957,7 @@ mod cycles_hair_path_tests {
             },
             &warnings,
         );
-        let mesh_bvh = Bvh::build(&[]).unwrap();
+        let mesh_bvh = Bvh::build(&[])?;
         let origin = DVec3::new(1.0, 0.0, 1.0);
         let direction = -DVec3::X;
         let first_hit = closest_hair_hit(
@@ -13713,12 +13968,16 @@ mod cycles_hair_path_tests {
             f64::INFINITY,
             RayKind::Camera.bit(),
         )
-        .unwrap();
+        .ok_or_else(|| {
+            PotError::invalid_argument("source instance fixture should produce a first hit")
+        })?;
         assert!(matches!(
             first_hit,
             PathHit::SplineHair { curve_index: 0, .. }
         ));
-        let excluded = path_primitive_id(&geometry, first_hit).unwrap();
+        let excluded = path_primitive_id(&geometry, first_hit).ok_or_else(|| {
+            PotError::invalid_argument("source instance hit should have a primitive id")
+        })?;
         assert_eq!(
             excluded,
             PathPrimitiveId::HairCurve {
@@ -13737,7 +13996,9 @@ mod cycles_hair_path_tests {
             RayKind::Camera,
             excluded,
         )
-        .unwrap();
+        .ok_or_else(|| {
+            PotError::invalid_argument("second curve instance should remain hittable")
+        })?;
         assert!(matches!(
             next_hit,
             PathHit::SplineHair { curve_index: 1, .. }
@@ -13749,16 +14010,19 @@ mod cycles_hair_path_tests {
                 element_index: 1,
             })
         );
+        Ok(())
     }
 }
+
 #[cfg(test)]
 mod sampled_side_tests {
     use crate::{
-        model::RayKind,
-        shader::{BsdfModel, SheenDistribution},
+        model::{Material, RayKind},
+        shader::{BsdfModel, BsdfParams, RayPortalParameters, SheenDistribution},
     };
+    use glam::DVec3;
 
-    use super::Closures;
+    use super::{Closures, HitClosure, Pcg32, Pick, Reflection, portal_continuation_allowed};
 
     #[test]
     fn ashikhmin_diffuse_label_does_not_make_its_closure_diffuse() {
@@ -13787,5 +14051,63 @@ mod sampled_side_tests {
             true,
             None,
         ));
+    }
+    fn portal_params(color: [f64; 4]) -> BsdfParams {
+        let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        params.model = BsdfModel::RayPortal(RayPortalParameters {
+            position: DVec3::ZERO,
+            direction: DVec3::Z,
+        });
+        params.base_color = color;
+        params
+    }
+
+    #[test]
+    fn tiny_mixed_portal_cannot_reach_hdr_emission() {
+        let portal = HitClosure::new(
+            1.0e-6,
+            &portal_params([0.92, 0.87, 0.73, 1.0]),
+            DVec3::Z,
+            DVec3::Z,
+            false,
+        );
+        let mut transparent_params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        transparent_params.alpha = 0.0;
+        transparent_params.reflectance = 0.0;
+        transparent_params.transparent_bsdf = true;
+        transparent_params.transparent_tint = [1.0; 3];
+        let transparent =
+            HitClosure::new(1.0 - 1.0e-6, &transparent_params, DVec3::Z, DVec3::Z, false);
+        let mut closures = Closures::new(vec![portal, transparent], DVec3::Z, DVec3::Z, false);
+        let mut rng = Pcg32::for_sample(17, 0, 0, 0);
+        let contribution = match closures.pick(0.0) {
+            Some(Pick::Reflect(index)) => match closures.reflect(index, DVec3::Z, &mut rng) {
+                Reflection::Portal { weight, .. } => weight * DVec3::splat(1.0e6),
+                _ => DVec3::ZERO,
+            },
+            Some(Pick::Pass { .. }) | None => DVec3::ZERO,
+        };
+        assert_eq!(contribution, DVec3::ZERO);
+    }
+
+    #[test]
+    fn portal_source_weight_cutoff_is_inclusive() {
+        let closure = HitClosure::new(
+            f64::from(1.0e-5_f32),
+            &portal_params([1.0; 4]),
+            DVec3::Z,
+            DVec3::Z,
+            false,
+        );
+        assert!(closure.reflect_weight() > 0.0);
+        let closures = Closures::new(vec![closure], DVec3::Z, DVec3::Z, false);
+        assert!(matches!(closures.pick(0.0), Some(Pick::Reflect(0))));
+    }
+
+    #[test]
+    fn portal_continuation_obeys_terminal_and_bounce_limits() {
+        assert!(portal_continuation_allowed(false, 0, 1));
+        assert!(!portal_continuation_allowed(false, 1, 1));
+        assert!(!portal_continuation_allowed(true, 0, 8));
     }
 }

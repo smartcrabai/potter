@@ -1257,12 +1257,9 @@ fn calculate_normals_minimum(tangents: &[DVec3], cyclic: bool, normals: &mut [DV
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::unwrap_used,
-    reason = "valid fixtures are required for the normal and curve preparation tests"
-)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::error::Error;
 
     use glam::{DMat4, DVec3};
     use serde_json::json;
@@ -1276,14 +1273,16 @@ mod tests {
     };
 
     #[test]
-    fn straight_z_up_poly_strand_uses_x_normals() {
+    fn straight_z_up_poly_strand_uses_x_normals() -> Result<(), Box<dyn Error>> {
         let positions = [DVec3::ZERO, DVec3::Z, DVec3::Z * 2.0];
-        let normals = curve_normals(&positions, 1, false, 1, 1, &[0.0; 3], None, &[]).unwrap();
+        let normals = curve_normals(&positions, 1, false, 1, 1, &[0.0; 3], None, &[])
+            .ok_or("curve normals were absent")?;
         assert_eq!(normals, [DVec3::X; 3]);
+        Ok(())
     }
 
     #[test]
-    fn empty_curve_has_empty_cycles_path_geometry() {
+    fn empty_curve_has_empty_cycles_path_geometry() -> Result<(), Box<dyn Error>> {
         let curves = HairCurvesData {
             curves: vec![HairCurve {
                 points: Vec::new(),
@@ -1297,16 +1296,17 @@ mod tests {
             HairCurveRenderMode::Thick,
             2,
         )
-        .unwrap();
+        .map_err(|error| format!("{error:?}"))?;
         assert_eq!(prepared.len(), 1);
         assert!(matches!(
             &prepared[0].curve.shape,
             HairCurveShape::CatmullRom { keys, cyclic: false } if keys.is_empty()
         ));
+        Ok(())
     }
 
     #[test]
-    fn cycles_path_uses_one_global_basis_for_every_authored_type() {
+    fn cycles_path_uses_one_global_basis_for_every_authored_type() -> Result<(), Box<dyn Error>> {
         let curve_data = |curve_types: &[i64]| HairCurvesData {
             curves: curve_types
                 .iter()
@@ -1338,7 +1338,7 @@ mod tests {
             HairCurveRenderMode::Ribbon,
             2,
         )
-        .unwrap();
+        .map_err(|error| format!("{error:?}"))?;
         assert!(prepared.iter().all(|curve| {
             curve.curve.render_mode == HairCurveRenderMode::ThickLinear
                 && matches!(
@@ -1354,7 +1354,7 @@ mod tests {
             HairCurveRenderMode::Ribbon,
             2,
         )
-        .unwrap();
+        .map_err(|error| format!("{error:?}"))?;
         assert!(prepared.iter().all(|curve| {
             curve.curve.render_mode == HairCurveRenderMode::Ribbon
                 && matches!(
@@ -1370,7 +1370,7 @@ mod tests {
             HairCurveRenderMode::ThickLinear,
             2,
         )
-        .unwrap();
+        .map_err(|error| format!("{error:?}"))?;
         assert!(prepared.iter().all(|curve| {
             curve.curve.render_mode == HairCurveRenderMode::ThickLinear
                 && matches!(
@@ -1378,10 +1378,11 @@ mod tests {
                     HairCurveShape::Linear { keys, cyclic: false } if keys.len() == 3
                 )
         }));
+        Ok(())
     }
 
     #[test]
-    fn point_normal_keys_mix_raw_before_huang_projection() {
+    fn point_normal_keys_mix_raw_before_huang_projection() -> Result<(), Box<dyn Error>> {
         // Blender 5.2.2 source point-domain normals for the canonical four-key curve.
         let source_normals = [
             DVec3::new(0.239_537_27, -0.970_887_18, 0.0),
@@ -1433,8 +1434,10 @@ mod tests {
             HairCurveRenderMode::ThickLinear,
             2,
         )
-        .unwrap()
-        .remove(0);
+        .map_err(|error| format!("{error:?}"))?
+        .into_iter()
+        .next()
+        .ok_or("curve preparation returned no curves")?;
         assert!(matches!(
             prepared.curve.shape,
             HairCurveShape::Linear { .. }
@@ -1444,7 +1447,10 @@ mod tests {
         let expected = source_normals[1]
             .normalize()
             .lerp(source_normals[2].normalize(), u);
-        let point_normal = prepared.point_normals.at(1, u).unwrap();
+        let point_normal = prepared
+            .point_normals
+            .at(1, u)
+            .ok_or("point normal was absent")?;
         assert!((point_normal - expected).length() < 1.0e-12);
         assert!(point_normal.length() < 0.995);
 
@@ -1457,24 +1463,41 @@ mod tests {
         assert!(
             (projection - DVec3::new(0.018_997_49, 0.202_840_71, -0.979_027_45)).length() < 1.0e-6
         );
+        Ok(())
     }
 
     #[test]
-    fn shadow_transparency_interpolates_f32_keys_and_defaults_missing_values_to_zero() {
+    fn shadow_transparency_interpolates_f32_keys_and_defaults_missing_values_to_zero()
+    -> Result<(), Box<dyn Error>> {
         let values = HairCurveShadowTransparency::new(Some(vec![0.2_f32, 0.8, 0.4]), false);
         let expected = f64::from(0.8_f32 * (1.0 - 0.25_f32) + 0.4 * 0.25_f32);
-        assert!((values.at(1, 0.25).unwrap() - expected).abs() < 1.0e-12);
+        assert!(
+            (values
+                .at(1, 0.25)
+                .ok_or("shadow transparency value was absent")?
+                - expected)
+                .abs()
+                < 1.0e-12
+        );
 
         let cyclic = HairCurveShadowTransparency::new(Some(vec![0.2_f32, 0.8, 0.4]), true);
         let expected = f64::from(0.4_f32 * (1.0 - 0.25_f32) + 0.2 * 0.25_f32);
-        assert!((cyclic.at(2, 0.25).unwrap() - expected).abs() < 1.0e-12);
+        assert!(
+            (cyclic
+                .at(2, 0.25)
+                .ok_or("cyclic shadow transparency value was absent")?
+                - expected)
+                .abs()
+                < 1.0e-12
+        );
 
         let missing = HairCurveShadowTransparency::new(None, false);
         assert_eq!(missing.at(0, 0.5), Some(0.0));
+        Ok(())
     }
 
     #[test]
-    fn cycles_path_uses_raw_bezier_and_nurbs_control_keys() {
+    fn cycles_path_uses_raw_bezier_and_nurbs_control_keys() -> Result<(), Box<dyn Error>> {
         let attribute = |domain: &str, data_type: &str, values| HairCurveAttribute {
             domain: domain.to_owned(),
             data_type: data_type.to_owned(),
@@ -1525,7 +1548,7 @@ mod tests {
             HairCurveRenderMode::Thick,
             2,
         )
-        .unwrap();
+        .map_err(|error| format!("{error:?}"))?;
         for (curve_index, (prepared, source_points)) in
             prepared.iter().zip(source_points.iter()).enumerate()
         {
@@ -1548,10 +1571,11 @@ mod tests {
                 source_radii[curve_index * 4..curve_index * 4 + 4].to_vec()
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn cyclic_source_keeps_normals_cyclic_but_path_endpoints_open() {
+    fn cyclic_source_keeps_normals_cyclic_but_path_endpoints_open() -> Result<(), Box<dyn Error>> {
         let attribute = |domain: &str, data_type: &str, values| HairCurveAttribute {
             domain: domain.to_owned(),
             data_type: data_type.to_owned(),
@@ -1592,8 +1616,10 @@ mod tests {
             HairCurveRenderMode::Thick,
             2,
         )
-        .unwrap()
-        .remove(0);
+        .map_err(|error| format!("{error:?}"))?
+        .into_iter()
+        .next()
+        .ok_or("curve preparation returned no curves")?;
         let HairCurveShape::CatmullRom {
             keys,
             cyclic: false,
@@ -1603,7 +1629,11 @@ mod tests {
         };
         assert_eq!(keys.len(), 3);
         assert_eq!(
-            prepared.curve.sample_local(1, 1.0).unwrap().position,
+            prepared
+                .curve
+                .sample_local(1, 1.0)
+                .ok_or("path endpoint was absent")?
+                .position,
             DVec3::new(0.0, 0.0, 2.0)
         );
         assert!(prepared.curve.sample_local(2, 0.0).is_none());
@@ -1611,9 +1641,10 @@ mod tests {
             prepared.point_normals.at(2, 0.5),
             Some(DVec3::new(0.5, 0.0, 0.5))
         );
+        Ok(())
     }
     #[test]
-    fn bezier_free_handle_tangents_define_source_point_normals() {
+    fn bezier_free_handle_tangents_define_source_point_normals() -> Result<(), Box<dyn Error>> {
         let attribute = |domain: &str, data_type: &str, values| HairCurveAttribute {
             domain: domain.to_owned(),
             data_type: data_type.to_owned(),
@@ -1666,22 +1697,46 @@ mod tests {
             HairCurveRenderMode::ThickLinear,
             2,
         )
-        .unwrap()
-        .remove(0);
+        .map_err(|error| format!("{error:?}"))?
+        .into_iter()
+        .next()
+        .ok_or("curve preparation returned no curves")?;
         let inverse_sqrt_two = std::f64::consts::FRAC_1_SQRT_2;
         let expected_first = DVec3::new(inverse_sqrt_two, -inverse_sqrt_two, 0.0);
         let expected_last = DVec3::new(-inverse_sqrt_two, -inverse_sqrt_two, 0.0);
-        assert!((prepared.point_normals.at(0, 0.0).unwrap() - expected_first).length() < 1.0e-6);
-        assert!((prepared.point_normals.at(0, 1.0).unwrap() - expected_last).length() < 1.0e-6);
+        assert!(
+            (prepared
+                .point_normals
+                .at(0, 0.0)
+                .ok_or("first point normal was absent")?
+                - expected_first)
+                .length()
+                < 1.0e-6
+        );
+        assert!(
+            (prepared
+                .point_normals
+                .at(0, 1.0)
+                .ok_or("last point normal was absent")?
+                - expected_last)
+                .length()
+                < 1.0e-6
+        );
         assert_eq!(
-            prepared.curve.sample_local(0, 0.0).unwrap().tangent,
+            prepared
+                .curve
+                .sample_local(0, 0.0)
+                .ok_or("curve start sample was absent")?
+                .tangent,
             DVec3::X,
             "render geometry remains on its raw linear path basis"
         );
+        Ok(())
     }
 
     #[test]
-    fn bezier_vector_segments_use_source_variable_offsets_for_point_normals() {
+    fn bezier_vector_segments_use_source_variable_offsets_for_point_normals()
+    -> Result<(), Box<dyn Error>> {
         let attribute = |domain: &str, data_type: &str, values| HairCurveAttribute {
             domain: domain.to_owned(),
             data_type: data_type.to_owned(),
@@ -1744,21 +1799,34 @@ mod tests {
             HairCurveRenderMode::ThickLinear,
             2,
         )
-        .unwrap()
-        .remove(0);
+        .map_err(|error| format!("{error:?}"))?
+        .into_iter()
+        .next()
+        .ok_or("curve preparation returned no curves")?;
         let expected = DVec3::new(
             2.0 * std::f64::consts::SQRT_2 / 3.0,
             -std::f64::consts::SQRT_2 / 6.0,
             std::f64::consts::SQRT_2 / 6.0,
         );
         assert!(
-            (prepared.point_normals.at(2, 0.0).unwrap() - expected).length() < 1.0e-4,
+            (prepared
+                .point_normals
+                .at(2, 0.0)
+                .ok_or("Bezier point normal was absent")?
+                - expected)
+                .length()
+                < 1.0e-4,
             "point normals must use the variable-offset Bezier evaluation, not uniform render subdivisions"
         );
         assert_eq!(
-            prepared.curve.sample_local(1, 0.0).unwrap().tangent,
+            prepared
+                .curve
+                .sample_local(1, 0.0)
+                .ok_or("Bezier segment sample was absent")?
+                .tangent,
             DVec3::Y,
             "normal evaluation must not change the linear render basis"
         );
+        Ok(())
     }
 }

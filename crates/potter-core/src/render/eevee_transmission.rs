@@ -1,6 +1,7 @@
-//! Transmission for realtime Beauty as EEVEE 5.2.2 evaluates it with its default material settings: no ray-traced
-//! refraction (`Material.use_raytrace_refraction` off), so each refraction samples the light probe, and the object's
-//! thickness (`Thickness`, `eevee_thickness_lib.bsl.hh`).
+//! Transmission in realtime Beauty uses EEVEE 5.2.2's probe/LTC model. With the default material setting,
+//! `Material.use_raytrace_refraction` disabled, refraction samples the light probe and applies object thickness
+//! (`Thickness`, `eevee_thickness_lib.bsl.hh`). The renderer's screen-space ray-tracing path is separate and does not
+//! trace transmitted closures.
 //!
 //! EEVEE sources (Blender v5.2.2):
 //! - `gpu/shaders/material/gpu_shader_material_principled.glsl`, the `MAT_REFRACTION` block: the transmission and
@@ -24,8 +25,8 @@
 //!
 //! Direct light through glass is EEVEE's LTC light pass (`eevee_ltc.rs`): the reflection's and the transmission's colours
 //! ([`GlassLight`]) integrate each light's emitter with the closure's inverse matrix. The transmission's shadow is the
-//! thickness-amended ray of `shadow_eval` (`render/scene.rs`). Not reproduced: ray-traced refraction
-//! (`use_raytrace_refraction`), which EEVEE leaves off by default.
+//! thickness-amended ray of `shadow_eval` (`render/scene.rs`). EEVEE's render-level screen-space ray tracing handles
+//! reflected closures only; material refraction ray tracing remains unsupported (and off by default in source scenes).
 
 use glam::DVec3;
 
@@ -50,13 +51,35 @@ pub(super) fn utility_texel(value: f64) -> f64 {
     f64::from(exr::prelude::f16::from_f32(value as f32).to_f32())
 }
 
-/// EEVEE's `sample_lut` addressing for a coordinate in `[0, 1]`: the two texels around it and the blend weight of the
-/// second. Texel `i` sits at coordinate `i / 63` (`UTIL_TEX_UV_SCALE` and `UTIL_TEX_UV_BIAS`).
-pub(super) fn texel_weights(coordinate: f64) -> (usize, usize, f64) {
-    let position = coordinate.clamp(0.0, 1.0) * LAST_TEXEL as f64;
+/// EEVEE's `sample_lut` coordinates after `UTIL_TEX_UV_SCALE` and `UTIL_TEX_UV_BIAS`; the sampler quantizes each
+/// bilinear phase to its observed 1/256 hardware step.
+fn texel_weights(coordinate: f64) -> (usize, usize, f64) {
+    let uv = coordinate.clamp(0.0, 1.0) as f32;
+    let uv = uv * (63.0_f32 / 64.0) + 0.5_f32 / 64.0;
+    let position = (uv * 64.0 - 0.5).clamp(0.0, LAST_TEXEL as f32);
     let low = (position.floor() as usize).min(LAST_TEXEL);
     let high = (low + 1).min(LAST_TEXEL);
-    (low, high, position - low as f64)
+    let fraction = position - low as f32;
+    let weight = ((fraction * 256.0 + 0.5).floor() / 256.0).min(1.0);
+    (low, high, f64::from(weight))
+}
+
+/// A filtered sample from Blender's RGBA16F utility texture: half-float texels, hardware bilinear weights, then a
+/// half-float filtered result.
+pub(super) fn utility_sample_2d(x: f64, y: f64, mut texel: impl FnMut(usize, usize) -> f64) -> f64 {
+    let (x0, x1, fx) = texel_weights(x);
+    let (y0, y1, fy) = texel_weights(y);
+    let low = blend(
+        utility_texel(texel(x0, y0)),
+        utility_texel(texel(x1, y0)),
+        fx,
+    );
+    let high = blend(
+        utility_texel(texel(x0, y1)),
+        utility_texel(texel(x1, y1)),
+        fx,
+    );
+    utility_texel(blend(low, high, fy))
 }
 
 /// The two roughness layers around `roughness` and the blend weight of the second (`sample_bsdf_lut`, layer
@@ -75,21 +98,9 @@ fn sqrt_one_minus(n_dot_v: f64) -> f64 {
 
 /// One channel of EEVEE's GGX split sum (`GGXBrdfData`): channel 0 is the scale, channel 1 the bias.
 fn brdf_channel(channel: usize, roughness: f64, n_dot_v: f64) -> f64 {
-    let (x0, x1, fx) = texel_weights(roughness);
-    let (y0, y1, fy) = texel_weights(sqrt_one_minus(n_dot_v));
-    blend(
-        blend(
-            utility_texel(brdf(x0, y0, channel)),
-            utility_texel(brdf(x1, y0, channel)),
-            fx,
-        ),
-        blend(
-            utility_texel(brdf(x0, y1, channel)),
-            utility_texel(brdf(x1, y1, channel)),
-            fx,
-        ),
-        fy,
-    )
+    utility_sample_2d(roughness, sqrt_one_minus(n_dot_v), |x, y| {
+        brdf(x, y, channel)
+    })
 }
 
 /// EEVEE's transmission factor for an IOR above one (`GGXBtdfGt1Data`) at roughness `roughness`, cosine `n_dot_v` and
@@ -97,24 +108,13 @@ fn brdf_channel(channel: usize, roughness: f64, n_dot_v: f64) -> f64 {
 /// does.
 fn transmission_factor(roughness: f64, n_dot_v: f64, amplitude: f64) -> f64 {
     let (l0, l1, fl) = layer_weights(roughness);
-    let (x0, x1, fx) = texel_weights(amplitude.sqrt());
-    let (y0, y1, fy) = texel_weights(sqrt_one_minus(n_dot_v));
-    let layer_value = |layer: usize| {
-        blend(
-            blend(
-                utility_texel(btdf(layer, x0, y0)),
-                utility_texel(btdf(layer, x1, y0)),
-                fx,
-            ),
-            blend(
-                utility_texel(btdf(layer, x0, y1)),
-                utility_texel(btdf(layer, x1, y1)),
-                fx,
-            ),
-            fy,
-        )
-    };
-    blend(layer_value(l0), layer_value(l1), fl)
+    let x = amplitude.sqrt();
+    let y = sqrt_one_minus(n_dot_v);
+    blend(
+        utility_sample_2d(x, y, |x, y| btdf(l0, x, y)),
+        utility_sample_2d(x, y, |x, y| btdf(l1, x, y)),
+        fl,
+    )
 }
 
 /// EEVEE's `GGXBsdfData` for an IOR below one: the scale, bias and transmission factor. Its coordinates are the
@@ -132,23 +132,8 @@ fn bsdf_channels(ior: f64, roughness: f64, n_dot_v: f64) -> [f64; 3] {
     let x = (ior * ior).clamp(0.0, 1.0);
     let y = (remapped * 0.5 + 0.5).clamp(0.0, 1.0);
     let (l0, l1, fl) = layer_weights(roughness);
-    let (x0, x1, fx) = texel_weights(x);
-    let (y0, y1, fy) = texel_weights(y);
-    let channel = |layer: usize, channel: usize| {
-        blend(
-            blend(
-                utility_texel(bsdf(layer, x0, y0, channel)),
-                utility_texel(bsdf(layer, x1, y0, channel)),
-                fx,
-            ),
-            blend(
-                utility_texel(bsdf(layer, x0, y1, channel)),
-                utility_texel(bsdf(layer, x1, y1, channel)),
-                fx,
-            ),
-            fy,
-        )
-    };
+    let channel =
+        |layer: usize, channel: usize| utility_sample_2d(x, y, |x, y| bsdf(layer, x, y, channel));
     [0, 1, 2].map(|index| blend(channel(l0, index), channel(l1, index), fl))
 }
 
@@ -640,22 +625,10 @@ pub(crate) fn glass_closures(
 }
 
 fn sample_glass_matrix(cos_theta: f64, roughness: f64) -> PackedMatrix {
-    let (x0, x1, fx) = texel_weights(roughness);
-    let (y0, y1, fy) = texel_weights(sqrt_one_minus(cos_theta));
     std::array::from_fn(|channel| {
-        blend(
-            blend(
-                utility_texel(ltc_matrix(x0, y0, channel)),
-                utility_texel(ltc_matrix(x1, y0, channel)),
-                fx,
-            ),
-            blend(
-                utility_texel(ltc_matrix(x0, y1, channel)),
-                utility_texel(ltc_matrix(x1, y1, channel)),
-                fx,
-            ),
-            fy,
-        )
+        utility_sample_2d(roughness, sqrt_one_minus(cos_theta), |x, y| {
+            ltc_matrix(x, y, channel)
+        })
     })
 }
 
@@ -758,6 +731,16 @@ fn transmission_light_normal(
 mod tests {
     use super::*;
     use crate::model::Material;
+
+    #[test]
+    fn utility_sampler_uses_half_up_weights_and_half_float_filtered_results() {
+        let raw_uv = (0.5 / 256.0) / 63.0;
+        assert_eq!(texel_weights(raw_uv), (0, 1, 1.0 / 256.0));
+        assert_eq!(
+            utility_sample_2d(raw_uv, 0.0, |x, _| if x == 0 { 1.0 } else { 1.1 }),
+            1.0
+        );
+    }
 
     /// The white glass sphere of the EEVEE probe: Principled, IOR 1.45, Transmission 1, at `roughness`.
     fn glass(roughness: f64) -> BsdfParams {
@@ -1033,16 +1016,10 @@ mod tests {
         let cosine = 0.73;
         let roughness = 0.27;
         let ior = 1.1_f64;
-        let (x0, x1, fx) = texel_weights(roughness);
-        let (y0, y1, fy) = texel_weights(sqrt_one_minus(cosine));
         let sample_channel = |channel| {
-            let texel =
-                |x, y| utility_texel(super::super::eevee_transmission_tables::brdf(x, y, channel));
-            blend(
-                blend(texel(x0, y0), texel(x1, y0), fx),
-                blend(texel(x0, y1), texel(x1, y1), fx),
-                fy,
-            )
+            utility_sample_2d(roughness, sqrt_one_minus(cosine), |x, y| {
+                brdf(x, y, channel)
+            })
         };
         let scale = sample_channel(0);
         let bias = sample_channel(1);

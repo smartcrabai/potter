@@ -22,6 +22,9 @@ EEVEE_SHEEN_ONLY = "--eevee-sheen-only" in CLI_ARGS
 EEVEE_PREVIEW_ONLY = "--eevee-preview-only" in CLI_ARGS
 SKIN_CROP_ONLY = "--skin-crop-only" in CLI_ARGS
 TOON_SUN_ONLY = "--toon-sun-only" in CLI_ARGS
+EEVEE_SSS_TRANSMISSION_ONLY = "--eevee-sss-transmission-only" in CLI_ARGS
+EEVEE_REFRACTION_LAYERS_ONLY = "--eevee-refraction-layers-only" in CLI_ARGS
+PATH_ONLY = "--path-only" in CLI_ARGS
 OUT = CLI_ARGS[-1]
 SKIN_CROP_SIZE = 4
 SKIN_SAMPLES = 4096
@@ -29,6 +32,7 @@ SKIN_SAMPLES = 4096
 if bpy.app.version != (5, 2, 2):
     raise RuntimeError(f"expected Blender 5.2.2, got {bpy.app.version_string}")
 bpy.context.preferences.filepaths.save_version = 0
+bpy.context.preferences.view.use_translate_new_dataname = False
 
 CASES = [
     ("sheen_ashikhmin", "ShaderNodeBsdfSheen", {"distribution": "ASHIKHMIN"}),
@@ -221,7 +225,8 @@ def make_hair_curve(name, location, material):
     return obj
 
 
-def make_scene(name, cases, engine, output_prefix, hair_on_mesh=False, link_normal_input=False):
+def make_scene(name, cases, engine, output_prefix, hair_on_mesh=False, link_normal_input=False,
+               independent_backdrop_layout=False):
     scene = bpy.context.scene
     clear_scene(scene)
     scene.name = name
@@ -265,8 +270,6 @@ def make_scene(name, cases, engine, output_prefix, hair_on_mesh=False, link_norm
         column, row = index % COLS, index // COLS
         x = (column - (COLS - 1) / 2.0) * CELL
         y = ((rows - 1) / 2.0 - row) * CELL
-        if case[0] == "ray_portal":
-            x, y = 0.0, 0.0
         tile = bpy.data.meshes.new(f"BackdropTile{index}")
         tile.from_pydata([(-0.58, -0.58, 0.0), (0.58, -0.58, 0.0),
                           (0.58, 0.58, 0.0), (-0.58, 0.58, 0.0)], [], [(0, 1, 2, 3)])
@@ -274,6 +277,10 @@ def make_scene(name, cases, engine, output_prefix, hair_on_mesh=False, link_norm
         scene.collection.objects.link(tile_obj)
         tile_obj.location = (x, y, 0.0)
         tile_obj.data.materials.append(tile_material(index))
+        if case[0] == "ray_portal":
+            if not independent_backdrop_layout:
+                tile_obj.location = (0.0, 0.0, 0.0)
+            x, y = 0.0, 0.0
 
         material, inputs = new_material(case)
         case_name, node_type, properties = case
@@ -397,6 +404,414 @@ def make_eevee_preview_scene():
         link_normal_input=True,
     )
 
+def make_eevee_sss_transmission_scene():
+    scene = bpy.context.scene
+    clear_scene(scene)
+    scene.name = "Shader BSDF EEVEE Burley SSS Backface Direct"
+    scene.render.engine = "BLENDER_EEVEE"
+    scene.render.resolution_x = 64
+    scene.render.resolution_y = 64
+    scene.render.resolution_percentage = 100
+    scene.render.film_transparent = False
+    scene.render.image_settings.file_format = "OPEN_EXR"
+    scene.render.image_settings.color_mode = "RGBA"
+    scene.render.image_settings.color_depth = "32"
+    scene.render.image_settings.exr_codec = "ZIP"
+    scene.render.threads_mode = "FIXED"
+    scene.render.threads = 1
+    scene.render.use_file_extension = True
+    scene.view_settings.view_transform = "Standard"
+    scene.view_settings.look = "None"
+    scene.view_settings.exposure = 0.0
+    scene.view_settings.gamma = 1.0
+    scene.display_settings.display_device = "sRGB"
+    scene.eevee.taa_render_samples = EEVEE_SAMPLES
+    if hasattr(scene.eevee, "use_raytracing"):
+        scene.eevee.use_raytracing = True
+
+    world = bpy.data.worlds.new("Black World")
+    scene.world = world
+    world.use_nodes = True
+    world.node_tree.nodes.clear()
+    background = world.node_tree.nodes.new("ShaderNodeBackground")
+    background.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+    background.inputs["Strength"].default_value = 0.0
+    output = world.node_tree.nodes.new("ShaderNodeOutputWorld")
+    world.node_tree.links.new(background.outputs["Background"], output.inputs["Surface"])
+
+    camera_data = bpy.data.cameras.new("Camera")
+    camera_data.type = "ORTHO"
+    camera_data.ortho_scale = 4.0
+    camera = bpy.data.objects.new("Camera", camera_data)
+    scene.collection.objects.link(camera)
+    camera.location = (0.0, 0.0, 4.0)
+    scene.camera = camera
+
+    material = bpy.data.materials.new("Burley SSS Transmission")
+    material.use_nodes = True
+    tree = material.node_tree
+    tree.nodes.clear()
+    output = tree.nodes.new("ShaderNodeOutputMaterial")
+    sss = tree.nodes.new("ShaderNodeSubsurfaceScattering")
+    sss.falloff = "BURLEY"
+    node_inputs = {
+        "Color": (0.8, 0.8, 0.8, 1.0),
+        "Weight": 1.0,
+        "Scale": 0.24,
+        "Radius": (1.0, 0.7, 0.4),
+        "IOR": 1.4,
+        "Roughness": 0.36,
+        "Anisotropy": 0.0,
+    }
+    for name, value in node_inputs.items():
+        set_input(sss, name, value)
+    tree.links.new(sss.outputs[0], output.inputs["Surface"])
+
+    thickness = tree.nodes.new("ShaderNodeValue")
+    thickness.outputs["Value"].default_value = 0.0
+    tree.links.new(thickness.outputs["Value"], output.inputs["Thickness"])
+
+    mesh = bpy.data.meshes.new("Thin Surface")
+    mesh.from_pydata([(-1.4, -1.4, 0.0), (1.4, -1.4, 0.0),
+                      (1.4, 1.4, 0.0), (-1.4, 1.4, 0.0)], [], [(0, 1, 2, 3)])
+    surface = bpy.data.objects.new("Burley SSS Surface", mesh)
+    scene.collection.objects.link(surface)
+    surface.data.materials.append(material)
+
+    sun_data = bpy.data.lights.new("Backside Sun", type="SUN")
+    sun_data.energy = 4.0
+    sun_data.color = (1.0, 1.0, 1.0)
+    sun_data.angle = 0.0
+    sun = bpy.data.objects.new("Backside Sun", sun_data)
+    scene.collection.objects.link(sun)
+    sun.rotation_euler = (math.pi, 0.0, 0.0)
+
+    output_path = os.path.join(OUT, "eevee_sss_transmission.exr")
+    scene.render.filepath = output_path
+    blend_path = os.path.join(OUT, "eevee_sss_transmission.blend")
+    bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+    bpy.ops.render.render(write_still=True)
+
+    image = bpy.data.images.load(output_path, check_existing=False)
+    width, height = image.size[:]
+    pixels = array("f", [0.0]) * (width * height * 4)
+    image.pixels.foreach_get(pixels)
+    probe = [width // 2, height // 2, 1]
+    totals = [0.0, 0.0, 0.0, 0.0]
+    count = 0
+    for dy in range(-probe[2], probe[2] + 1):
+        for dx in range(-probe[2], probe[2] + 1):
+            source_index = ((height - 1 - (probe[1] + dy)) * width + probe[0] + dx) * 4
+            for channel in range(4):
+                totals[channel] += float(pixels[source_index + channel])
+            count += 1
+    corner_probe = [2, 2]
+    corner_index = ((height - 1 - corner_probe[1]) * width + corner_probe[0]) * 4
+    corner_rgba = [float(pixels[corner_index + channel]) for channel in range(4)]
+    build_hash = bpy.app.build_hash
+    if isinstance(build_hash, bytes):
+        build_hash = build_hash.decode("ascii")
+    capture = {
+        "blender_version": bpy.app.version_string,
+        "blender_build_hash": build_hash,
+        "engine": scene.render.engine,
+        "resolution": [width, height],
+        "samples": EEVEE_SAMPLES,
+        "seed": SEED,
+        "linear_exr": os.path.basename(output_path),
+        "source": "Blender 5.2.2 d13 eevee_deferred_eval.bsl.hh:183-201",
+        "world": {"background_color": [0.0, 0.0, 0.0, 1.0], "strength": 0.0},
+        "light": {"type": "SUN", "energy": sun_data.energy, "rotation_euler": [math.pi, 0.0, 0.0]},
+        "surface": {"normal": [0.0, 0.0, 1.0], "thickness": 0.0,
+                    "thickness_node": {"type": "ShaderNodeValue", "value": 0.0}},
+        "cases": [{
+            "name": "burley_sss_backface_direct",
+            "mode": {"node_type": sss.bl_idname, "falloff": sss.falloff},
+            "inputs": node_inputs,
+            "probe": probe,
+            "linear_rgba": [value / count for value in totals],
+            "corner_probe": corner_probe,
+            "corner_rgba": corner_rgba,
+        }],
+    }
+    with open(os.path.join(OUT, "eevee_sss_transmission.json"), "w", encoding="utf-8") as stream:
+        json.dump(capture, stream, indent=2)
+        stream.write("\n")
+    bpy.data.images.remove(image)
+
+
+
+def make_eevee_refraction_layers_scene():
+    scene = bpy.context.scene
+    clear_scene(scene)
+    scene.name = "EEVEE Screen Refraction Layer Feedback"
+    scene.render.engine = "BLENDER_EEVEE"
+    scene.render.resolution_x = 128
+    scene.render.resolution_y = 64
+    scene.render.resolution_percentage = 100
+    scene.render.film_transparent = False
+    scene.render.image_settings.file_format = "OPEN_EXR"
+    scene.render.image_settings.color_mode = "RGBA"
+    scene.render.image_settings.color_depth = "32"
+    scene.render.image_settings.exr_codec = "ZIP"
+    scene.render.threads_mode = "FIXED"
+    scene.render.threads = 1
+    scene.render.use_file_extension = True
+    scene.view_settings.view_transform = "Standard"
+    scene.view_settings.look = "None"
+    scene.view_settings.exposure = 0.0
+    scene.view_settings.gamma = 1.0
+    scene.display_settings.display_device = "sRGB"
+    scene.eevee.taa_render_samples = EEVEE_SAMPLES
+    scene.eevee.use_raytracing = True
+    scene.eevee.ray_tracing_method = "SCREEN"
+    ray_tracing = scene.eevee.ray_tracing_options
+    ray_tracing.resolution_scale = "1"
+    ray_tracing.screen_trace_quality = 1.0
+    ray_tracing.screen_trace_thickness = 0.1
+    ray_tracing.trace_max_roughness = 0.5
+
+    world = bpy.data.worlds.new("Black World")
+    scene.world = world
+    world.use_nodes = True
+    world.node_tree.nodes.clear()
+    background = world.node_tree.nodes.new("ShaderNodeBackground")
+    background.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+    background.inputs["Strength"].default_value = 0.0
+    output = world.node_tree.nodes.new("ShaderNodeOutputWorld")
+    world.node_tree.links.new(background.outputs["Background"], output.inputs["Surface"])
+
+    camera_data = bpy.data.cameras.new("Camera")
+    camera_data.type = "ORTHO"
+    camera_data.ortho_scale = 8.0
+    camera = bpy.data.objects.new("Camera", camera_data)
+    scene.collection.objects.link(camera)
+    camera.location = (0.0, 0.0, 4.0)
+    scene.camera = camera
+
+    def emission_material(name, color, screen_refraction=False):
+        material = bpy.data.materials.new(name)
+        material.use_nodes = True
+        material.use_raytrace_refraction = screen_refraction
+        tree = material.node_tree
+        tree.nodes.clear()
+        emission = tree.nodes.new("ShaderNodeEmission")
+        emission.inputs["Color"].default_value = (*color, 1.0)
+        output = tree.nodes.new("ShaderNodeOutputMaterial")
+        tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
+        return material
+
+    def rectangle(name, bounds, z, material, x_slope=0.0):
+        left, bottom, right, top = bounds
+        mesh = bpy.data.meshes.new(name)
+        mesh.from_pydata(
+            [
+                (left, bottom, z + left * x_slope),
+                (right, bottom, z + right * x_slope),
+                (right, top, z + right * x_slope),
+                (left, top, z + left * x_slope),
+            ],
+            [],
+            [(0, 1, 2, 3)],
+        )
+        obj = bpy.data.objects.new(name, mesh)
+        scene.collection.objects.link(obj)
+        obj.data.materials.append(material)
+        return obj
+
+    base = emission_material("Opaque red emissive backplate", (0.8, 0.025, 0.01))
+    rectangle("Opaque red backplate", (-4.0, -2.0, 4.0, 2.0), -0.5, base)
+
+    emission = emission_material(
+        "Flagged emission without transmission", (0.02, 0.8, 0.08), True
+    )
+    rectangle("Flagged emission under enabled glass", (-3.35, -0.5, -2.45, 0.5), 0.4, emission)
+    rectangle("Visible flagged emission control", (-0.45, 0.55, 0.45, 1.45), 0.6, emission)
+
+    principled = bpy.data.materials.new("Flagged Principled with zero transmission")
+    principled.use_nodes = True
+    principled.use_raytrace_refraction = True
+    shader = principled.node_tree.nodes.get("Principled BSDF")
+    if shader is None:
+        raise RuntimeError("Principled BSDF node is missing")
+    set_input(shader, "Base Color", (0.12, 0.04, 0.8, 1.0))
+    set_input(shader, "Roughness", 1.0)
+    set_input(shader, "Transmission Weight", 0.0)
+    set_input(shader, "Emission Color", (0.12, 0.04, 0.8, 1.0))
+    set_input(shader, "Emission Strength", 1.0)
+    rectangle(
+        "Flagged Principled under enabled glass",
+        (-2.35, -0.5, -1.45, 0.5),
+        0.4,
+        principled,
+    )
+    rectangle("Visible flagged Principled control", (-0.45, -1.45, 0.45, -0.55), 0.6, principled)
+
+    sss = bpy.data.materials.new("Opaque Burley SSS feedback target")
+    sss.use_nodes = True
+    sss.use_raytrace_refraction = False
+    sss.node_tree.nodes.clear()
+    sss_output = sss.node_tree.nodes.new("ShaderNodeOutputMaterial")
+    sss_node = sss.node_tree.nodes.new("ShaderNodeSubsurfaceScattering")
+    sss_node.falloff = "BURLEY"
+    sss_inputs = {
+        "Color": (0.12, 0.45, 0.9, 1.0),
+        "Weight": 1.0,
+        "Scale": 0.24,
+        "Radius": (0.25, 0.65, 1.0),
+        "IOR": 1.4,
+        "Roughness": 0.36,
+        "Anisotropy": 0.0,
+    }
+    for name, value in sss_inputs.items():
+        set_input(sss_node, name, value)
+    sss.node_tree.links.new(sss_node.outputs[0], sss_output.inputs["Surface"])
+    rectangle("Resolved opaque SSS target", (-1.25, -0.7, -0.55, 0.7), 0.4, sss)
+    rectangle("Visible opaque SSS control", (-0.45, -0.35, 0.45, 0.35), 0.4, sss)
+
+    sun_data = bpy.data.lights.new("Front Sun", type="SUN")
+    sun_data.energy = 4.0
+    sun_data.color = (1.0, 1.0, 1.0)
+    sun_data.angle = 0.0
+    sun_data.use_shadow = False
+    sun = bpy.data.objects.new("Front Sun", sun_data)
+    scene.collection.objects.link(sun)
+    sun.rotation_euler = (0.0, 0.0, 0.0)
+
+    def glass_material(name, screen_refraction):
+        material = bpy.data.materials.new(name)
+        material.use_nodes = True
+        material.use_raytrace_refraction = screen_refraction
+        material.thickness_mode = "SLAB"
+        material.node_tree.nodes.clear()
+        glass = material.node_tree.nodes.new("ShaderNodeBsdfRefraction")
+        glass.distribution = "GGX"
+        glass.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+        glass.inputs["Roughness"].default_value = 0.05
+        glass.inputs["IOR"].default_value = 1.45
+        glass.inputs["Normal"].default_value = (0.0, 0.0, 1.0)
+        output = material.node_tree.nodes.new("ShaderNodeOutputMaterial")
+        output.inputs["Thickness"].default_value = 0.25
+        material.node_tree.links.new(glass.outputs[0], output.inputs["Surface"])
+        return material
+
+    glass_enabled = glass_material("Enabled screen-refraction glass", True)
+    glass_disabled = glass_material("Disabled screen-refraction glass", False)
+    rectangle("Enabled glass pane", (-3.8, -1.8, -0.5, 1.8), 1.5, glass_enabled, 0.25)
+    rectangle("Disabled glass pane", (0.5, -1.8, 3.8, 1.8), 1.5, glass_disabled, 0.25)
+
+    output_path = os.path.join(OUT, "eevee_refraction_layers.exr")
+    blend_path = os.path.join(OUT, "eevee_refraction_layers.blend")
+    scene.render.filepath = output_path
+    bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+    bpy.ops.render.render(write_still=True)
+
+    image = bpy.data.images.load(output_path, check_existing=False)
+    width, height = image.size[:]
+    pixels = array("f", [0.0]) * (width * height * 4)
+    image.pixels.foreach_get(pixels)
+    cases = []
+    probes = [
+        ("enabled_glass_over_flagged_emission", [17, 32, 1], "enabled glass must see red opaque BACK"),
+        ("enabled_glass_over_principled_transmission_zero", [33, 32, 1], "enabled glass must see red opaque BACK"),
+        ("enabled_glass_over_resolved_sss", [49, 32, 1], "enabled glass must see the resolved opaque SSS feedback"),
+        ("disabled_glass_uses_world", [96, 32, 1], "disabled glass uses the black World probe"),
+        ("flagged_emission_visible", [64, 17, 1], "flagged nontransmissive emission remains visible"),
+        ("flagged_principled_visible", [64, 46, 1], "flagged Principled transmission=0 remains visible"),
+        ("opaque_sss_visible", [64, 32, 1], "opaque SSS source target is visibly distinct"),
+        ("red_backplate_visible", [126, 32, 1], "unoccluded emissive backplate color"),
+    ]
+    for name, probe, behavior in probes:
+        x, y, radius = probe
+        total = [0.0, 0.0, 0.0, 0.0]
+        count = 0
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                index = ((height - 1 - (y + dy)) * width + x + dx) * 4
+                for channel in range(4):
+                    total[channel] += float(pixels[index + channel])
+                count += 1
+        cases.append({
+            "name": name,
+            "probe": probe,
+            "world_location": [
+                -4.0 + (x + 0.5) * 8.0 / width,
+                2.0 - (y + 0.5) * 4.0 / height,
+            ],
+            "behavior": behavior,
+            "linear_rgba": [value / count for value in total],
+        })
+    build_hash = bpy.app.build_hash
+    if isinstance(build_hash, bytes):
+        build_hash = build_hash.decode("ascii")
+    capture = {
+        "blender_version": bpy.app.version_string,
+        "blender_build_hash": build_hash,
+        "blender_binary": bpy.app.binary_path,
+        "blender_binary_sha256": file_sha256(bpy.app.binary_path),
+        "generator": "blender --background --factory-startup --python generate.py -- --eevee-refraction-layers-only <output-directory>",
+        "engine": scene.render.engine,
+        "resolution": [width, height],
+        "samples": scene.eevee.taa_render_samples,
+        "seed": SEED,
+        "linear_exr": os.path.basename(output_path),
+        "pixel_format": "32-bit RGBA OpenEXR ZIP",
+        "render": {
+            "resolution_percentage": scene.render.resolution_percentage,
+            "film_transparent": scene.render.film_transparent,
+            "threads_mode": scene.render.threads_mode,
+            "threads": scene.render.threads,
+            "frame": scene.frame_current,
+        },
+        "view": {
+            "transform": scene.view_settings.view_transform,
+            "look": scene.view_settings.look,
+            "exposure": scene.view_settings.exposure,
+            "gamma": scene.view_settings.gamma,
+        },
+        "raytracing": {
+            "enabled": scene.eevee.use_raytracing,
+            "method": scene.eevee.ray_tracing_method,
+            "resolution_scale": ray_tracing.resolution_scale,
+            "screen_trace_quality": ray_tracing.screen_trace_quality,
+            "screen_trace_thickness": ray_tracing.screen_trace_thickness,
+            "trace_max_roughness": ray_tracing.trace_max_roughness,
+        },
+        "world": {"background_color": [0.0, 0.0, 0.0, 1.0], "strength": 0.0},
+        "camera": {
+            "projection": "ORTHO",
+            "location": [0.0, 0.0, 4.0],
+            "ortho_scale": 8.0,
+            "bounds": [-4.0, 4.0, -2.0, 2.0],
+        },
+        "geometry": {
+            "enabled_glass_bounds": [-3.8, -1.8, -0.5, 1.8],
+            "disabled_glass_bounds": [0.5, -1.8, 3.8, 1.8],
+            "glass_z": 1.5,
+            "glass_x_slope": 0.25,
+            "backplate_bounds": [-4.0, -2.0, 4.0, 2.0],
+            "backplate_z": -0.5,
+            "flagged_emission_under_glass_bounds": [-3.35, -0.5, -2.45, 0.5],
+            "flagged_principled_under_glass_bounds": [-2.35, -0.5, -1.45, 0.5],
+            "resolved_sss_bounds": [-1.25, -0.7, -0.55, 0.7],
+            "visible_opaque_sss_bounds": [-0.45, -0.35, 0.45, 0.35],
+            "unoccluded_backplate_bounds": [3.8, -2.0, 4.0, 2.0],
+            "opaque_target_z": 0.4,
+        },
+        "materials": {
+            "enabled_glass": {"name": glass_enabled.name, "node": "ShaderNodeBsdfRefraction", "use_raytrace_refraction": True, "ior": 1.45, "roughness": 0.05, "normal": [0.0, 0.0, 1.0], "thickness_mode": "SLAB", "thickness": 0.25},
+            "disabled_glass": {"name": glass_disabled.name, "node": "ShaderNodeBsdfRefraction", "use_raytrace_refraction": False, "ior": 1.45, "roughness": 0.05, "normal": [0.0, 0.0, 1.0], "thickness_mode": "SLAB", "thickness": 0.25},
+            "flagged_emission": {"name": emission.name, "node": "ShaderNodeEmission", "use_raytrace_refraction": True, "transmission": 0.0},
+            "flagged_principled": {"name": principled.name, "node": "ShaderNodeBsdfPrincipled", "use_raytrace_refraction": True, "transmission_weight": 0.0},
+            "opaque_sss": {"name": sss.name, "use_raytrace_refraction": False, "node": "BURLEY"},
+        },
+        "light": {"type": "SUN", "energy": sun_data.energy, "angle": 0.0, "rotation_euler": [0.0, 0.0, 0.0], "use_shadow": False},
+        "cases": cases,
+    }
+    with open(os.path.join(OUT, "eevee_refraction_layers.json"), "w", encoding="utf-8") as stream:
+        json.dump(capture, stream, indent=2)
+        stream.write("\n")
+    bpy.data.images.remove(image)
 
 
 def frame_bounds(camera, scene):
@@ -843,7 +1258,14 @@ def remove_blend_backups(names):
 
 
 os.makedirs(OUT, exist_ok=True)
-if EEVEE_PREVIEW_ONLY:
+if PATH_ONLY:
+    make_scene("Shader BSDF Path Wave12", CASES, "CYCLES", "path",
+               independent_backdrop_layout=True)
+    remove_blend_backups(("path",))
+elif EEVEE_REFRACTION_LAYERS_ONLY:
+    make_eevee_refraction_layers_scene()
+    remove_blend_backups(("eevee_refraction_layers",))
+elif EEVEE_PREVIEW_ONLY:
     make_eevee_preview_scene()
     remove_blend_backups(("eevee_preview",))
 elif EEVEE_SHEEN_ONLY:
@@ -857,7 +1279,8 @@ elif TOON_SUN_ONLY:
 elif SUN_ONLY:
     make_sheen_sun_scene()
 else:
-    make_scene("Shader BSDF Path Wave12", CASES, "CYCLES", "path")
+    make_scene("Shader BSDF Path Wave12", CASES, "CYCLES", "path",
+               independent_backdrop_layout=True)
     render_skin_crop()
     make_scene("Shader BSDF EEVEE Wave12", EEVEE_CASES, "BLENDER_EEVEE", "eevee")
     make_eevee_sheen_scenes()

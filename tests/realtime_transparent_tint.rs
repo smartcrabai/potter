@@ -1,14 +1,10 @@
-//! Realtime Beauty tints what a Transparent BSDF passes, as EEVEE 5.2.2 does, for a BLENDED pane and for a Mix Shader of
-//! a Transparent and an opaque closure.
+//! Realtime Beauty tints what a Transparent BSDF passes, as EEVEE 5.2.2 does, for BLENDED, MIX, and DITHERED materials.
 //!
 //! `realtime_transparent_tint.py` renders a pane whose Transparent BSDF has the Color (0.2, 0.8, 0.4) in front of an
 //! emitter of radiance 1. A BLENDED pane keeps the Color per channel; a MIX pane (Mix 0.5 with an opaque black Principled)
-//! passes 0.5 of it, which tests the weighted sum over transparent closures. EEVEE's means match Potter's within the
-//! half-float rounding of the EXR. This test writes the scene with Blender and renders only Potter.
-//!
-//! DITHERED is not asserted. EEVEE's dithered mean sits 0.00956 above the Color's channel mean, 13 standard errors, and
-//! it comes from EEVEE's hashed alpha test and film filter (`realtime_transparent_tint.json`, a known gap). Potter's
-//! dithered value is not pinned here: matching EEVEE needs the per-sample hashed test on top of the film filter.
+//! passes 0.5 of it, which tests the weighted sum over transparent closures. DITHERED hashes each sample's transmittance
+//! against EEVEE's primitive-position threshold, so the test compares Potter with the same-build source sample render.
+//! BLENDED and MIX retain their measured half-float patch bounds.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -43,10 +39,10 @@ const EEVEE: &str = include_str!("fixtures/native_oracle/realtime_transparent_ti
 const PATCH: [f64; 9] = [
     0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625, 0.6875, 0.75,
 ];
-/// The render methods the oracle asserts. BLENDED is one Transparent closure; MIX is a Mix(0.5) of a Transparent and an
-/// opaque closure, so the surface's tint is the weighted sum over the transparent closures. DITHERED is recorded in
-/// `realtime_transparent_tint.json` but not asserted.
-const METHODS: [&str; 2] = ["BLENDED", "MIX"];
+/// The render methods the oracle asserts. BLENDED is one Transparent closure; MIX is a Mix(0.5) of a Transparent and
+/// an opaque closure; DITHERED checks the source's per-sample hashed depth-prepass route.
+const METHODS: [&str; 3] = ["BLENDED", "MIX", "DITHERED"];
+const DITHERED_TOLERANCE: f64 = 0.000_244_140_625;
 
 /// The expected patch mean per channel and tolerance for `method`: EEVEE's measured mean, within the half-float
 /// rounding of its EXR.
@@ -68,13 +64,28 @@ fn expected(method: &str) -> TestResult<([f64; 3], f64)> {
     Ok((mean, tolerance))
 }
 
-/// Writes the Blender scene of `method` as a .blend, without rendering it, and returns its path.
+/// Reads the same-frame EEVEE patch mean captured by `realtime_transparent_tint.py`.
+fn source_patch_mean(blend: &Path) -> TestResult<[f64; 3]> {
+    let source: Value = serde_json::from_slice(&fs::read(blend.with_file_name("unused.json"))?)?;
+    let values = source["patch_mean"]
+        .as_array()
+        .ok_or("the EEVEE source patch mean is missing")?;
+    let mut mean = [0.0; 3];
+    for (value, slot) in values.iter().zip(mean.iter_mut()) {
+        *slot = value
+            .as_f64()
+            .ok_or("the EEVEE source patch mean is not numeric")?;
+    }
+    Ok(mean)
+}
+
+/// Writes a Blender scene; DITHERED also captures its exact same-sample reference frame.
 fn blender_scene(blender: &Path, root: &Path, method: &str) -> TestResult<PathBuf> {
     let dir = root.join(method);
     fs::create_dir_all(&dir)?;
     let script = write_script(&dir, "realtime_transparent_tint.py", SCRIPT)?;
     let blend = dir.join("scene.blend");
-    // The render flag `0` stops the generator after saving the .blend, so the image and JSON paths are not written.
+    let render = if method == "DITHERED" { "1" } else { "0" };
     run_blender_arguments(
         blender,
         &script,
@@ -84,7 +95,7 @@ fn blender_scene(blender: &Path, root: &Path, method: &str) -> TestResult<PathBu
             dir.join("unused.exr").as_path(),
             dir.join("unused.json").as_path(),
             Path::new(method),
-            Path::new("0"),
+            Path::new(render),
         ],
     )?;
     Ok(blend)
@@ -167,7 +178,11 @@ fn transparent_tint_matches_its_expectation_per_render_method() -> TestResult {
         let project = import_scene(&blender, root.path(), &blend)?;
         let frame = potter_realtime_frame(&project, root.path(), &method.to_lowercase())?;
         let actual = patch_mean(&frame);
-        let (expected, tolerance) = expected(method)?;
+        let (expected, tolerance) = if method == "DITHERED" {
+            (source_patch_mean(&blend)?, DITHERED_TOLERANCE)
+        } else {
+            expected(method)?
+        };
         for (channel, (actual, expected)) in actual.iter().zip(expected).enumerate() {
             assert!(
                 (actual - expected).abs() <= tolerance,

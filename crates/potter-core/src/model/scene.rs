@@ -96,6 +96,7 @@ impl SceneDoc {
                         excluded_collections: Vec::new(),
                     },
                 )]),
+                eevee_has_local_volume_probe_grids: Some(false),
                 cycles_hair_shadow_groups: None,
                 frame_current: 1.0,
                 frame_start: 1,
@@ -232,6 +233,49 @@ impl SceneDoc {
                         ErrorCode::SceneInvalid,
                         "hair Curves surface must reference a mesh object",
                         json!({"data_id":data_id,"surface":surface_id}),
+                    ));
+                }
+            }
+        }
+        for (world_id, world) in &self.worlds {
+            if world.eevee_sun_threshold.is_some_and(|threshold| {
+                !threshold.is_finite() || !(0.0..=f64::from(f32::MAX)).contains(&threshold)
+            }) {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "world eevee_sun_threshold must be in Blender's 0..=FLT_MAX range",
+                    json!({"world_id":world_id}),
+                ));
+            }
+            for (setting, value, maximum) in [
+                (
+                    "eevee_sun_angle",
+                    world.eevee_sun_angle,
+                    f64::from(std::f32::consts::PI),
+                ),
+                (
+                    "eevee_sun_shadow_maximum_resolution",
+                    world.eevee_sun_shadow_maximum_resolution,
+                    f64::from(f32::MAX),
+                ),
+                (
+                    "eevee_sun_shadow_jitter_overblur",
+                    world.eevee_sun_shadow_jitter_overblur,
+                    100.0,
+                ),
+                (
+                    "eevee_sun_shadow_filter_radius",
+                    world.eevee_sun_shadow_filter_radius,
+                    f64::from(f32::MAX),
+                ),
+            ] {
+                if value
+                    .is_some_and(|value| !value.is_finite() || !(0.0..=maximum).contains(&value))
+                {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        format!("world {setting} is outside Blender's RNA range"),
+                        json!({"world_id":world_id}),
                     ));
                 }
             }
@@ -1551,6 +1595,9 @@ pub struct Scene {
     pub name: String,
     pub root_collection: Id,
     pub view_layers: Registry<ViewLayer>,
+    /// Marker for visible, render-enabled Grid `LightProbes` in the source view layers. Their caches are not exposed through RNA.
+    #[serde(default)]
+    pub eevee_has_local_volume_probe_grids: Option<bool>,
     /// Exact Cycles Hair geometry-key groups captured from each Blender render view layer.
     /// `None` means this document has no captured Blender provenance; `Some([])` means the
     /// Cycles render callback captured no Hair geometry groups.
@@ -2248,6 +2295,7 @@ fn is_default_filter_width<T: Copy + Into<f64>>(value: &T) -> bool {
 
 /// Blender's `SceneEEVEE.gi_cubemap_resolution` enum values.
 pub const EEVEE_GI_CUBEMAP_RESOLUTIONS: [u32; 6] = [128, 256, 512, 1024, 2048, 4096];
+pub const EEVEE_RAYTRACING_RESOLUTION_SCALES: [u32; 5] = [1, 2, 4, 8, 16];
 
 fn default_eevee_volumetric_tile_size() -> u32 {
     8
@@ -2296,6 +2344,20 @@ pub enum CyclesCurveShape {
     Ribbons,
     Thick,
     ThickLinear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EeveeRayTracingMethod {
+    Probe,
+    Screen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EeveeFastGiMethod {
+    AmbientOcclusionOnly,
+    GlobalIllumination,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2360,6 +2422,52 @@ pub struct RenderSettings {
     pub eevee_light_threshold: f64,
     /// Blender's `SceneEEVEE.gi_cubemap_resolution`; EEVEE sphere probes capture at half this extent.
     pub eevee_gi_cubemap_resolution: Option<u32>,
+    /// Blender's `SceneEEVEE.use_raytracing`; `None` is unknown or retains the legacy native renderer path.
+    #[serde(default)]
+    pub eevee_use_raytracing: Option<bool>,
+    #[serde(default)]
+    pub eevee_use_fast_gi: Option<bool>,
+    #[serde(default)]
+    pub eevee_raytracing_method: Option<EeveeRayTracingMethod>,
+    #[serde(default)]
+    pub eevee_raytracing_resolution_scale: Option<u32>,
+    #[serde(default)]
+    pub eevee_raytracing_screen_trace_quality: Option<f64>,
+    #[serde(default)]
+    pub eevee_raytracing_screen_trace_thickness: Option<f64>,
+    #[serde(default)]
+    pub eevee_raytracing_trace_max_roughness: Option<f64>,
+    #[serde(default)]
+    pub eevee_raytracing_use_backface_hit: Option<bool>,
+    #[serde(default)]
+    pub eevee_raytracing_backface_radiance_scale: Option<f64>,
+    #[serde(default)]
+    pub eevee_raytracing_use_denoise: Option<bool>,
+    #[serde(default)]
+    pub eevee_raytracing_denoise_spatial: Option<bool>,
+    #[serde(default)]
+    pub eevee_raytracing_denoise_temporal: Option<bool>,
+    #[serde(default)]
+    pub eevee_raytracing_denoise_bilateral: Option<bool>,
+    #[serde(default)]
+    pub eevee_fast_gi_method: Option<EeveeFastGiMethod>,
+    #[serde(default)]
+    pub eevee_fast_gi_bias: Option<f64>,
+    #[serde(default)]
+    pub eevee_fast_gi_resolution: Option<u32>,
+    #[serde(default)]
+    pub eevee_fast_gi_step_count: Option<u32>,
+    #[serde(default)]
+    pub eevee_fast_gi_ray_count: Option<u32>,
+    #[serde(default)]
+    pub eevee_fast_gi_quality: Option<f64>,
+    #[serde(default)]
+    pub eevee_fast_gi_distance: Option<f64>,
+    #[serde(default)]
+    pub eevee_fast_gi_thickness_near: Option<f64>,
+    /// Blender's `SceneEEVEE.clamp_surface_indirect`; zero disables indirect-light clamping in EEVEE.
+    #[serde(default)]
+    pub eevee_clamp_surface_indirect: Option<f64>,
 
     /// EEVEE's volume resolve settings (`scene.eevee`), omitted at Blender defaults.
     #[serde(
@@ -2448,6 +2556,47 @@ impl RenderSettings {
             ));
         }
 
+        let raytracing = [
+            (self.eevee_raytracing_screen_trace_quality, 0.0, 1.0),
+            (
+                self.eevee_raytracing_screen_trace_thickness,
+                1e-6,
+                f32::MAX as f64,
+            ),
+            (self.eevee_raytracing_trace_max_roughness, 0.0, 1.0),
+            (self.eevee_raytracing_backface_radiance_scale, 0.0, 1.0),
+            (self.eevee_fast_gi_bias, 0.0, 1.0),
+            (self.eevee_fast_gi_quality, 0.0, 1.0),
+            (self.eevee_fast_gi_distance, 0.0, 100_000.0),
+            (self.eevee_fast_gi_thickness_near, 0.0, 100_000.0),
+            (self.eevee_clamp_surface_indirect, 0.0, f64::from(f32::MAX)),
+        ];
+        if raytracing.iter().any(|(value, min, max)| {
+            value.is_some_and(|value| !value.is_finite() || value < *min || value > *max)
+        }) {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "EEVEE ray-tracing and Fast GI settings are outside Blender RNA ranges",
+            ));
+        }
+        if self
+            .eevee_raytracing_resolution_scale
+            .is_some_and(|value| !EEVEE_RAYTRACING_RESOLUTION_SCALES.contains(&value))
+            || self
+                .eevee_fast_gi_resolution
+                .is_some_and(|value| !EEVEE_RAYTRACING_RESOLUTION_SCALES.contains(&value))
+            || self
+                .eevee_fast_gi_ray_count
+                .is_some_and(|value| !(1..=16).contains(&value))
+            || self
+                .eevee_fast_gi_step_count
+                .is_some_and(|value| !(1..=64).contains(&value))
+        {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "EEVEE ray-tracing resolution and Fast GI integer settings are outside Blender RNA ranges",
+            ));
+        }
         if !matches!(self.eevee_volumetric_tile_size, 1 | 2 | 4 | 8 | 16)
             || !(1..=256).contains(&self.eevee_volumetric_samples)
             || !self.eevee_volumetric_sample_distribution.is_finite()
@@ -2489,6 +2638,28 @@ impl Default for RenderSettings {
             cryptomatte_accurate: false,
             eevee_light_threshold: default_light_threshold(),
             eevee_gi_cubemap_resolution: Some(512),
+            eevee_use_raytracing: None,
+            eevee_use_fast_gi: None,
+            eevee_raytracing_method: None,
+            eevee_raytracing_resolution_scale: None,
+            eevee_raytracing_screen_trace_quality: None,
+            eevee_raytracing_screen_trace_thickness: None,
+            eevee_raytracing_trace_max_roughness: None,
+            eevee_raytracing_use_backface_hit: None,
+            eevee_raytracing_backface_radiance_scale: None,
+            eevee_raytracing_use_denoise: None,
+            eevee_raytracing_denoise_spatial: None,
+            eevee_raytracing_denoise_temporal: None,
+            eevee_raytracing_denoise_bilateral: None,
+            eevee_fast_gi_bias: None,
+            eevee_fast_gi_resolution: None,
+            eevee_fast_gi_step_count: None,
+            eevee_fast_gi_ray_count: None,
+            eevee_fast_gi_quality: None,
+            eevee_fast_gi_distance: None,
+            eevee_fast_gi_thickness_near: None,
+            eevee_fast_gi_method: None,
+            eevee_clamp_surface_indirect: Some(10.0),
 
             eevee_volumetric_tile_size: default_eevee_volumetric_tile_size(),
             eevee_volumetric_samples: default_eevee_volumetric_samples(),
@@ -2889,6 +3060,20 @@ pub struct World {
     pub background_color: Option<[f64; 3]>,
     pub strength: f64,
     pub node_tree: Option<Id>,
+    /// Blender's `World.sun_threshold`, which clamps world radiance during EEVEE sphere-probe capture.
+    pub eevee_sun_threshold: Option<f64>,
+    /// Blender's `World.sun_angle`, the extracted sun's angular diameter.
+    pub eevee_sun_angle: Option<f64>,
+    /// Blender's `World.use_sun_shadow`, controlling shadows from the extracted sun.
+    pub eevee_use_sun_shadow: Option<bool>,
+    /// Blender's `World.sun_shadow_maximum_resolution`, the extracted sun's shadow-map pixel limit.
+    pub eevee_sun_shadow_maximum_resolution: Option<f64>,
+    /// Blender's `World.sun_shadow_jitter_overblur`, applied to jittered extracted-sun shadows.
+    pub eevee_sun_shadow_jitter_overblur: Option<f64>,
+    /// Blender's `World.sun_shadow_filter_radius`, the extracted sun's PCF filter radius.
+    pub eevee_sun_shadow_filter_radius: Option<f64>,
+    /// Blender's `World.use_sun_shadow_jitter`, enabling jittered extracted-sun shadows.
+    pub eevee_use_sun_shadow_jitter: Option<bool>,
 }
 
 impl Default for World {
@@ -2898,6 +3083,13 @@ impl Default for World {
             background_color: None,
             strength: 1.0,
             node_tree: None,
+            eevee_sun_threshold: Some(10.0),
+            eevee_sun_angle: Some(f64::from(0.526_f32.to_radians())),
+            eevee_use_sun_shadow: Some(true),
+            eevee_sun_shadow_maximum_resolution: Some(f64::from(0.001_f32)),
+            eevee_sun_shadow_jitter_overblur: Some(10.0),
+            eevee_sun_shadow_filter_radius: Some(1.0),
+            eevee_use_sun_shadow_jitter: Some(false),
         }
     }
 }
@@ -4508,6 +4700,9 @@ pub struct Material {
     pub emission_strength: f64,
     #[serde(default)]
     pub transmission: f64,
+    /// Blender's EEVEE refraction toggle; `None` means imported data did not record it.
+    #[serde(default)]
+    pub use_raytrace_refraction: Option<bool>,
     #[serde(default = "default_ior")]
     pub ior: f64,
     /// Blender's `Material.thickness_mode`: the refraction thickness model EEVEE uses when the Thickness socket is not
@@ -4571,6 +4766,7 @@ impl Default for Material {
             emission_color: [0.0; 3],
             emission_strength: 0.0,
             transmission: 0.0,
+            use_raytrace_refraction: Some(false),
             ior: default_ior(),
             thickness_mode: ThicknessMode::Sphere,
             double_sided: default_true(),
@@ -4670,6 +4866,133 @@ mod tests {
             serde_json::json!([])
         );
     }
+    #[test]
+    fn eevee_sun_threshold_uses_blender_default_and_validates_source_range() {
+        assert_eq!(super::World::default().eevee_sun_threshold, Some(10.0));
+        let world_id = Id::new("test_world").unwrap();
+        let valid = super::World {
+            eevee_sun_threshold: Some(f64::from(0.125_f32)),
+            ..super::World::default()
+        };
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.worlds.insert(world_id.clone(), valid.clone());
+        doc.validate().unwrap();
+        let serialized = serde_json::to_value(&valid).unwrap();
+        assert_eq!(serialized["eevee_sun_threshold"], f64::from(0.125_f32));
+        let round_trip: super::World = serde_json::from_value(serialized).unwrap();
+        assert_eq!(round_trip, valid);
+
+        for threshold in [None, Some(0.0), Some(f64::from(f32::MAX))] {
+            let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+            doc.worlds.insert(
+                world_id.clone(),
+                super::World {
+                    eevee_sun_threshold: threshold,
+                    ..super::World::default()
+                },
+            );
+            doc.validate().unwrap();
+        }
+        for threshold in [
+            Some(-f64::EPSILON),
+            Some(f64::from(f32::MAX) + 1.0),
+            Some(f64::INFINITY),
+        ] {
+            let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+            doc.worlds.insert(
+                world_id.clone(),
+                super::World {
+                    eevee_sun_threshold: threshold,
+                    ..super::World::default()
+                },
+            );
+            assert!(doc.validate().is_err());
+        }
+    }
+    #[test]
+    fn eevee_world_sun_shadow_settings_round_trip_defaults_and_validate_rna_ranges() {
+        let defaults = super::World::default();
+        assert_eq!(
+            defaults.eevee_sun_angle,
+            Some(f64::from(0.526_f32.to_radians()))
+        );
+        assert_eq!(defaults.eevee_use_sun_shadow, Some(true));
+        assert_eq!(
+            defaults.eevee_sun_shadow_maximum_resolution,
+            Some(f64::from(0.001_f32))
+        );
+        assert_eq!(defaults.eevee_sun_shadow_jitter_overblur, Some(10.0));
+        assert_eq!(defaults.eevee_sun_shadow_filter_radius, Some(1.0));
+        assert_eq!(defaults.eevee_use_sun_shadow_jitter, Some(false));
+
+        let world_id = Id::new("sun_world").unwrap();
+        let valid = super::World {
+            eevee_sun_angle: Some(f64::from(std::f32::consts::PI)),
+            eevee_use_sun_shadow: Some(false),
+            eevee_sun_shadow_maximum_resolution: Some(f64::from(f32::MAX)),
+            eevee_sun_shadow_jitter_overblur: Some(100.0),
+            eevee_sun_shadow_filter_radius: Some(f64::from(f32::MAX)),
+            eevee_use_sun_shadow_jitter: Some(true),
+            ..super::World::default()
+        };
+        let serialized = serde_json::to_value(&valid).unwrap();
+        let round_trip: super::World = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(round_trip, valid);
+        assert_eq!(serialized["eevee_use_sun_shadow"], false);
+
+        for invalid in [
+            super::World {
+                eevee_sun_angle: Some(-f64::EPSILON),
+                ..super::World::default()
+            },
+            super::World {
+                eevee_sun_angle: Some(f64::from(std::f32::consts::PI) + 1.0),
+                ..super::World::default()
+            },
+            super::World {
+                eevee_sun_shadow_maximum_resolution: Some(f64::INFINITY),
+                ..super::World::default()
+            },
+            super::World {
+                eevee_sun_shadow_jitter_overblur: Some(100.0 + f64::EPSILON),
+                ..super::World::default()
+            },
+            super::World {
+                eevee_sun_shadow_filter_radius: Some(-f64::EPSILON),
+                ..super::World::default()
+            },
+        ] {
+            let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+            doc.worlds.insert(world_id.clone(), invalid);
+            assert!(doc.validate().is_err());
+        }
+
+        let unknown = super::World {
+            eevee_sun_angle: None,
+            eevee_use_sun_shadow: None,
+            eevee_sun_shadow_maximum_resolution: None,
+            eevee_sun_shadow_jitter_overblur: None,
+            eevee_sun_shadow_filter_radius: None,
+            eevee_use_sun_shadow_jitter: None,
+            ..super::World::default()
+        };
+        let serialized = serde_json::to_value(&unknown).unwrap();
+        for field in [
+            "eevee_sun_angle",
+            "eevee_use_sun_shadow",
+            "eevee_sun_shadow_maximum_resolution",
+            "eevee_sun_shadow_jitter_overblur",
+            "eevee_sun_shadow_filter_radius",
+            "eevee_use_sun_shadow_jitter",
+        ] {
+            assert!(serialized[field].is_null(), "{field}");
+        }
+        assert_eq!(
+            serde_json::from_value::<super::World>(serialized).unwrap(),
+            unknown
+        );
+    }
+
     #[test]
     fn cycles_hair_shadow_groups_round_trip_and_remain_absent_for_old_scenes() {
         let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
@@ -5026,6 +5349,119 @@ mod tests {
             "eevee_volumetric_end",
         ] {
             assert!(value.get(field).is_none(), "{field} should be omitted");
+        }
+    }
+    #[test]
+    fn eevee_raytracing_setting_round_trips_true_false_and_unknown() {
+        for value in [Some(true), Some(false), None] {
+            let render = super::RenderSettings {
+                eevee_use_raytracing: value,
+                ..super::RenderSettings::default()
+            };
+            let serialized = serde_json::to_value(&render).unwrap();
+            assert_eq!(serialized["eevee_use_raytracing"].as_bool(), value);
+            let round_trip: super::RenderSettings = serde_json::from_value(serialized).unwrap();
+            assert_eq!(round_trip.eevee_use_raytracing, value);
+        }
+    }
+    #[test]
+    fn eevee_local_volume_probe_marker_round_trips_unknown_and_native_default() {
+        let mut legacy = serde_json::to_value(SceneDoc::new("scene-test".to_owned())).unwrap();
+        assert_eq!(
+            legacy["scenes"]["scene_main"]["eevee_has_local_volume_probe_grids"].as_bool(),
+            Some(false)
+        );
+        legacy["scenes"]["scene_main"]
+            .as_object_mut()
+            .unwrap()
+            .remove("eevee_has_local_volume_probe_grids");
+        let legacy: SceneDoc = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            legacy.scenes[&Id::from_static("scene_main")].eevee_has_local_volume_probe_grids,
+            None
+        );
+
+        for value in [Some(true), Some(false), None] {
+            let mut source = serde_json::to_value(SceneDoc::new("scene-test".to_owned())).unwrap();
+            source["scenes"]["scene_main"]["eevee_has_local_volume_probe_grids"] =
+                value.map_or(serde_json::Value::Null, serde_json::Value::Bool);
+            let round_trip: SceneDoc = serde_json::from_value(source).unwrap();
+            assert_eq!(
+                round_trip.scenes[&Id::from_static("scene_main")]
+                    .eevee_has_local_volume_probe_grids,
+                value
+            );
+        }
+    }
+    #[test]
+    fn eevee_raytracing_and_fast_gi_options_round_trip_and_validate() {
+        assert_eq!(
+            super::RenderSettings::default().eevee_clamp_surface_indirect,
+            Some(10.0)
+        );
+        let render = super::RenderSettings {
+            eevee_use_raytracing: Some(true),
+            eevee_use_fast_gi: Some(true),
+            eevee_raytracing_method: Some(super::EeveeRayTracingMethod::Screen),
+            eevee_raytracing_resolution_scale: Some(4),
+            eevee_raytracing_screen_trace_quality: Some(0.75),
+            eevee_raytracing_screen_trace_thickness: Some(0.2),
+            eevee_raytracing_trace_max_roughness: Some(0.8),
+            eevee_raytracing_use_backface_hit: Some(false),
+            eevee_raytracing_backface_radiance_scale: Some(0.4),
+            eevee_raytracing_use_denoise: Some(true),
+            eevee_raytracing_denoise_spatial: Some(false),
+            eevee_raytracing_denoise_temporal: Some(true),
+            eevee_raytracing_denoise_bilateral: Some(false),
+            eevee_fast_gi_bias: Some(0.2),
+            eevee_fast_gi_resolution: Some(8),
+            eevee_fast_gi_step_count: Some(32),
+            eevee_fast_gi_ray_count: Some(5),
+            eevee_fast_gi_quality: Some(0.7),
+            eevee_fast_gi_distance: Some(125.0),
+            eevee_fast_gi_thickness_near: Some(0.3),
+            eevee_fast_gi_method: Some(super::EeveeFastGiMethod::AmbientOcclusionOnly),
+            eevee_clamp_surface_indirect: Some(f64::from(18.75_f32)),
+            ..super::RenderSettings::default()
+        };
+        assert!(render.validate().is_ok());
+        let serialized = serde_json::to_value(&render).unwrap();
+        assert_eq!(serialized["eevee_raytracing_method"], "screen");
+        assert_eq!(serialized["eevee_fast_gi_method"], "ambient_occlusion_only");
+        assert_eq!(
+            serialized["eevee_clamp_surface_indirect"],
+            f64::from(18.75_f32)
+        );
+        let round_trip: super::RenderSettings = serde_json::from_value(serialized).unwrap();
+        assert_eq!(round_trip, render);
+
+        for invalid in [
+            super::RenderSettings {
+                eevee_raytracing_resolution_scale: Some(3),
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                eevee_raytracing_screen_trace_thickness: Some(0.0),
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                eevee_fast_gi_ray_count: Some(17),
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                eevee_fast_gi_step_count: Some(65),
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                eevee_clamp_surface_indirect: Some(-f64::EPSILON),
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                eevee_clamp_surface_indirect: Some(f64::from(f32::MAX) + 1.0),
+                ..super::RenderSettings::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
         }
     }
     #[test]

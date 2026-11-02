@@ -3457,6 +3457,60 @@ def _eevee_gi_cubemap_resolution(scene):
     value = getattr(eevee, "gi_cubemap_resolution", None) if eevee is not None else None
     return int(value) if value is not None else None
 
+def _rna_optional_bool(owner, name):
+    value = getattr(owner, name, None) if owner is not None else None
+    return bool(value) if value is not None else None
+
+
+def _rna_optional_float(owner, name):
+    value = getattr(owner, name, None) if owner is not None else None
+    return float(value) if value is not None else None
+
+
+def _rna_optional_int(owner, name):
+    value = getattr(owner, name, None) if owner is not None else None
+    return int(value) if value is not None else None
+
+
+def _eevee_has_local_volume_probe_grids(scene):
+    # Object.lightprobe_cache is not exposed through RNA; this records visible source Grid probes conservatively.
+    for view_layer in scene.view_layers:
+        for obj in view_layer.objects:
+            if obj.hide_render:
+                continue
+            if obj.type == "LIGHT_PROBE" and getattr(obj.data, "type", None) == "VOLUME":
+                return True
+    return False
+
+
+def _eevee_raytracing_settings(scene):
+    eevee = getattr(scene, "eevee", None)
+    raytracing = getattr(eevee, "ray_tracing_options", None) if eevee is not None else None
+    return {
+        "eevee_use_raytracing": _rna_optional_bool(eevee, "use_raytracing"),
+        "eevee_use_fast_gi": _rna_optional_bool(eevee, "use_fast_gi"),
+        "eevee_clamp_surface_indirect": _rna_optional_float(eevee, "clamp_surface_indirect"),
+        "eevee_raytracing_method": getattr(eevee, "ray_tracing_method", None) if eevee is not None else None,
+        "eevee_raytracing_resolution_scale": _rna_optional_int(raytracing, "resolution_scale"),
+        "eevee_raytracing_screen_trace_quality": _rna_optional_float(raytracing, "screen_trace_quality"),
+        "eevee_raytracing_screen_trace_thickness": _rna_optional_float(raytracing, "screen_trace_thickness"),
+        "eevee_raytracing_trace_max_roughness": _rna_optional_float(raytracing, "trace_max_roughness"),
+        "eevee_raytracing_use_backface_hit": _rna_optional_bool(raytracing, "use_backface_hit"),
+        "eevee_raytracing_backface_radiance_scale": _rna_optional_float(raytracing, "backface_radiance_scale"),
+        "eevee_raytracing_use_denoise": _rna_optional_bool(raytracing, "use_denoise"),
+        "eevee_raytracing_denoise_spatial": _rna_optional_bool(raytracing, "denoise_spatial"),
+        "eevee_raytracing_denoise_temporal": _rna_optional_bool(raytracing, "denoise_temporal"),
+        "eevee_raytracing_denoise_bilateral": _rna_optional_bool(raytracing, "denoise_bilateral"),
+        "eevee_fast_gi_bias": _rna_optional_float(eevee, "fast_gi_bias"),
+        "eevee_fast_gi_resolution": _rna_optional_int(eevee, "fast_gi_resolution"),
+        "eevee_fast_gi_step_count": _rna_optional_int(eevee, "fast_gi_step_count"),
+        "eevee_fast_gi_ray_count": _rna_optional_int(eevee, "fast_gi_ray_count"),
+        "eevee_fast_gi_quality": _rna_optional_float(eevee, "fast_gi_quality"),
+        "eevee_fast_gi_distance": _rna_optional_float(eevee, "fast_gi_distance"),
+        "eevee_fast_gi_thickness_near": _rna_optional_float(eevee, "fast_gi_thickness_near"),
+        "eevee_fast_gi_method": getattr(eevee, "fast_gi_method", None) if eevee is not None else None,
+    }
+
 
 def _cryptomatte_accurate(scene):
     return any(bool(getattr(layer, CRYPTOMATTE_ACCURATE_PROP, False)) for layer in scene.view_layers)
@@ -4149,6 +4203,16 @@ def dump_scene(scene):
         world_info = {"name": world.name_full, "potter_id": world.get("potter.id"),
                       "library": library_reference(world), "color": color,
                       "background_color": background_color, "strength": strength,
+                      "sun_threshold": _rna_optional_float(world, "sun_threshold"),
+                      "sun_angle": _rna_optional_float(world, "sun_angle"),
+                      "use_sun_shadow": _rna_optional_bool(world, "use_sun_shadow"),
+                      "sun_shadow_maximum_resolution": _rna_optional_float(
+                          world, "sun_shadow_maximum_resolution"),
+                      "sun_shadow_jitter_overblur": _rna_optional_float(
+                          world, "sun_shadow_jitter_overblur"),
+                      "sun_shadow_filter_radius": _rna_optional_float(
+                          world, "sun_shadow_filter_radius"),
+                      "use_sun_shadow_jitter": _rna_optional_bool(world, "use_sun_shadow_jitter"),
                       "nodes": tree_dump(world.node_tree),
                       "custom_properties": custom_props(world), "fake_user": bool(world.use_fake_user),
                       "users": int(world.users)}
@@ -4208,6 +4272,7 @@ def dump_scene(scene):
                 "cryptomatte_accurate": _cryptomatte_accurate(scene),
                 "eevee_light_threshold": _eevee_light_threshold(scene),
                 "eevee_gi_cubemap_resolution": _eevee_gi_cubemap_resolution(scene),
+                **_eevee_raytracing_settings(scene),
                 "eevee_use_volumetric_shadows": _eevee_use_volumetric_shadows(scene),
                 "eevee_volumetric_tile_size": _eevee_volumetric_tile_size(scene),
                 "eevee_volumetric_samples": _eevee_volumetric_samples(scene),
@@ -4221,6 +4286,7 @@ def dump_scene(scene):
             "use_compositing": bool(getattr(scene.render, "use_compositing", False)),
             "compositor": _scene_compositor(scene),
             "color_management": _color_management_dump(scene),
+            "eevee_has_local_volume_probe_grids": _eevee_has_local_volume_probe_grids(scene),
             "view_layers": layers,
             "cycles_hair_shadow_groups": cycles_hair_shadow_groups,
             "display_shading": _display_shading_dump(scene),
@@ -4329,6 +4395,7 @@ def material_dump(material):
     emission_strength = 0.0
     transmission = 0.0
     ior = 1.5
+    raytrace_refraction = getattr(material, "use_raytrace_refraction", None)
     if material.use_nodes and material.node_tree:
         shader = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
         if shader:
@@ -4363,6 +4430,7 @@ def material_dump(material):
             "metallic": metallic, "roughness": roughness,
             "emission_color": emission_color, "emission_strength": emission_strength,
             "transmission": transmission, "ior": ior,
+            "use_raytrace_refraction": (bool(raytrace_refraction) if raytrace_refraction is not None else None),
             "thickness_mode": "slab" if getattr(material, "thickness_mode", "SPHERE") == "SLAB" else "sphere",
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
             "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
@@ -10247,6 +10315,86 @@ def export_doc(doc, target, pack, scene_hash, context):
             )
             scene.eevee.volumetric_start = float(render.get("eevee_volumetric_start", 0.1))
             scene.eevee.volumetric_end = float(render.get("eevee_volumetric_end", 100.0))
+
+        eevee = getattr(scene, "eevee", None)
+        raytracing = getattr(eevee, "ray_tracing_options", None) if eevee is not None else None
+        raytracing_values = {
+            "eevee_raytracing_resolution_scale": (raytracing, "resolution_scale", True),
+            "eevee_raytracing_screen_trace_quality": (raytracing, "screen_trace_quality", False),
+            "eevee_raytracing_screen_trace_thickness": (raytracing, "screen_trace_thickness", False),
+            "eevee_raytracing_trace_max_roughness": (raytracing, "trace_max_roughness", False),
+            "eevee_raytracing_use_backface_hit": (raytracing, "use_backface_hit", False),
+            "eevee_raytracing_backface_radiance_scale": (raytracing, "backface_radiance_scale", False),
+            "eevee_raytracing_use_denoise": (raytracing, "use_denoise", False),
+            "eevee_raytracing_denoise_spatial": (raytracing, "denoise_spatial", False),
+            "eevee_raytracing_denoise_temporal": (raytracing, "denoise_temporal", False),
+            "eevee_raytracing_denoise_bilateral": (raytracing, "denoise_bilateral", False),
+        }
+        for key, (owner, prop, enum_value) in raytracing_values.items():
+            value = render.get(key)
+            if value is None:
+                continue
+            if owner is None or not hasattr(owner, prop):
+                raise ValueError("Blender build does not expose RaytraceEEVEE." + prop)
+            if enum_value:
+                if type(value) is not int or value not in (1, 2, 4, 8, 16):
+                    raise ValueError(key + " must be 1, 2, 4, 8, or 16")
+                value = str(value)
+            elif type(value) is bool:
+                pass
+            elif type(value) is int or type(value) is float:
+                value = float(value)
+            else:
+                raise ValueError(key + " has the wrong type")
+            setattr(owner, prop, value)
+
+        eevee_values = {
+            "eevee_use_raytracing": ("use_raytracing", "bool"),
+            "eevee_use_fast_gi": ("use_fast_gi", "bool"),
+            "eevee_raytracing_method": ("ray_tracing_method", "ray_method"),
+            "eevee_fast_gi_bias": ("fast_gi_bias", "float"),
+            "eevee_fast_gi_resolution": ("fast_gi_resolution", "resolution"),
+            "eevee_fast_gi_step_count": ("fast_gi_step_count", "int"),
+            "eevee_fast_gi_ray_count": ("fast_gi_ray_count", "int"),
+            "eevee_fast_gi_quality": ("fast_gi_quality", "float"),
+            "eevee_fast_gi_distance": ("fast_gi_distance", "float"),
+            "eevee_fast_gi_thickness_near": ("fast_gi_thickness_near", "float"),
+            "eevee_fast_gi_method": ("fast_gi_method", "fast_gi_method"),
+            "eevee_clamp_surface_indirect": ("clamp_surface_indirect", "float"),
+        }
+        for key, (prop, kind) in eevee_values.items():
+            value = render.get(key)
+            if value is None:
+                continue
+            if eevee is None or not hasattr(eevee, prop):
+                raise ValueError("Blender build does not expose SceneEEVEE." + prop)
+            if kind == "bool":
+                if type(value) is not bool:
+                    raise ValueError(key + " must be a boolean")
+            elif kind in ("resolution", "int"):
+                if type(value) is not int:
+                    raise ValueError(key + " must be an integer")
+                if kind == "resolution":
+                    if value not in (1, 2, 4, 8, 16):
+                        raise ValueError(key + " must be 1, 2, 4, 8, or 16")
+                    value = str(value)
+                elif key == "eevee_fast_gi_step_count" and not 1 <= value <= 64:
+                    raise ValueError(key + " must be in 1..=64")
+                elif key == "eevee_fast_gi_ray_count" and not 1 <= value <= 16:
+                    raise ValueError(key + " must be in 1..=16")
+            elif kind == "float":
+                if type(value) not in (int, float):
+                    raise ValueError(key + " must be a number")
+                value = float(value)
+            elif kind == "ray_method":
+                if value not in ("probe", "screen"):
+                    raise ValueError(key + " must be probe or screen")
+                value = value.upper()
+            elif kind == "fast_gi_method":
+                if value not in ("ambient_occlusion_only", "global_illumination"):
+                    raise ValueError(key + " must be ambient_occlusion_only or global_illumination")
+                value = "AMBIENT_OCCLUSION_ONLY" if value == "ambient_occlusion_only" else "GLOBAL_ILLUMINATION"
+            setattr(eevee, prop, value)
         unit = item.get("unit", {})
         try:
             scene.unit_settings.system = unit.get("system", "metric").upper()
@@ -10556,6 +10704,23 @@ def export_doc(doc, target, pack, scene_hash, context):
             continue
         world = bpy.data.worlds.new(compatibility_name(doc, "World", world_id, world_id))
         world.color = item["color"]
+        threshold = item.get("eevee_sun_threshold")
+        if threshold is not None:
+            if not hasattr(world, "sun_threshold"):
+                raise RuntimeError("Blender World.sun_threshold is unavailable")
+            world.sun_threshold = float(threshold)
+        for field, property_name in (
+                ("eevee_sun_angle", "sun_angle"),
+                ("eevee_use_sun_shadow", "use_sun_shadow"),
+                ("eevee_sun_shadow_maximum_resolution", "sun_shadow_maximum_resolution"),
+                ("eevee_sun_shadow_jitter_overblur", "sun_shadow_jitter_overblur"),
+                ("eevee_sun_shadow_filter_radius", "sun_shadow_filter_radius"),
+                ("eevee_use_sun_shadow_jitter", "use_sun_shadow_jitter")):
+            value = item.get(field)
+            if value is not None:
+                if not hasattr(world, property_name):
+                    raise RuntimeError(f"Blender World.{property_name} is unavailable")
+                setattr(world, property_name, value)
         world.use_nodes = True
         source = compatibility_block(doc, "worlds", "World", world_id)
         set_id(world.node_tree, item.get("node_tree"))
@@ -10586,6 +10751,10 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.roughness = viewport["roughness"] if viewport else item["roughness"]
         mat.metallic = viewport["metallic"] if viewport else item["metallic"]
         mat.use_backface_culling = not bool(item.get("double_sided", True))
+        if item.get("use_raytrace_refraction") is not None:
+            _set_required(
+                mat, "use_raytrace_refraction", item["use_raytrace_refraction"],
+                "material " + item["name"])
         mat.use_transparent_shadow = bool(item.get("use_transparent_shadow", True))
         mat.cycles.use_bump_map_correction = bool(item.get("use_bump_map_correction", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
