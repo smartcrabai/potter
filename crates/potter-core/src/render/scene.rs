@@ -3136,23 +3136,25 @@ fn build_point_shadow_maps(
         .collect();
     let mut maps = BTreeMap::new();
     for (id, node) in &doc.nodes {
-        let Some(light) = node
-            .data
-            .as_ref()
-            .and_then(|data_id| doc.data_blocks.get(data_id))
-            .and_then(|block| block.light.as_ref())
-        else {
-            continue;
-        };
-        if !matches!(
-            light.light_type,
-            crate::model::LightType::Point | crate::model::LightType::Spot
-        ) {
-            continue;
-        }
         let Some(evaluated) = snapshot.nodes.get(id) else {
             continue;
         };
+        let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+            node.data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id))
+                .and_then(|block| block.light.as_ref())
+        }) else {
+            continue;
+        };
+        if light.use_shadow == Some(false)
+            || !matches!(
+                light.light_type,
+                crate::model::LightType::Point | crate::model::LightType::Spot
+            )
+        {
+            continue;
+        }
         let position =
             DMat4::from_cols_array(&evaluated.world_matrix).transform_point3(DVec3::ZERO);
         maps.insert(id.clone(), PointShadowMap::build(position, &opaque)?);
@@ -4012,6 +4014,7 @@ fn eevee_world_sun_light(
             color: source.radiance.to_array().map(f64::from),
             energy: std::f64::consts::FRAC_1_PI * (1.0 + 1.0 / sun_disc_radius(sun_angle).powi(2)),
             sun_angle,
+            use_shadow: Some(use_shadows),
             ..LightData::default()
         },
         matrix: eevee_world_sun_matrix(source.direction),
@@ -6086,18 +6089,21 @@ fn standalone_eevee_lighting(
                 if influence <= 0.0 {
                     continue;
                 }
-                let direct_context = DirectLightContext {
-                    light,
-                    matrix,
-                    receiver,
-                    normal,
-                    ray_visibility: light_node.resolved_ray_visibility(),
-                    shadow,
-                    point_shadow: None,
-                    sun_shadow_radius: None,
-                };
-                result +=
-                    translucent_direct_contribution(&direct_context, color, thickness) * influence;
+                let contribution =
+                    with_light_shadow_setting(light, shadow, None, |shadow, point_shadow| {
+                        let direct_context = DirectLightContext {
+                            light,
+                            matrix,
+                            receiver,
+                            normal,
+                            ray_visibility: light_node.resolved_ray_visibility(),
+                            shadow,
+                            point_shadow,
+                            sun_shadow_radius: None,
+                        };
+                        translucent_direct_contribution(&direct_context, color, thickness)
+                    })?;
+                result += contribution * influence;
             }
             if let Some(sun) = context.world_sun {
                 let direct_context = world_sun_direct_context(sun, receiver, normal, shadow);
@@ -6151,16 +6157,24 @@ fn standalone_eevee_lighting(
                 if influence <= 0.0 || !visibility.allows(RayKind::Transmission) {
                     continue;
                 }
-                let (reflection, transmission) = glass_direct_contribution(
+                let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
+                let (reflection, transmission) = with_light_shadow_setting(
                     light,
-                    matrix,
-                    receiver,
-                    &glass,
-                    thickness,
-                    visibility,
                     shadow,
-                    shadow.and_then(|scene| scene.point_maps.get(id)),
-                );
+                    point_shadow,
+                    |shadow, point_shadow| {
+                        glass_direct_contribution(
+                            light,
+                            matrix,
+                            receiver,
+                            &glass,
+                            thickness,
+                            visibility,
+                            shadow,
+                            point_shadow,
+                        )
+                    },
+                )?;
                 direct_radiance.0 += reflection * influence;
                 direct_radiance.1 += transmission * influence;
             }
@@ -6200,18 +6214,26 @@ fn standalone_eevee_lighting(
                 if influence <= 0.0 {
                     continue;
                 }
-                let direct_context = DirectLightContext {
+                let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
+                let contribution = with_light_shadow_setting(
                     light,
-                    matrix,
-                    receiver,
-                    normal: metallic_normal,
-                    ray_visibility: light_node.resolved_ray_visibility(),
                     shadow,
-                    point_shadow: shadow.and_then(|scene| scene.point_maps.get(id)),
-                    sun_shadow_radius: None,
-                };
-                result += metallic_direct_contribution(&direct_context, roughness, reflectance)
-                    * influence;
+                    point_shadow,
+                    |shadow, point_shadow| {
+                        let direct_context = DirectLightContext {
+                            light,
+                            matrix,
+                            receiver,
+                            normal: metallic_normal,
+                            ray_visibility: light_node.resolved_ray_visibility(),
+                            shadow,
+                            point_shadow,
+                            sun_shadow_radius: None,
+                        };
+                        metallic_direct_contribution(&direct_context, roughness, reflectance)
+                    },
+                )?;
+                result += contribution * influence;
             }
             if let Some(sun) = context.world_sun {
                 let direct_context =
@@ -6345,7 +6367,7 @@ fn shade_eevee_gbuffer(
                     || !matches!(params.model, BsdfModel::Subsurface)
                 {
                     let direct =
-                        eevee_gbuffer_diffuse_direct(context, lobe_normal, view, light_threshold);
+                        eevee_gbuffer_diffuse_direct(context, lobe_normal, view, light_threshold)?;
                     let indirect = raytrace_radiance.unwrap_or_else(|| {
                         context.world.map_or(DVec3::ZERO, |world| {
                             prefiltered_world(world, lobe_normal, 1.0, irradiance_probe_radiance)
@@ -6389,21 +6411,30 @@ fn shade_eevee_gbuffer(
                     if influence <= 0.0 {
                         continue;
                     }
-                    let direct_context = DirectLightContext {
+                    let point_shadow = context.shadow.and_then(|shadow| shadow.point_maps.get(id));
+                    let contribution = with_light_shadow_setting(
                         light,
-                        matrix,
-                        receiver,
-                        normal: lobe_normal,
-                        ray_visibility: light_node.resolved_ray_visibility(),
-                        shadow: context.shadow,
-                        point_shadow: context.shadow.and_then(|shadow| shadow.point_maps.get(id)),
-                        sun_shadow_radius: None,
-                    };
-                    lobe += translucent_direct_contribution(
-                        &direct_context,
-                        translucent_color,
-                        thickness,
-                    ) * influence;
+                        context.shadow,
+                        point_shadow,
+                        |shadow, point_shadow| {
+                            let direct_context = DirectLightContext {
+                                light,
+                                matrix,
+                                receiver,
+                                normal: lobe_normal,
+                                ray_visibility: light_node.resolved_ray_visibility(),
+                                shadow,
+                                point_shadow,
+                                sun_shadow_radius: None,
+                            };
+                            translucent_direct_contribution(
+                                &direct_context,
+                                translucent_color,
+                                thickness,
+                            )
+                        },
+                    )?;
+                    lobe += contribution * influence;
                 }
                 if let Some(sun) = context.world_sun {
                     let direct_context =
@@ -6452,19 +6483,25 @@ fn shade_eevee_gbuffer(
                     if influence <= 0.0 {
                         continue;
                     }
-                    let direct_context = DirectLightContext {
+                    let point_shadow = context.shadow.and_then(|shadow| shadow.point_maps.get(id));
+                    let contribution = with_light_shadow_setting(
                         light,
-                        matrix,
-                        receiver,
-                        normal: lobe_normal,
-                        ray_visibility: light_node.resolved_ray_visibility(),
-                        shadow: context.shadow,
-                        point_shadow: context.shadow.and_then(|shadow| shadow.point_maps.get(id)),
-                        sun_shadow_radius: None,
-                    };
-                    let contribution =
-                        metallic_direct_contribution(&direct_context, roughness, DVec3::ONE)
-                            * influence;
+                        context.shadow,
+                        point_shadow,
+                        |shadow, point_shadow| {
+                            let direct_context = DirectLightContext {
+                                light,
+                                matrix,
+                                receiver,
+                                normal: lobe_normal,
+                                ray_visibility: light_node.resolved_ray_visibility(),
+                                shadow,
+                                point_shadow,
+                                sun_shadow_radius: None,
+                            };
+                            metallic_direct_contribution(&direct_context, roughness, DVec3::ONE)
+                        },
+                    )? * influence;
                     direct_radiance += contribution;
                 }
                 if let Some(sun) = context.world_sun {
@@ -6567,16 +6604,24 @@ fn shade_eevee_gbuffer(
                     if influence <= 0.0 || !ray_visibility.allows(RayKind::Transmission) {
                         continue;
                     }
-                    let (_, transmission) = glass_direct_contribution(
+                    let point_shadow = context.shadow.and_then(|shadow| shadow.point_maps.get(id));
+                    let (_, transmission) = with_light_shadow_setting(
                         light,
-                        matrix,
-                        receiver,
-                        &glass,
-                        lobe_thickness,
-                        ray_visibility,
                         context.shadow,
-                        context.shadow.and_then(|shadow| shadow.point_maps.get(id)),
-                    );
+                        point_shadow,
+                        |shadow, point_shadow| {
+                            glass_direct_contribution(
+                                light,
+                                matrix,
+                                receiver,
+                                &glass,
+                                lobe_thickness,
+                                ray_visibility,
+                                shadow,
+                                point_shadow,
+                            )
+                        },
+                    )?;
                     direct_radiance += transmission * influence;
                 }
                 let direct_store = rgb9e5_roundtrip(direct_radiance);
@@ -6620,7 +6665,7 @@ fn eevee_gbuffer_diffuse_direct(
     normal: DVec3,
     view: DVec3,
     light_threshold: f64,
-) -> DVec3 {
+) -> Result<DVec3> {
     eevee_diffuse_direct(
         context.doc,
         context.snapshot,
@@ -6643,7 +6688,7 @@ fn eevee_diffuse_direct(
     shadow: ShadowContext<'_>,
     world_sun: Option<&EeveeWorldSunLight>,
     light_threshold: f64,
-) -> DVec3 {
+) -> Result<DVec3> {
     eevee_direct_lighting(
         doc,
         snapshot,
@@ -6665,7 +6710,7 @@ fn eevee_subsurface_transmission_direct(
     shadow: ShadowContext<'_>,
     world_sun: Option<&EeveeWorldSunLight>,
     light_threshold: f64,
-) -> DVec3 {
+) -> Result<DVec3> {
     eevee_direct_lighting(
         doc,
         snapshot,
@@ -6678,6 +6723,45 @@ fn eevee_subsurface_transmission_direct(
     )
 }
 
+pub(super) fn evaluate_light_shadow_setting<T: PartialEq>(
+    use_shadow: Option<bool>,
+    mut evaluate: impl FnMut(bool) -> Result<T>,
+) -> Result<T> {
+    if let Some(casts_shadows) = use_shadow {
+        evaluate(casts_shadows)
+    } else {
+        let shadowed = evaluate(true)?;
+        if shadowed == evaluate(false)? {
+            Ok(shadowed)
+        } else {
+            Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "direct lighting needs the imported light's source shadow setting; reimport from Blender to recover it",
+                serde_json::json!({"feature_id":"render.light.use_shadow"}),
+            ))
+        }
+    }
+}
+
+fn with_light_shadow_setting<T: PartialEq>(
+    light: &crate::model::LightData,
+    shadow: ShadowContext<'_>,
+    point_shadow: Option<&PointShadowMap>,
+    mut evaluate: impl FnMut(ShadowContext<'_>, Option<&PointShadowMap>) -> T,
+) -> Result<T> {
+    if light.use_shadow.is_none() && shadow.is_none() && point_shadow.is_none() {
+        return Ok(evaluate(None, None));
+    }
+    evaluate_light_shadow_setting(light.use_shadow, |casts_shadows| {
+        let (shadow, point_shadow) = if casts_shadows {
+            (shadow, point_shadow)
+        } else {
+            (None, None)
+        };
+        Ok(evaluate(shadow, point_shadow))
+    })
+}
+
 fn eevee_direct_lighting(
     doc: &SceneDoc,
     snapshot: &Snapshot,
@@ -6687,7 +6771,7 @@ fn eevee_direct_lighting(
     world_sun: Option<&EeveeWorldSunLight>,
     light_threshold: f64,
     mut evaluate: impl FnMut(&DirectLightContext<'_>) -> DVec3,
-) -> DVec3 {
+) -> Result<DVec3> {
     let mut result = DVec3::ZERO;
     for (id, light_node) in &doc.nodes {
         let Some(evaluated) = snapshot.nodes.get(id) else {
@@ -6707,23 +6791,28 @@ fn eevee_direct_lighting(
         if influence <= 0.0 {
             continue;
         }
-        let direct = DirectLightContext {
-            light,
-            matrix,
-            receiver,
-            normal,
-            ray_visibility: light_node.resolved_ray_visibility(),
-            shadow,
-            point_shadow: shadow.and_then(|scene| scene.point_maps.get(id)),
-            sun_shadow_radius: None,
-        };
-        result += evaluate(&direct) * influence;
+        let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
+        let contribution =
+            with_light_shadow_setting(light, shadow, point_shadow, |shadow, point_shadow| {
+                let direct = DirectLightContext {
+                    light,
+                    matrix,
+                    receiver,
+                    normal,
+                    ray_visibility: light_node.resolved_ray_visibility(),
+                    shadow,
+                    point_shadow,
+                    sun_shadow_radius: None,
+                };
+                evaluate(&direct)
+            })?;
+        result += contribution * influence;
     }
     if let Some(sun) = world_sun {
         let direct = world_sun_direct_context(sun, receiver, normal, shadow);
         result += evaluate(&direct);
     }
-    result
+    Ok(result)
 }
 
 fn shade(context: &SurfaceShadeContext<'_>) -> Result<[f64; 4]> {
@@ -6888,32 +6977,47 @@ fn shade(context: &SurfaceShadeContext<'_>) -> Result<[f64; 4]> {
                 let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
                 let influence = light_influence_at(light, matrix, point, light_threshold);
                 let ray_visibility = light_node.resolved_ray_visibility();
-                lobes += light_contribution(
+                let contribution = with_light_shadow_setting(
                     light,
-                    matrix,
-                    point,
-                    shadow_point,
-                    normal,
-                    geometric,
-                    &lobe,
-                    &shading,
                     shadow,
                     point_shadow,
-                    ray_visibility,
-                    thickness,
-                    None,
-                ) * influence;
+                    |shadow, point_shadow| {
+                        light_contribution(
+                            light,
+                            matrix,
+                            point,
+                            shadow_point,
+                            normal,
+                            geometric,
+                            &lobe,
+                            &shading,
+                            shadow,
+                            point_shadow,
+                            ray_visibility,
+                            thickness,
+                            None,
+                        )
+                    },
+                )?;
+                lobes += contribution * influence;
                 if let Some(glass) = &glass {
-                    let (reflection, transmission) = glass_direct_contribution(
+                    let (reflection, transmission) = with_light_shadow_setting(
                         light,
-                        matrix,
-                        receiver,
-                        glass,
-                        thickness,
-                        ray_visibility,
                         shadow,
                         point_shadow,
-                    );
+                        |shadow, point_shadow| {
+                            glass_direct_contribution(
+                                light,
+                                matrix,
+                                receiver,
+                                glass,
+                                thickness,
+                                ray_visibility,
+                                shadow,
+                                point_shadow,
+                            )
+                        },
+                    )?;
                     glass_direct_radiance.0 += reflection * influence;
                     glass_direct_radiance.1 += transmission * influence;
                 }
@@ -7109,7 +7213,7 @@ fn eevee_subsurface_sample(
         shadow,
         world_sun,
         light_threshold,
-    );
+    )?;
     let transmission = super::eevee_advanced_bsdf::eevee_subsurface_transmission(
         profile_radius,
         thickness.value() as f32,
@@ -7125,7 +7229,7 @@ fn eevee_subsurface_sample(
             shadow,
             world_sun,
             light_threshold,
-        )
+        )?
     } else {
         DVec3::ZERO
     };

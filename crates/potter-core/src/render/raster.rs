@@ -3793,6 +3793,7 @@ fn eevee_sqrt_fast(value: f32) -> f32 {
 
 fn eevee_screen_thickness(
     frame: &CameraFrame,
+    projection: &Mat4,
     width: u32,
     height: u32,
     minimum_thickness: f32,
@@ -3823,7 +3824,7 @@ fn eevee_screen_thickness(
         ScreenThicknessParameters {
             vs_scale: avg_pixel_radius_unit * min_pixel_thickness,
             vs_bias: -minimum_thickness,
-            ndc_scale: -0.5,
+            ndc_scale: projection.w_axis.z * 0.5,
             ndc_bias: 0.0,
         }
     } else {
@@ -3835,6 +3836,19 @@ fn eevee_screen_thickness(
                 * (-2.0 / (frame.far as f32 - frame.near as f32))
                 * 0.5,
         }
+    }
+}
+fn eevee_screen_trace_ray(
+    view: Mat4,
+    world_origin: Vec3,
+    direction: Vec3,
+    origin_offset: Vec3,
+    max_time: f32,
+) -> ScreenTraceRay {
+    ScreenTraceRay {
+        origin: view.transform_point3(world_origin) + origin_offset,
+        direction,
+        max_time,
     }
 }
 
@@ -4270,6 +4284,7 @@ fn trace_eevee_sample_frame(
             quality: (1.0 - 0.95 * settings.screen_trace_quality) as f32,
             ray_thickness: eevee_screen_thickness(
                 render.frame,
+                &view.projection,
                 width,
                 height,
                 settings.screen_trace_thickness as f32,
@@ -4634,7 +4649,6 @@ fn trace_eevee_closure_frame(
                 continue;
             }
 
-            let origin_view = frame.view.view.transform_point3(surface.point.as_vec3());
             let ray_direction = Vec3::new(
                 direction_and_pdf_inverse[0],
                 direction_and_pdf_inverse[1],
@@ -4672,11 +4686,13 @@ fn trace_eevee_closure_frame(
                     frame.view.screen_camera,
                     frame.parameters,
                     hiz,
-                    ScreenTraceRay {
-                        origin: origin_view,
-                        direction: ray_direction,
-                        max_time: (frame.view.far - frame.view.near).abs(),
-                    },
+                    eevee_screen_trace_ray(
+                        frame.view.view,
+                        surface.point.as_vec3(),
+                        ray_direction,
+                        generated.origin_offset,
+                        (frame.view.far - frame.view.near).abs(),
+                    ),
                     eevee_interleaved_gradient_noise(
                         Vec2::new(trace_x as f32, trace_y as f32),
                         5.0,
@@ -7562,6 +7578,33 @@ fn hit_color(
     Ok(Some(sample))
 }
 
+fn blocks_refraction_layer(triangle: &Triangle, sample: &SurfaceSample) -> bool {
+    let Some(raytrace) = sample.eevee_raytrace else {
+        return false;
+    };
+    if !sample.has_surface
+        || !raytrace.has_gbuffer_route
+        || raytrace.screen_refraction != Some(false)
+        || sample.holdout_weight > 0.0
+        || !is_white(sample.transparent_tint)
+    {
+        return false;
+    }
+    match triangle.alpha_mode {
+        AlphaMode::Opaque => true,
+        AlphaMode::Clip => hit_opacity(triangle, sample.color) > 0.0,
+        AlphaMode::Dithered => sample.eevee_dither.is_some(),
+        AlphaMode::Blend => false,
+    }
+}
+
+fn is_visible_surface(triangle: &Triangle, sample: &SurfaceSample) -> bool {
+    sample.has_surface
+        && ((triangle.alpha_mode == AlphaMode::Dithered && sample.eevee_dither.is_some())
+            || hit_opacity(triangle, sample.color) > 0.0
+            || sample.holdout_weight > 0.0)
+}
+
 fn nearest_visible_hit(
     triangles: &[PreparedTriangle],
     visibility: &super::bvh::Bvh,
@@ -7602,18 +7645,20 @@ fn nearest_visible_hit(
             cursor = Some((hit.depth, triangle_index));
             continue;
         };
-        if sample.has_surface
+        let visible = is_visible_surface(&triangle.source, &sample);
+        if visible
+            && raytrace_layer == Some(EeveeRaytraceLayer::Refraction)
+            && blocks_refraction_layer(&triangle.source, &sample)
+        {
+            return Ok(None);
+        }
+        if visible
             && raytrace_layer.is_some_and(|layer| !layer.contains(sample.eevee_raytrace.as_ref()))
         {
             cursor = Some((hit.depth, triangle_index));
             continue;
         }
-        if sample.has_surface
-            && ((triangle.source.alpha_mode == AlphaMode::Dithered
-                && sample.eevee_dither.is_some())
-                || hit_opacity(&triangle.source, sample.color) > 0.0
-                || sample.holdout_weight > 0.0)
-        {
+        if visible {
             return Ok(Some(VisibleHit {
                 triangle_index,
                 hit,
@@ -7654,6 +7699,7 @@ fn composite_sample_with_association(
     const MAX_ALPHA_LAYERS: usize = 16;
     let mut hits: [Option<VisibleHit>; MAX_ALPHA_LAYERS] = [None; MAX_ALPHA_LAYERS];
     let mut hit_count = 0;
+    let mut refraction_blocker: Option<(f64, usize)> = None;
     visibility.overlapping(ray.origin, ray.direction, candidates);
     // Equal depths keep the first layer inserted, so visit the candidates in triangle order.
     candidates.sort_unstable();
@@ -7703,6 +7749,17 @@ fn composite_sample_with_association(
             eevee_raytrace: sample.eevee_raytrace,
             eevee_dither: dither,
         };
+        if raytrace_layer == Some(EeveeRaytraceLayer::Refraction)
+            && blocks_refraction_layer(&triangle.source, &sample)
+        {
+            let blocker = (hit.depth, triangle_index);
+            if refraction_blocker.is_none_or(|(depth, index)| {
+                blocker.0 < depth || (equal_f64(blocker.0, depth) && blocker.1 < index)
+            }) {
+                refraction_blocker = Some(blocker);
+            }
+            continue;
+        }
         if raytrace_layer.is_some_and(|layer| !layer.contains(visible_hit.eevee_raytrace.as_ref()))
         {
             continue;
@@ -7722,6 +7779,20 @@ fn composite_sample_with_association(
         }
         hits[insert_at] = Some(visible_hit);
         hit_count = next_count;
+    }
+    if let Some((blocker_depth, blocker_index)) = refraction_blocker {
+        let mut retained = 0;
+        while retained < hit_count
+            && hits[retained].is_some_and(|visible_hit| {
+                visible_hit.hit.depth < blocker_depth
+                    || (equal_f64(visible_hit.hit.depth, blocker_depth)
+                        && visible_hit.triangle_index < blocker_index)
+            })
+        {
+            retained += 1;
+        }
+        hits[retained..hit_count].fill(None);
+        hit_count = retained;
     }
     let eevee_raytrace = hits
         .iter()
@@ -9706,12 +9777,14 @@ mod visibility_tests {
     use glam::DVec3;
 
     use super::{
-        AlphaMode, Camera, CameraFrame, EeveeRaytraceFeedback, FilmSampleJitter, Hit, Layer, Mode,
-        PreparedTriangle, Projection, RasterPixelSample, Ray, StereoMode, Triangle, camera_frame,
-        camera_matrices_for_raster, composite_layers_with_association,
-        composite_sample_with_association, hit_opacity, intersect_triangle, nearest_visible_hit,
-        prepare_triangles, raster_hit_context, ray_barycentric_on_triangle, ray_for_pixel_in_frame,
-        ray_for_subpixel_in_frame, realtime_hit_differentials,
+        AlphaMode, Camera, CameraFrame, EeveeDitherSample, EeveeRaytraceFeedback,
+        EeveeRaytraceSample, FilmSampleJitter, Hit, Layer, Mode, PreparedTriangle, Projection,
+        RasterHitContext, RasterPixelSample, Ray, StereoMode, SurfaceHit, SurfaceSample,
+        SurfaceShader, Triangle, camera_frame, camera_matrices_for_raster,
+        composite_layers_with_association, composite_sample_with_association, hit_opacity,
+        intersect_triangle, nearest_visible_hit, prepare_triangles, raster_hit_context,
+        ray_barycentric_on_triangle, ray_for_pixel_in_frame, ray_for_subpixel_in_frame,
+        realtime_hit_differentials,
     };
     use crate::float::equal_f64;
     use crate::model::RayVisibility;
@@ -9797,6 +9870,256 @@ mod visibility_tests {
             stereo_mode: StereoMode::None,
             interocular_distance: 0.065,
         }
+    }
+
+    fn layer_triangle(
+        z: f64,
+        material_index: usize,
+        alpha_mode: AlphaMode,
+        alpha: f64,
+    ) -> Triangle {
+        let mut triangle = triangle([
+            DVec3::new(-10.0, -10.0, z),
+            DVec3::new(10.0, -10.0, z),
+            DVec3::new(0.0, 10.0, z),
+        ]);
+        triangle.material_index = material_index;
+        triangle.alpha_mode = alpha_mode;
+        triangle.color = [0.9, 0.1, 0.2, alpha];
+        triangle
+    }
+
+    struct RefractionLayerShader;
+
+    impl SurfaceShader for RefractionLayerShader {
+        fn shade(
+            &self,
+            triangle: &Triangle,
+            _hit: &SurfaceHit<'_>,
+        ) -> super::Result<SurfaceSample> {
+            let material_index = triangle.material_index;
+            let (has_gbuffer_route, screen_refraction) = match material_index {
+                0 => (true, Some(true)),
+                1 => (false, Some(false)),
+                6 => (true, None),
+                _ => (true, Some(false)),
+            };
+            Ok(SurfaceSample {
+                color: triangle.color,
+                has_surface: material_index != 8,
+                transparent_tint: if material_index == 3 {
+                    [0.5; 3]
+                } else {
+                    [1.0; 3]
+                },
+                holdout_weight: 0.0,
+                subsurface: None,
+                eevee_raytrace: (material_index != 8).then_some(EeveeRaytraceSample {
+                    point: DVec3::ZERO,
+                    normal: DVec3::Z,
+                    has_gbuffer_route,
+                    screen_refraction,
+                    bins: [None; 3],
+                }),
+                eevee_dither: match material_index {
+                    4 => Some(EeveeDitherSample {
+                        transparency: 1.0,
+                        alpha_reciprocal: 1.0,
+                    }),
+                    7 => Some(EeveeDitherSample {
+                        transparency: 0.0,
+                        alpha_reciprocal: 1.0,
+                    }),
+                    _ => None,
+                },
+            })
+        }
+
+        fn needs_eevee_gbuffer_context(&self) -> bool {
+            true
+        }
+    }
+
+    fn dither_context(ray: Ray) -> RasterHitContext<'static> {
+        RasterHitContext {
+            sample_index: 0,
+            camera_matrices: None,
+            x_neighbor: Some((
+                Ray {
+                    origin: ray.origin + DVec3::X * 0.01,
+                    direction: ray.direction,
+                },
+                1.0,
+            )),
+            y_neighbor: Some((
+                Ray {
+                    origin: ray.origin + DVec3::Y * 0.01,
+                    direction: ray.direction,
+                },
+                1.0,
+            )),
+            gbuffer_frag_coord: None,
+            gbuffer_sample_offset: None,
+            gbuffer_closure_random: None,
+            eevee_raytrace_feedback: EeveeRaytraceFeedback::default(),
+        }
+    }
+
+    #[test]
+    fn refraction_layer_consumers_stop_at_visible_deferred_opaque() {
+        let camera = test_camera();
+        let frame = camera_frame(&camera, SIZE, SIZE).expect("frame");
+        let ray = ray_for_pixel_in_frame(&frame, camera.position, SIZE, SIZE, SIZE / 2, SIZE / 2)
+            .expect("pixel ray")
+            .expect("center ray");
+        let shader = RefractionLayerShader;
+        let base = [
+            layer_triangle(0.0, 0, AlphaMode::Opaque, 1.0),
+            layer_triangle(1.5, 1, AlphaMode::Opaque, 1.0),
+        ];
+        let prepared = prepare_triangles(&base, Mode::Solid).expect("base layers prepare");
+        let visibility =
+            Bvh::build_from_positions(prepared.iter().map(|triangle| triangle.source.positions))
+                .expect("base visibility builds");
+        let mut candidates = Vec::new();
+        let target = nearest_visible_hit(
+            &prepared,
+            &visibility,
+            &mut candidates,
+            ray,
+            &frame,
+            Some(super::RasterShader::Main(&shader)),
+            None,
+            Some(super::EeveeRaytraceLayer::Refraction),
+        )
+        .expect("forward-only surface passes through");
+        let target = target.expect("flagged layer behind forward surface remains visible");
+        assert_eq!(target.triangle_index, 0);
+        let baseline = composite_sample_with_association(
+            &prepared,
+            &visibility,
+            &mut candidates,
+            ray,
+            ray.direction,
+            &frame,
+            &camera,
+            BACKGROUND,
+            None,
+            Some(super::RasterShader::Main(&shader)),
+            None,
+            Some(&target),
+            None,
+            None,
+            Some(super::EeveeRaytraceLayer::Refraction),
+        )
+        .expect("refraction composite resolves");
+        assert_eq!(baseline.straight, [0.9, 0.1, 0.2, 1.0]);
+        assert!(baseline.eevee_raytrace.is_some());
+
+        let blocked = [
+            base[0].clone(),
+            base[1].clone(),
+            layer_triangle(1.0, 2, AlphaMode::Opaque, 1.0),
+        ];
+        let prepared = prepare_triangles(&blocked, Mode::Solid).expect("blocked layers prepare");
+        let visibility =
+            Bvh::build_from_positions(prepared.iter().map(|triangle| triangle.source.positions))
+                .expect("blocked visibility builds");
+        assert!(
+            nearest_visible_hit(
+                &prepared,
+                &visibility,
+                &mut candidates,
+                ray,
+                &frame,
+                Some(super::RasterShader::Main(&shader)),
+                None,
+                Some(super::EeveeRaytraceLayer::Refraction),
+            )
+            .expect("deferred blocker resolves")
+            .is_none()
+        );
+        let blocked_composite = composite_sample_with_association(
+            &prepared,
+            &visibility,
+            &mut candidates,
+            ray,
+            ray.direction,
+            &frame,
+            &camera,
+            BACKGROUND,
+            None,
+            Some(super::RasterShader::Main(&shader)),
+            None,
+            Some(&target),
+            None,
+            None,
+            Some(super::EeveeRaytraceLayer::Refraction),
+        )
+        .expect("cached target is occluded during composite");
+        assert_eq!(blocked_composite.straight, BACKGROUND);
+        assert!(blocked_composite.eevee_raytrace.is_none());
+
+        let context = dither_context(ray);
+        for (material, alpha_mode, alpha) in [
+            (1, AlphaMode::Opaque, 1.0),
+            (3, AlphaMode::Blend, 1.0),
+            (4, AlphaMode::Dithered, 1.0),
+            (5, AlphaMode::Clip, 0.25),
+            (6, AlphaMode::Opaque, 1.0),
+            (8, AlphaMode::Opaque, 1.0),
+        ] {
+            let pass_through = [
+                layer_triangle(0.0, 0, AlphaMode::Opaque, 1.0),
+                layer_triangle(1.5, material, alpha_mode, alpha),
+            ];
+            let prepared =
+                prepare_triangles(&pass_through, Mode::Solid).expect("pass-through prepares");
+            let visibility = Bvh::build_from_positions(
+                prepared.iter().map(|triangle| triangle.source.positions),
+            )
+            .expect("pass-through visibility builds");
+            let hit = nearest_visible_hit(
+                &prepared,
+                &visibility,
+                &mut candidates,
+                ray,
+                &frame,
+                Some(super::RasterShader::Main(&shader)),
+                Some(&context),
+                Some(super::EeveeRaytraceLayer::Refraction),
+            )
+            .expect("pass-through classification resolves");
+            assert_eq!(
+                hit.map(|visible| visible.triangle_index),
+                Some(0),
+                "material {material} must not occlude the flagged layer"
+            );
+        }
+
+        let dithered_opaque = [
+            layer_triangle(0.0, 0, AlphaMode::Opaque, 1.0),
+            layer_triangle(1.5, 7, AlphaMode::Dithered, 1.0),
+        ];
+        let prepared =
+            prepare_triangles(&dithered_opaque, Mode::Solid).expect("kept DITHER prepares");
+        let visibility =
+            Bvh::build_from_positions(prepared.iter().map(|triangle| triangle.source.positions))
+                .expect("kept DITHER visibility builds");
+        assert!(
+            nearest_visible_hit(
+                &prepared,
+                &visibility,
+                &mut candidates,
+                ray,
+                &frame,
+                Some(super::RasterShader::Main(&shader)),
+                Some(&context),
+                Some(super::EeveeRaytraceLayer::Refraction),
+            )
+            .expect("kept DITHER blocks")
+            .is_none()
+        );
     }
 
     #[test]
@@ -10620,5 +10943,131 @@ mod eevee_camera_bound_tests {
         assert!(
             (eevee_camera_bound_radius(perspective, 1.0, 3.0) - 19.0_f32.sqrt()).abs() < 1.0e-5
         );
+    }
+}
+#[cfg(test)]
+mod eevee_screen_thickness_tests {
+    use super::{
+        Camera, Projection, ProjectionFrame, StereoMode, camera_frame, eevee_projection_matrix,
+        eevee_screen_thickness, eevee_screen_trace_ray,
+    };
+    use crate::error::Result;
+    use glam::{DVec3, Mat4, Quat, Vec3};
+
+    fn camera(projection: Projection) -> Camera {
+        Camera {
+            position: DVec3::ZERO,
+            target: DVec3::new(0.0, 0.0, -1.0),
+            up: DVec3::Y,
+            near: 0.1,
+            far: 100.0,
+            projection,
+            shift: [0.0; 2],
+            depth_of_field: None,
+            stereo_mode: StereoMode::None,
+            interocular_distance: 0.0,
+        }
+    }
+
+    #[test]
+    fn perspective_screen_thickness_matches_source_near_and_far_depths() -> Result<()> {
+        let width = 64;
+        let height = 64;
+        let frame = camera_frame(
+            &camera(Projection::Perspective {
+                lens_mm: 50.0,
+                sensor_width_mm: 36.0,
+            }),
+            width,
+            height,
+        )?;
+        let projection = eevee_projection_matrix(&frame, width, height, 0.5, 0.5)?;
+        let minimum_thickness = 0.02_f32;
+        let parameters =
+            eevee_screen_thickness(&frame, &projection, width, height, minimum_thickness);
+
+        let ProjectionFrame::Perspective {
+            horizontal_scale,
+            vertical_scale,
+        } = frame.projection
+        else {
+            return Err(crate::error::PotError::new(
+                crate::error::ErrorCode::InternalError,
+                "perspective test camera did not produce a perspective frame",
+            ));
+        };
+        let pixel_x = 2.0 * horizontal_scale / f64::from(width);
+        let pixel_y = 2.0 * vertical_scale / f64::from(height);
+        let source_view_scale = ((pixel_x * pixel_x + pixel_y * pixel_y).sqrt() as f32) * 3.0;
+        let near = frame.near as f32;
+        let far = frame.far as f32;
+        let source_ndc_scale = -(near * far) / (far - near);
+        assert!((parameters.ndc_scale - source_ndc_scale).abs() < 1.0e-6);
+
+        for view_z in [-near, -far] {
+            let source_view_thickness = view_z * source_view_scale - minimum_thickness;
+            let source_ndc_thickness =
+                source_view_thickness / (view_z * (view_z + source_view_thickness));
+            let expected = source_ndc_thickness * source_ndc_scale;
+
+            let view_thickness = view_z * parameters.vs_scale + parameters.vs_bias;
+            let actual = view_thickness / (view_z * (view_z + view_thickness))
+                * parameters.ndc_scale
+                + parameters.ndc_bias;
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn orthographic_screen_thickness_keeps_source_bias_and_gl_range() -> Result<()> {
+        let width = 64;
+        let height = 64;
+        let frame = camera_frame(
+            &camera(Projection::Orthographic { height: 4.0 }),
+            width,
+            height,
+        )?;
+        let projection = eevee_projection_matrix(&frame, width, height, 0.5, 0.5)?;
+        let minimum_thickness = 0.02_f32;
+        let parameters =
+            eevee_screen_thickness(&frame, &projection, width, height, minimum_thickness);
+        let ProjectionFrame::Orthographic {
+            half_width,
+            half_height,
+        } = frame.projection
+        else {
+            return Err(crate::error::PotError::new(
+                crate::error::ErrorCode::InternalError,
+                "orthographic test camera did not produce an orthographic frame",
+            ));
+        };
+        let pixel_x = 2.0 * half_width / f64::from(width);
+        let pixel_y = 2.0 * half_height / f64::from(height);
+        let average_pixel_radius = ((pixel_x * pixel_x + pixel_y * pixel_y).sqrt() as f32) * 3.0;
+        let expected_bias = -(average_pixel_radius + minimum_thickness)
+            * (-2.0 / (frame.far as f32 - frame.near as f32))
+            * 0.5;
+        assert_eq!(parameters.vs_scale, 0.0);
+        assert_eq!(parameters.vs_bias, 1.0);
+        assert_eq!(parameters.ndc_scale, 0.0);
+        assert!((parameters.ndc_bias - expected_bias).abs() < 1.0e-7);
+        Ok(())
+    }
+
+    #[test]
+    fn screen_trace_ray_applies_generated_origin_offset_in_view_space() {
+        let view =
+            Mat4::from_rotation_translation(Quat::from_rotation_y(0.7), Vec3::new(3.0, -2.0, 1.0));
+        let world_origin = Vec3::new(-1.0, 0.5, -4.0);
+        let direction = Vec3::new(0.2, -0.1, -0.9);
+        let origin_offset = Vec3::new(-0.4, 0.0, -1.8);
+        let ray = eevee_screen_trace_ray(view, world_origin, direction, origin_offset, 12.0);
+        assert_eq!(
+            ray.origin,
+            view.transform_point3(world_origin) + origin_offset
+        );
+        assert_eq!(ray.direction, direction);
+        assert_eq!(ray.max_time, 12.0);
     }
 }

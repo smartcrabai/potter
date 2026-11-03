@@ -421,6 +421,7 @@ fn create_light(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "spread",
             "spot_size",
             "spot_blend",
+            "use_shadow",
         ],
         &["id"],
     )?;
@@ -441,6 +442,7 @@ fn create_light(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "spread",
             "spot_size",
             "spot_blend",
+            "use_shadow",
         ],
     );
     apply_light_values(engine, &light_values, "", &mut light)?;
@@ -508,6 +510,7 @@ fn apply_light_values(
             "spread",
             "spot_size",
             "spot_blend",
+            "use_shadow",
         ],
         prefix,
     )?;
@@ -562,6 +565,15 @@ fn apply_light_values(
                 ),
             )
         })?;
+    }
+    if let Some(value) = values.get("use_shadow") {
+        light.use_shadow = Some(value.as_bool().ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "use_shadow must be true or false",
+                &operation_pointer(engine.operation_index, &format!("{prefix}use_shadow")),
+            )
+        })?);
     }
     if let Some(value) = values.get("spread") {
         if light.light_type != LightType::Area {

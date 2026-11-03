@@ -2884,6 +2884,8 @@ pub enum LightType {
 #[serde(default, deny_unknown_fields)]
 pub struct LightData {
     pub light_type: LightType,
+    /// Whether this light casts shadows. Defaults to `Some(true)` to preserve native behavior.
+    pub use_shadow: Option<bool>,
     #[serde(default = "white_rgb")]
     pub color: [f64; 3],
     pub energy: f64,
@@ -2959,6 +2961,7 @@ impl Default for LightData {
     fn default() -> Self {
         Self {
             light_type: LightType::Point,
+            use_shadow: Some(true),
             color: white_rgb(),
             energy: 1000.0,
             radius: 0.1,
@@ -5595,6 +5598,13 @@ mod tests {
             "light_type":"area","energy":10.0,"radius":0.1,"spot_size":std::f64::consts::FRAC_PI_4,"spot_blend":0.15
         })).unwrap();
         assert_eq!(light.color, [1.0, 1.0, 1.0]);
+        assert_eq!(light.use_shadow, Some(true));
+
+        let light_without_shadows: LightData =
+            serde_json::from_value(serde_json::json!({"use_shadow":false})).unwrap();
+        let roundtrip: LightData =
+            serde_json::from_value(serde_json::to_value(light_without_shadows).unwrap()).unwrap();
+        assert_eq!(roundtrip.use_shadow, Some(false));
 
         let modifier: Modifier = serde_json::from_value(serde_json::json!({
             "id":"bevel","type":"bevel","name":"Bevel"

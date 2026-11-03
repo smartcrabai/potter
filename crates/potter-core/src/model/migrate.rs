@@ -122,6 +122,8 @@ fn parse_scene_inner(
             && has_legacy_mixrgb_alpha_links(&value))
         || (source_schema_version.is_some_and(|version| version <= 17)
             && has_materials_missing_raytrace_refraction(&value))
+        || (source_schema_version.is_some_and(|version| version <= 18)
+            && has_lights_missing_use_shadow(&value))
         || ((source_schema_version.is_some_and(|version| version <= 17)
             && has_blender_realtime_scene(&value))
             || (source_schema_version == Some(18)
@@ -652,9 +654,10 @@ fn json_error(error: &serde_json::Error) -> PotError {
 /// version 15 marks Blender-mapped materials without saved pass indices unknown and shader nodes
 /// without stored output defaults. Version 16 migrates `NodeMath` shader state; version 17 restores
 /// Cycles curve settings from the retained Blender intermediate where possible, otherwise marking
-/// unavailable imported-hair settings unknown. Version 18 captures material refraction settings from
-/// retained raw records when available, otherwise marking the imported value unknown. `root` is the
-/// project directory that holds image blobs and linked sources, which the version 3 to 4 step reads.
+/// unavailable imported-hair settings unknown. Version 18 captures material refraction and light
+/// shadow settings from retained Blender data where possible, otherwise marking imported values
+/// unknown. `root` is the project directory that holds image blobs and linked sources, which the
+/// version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     let source_schema_version = value.get("schema_version").and_then(Value::as_u64);
     let mut warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
@@ -715,6 +718,7 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
         warnings.extend(upgrade_v18_world_sun_settings(value)?);
         warnings.extend(upgrade_v18_eevee_clamp_surface_indirect(value)?);
         upgrade_material_raytrace_refraction(value)?;
+        upgrade_light_use_shadow(value)?;
         warnings.extend(upgrade_v18_eevee_has_local_volume_probe_grids(value)?);
     }
     upgrade_scene_gravity_from_blender_metadata(value);
@@ -1501,7 +1505,7 @@ fn retained_blender_material_raytrace_refraction(
         }
         let mut namespace_cache = BTreeMap::new();
         for material_id in materials.keys() {
-            if is_possible_appended_material_id(
+            if is_possible_appended_id(
                 namespace,
                 &source_material_ids,
                 material_id,
@@ -1512,7 +1516,7 @@ fn retained_blender_material_raytrace_refraction(
         }
     }
 
-    for material_id in retained_potter_project_material_ids(value, compatibility) {
+    for material_id in retained_potter_project_linked_ids(value, compatibility, "materials") {
         if materials.contains_key(&material_id) {
             *retained.entry(material_id).or_default() = None;
         }
@@ -1520,28 +1524,28 @@ fn retained_blender_material_raytrace_refraction(
     Ok(retained)
 }
 
-fn is_possible_appended_material_id(
+fn is_possible_appended_id(
     namespace_prefix: &str,
-    source_material_ids: &BTreeSet<String>,
-    material_id: &str,
+    source_ids: &BTreeSet<String>,
+    current_id: &str,
     namespace_cache: &mut BTreeMap<(String, usize), bool>,
 ) -> bool {
-    if source_material_ids.contains(material_id) {
+    if source_ids.contains(current_id) {
         return true;
     }
-    if !Id::is_valid(material_id) {
+    if !Id::is_valid(current_id) {
         return false;
     }
     let maximum_layers = namespace_prefix.split('_').count();
-    for (separator, _) in material_id.match_indices('_') {
+    for (separator, _) in current_id.match_indices('_') {
         if separator == 0 {
             continue;
         }
-        let namespace = &material_id[..separator];
-        let body = &material_id[separator + 1..];
+        let namespace = &current_id[..separator];
+        let body = &current_id[separator + 1..];
         for suffix_start in 0..=body.len() {
             let suffix = &body[suffix_start..];
-            let Some(suffix_count) = material_remap_suffix_count(suffix) else {
+            let Some(suffix_count) = remap_suffix_count(suffix) else {
                 continue;
             };
             if suffix_count > maximum_layers {
@@ -1562,10 +1566,10 @@ fn is_possible_appended_material_id(
                 continue;
             }
             if source_prefix.len() < available {
-                if source_material_ids.contains(source_prefix) {
+                if source_ids.contains(source_prefix) {
                     return true;
                 }
-            } else if source_material_ids
+            } else if source_ids
                 .range(source_prefix.to_owned()..)
                 .next()
                 .is_some_and(|source_id| source_id.starts_with(source_prefix))
@@ -1577,7 +1581,7 @@ fn is_possible_appended_material_id(
     false
 }
 
-fn material_remap_suffix_count(suffixes: &str) -> Option<usize> {
+fn remap_suffix_count(suffixes: &str) -> Option<usize> {
     let bytes = suffixes.as_bytes();
     let mut index = 0;
     let mut count = 0;
@@ -1676,15 +1680,16 @@ fn possible_appended_namespace_chain(
     )
 }
 
-fn retained_potter_project_material_ids(
+fn retained_potter_project_linked_ids(
     value: &Value,
     compatibility: &Map<String, Value>,
+    registry: &str,
 ) -> BTreeSet<String> {
     let Some(libraries) = value.get("libraries").and_then(Value::as_object) else {
         return BTreeSet::new();
     };
     let mut potter_libraries = BTreeSet::new();
-    let mut material_ids = BTreeSet::new();
+    let mut retained_ids = BTreeSet::new();
     for (library_id, library) in libraries {
         if library
             .get("kind")
@@ -1696,10 +1701,10 @@ fn retained_potter_project_material_ids(
         if let Some(linked_ids) = library
             .get("linked_ids")
             .and_then(Value::as_object)
-            .and_then(|linked_ids| linked_ids.get("materials"))
+            .and_then(|linked_ids| linked_ids.get(registry))
             .and_then(Value::as_array)
         {
-            material_ids.extend(
+            retained_ids.extend(
                 linked_ids
                     .iter()
                     .filter_map(Value::as_str)
@@ -1707,26 +1712,29 @@ fn retained_potter_project_material_ids(
             );
         }
         if let Some(items) = library.get("items").and_then(Value::as_object) {
-            material_ids.extend(items.keys().filter_map(|key| {
-                let (registry, material_id) = key.split_once(':')?;
-                (registry == "materials").then(|| material_id.to_owned())
+            retained_ids.extend(items.keys().filter_map(|key| {
+                let (item_registry, id) = key.split_once(':')?;
+                (item_registry == registry).then(|| id.to_owned())
             }));
         }
     }
     if let Some(linked_ids) = compatibility.get("linked_ids").and_then(Value::as_object) {
         for (key, metadata) in linked_ids {
-            let Some(("materials", material_id)) = key.split_once(':') else {
+            let Some((item_registry, id)) = key.split_once(':') else {
                 continue;
             };
+            if item_registry != registry {
+                continue;
+            }
             let Some(library_id) = metadata.get("library_id").and_then(Value::as_str) else {
                 continue;
             };
             if potter_libraries.contains(library_id) {
-                material_ids.insert(material_id.to_owned());
+                retained_ids.insert(id.to_owned());
             }
         }
     }
-    material_ids
+    retained_ids
 }
 
 fn has_materials_missing_raytrace_refraction(value: &Value) -> bool {
@@ -1740,6 +1748,155 @@ fn has_materials_missing_raytrace_refraction(value: &Value) -> bool {
                     .is_some_and(|material| !material.contains_key("use_raytrace_refraction"))
             })
         })
+}
+
+fn has_lights_missing_use_shadow(value: &Value) -> bool {
+    value
+        .get("data_blocks")
+        .and_then(Value::as_object)
+        .is_some_and(|data_blocks| {
+            data_blocks.values().any(|data| {
+                data.get("light")
+                    .and_then(Value::as_object)
+                    .is_some_and(|light| !light.contains_key("use_shadow"))
+            })
+        })
+}
+
+fn retained_blender_light_use_shadow(value: &Value) -> Result<BTreeMap<String, Option<bool>>> {
+    let Some(compatibility) = value.get("compatibility").and_then(Value::as_object) else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(data_blocks) = value.get("data_blocks").and_then(Value::as_object) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut retained = BTreeMap::new();
+    if let Some(adapter) = compatibility.get("blender_adapter")
+        && let Some(raw_lights) = adapter
+            .get("intermediate")
+            .and_then(|intermediate| intermediate.get("lights"))
+            .and_then(Value::as_array)
+        && let Some(mappings) = adapter.get("id_mappings").and_then(Value::as_object)
+    {
+        for (mapping_key, mapped_id) in mappings {
+            let Some(light_name) = mapping_key.strip_prefix("Light:") else {
+                continue;
+            };
+            let Some(light_id) = mapped_id.as_str().filter(|id| {
+                data_blocks
+                    .get(*id)
+                    .is_some_and(|data| data.get("light").is_some())
+            }) else {
+                continue;
+            };
+            let setting = if let Some(raw_light) = raw_lights
+                .iter()
+                .find(|raw| raw.get("name").and_then(Value::as_str) == Some(light_name))
+            {
+                match raw_light.get("use_shadow") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Bool(setting)) => Some(*setting),
+                    Some(_) => {
+                        return Err(invalid("retained Blender Light.use_shadow is invalid"));
+                    }
+                }
+            } else {
+                None
+            };
+            if retained
+                .insert(light_id.to_owned(), setting)
+                .is_some_and(|previous| previous != setting)
+            {
+                return Err(invalid(
+                    "retained Blender Light.use_shadow values conflict for one light",
+                ));
+            }
+        }
+    }
+
+    for (adapter_key, adapter) in compatibility {
+        let Some(namespace) = adapter_key.strip_suffix("_blender_adapter") else {
+            continue;
+        };
+        if namespace.is_empty() {
+            continue;
+        }
+        let Some(mappings) = adapter.get("id_mappings").and_then(Value::as_object) else {
+            continue;
+        };
+        let source_light_ids = mappings
+            .iter()
+            .filter_map(|(mapping_key, mapped_id)| {
+                mapping_key.strip_prefix("Light:")?;
+                mapped_id
+                    .as_str()
+                    .filter(|id| Id::is_valid(id))
+                    .map(str::to_owned)
+            })
+            .collect::<BTreeSet<_>>();
+        if source_light_ids.is_empty() {
+            continue;
+        }
+        let mut namespace_cache = BTreeMap::new();
+        for (light_id, data) in data_blocks {
+            if data.get("light").is_some()
+                && is_possible_appended_id(
+                    namespace,
+                    &source_light_ids,
+                    light_id,
+                    &mut namespace_cache,
+                )
+            {
+                retained.entry(light_id.clone()).or_insert(None);
+            }
+        }
+    }
+
+    for light_id in retained_potter_project_linked_ids(value, compatibility, "data_blocks") {
+        if data_blocks
+            .get(&light_id)
+            .is_some_and(|data| data.get("light").is_some())
+        {
+            retained.entry(light_id).or_insert(None);
+        }
+    }
+    Ok(retained)
+}
+
+fn upgrade_light_use_shadow(value: &mut Value) -> Result<()> {
+    let retained = retained_blender_light_use_shadow(value)?;
+    let adapter = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"));
+    let imported_blender = adapter.is_some_and(Value::is_object);
+    let has_complete_blender_capture = adapter.is_some_and(|adapter| {
+        adapter
+            .get("intermediate")
+            .and_then(|intermediate| intermediate.get("lights"))
+            .is_some_and(Value::is_array)
+            && adapter.get("id_mappings").is_some_and(Value::is_object)
+    });
+    if let Some(data_blocks) = value.get_mut("data_blocks").and_then(Value::as_object_mut) {
+        for (data_id, data) in data_blocks {
+            let Some(light) = data.get_mut("light").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            if !light.contains_key("use_shadow") {
+                let setting = retained.get(data_id).copied().unwrap_or({
+                    if imported_blender && !has_complete_blender_capture {
+                        None
+                    } else {
+                        Some(true)
+                    }
+                });
+                light.insert(
+                    "use_shadow".to_owned(),
+                    setting.map_or(Value::Null, |setting| json!(setting)),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn upgrade_material_raytrace_refraction(value: &mut Value) -> Result<()> {
@@ -2112,6 +2269,7 @@ fn upgrade_v17(value: &mut Value) -> Result<Vec<Value>> {
         }
     }
     upgrade_material_raytrace_refraction(value)?;
+    upgrade_light_use_shadow(value)?;
     value["schema_version"] = json!(18);
     Ok(warnings)
 }
@@ -5583,6 +5741,33 @@ mod tests {
     fn no_assets() -> &'static Path {
         Path::new("no-assets")
     }
+
+    fn legacy_light_shadow_scene(
+        blender_adapter: bool,
+        retained_setting: Option<bool>,
+    ) -> TestResult<Value> {
+        let mut source = serde_json::to_value(SceneDoc::new(
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+        ))?;
+        source["schema_version"] = json!(18);
+        let mut light = serde_json::to_value(crate::model::LightData::default())?;
+        light
+            .as_object_mut()
+            .ok_or("light data serialized as a non-object")?
+            .remove("use_shadow");
+        source["data_blocks"]["sun"] = json!({"type":"light","light":light});
+        if blender_adapter {
+            let mut raw_light = json!({"name":"Sun"});
+            if let Some(setting) = retained_setting {
+                raw_light["use_shadow"] = json!(setting);
+            }
+            source["compatibility"]["blender_adapter"] = json!({
+                "intermediate":{"lights":[raw_light]},
+                "id_mappings":{"Light:Sun":"sun"}
+            });
+        }
+        Ok(source)
+    }
     fn schema_seventeen_curve_scene(
         blender_adapter: bool,
         hair_curves: bool,
@@ -6985,6 +7170,131 @@ mod tests {
         assert_eq!(world.eevee_sun_shadow_jitter_overblur, Some(37.5));
         assert_eq!(world.eevee_sun_shadow_filter_radius, Some(2.5));
         assert_eq!(world.eevee_use_sun_shadow_jitter, Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_seventeen_native_light_shadow_keeps_existing_behavior() -> TestResult {
+        let mut source = legacy_light_shadow_scene(false, None)?;
+        source["schema_version"] = json!(17);
+        upgrade_scene(&mut source, no_assets())?;
+        assert_eq!(
+            source["data_blocks"]["sun"]["light"]["use_shadow"],
+            json!(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_eighteen_blender_light_shadow_recovers_raw_values_and_preserves_hash() -> TestResult {
+        for setting in [false, true] {
+            let source = legacy_light_shadow_scene(true, Some(setting))?;
+            let expected_hash = crate::hash::sha256(&crate::hash::canonicalize(&source)?);
+            let parsed = parse_scene_with_original_hash(
+                &serde_json::to_vec(&source)?,
+                no_assets(),
+                no_assets(),
+            )?;
+            assert!(parsed.legacy);
+            assert_eq!(parsed.legacy_hash.as_deref(), Some(expected_hash.as_str()));
+            assert_eq!(
+                parsed.doc.data_blocks[&Id::new("sun")?]
+                    .light
+                    .as_ref()
+                    .ok_or("migrated light payload is missing")?
+                    .use_shadow,
+                Some(setting)
+            );
+        }
+
+        let mut explicit = legacy_light_shadow_scene(true, Some(true))?;
+        explicit["data_blocks"]["sun"]["light"]["use_shadow"] = json!(false);
+        upgrade_scene(&mut explicit, no_assets())?;
+        assert_eq!(
+            explicit["data_blocks"]["sun"]["light"]["use_shadow"],
+            json!(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_eighteen_blender_light_shadow_stays_unknown_without_retained_rna() -> TestResult {
+        let source = legacy_light_shadow_scene(true, None)?;
+        let expected_hash = crate::hash::sha256(&crate::hash::canonicalize(&source)?);
+        let parsed = parse_scene_with_original_hash(
+            &serde_json::to_vec(&source)?,
+            no_assets(),
+            no_assets(),
+        )?;
+        assert!(parsed.legacy);
+        assert_eq!(parsed.legacy_hash.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(
+            parsed.doc.data_blocks[&Id::new("sun")?]
+                .light
+                .as_ref()
+                .ok_or("migrated light payload is missing")?
+                .use_shadow,
+            None
+        );
+
+        let mut history = history_record(&source);
+        history["scene_hash"] = json!(expected_hash.clone());
+        let (record, _) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert_eq!(record.scene_hash, expected_hash);
+        assert_eq!(
+            record.snapshot.data_blocks[&Id::new("sun")?]
+                .light
+                .as_ref()
+                .ok_or("history light payload is missing")?
+                .use_shadow,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_eighteen_appended_and_potter_linked_lights_remain_unknown() -> TestResult {
+        let mut appended = legacy_light_shadow_scene(false, None)?;
+        appended["data_blocks"]["asset_sun"] = appended["data_blocks"]["sun"].clone();
+        appended["compatibility"]["asset_blender_adapter"] =
+            json!({"id_mappings":{"Light:Sun":"sun"}});
+        upgrade_scene(&mut appended, no_assets())?;
+        assert_eq!(
+            appended["data_blocks"]["asset_sun"]["light"]["use_shadow"],
+            Value::Null
+        );
+
+        let mut linked = legacy_light_shadow_scene(false, None)?;
+        linked["libraries"]["source"] = json!({
+            "kind":"potter_project",
+            "linked_ids":{"data_blocks":["sun"]}
+        });
+        upgrade_scene(&mut linked, no_assets())?;
+        assert_eq!(
+            linked["data_blocks"]["sun"]["light"]["use_shadow"],
+            Value::Null
+        );
+
+        let mut linked_item = legacy_light_shadow_scene(false, None)?;
+        linked_item["libraries"]["source"] = json!({
+            "kind":"potter_project",
+            "items":{"data_blocks:sun":{}}
+        });
+        upgrade_scene(&mut linked_item, no_assets())?;
+        assert_eq!(
+            linked_item["data_blocks"]["sun"]["light"]["use_shadow"],
+            Value::Null
+        );
+
+        let mut compatibility_link = legacy_light_shadow_scene(false, None)?;
+        compatibility_link["libraries"]["source"] = json!({"kind":"potter_project"});
+        compatibility_link["compatibility"]["linked_ids"] =
+            json!({"data_blocks:sun":{"library_id":"source"}});
+        upgrade_scene(&mut compatibility_link, no_assets())?;
+        assert_eq!(
+            compatibility_link["data_blocks"]["sun"]["light"]["use_shadow"],
+            Value::Null
+        );
         Ok(())
     }
     #[test]

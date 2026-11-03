@@ -208,7 +208,7 @@ fn scene_schema() -> Value {
         "mesh":{"type":"object","required":["vertices","edges","faces","attributes","next_id"],"properties":{"vertices":{"type":"array","items":{"$ref":"#/$defs/vertex"}},"edges":{"type":"array","items":{"$ref":"#/$defs/edge"}},"faces":{"type":"array","items":{"$ref":"#/$defs/face"}},"attributes":{"type":"object"},"next_id":{"type":"object","properties":{"vertex":{"type":"integer","minimum":0},"edge":{"type":"integer","minimum":0},"face":{"type":"integer","minimum":0}},"required":["vertex","edge","face"],"additionalProperties":false}},"additionalProperties":false},
         "data_block":{"type":"object","required":["type"],"properties":{"type":{"type":"string"},"descriptor":{"type":["object","null"]},"mesh":{"oneOf":[{"$ref":"#/$defs/mesh"},{"type":"null"}]},"camera":{"oneOf":[{"$ref":"#/$defs/camera"},{"type":"null"}]},"light":{"oneOf":[{"$ref":"#/$defs/light"},{"type":"null"}]},"grease_pencil":{"type":["object","null"]},"armature":{"type":["object","null"]},"shape_keys":{"type":["object","null"]},"vertex_groups":{"type":"array","items":{"type":"object"}},"vertex_weights":{"type":"object"}},"additionalProperties":false},
         "camera": camera_data_schema(),
-        "light":{"type":"object","required":["light_type","color","energy","radius","spot_size","spot_blend"],"properties":{"light_type":{"enum":["point","sun","spot","area"]},"color":{"$ref":"#/$defs/vec3"},"energy":{"type":"number"},"radius":{"type":"number"},"soft_falloff":{"type":"boolean"},"use_multiple_importance_sampling":{"type":"boolean"},"spread":{"type":"number","minimum":0,"maximum":std::f64::consts::PI},"spot_size":{"type":"number"},"spot_blend":{"type":"number"}},"additionalProperties":false},
+        "light":{"type":"object","required":["light_type","color","energy","radius","spot_size","spot_blend","use_shadow"],"properties":{"light_type":{"enum":["point","sun","spot","area"]},"color":{"$ref":"#/$defs/vec3"},"energy":{"type":"number"},"radius":{"type":"number"},"soft_falloff":{"type":"boolean"},"use_multiple_importance_sampling":{"type":"boolean"},"spread":{"type":"number","minimum":0,"maximum":std::f64::consts::PI},"spot_size":{"type":"number"},"spot_blend":{"type":"number"},"use_shadow":{"type":["boolean","null"],"description":"Whether this light casts shadows; null indicates that the source value is unavailable.","examples":[true,false,null]}},"additionalProperties":false},
         "material":{"type":"object","required":["name","base_color","metallic","roughness","emission_color","emission_strength","transmission","ior","double_sided","node_tree","base_color_texture","roughness_texture","metallic_texture","normal_texture"],"properties":{"name":{"type":"string"},"base_color":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":4,"maxItems":4},"metallic":{"type":"number","minimum":0,"maximum":1},"roughness":{"type":"number","minimum":0,"maximum":1},"emission_color":{"$ref":"#/$defs/vec3"},"emission_strength":{"type":"number","minimum":0},"transmission":{"type":"number","minimum":0,"maximum":1},"ior":{"type":"number","exclusiveMinimum":0},"thickness_mode":{"type":"string","enum":["sphere","slab"]},"double_sided":{"type":"boolean"},"node_tree":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"base_color_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"roughness_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"metallic_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"normal_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]}},"additionalProperties":false},
         "texture_ref":texture_ref,
         "world":{"type":"object","required":["color","strength"],"properties":{"color":{"$ref":"#/$defs/vec3"},"strength":{"type":"number","minimum":0}},"additionalProperties":false},
@@ -2128,11 +2128,12 @@ fn operation_contract(name: &str) -> OperationContract {
                 "spread",
                 "spot_size",
                 "spot_blend",
+                "use_shadow",
             ],
             vec!["op", "id"],
             "light object",
             "none",
-            json!({"tags":[],"visible":true,"render_visible":true,"selectable":true,"light_type":"point","color":[1,1,1],"energy":1000,"radius":0.1}),
+            json!({"tags":[],"visible":true,"render_visible":true,"selectable":true,"light_type":"point","color":[1,1,1],"energy":1000,"radius":0.1,"use_shadow":true}),
         ),
         "light.update" => (
             vec!["target", "set"],
@@ -2949,6 +2950,7 @@ fn field_schema(operation: &str, field: &str) -> Value {
         "interpolation" => json!({"enum":["constant","linear","bezier"],"default":"linear"}),
         "method" => json!({"enum":["box","smart","cube"],"default":"box"}),
         "shape" => json!({"enum":["box","sphere","convex_hull","mesh"]}),
+        "use_shadow" => light_shadow_schema(),
         "active" | "visible" | "render_visible" | "selectable" | "enabled" | "double_sided"
         | "show_viewport" | "show_render" | "recursive" | "cascade_data" | "unlink"
         | "keep_world" | "merge" | "individual" => {
@@ -3541,9 +3543,12 @@ fn camera_data_schema() -> Value {
 }
 
 fn light_set_properties() -> Value {
-    json!({"light_type":{"enum":["point","sun","spot","area"]},"color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},"energy":{"type":"number","minimum":0},"radius":{"type":"number","minimum":0},"soft_falloff":{"type":"boolean"},"use_multiple_importance_sampling":{"type":"boolean"},"spread":{"type":"number","minimum":0,"maximum":std::f64::consts::PI},"spot_size":{"type":"number","exclusiveMinimum":0,"maximum":std::f64::consts::TAU},"spot_blend":{"type":"number","minimum":0,"maximum":1}})
+    json!({"light_type":{"enum":["point","sun","spot","area"]},"color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},"energy":{"type":"number","minimum":0},"radius":{"type":"number","minimum":0},"soft_falloff":{"type":"boolean"},"use_multiple_importance_sampling":{"type":"boolean"},"spread":{"type":"number","minimum":0,"maximum":std::f64::consts::PI},"spot_size":{"type":"number","exclusiveMinimum":0,"maximum":std::f64::consts::TAU},"spot_blend":{"type":"number","minimum":0,"maximum":1},"use_shadow":light_shadow_schema()})
 }
 
+fn light_shadow_schema() -> Value {
+    json!({"type":"boolean","default":true,"description":"Whether this light casts shadows.","examples":[false,true]})
+}
 fn world_set_properties() -> Value {
     json!({
         "color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},

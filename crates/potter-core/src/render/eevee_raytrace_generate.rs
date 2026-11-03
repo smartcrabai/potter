@@ -45,8 +45,9 @@ impl RayThickness {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RayGenerateInput {
     pub(crate) lobe: RayLobe,
+    /// Decoded G-buffer normal in view space, before transmission-context amendment.
     pub(crate) normal: Vec3,
-    /// EEVEE's view vector `V`, pointing toward the viewer.
+    /// Unamended view vector `V`, pointing toward the viewer in view space.
     pub(crate) view: Vec3,
     pub(crate) roughness: f32,
     pub(crate) ior: f32,
@@ -57,6 +58,8 @@ pub(crate) struct RayGenerateInput {
 pub(crate) struct RaySample {
     pub(crate) direction: Vec3,
     pub(crate) pdf: f32,
+    /// Source transmission entry-to-exit displacement, in the direction's view-space frame.
+    pub(crate) origin_offset: Vec3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,10 +101,11 @@ pub(crate) fn generate_ray(
         random.x = 1.0 - random.x * (1.0 - rng_bias);
     }
 
+    let mut origin_offset = Vec3::ZERO;
     let mut normal = input.normal;
     let mut view = input.view;
     if input.lobe == RayLobe::GgxRefraction && thickness.value != 0.0 {
-        amend_transmission_context(
+        origin_offset = amend_transmission_context(
             &mut normal,
             &mut view,
             input.roughness,
@@ -133,7 +137,17 @@ pub(crate) fn generate_ray(
         }
     };
     sample.direction = tangent_to_world * sample.direction;
-    Ok(sample)
+    if input.lobe == RayLobe::Translucent
+        && thickness.source_mode() == ThicknessMode::Sphere
+        && thickness.value != 0.0
+    {
+        origin_offset = (sample.direction - input.normal) * (thickness.value * 0.505);
+    }
+    Ok(RaySample {
+        direction: sample.direction,
+        pdf: sample.pdf,
+        origin_offset,
+    })
 }
 
 fn sample_cylinder(noise: Vec2) -> Vec3 {
@@ -159,6 +173,7 @@ fn diffuse_sample(random: Vec3) -> RaySample {
     RaySample {
         direction: Vec3::new(random.y * sin_theta, random.z * sin_theta, cos_theta),
         pdf: cos_theta * INV_PI,
+        origin_offset: Vec3::ZERO,
     }
 }
 
@@ -169,6 +184,7 @@ fn translucent_sample(random: Vec3, thickness: RayThickness) -> RaySample {
         RaySample {
             direction: Vec3::new(random.y * sin_theta, random.z * sin_theta, -cos_theta),
             pdf: 0.25 * INV_PI,
+            origin_offset: Vec3::ZERO,
         }
     } else {
         let mut sample = diffuse_sample(random);
@@ -182,6 +198,7 @@ fn ggx_sample_reflection(random: Vec3, view: Vec3, alpha: f32) -> RaySample {
         return RaySample {
             pdf: 1.0e6_f32,
             direction: reflect(-view, Vec3::Z),
+            origin_offset: Vec3::ZERO,
         };
     }
 
@@ -213,6 +230,7 @@ fn ggx_sample_reflection(random: Vec3, view: Vec3, alpha: f32) -> RaySample {
     RaySample {
         direction: reflect(-view, half),
         pdf,
+        origin_offset: Vec3::ZERO,
     }
 }
 
@@ -231,6 +249,7 @@ fn ggx_sample_refraction(
         return RaySample {
             pdf: 1.0e6_f32,
             direction: refract(-view, Vec3::Z, 1.0 / ior),
+            origin_offset: Vec3::ZERO,
         };
     }
 
@@ -255,7 +274,11 @@ fn ggx_sample_refraction(
     let pdf = distribution * geometry_view * (view_half_dot * light_half_dot).abs() * square(ior)
         / (view.z * denominator);
 
-    RaySample { direction, pdf }
+    RaySample {
+        direction,
+        pdf,
+        origin_offset: Vec3::ZERO,
+    }
 }
 
 fn ggx_distribution(normal_half: f32, alpha_squared: f32) -> f32 {
@@ -269,7 +292,7 @@ fn amend_transmission_context(
     roughness: f32,
     ior: f32,
     thickness: RayThickness,
-) {
+) -> Vec3 {
     let perceived_roughness_factor = if ior > 1.0 {
         1.0 - 1.0 / ior
     } else {
@@ -277,12 +300,17 @@ fn amend_transmission_context(
     };
     let perceived_roughness = roughness * sqrt_fast(perceived_roughness_factor);
     let direction = dominant_transmission_direction(*normal, *view, ior, perceived_roughness);
-    if thickness.source_mode() == ThicknessMode::Sphere {
+    let origin_offset = if thickness.source_mode() == ThicknessMode::Sphere {
         let cos_alpha = direction.dot(-*normal);
         let hit_normal = normalize(*normal + direction * (cos_alpha * 2.0));
         *normal = -hit_normal;
-    }
+        direction * (cos_alpha * thickness.value)
+    } else {
+        let distance_from_shading_plane = direction.dot(-*normal);
+        direction * (thickness.value / distance_from_shading_plane)
+    };
     *view = -direction;
+    origin_offset
 }
 
 fn dominant_transmission_direction(normal: Vec3, view: Vec3, ior: f32, roughness: f32) -> Vec3 {
@@ -356,4 +384,102 @@ fn mix_vec3(a: Vec3, b: Vec3, factor: f32) -> Vec3 {
 
 fn sqrt_fast(value: f32) -> f32 {
     f32::from_bits(0x1fbd_1df5_u32.wrapping_add(value.to_bits() >> 1))
+}
+#[cfg(test)]
+mod tests {
+    use super::{
+        RayGenerateError, RayGenerateInput, RayLobe, RayThickness, ThicknessMode,
+        dominant_transmission_direction, generate_ray, sqrt_fast,
+    };
+    use glam::Vec3;
+
+    fn refraction_input(mode: ThicknessMode, thickness: f32) -> RayGenerateInput {
+        RayGenerateInput {
+            lobe: RayLobe::GgxRefraction,
+            normal: Vec3::Z,
+            view: Vec3::new(0.3, 0.0, 0.953_939_2).normalize(),
+            roughness: 0.18,
+            ior: 1.5,
+            thickness: RayThickness {
+                mode,
+                value: thickness,
+            },
+        }
+    }
+
+    fn dominant_direction(input: RayGenerateInput) -> Vec3 {
+        let perceived_factor = 1.0 - 1.0 / input.ior;
+        let perceived_roughness = input.roughness * sqrt_fast(perceived_factor);
+        dominant_transmission_direction(input.normal, input.view, input.ior, perceived_roughness)
+    }
+
+    #[test]
+    fn ggx_refraction_offsets_reach_source_sphere_exit() -> Result<(), RayGenerateError> {
+        let input = refraction_input(ThicknessMode::Sphere, 2.0);
+        let generated = generate_ray(input, [0.23, 0.37])?;
+        let dominant = dominant_direction(input);
+        let cos_alpha = dominant.dot(-input.normal);
+        let expected = dominant * (cos_alpha * input.thickness.value);
+        assert!((generated.origin_offset - expected).length() < 1.0e-6);
+
+        let radius = input.thickness.value * 0.5;
+        let sphere_center = -input.normal * radius;
+        assert!(((generated.origin_offset - sphere_center).length() - radius).abs() < 1.0e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn ggx_refraction_offsets_reach_source_slab_exit() -> Result<(), RayGenerateError> {
+        let input = refraction_input(ThicknessMode::Slab, 2.0);
+        let generated = generate_ray(input, [0.23, 0.37])?;
+        let dominant = dominant_direction(input);
+        let expected = dominant * (input.thickness.value / dominant.dot(-input.normal));
+        assert!((generated.origin_offset - expected).length() < 1.0e-6);
+        assert!(
+            (generated.origin_offset.dot(-input.normal) - input.thickness.value).abs() < 1.0e-6
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn translucent_sphere_offset_uses_the_sampled_ray() -> Result<(), RayGenerateError> {
+        let input = RayGenerateInput {
+            lobe: RayLobe::Translucent,
+            ..refraction_input(ThicknessMode::Sphere, 2.0)
+        };
+        let generated = generate_ray(input, [0.23, 0.37])?;
+        let expected = (generated.direction - input.normal) * (input.thickness.value * 0.505);
+        assert!((generated.origin_offset - expected).length() < 1.0e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_thickness_and_non_sphere_lobes_keep_origin() -> Result<(), RayGenerateError> {
+        let zero_thickness =
+            generate_ray(refraction_input(ThicknessMode::Sphere, 0.0), [0.23, 0.37])?;
+        assert_eq!(zero_thickness.origin_offset, Vec3::ZERO);
+
+        let thin_glass = RayGenerateInput {
+            lobe: RayLobe::ThinGlassTransmission,
+            ..refraction_input(ThicknessMode::Sphere, 2.0)
+        };
+        assert_eq!(
+            generate_ray(thin_glass, [0.23, 0.37])?.origin_offset,
+            Vec3::ZERO
+        );
+
+        let translucent_slab = RayGenerateInput {
+            lobe: RayLobe::Translucent,
+            thickness: RayThickness {
+                mode: ThicknessMode::Slab,
+                value: 2.0,
+            },
+            ..refraction_input(ThicknessMode::Sphere, 2.0)
+        };
+        assert_eq!(
+            generate_ray(translucent_slab, [0.23, 0.37])?.origin_offset,
+            Vec3::ZERO
+        );
+        Ok(())
+    }
 }

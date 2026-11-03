@@ -4417,6 +4417,7 @@ fn build_imported_graph(
                 camera: None,
                 light: Some(LightData {
                     light_type,
+                    use_shadow: item.get("use_shadow").and_then(Value::as_bool),
                     color: vec3_field(item, "color", [1.0; 3]),
                     energy: number_field(item, "energy", 1000.0),
                     radius: number_field(item, "shadow_soft_size", 0.1),
@@ -15407,6 +15408,26 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
         }
     }
     for (data_id, data) in &doc.data_blocks {
+        if data.data_type == "light"
+            && data
+                .light
+                .as_ref()
+                .is_some_and(|light| light.use_shadow.is_none())
+        {
+            let light_is_linked = doc.libraries.values().any(|library| {
+                library
+                    .linked_ids
+                    .get("data_blocks")
+                    .is_some_and(|data_blocks| data_blocks.contains(data_id))
+            });
+            if !light_is_linked {
+                losses.push(loss(
+                    "blender.light.use_shadow",
+                    Some(data_id.as_str()),
+                    "Light.use_shadow is unknown and cannot be restored without choosing a value; a recreated light would use Blender's default. Reimport the source .blend or set Light.use_shadow before export.",
+                ));
+            }
+        }
         if !matches!(
             data.data_type.as_str(),
             "mesh"
@@ -17530,6 +17551,56 @@ mod tests {
         }));
         Ok(())
     }
+    #[test]
+    fn unknown_light_shadow_is_an_export_loss_unless_its_linked_source_is_reused() -> Result<()> {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let light_id = Id::new("unknown_light_shadow")?;
+        doc.data_blocks.insert(
+            light_id.clone(),
+            DataBlock {
+                data_type: "light".to_owned(),
+                light: Some(LightData {
+                    use_shadow: None,
+                    ..LightData::default()
+                }),
+                ..DataBlock::default()
+            },
+        );
+        let unknown = export_losses(&doc)
+            .into_iter()
+            .find(|loss| loss.feature_id == "blender.light.use_shadow")
+            .ok_or_else(|| invalid_intermediate("unknown Light.use_shadow was not reported"))?;
+        assert_eq!(unknown.data_id.as_deref(), Some(light_id.as_str()));
+
+        doc.libraries.insert(
+            Id::new("light_library")?,
+            Library {
+                linked_ids: std::collections::BTreeMap::from([(
+                    "data_blocks".to_owned(),
+                    vec![light_id.clone()],
+                )]),
+                ..Library::default()
+            },
+        );
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .all(|loss| loss.feature_id != "blender.light.use_shadow")
+        );
+
+        doc.libraries.clear();
+        doc.data_blocks
+            .get_mut(&light_id)
+            .and_then(|data| data.light.as_mut())
+            .ok_or_else(|| invalid_intermediate("test light data is missing"))?
+            .use_shadow = Some(false);
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .all(|loss| loss.feature_id != "blender.light.use_shadow")
+        );
+        Ok(())
+    }
 
     #[test]
     fn usd_cache_files_import_as_cache_usd_losses() {
@@ -18984,7 +19055,7 @@ mod tests {
                 "nodes": {"nodes": [{"name":"Principled BSDF","type":"ShaderNodeBsdfPrincipled"}]},
                 "custom_properties": {}, "fake_user": false, "users": 1
             }],
-            "cameras": [], "lights": [],
+            "cameras": [], "lights": [{"name":"Legacy Light", "potter_id":"light_legacy", "type":"POINT"}],
             "actions": [{
                 "name": "Move", "potter_id": "action_move",
                 "fcurves": [{"path": "location", "index": 0,
@@ -19019,6 +19090,13 @@ mod tests {
             b"ORIGINAL".to_vec(),
             &BTreeMap::new(),
         )?;
+        assert_eq!(
+            test_data_ref(&imported.doc, "light_legacy")?
+                .light
+                .as_ref()
+                .and_then(|light| light.use_shadow),
+            None
+        );
         assert_eq!(imported.doc.active_scene.as_str(), "scene_test");
         let scene = imported
             .doc
@@ -23046,6 +23124,73 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 .and_then(Value::as_bool),
             Some(true)
         );
+        Ok(())
+    }
+    #[test]
+    fn blender_refraction_fixture_roundtrips_light_use_shadow_false_and_true() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../tests/fixtures/native_oracle/shader_bsdf_wave12/eevee_refraction_layers.blend",
+        );
+        let imported = import_blend(&source, Some(&blender))?;
+        let light_id = imported
+            .doc
+            .data_blocks
+            .iter()
+            .find(|(_, data)| data.light.is_some())
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| invalid_intermediate("refraction fixture has no light"))?;
+        assert_eq!(
+            test_data_ref(&imported.doc, light_id.as_str())?
+                .light
+                .as_ref()
+                .and_then(|light| light.use_shadow),
+            Some(false)
+        );
+
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let context = export_context();
+        for expected in [false, true] {
+            let mut doc = imported.doc.clone();
+            doc.data_blocks
+                .get_mut(&light_id)
+                .and_then(|data| data.light.as_mut())
+                .ok_or_else(|| invalid_intermediate("refraction fixture light data is missing"))?
+                .use_shadow = Some(expected);
+            let output = directory
+                .path()
+                .join(format!("light-shadow-{expected}.blend"));
+            let report = export_blend(
+                &doc,
+                &project,
+                &output,
+                &ExportOptions {
+                    allow_lossy: true,
+                    pack: false,
+                    blender: Some(&blender),
+                    context: &context,
+                },
+            )?;
+            assert!(
+                report.losses.iter().all(|loss| {
+                    loss.feature_id != "blender.light.use_shadow"
+                        || loss.data_id.as_deref() != Some(light_id.as_str())
+                }),
+                "explicit Light.use_shadow reported an export loss: {:?}",
+                report.losses
+            );
+            let reopened = import_blend(&output, Some(&blender))?;
+            assert_eq!(
+                test_data_ref(&reopened.doc, light_id.as_str())?
+                    .light
+                    .as_ref()
+                    .and_then(|light| light.use_shadow),
+                Some(expected)
+            );
+        }
         Ok(())
     }
     #[test]

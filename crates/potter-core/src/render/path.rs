@@ -67,8 +67,9 @@ use super::{
         ray_for_sample_in_frame, smooth_shadow_origin,
     },
     scene::{
-        ElementRecord, Geometry, HitPose, LayerTables, ObjectRecord, SceneShader, layered_context,
-        object_info_color, object_info_pass_index, object_space,
+        ElementRecord, Geometry, HitPose, LayerTables, ObjectRecord, SceneShader,
+        evaluate_light_shadow_setting, layered_context, object_info_color, object_info_pass_index,
+        object_space,
     },
 };
 
@@ -104,8 +105,8 @@ struct PointLight {
     /// Blender's `volume_factor` (`Light.volume_fac`), which EEVEE multiplies the light's volume in-scatter by
     /// (`eevee_light.cc`, `power[LIGHT_VOLUME]`). The path tracer does not apply it, as Cycles does not.
     volume_factor: f64,
-    /// `World.use_sun_shadow` on the synthetic `WorldSun`; `None` leaves authored lights on the scene-wide switch.
-    use_sun_shadow: Option<bool>,
+    /// The source shadow flag; a synthetic `WorldSun` carries its known `World` setting here.
+    use_shadow: Option<bool>,
     /// The squared radius of the light's volume influence (`light_attenuation_volume`), infinite for a sun. The realtime
     /// in-scatter fades with it; the path tracer does not.
     volume_radius_squared: f64,
@@ -2868,7 +2869,7 @@ mod camera_light_shape_tests {
             spread: None,
             use_mis: true,
             volume_factor: 0.0,
-            use_sun_shadow: None,
+            use_shadow: Some(true),
             volume_radius_squared: 0.0,
             ray_mask: RayKind::Camera.bit(),
             camera_shape_eligible: true,
@@ -3008,7 +3009,7 @@ mod camera_light_shape_tests {
             spread: Some(spread),
             use_mis: true,
             volume_factor: 0.0,
-            use_sun_shadow: None,
+            use_shadow: Some(true),
             volume_radius_squared: 0.0,
             ray_mask: RayKind::Camera.bit(),
             camera_shape_eligible: true,
@@ -4566,7 +4567,7 @@ pub(super) fn prepare_realtime_volume_transport<'a>(
             spread: None,
             use_mis: false,
             volume_factor: 1.0,
-            use_sun_shadow: Some(sun.use_sun_shadow),
+            use_shadow: Some(sun.use_sun_shadow),
             volume_radius_squared: f64::INFINITY,
             ray_mask: RayKind::VolumeScatter.bit(),
             camera_shape_eligible: false,
@@ -5103,26 +5104,30 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
                             let Some(sample) = sample_light(light, point, self.rng) else {
                                 continue;
                             };
-                            let visibility = if self.query.transport.volumetric_shadows
-                                && light.use_sun_shadow.unwrap_or(true)
-                            {
-                                march_volumes_with_budget(
-                                    &self.query.transport.volumes,
-                                    point,
-                                    sample.direction,
-                                    sample.distance,
-                                    Some(self.rng),
-                                    16,
-                                    RayKind::Shadow,
-                                )?
-                            } else {
-                                DVec3::ONE
-                            };
                             let phase =
                                 instance.phase_density(self.direction.dot(sample.direction));
-                            voxel_source += instance.albedo
-                                * sample.radiance
-                                * (scattering * phase * visibility * gain);
+                            let direct =
+                                evaluate_light_shadow_setting(light.use_shadow, |casts_shadows| {
+                                    let visibility = if self.query.transport.volumetric_shadows
+                                        && casts_shadows
+                                    {
+                                        march_volumes_with_budget(
+                                            &self.query.transport.volumes,
+                                            point,
+                                            sample.direction,
+                                            sample.distance,
+                                            Some(self.rng),
+                                            16,
+                                            RayKind::Shadow,
+                                        )?
+                                    } else {
+                                        DVec3::ONE
+                                    };
+                                    Ok(instance.albedo
+                                        * sample.radiance
+                                        * (scattering * phase * visibility * gain))
+                                })?;
+                            voxel_source += direct;
                         }
                     }
                 }
@@ -5136,35 +5141,38 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
                     let Some(sample) = eevee_volume_light_sample(light, point) else {
                         continue;
                     };
-                    let visibility = if self.query.transport.volumetric_shadows
-                        && light.use_sun_shadow.unwrap_or(true)
-                    {
-                        shadow_transmittance_with_volumetric_shadows(
-                            scene,
-                            media,
-                            ShadowRay {
-                                point,
-                                normal: DVec3::ZERO,
-                                shading: DVec3::ZERO,
-                                direction: sample.direction,
-                                distance: sample.distance,
-                                footprint: self.footprint.at_distance(distance),
-                            },
-                            u32::MAX,
-                            true,
-                            self.rng,
-                            self.evaluator_workspace,
-                        )?
-                    } else {
-                        DVec3::ONE
-                    };
-                    let cosine = self.direction.dot(sample.direction);
-                    let mut scatter = DVec3::ZERO;
-                    for medium in media {
-                        scatter += DVec3::from_array(medium.params.volume_scatter)
-                            * henyey_greenstein(cosine, medium.params.volume_anisotropy);
-                    }
-                    mesh_source += sample.radiance * visibility * scatter;
+                    let direct =
+                        evaluate_light_shadow_setting(light.use_shadow, |casts_shadows| {
+                            let visibility =
+                                if self.query.transport.volumetric_shadows && casts_shadows {
+                                    shadow_transmittance_with_volumetric_shadows(
+                                        scene,
+                                        media,
+                                        ShadowRay {
+                                            point,
+                                            normal: DVec3::ZERO,
+                                            shading: DVec3::ZERO,
+                                            direction: sample.direction,
+                                            distance: sample.distance,
+                                            footprint: self.footprint.at_distance(distance),
+                                        },
+                                        u32::MAX,
+                                        true,
+                                        self.rng,
+                                        self.evaluator_workspace,
+                                    )?
+                                } else {
+                                    DVec3::ONE
+                                };
+                            let cosine = self.direction.dot(sample.direction);
+                            let mut scatter = DVec3::ZERO;
+                            for medium in media {
+                                scatter += DVec3::from_array(medium.params.volume_scatter)
+                                    * henyey_greenstein(cosine, medium.params.volume_anisotropy);
+                            }
+                            Ok(sample.radiance * visibility * scatter)
+                        })?;
+                    mesh_source += direct;
                 }
             }
             let extinction = mesh_extinction + voxel_extinction * self.meters_per_unit;
@@ -5293,25 +5301,27 @@ fn realtime_voxel_integral(
                         let Some(sample) = sample_light(light, point, rng) else {
                             continue;
                         };
-                        let visibility = if transport.volumetric_shadows
-                            && light.use_sun_shadow.unwrap_or(true)
-                        {
-                            march_volumes_with_budget(
-                                &transport.volumes,
-                                point,
-                                sample.direction,
-                                sample.distance,
-                                Some(rng),
-                                16,
-                                RayKind::Shadow,
-                            )?
-                        } else {
-                            DVec3::ONE
-                        };
                         let phase = instance.phase_density(direction.dot(sample.direction));
-                        source += instance.albedo
-                            * sample.radiance
-                            * (scattering_coefficient * phase * visibility * gain);
+                        let direct =
+                            evaluate_light_shadow_setting(light.use_shadow, |casts_shadows| {
+                                let visibility = if transport.volumetric_shadows && casts_shadows {
+                                    march_volumes_with_budget(
+                                        &transport.volumes,
+                                        point,
+                                        sample.direction,
+                                        sample.distance,
+                                        Some(rng),
+                                        16,
+                                        RayKind::Shadow,
+                                    )?
+                                } else {
+                                    DVec3::ONE
+                                };
+                                Ok(instance.albedo
+                                    * sample.radiance
+                                    * (scattering_coefficient * phase * visibility * gain))
+                            })?;
+                        source += direct;
                     }
                 }
             }
@@ -6835,7 +6845,7 @@ mod overlay_tests {
             spread: None,
             use_mis: true,
             volume_factor: 0.0,
-            use_sun_shadow: None,
+            use_shadow: Some(true),
             volume_radius_squared: 0.0,
             ray_mask: RayKind::Camera.bit(),
             camera_shape_eligible: true,
@@ -8133,32 +8143,39 @@ fn direct_lighting(
         if bsdf.max_element() <= 0.0 || sample.radiance.max_element() <= 0.0 {
             continue;
         }
-        let visibility = shadow_transmittance(
-            scene,
-            media,
-            ShadowRay {
-                point: shadow_point,
-                normal: geometric,
-                shading: closures.smooth,
-                direction: sample.direction,
-                distance: sample.distance,
-                footprint,
-            },
-            transparent_budget,
-            rng,
-            evaluator_workspace,
-        )?;
-        if visibility.max_element() <= 0.0 {
-            continue;
-        }
-        // A BSDF ray reaches a hittable light only when the path continues past this vertex and no volume can
-        // scatter it first (`trace_path`).
-        let mis = if scatters && volumes.is_empty() && light.hittable() {
-            power_heuristic(sample.pdf, closures.continuous_pdf(sample.direction, None))
-        } else {
-            1.0
-        };
-        contribution += bsdf * sample.radiance * (visibility * mis);
+        let direct = evaluate_light_shadow_setting(light.use_shadow, |casts_shadows| {
+            let visibility = if casts_shadows {
+                shadow_transmittance(
+                    scene,
+                    media,
+                    ShadowRay {
+                        point: shadow_point,
+                        normal: geometric,
+                        shading: closures.smooth,
+                        direction: sample.direction,
+                        distance: sample.distance,
+                        footprint,
+                    },
+                    transparent_budget,
+                    rng,
+                    evaluator_workspace,
+                )?
+            } else {
+                DVec3::ONE
+            };
+            if visibility.max_element() <= 0.0 {
+                return Ok(DVec3::ZERO);
+            }
+            // A BSDF ray reaches a hittable light only when the path continues past this vertex and no volume can
+            // scatter it first (`trace_path`).
+            let mis = if scatters && volumes.is_empty() && light.hittable() {
+                power_heuristic(sample.pdf, closures.continuous_pdf(sample.direction, None))
+            } else {
+                1.0
+            };
+            Ok(bsdf * sample.radiance * (visibility * mis))
+        })?;
+        contribution += direct;
     }
     // The environment's cosine strategy follows the dominant closure's normal, as `environment_light_pdf` takes it.
     let direction = match importance {
@@ -8468,22 +8485,29 @@ fn volume_light_nee(
     if sample.radiance.max_element() <= 0.0 {
         return Ok((DVec3::ZERO, sample.direction));
     }
-    let visibility = shadow_transmittance(
-        scene,
-        media,
-        ShadowRay {
-            point,
-            normal: DVec3::ZERO,
-            shading: DVec3::ZERO,
-            direction: sample.direction,
-            distance: sample.distance,
-            footprint,
-        },
-        transparent_budget,
-        rng,
-        evaluator_workspace,
-    )?;
-    Ok((sample.radiance * visibility, sample.direction))
+    let radiance = evaluate_light_shadow_setting(light.use_shadow, |casts_shadows| {
+        let visibility = if casts_shadows {
+            shadow_transmittance(
+                scene,
+                media,
+                ShadowRay {
+                    point,
+                    normal: DVec3::ZERO,
+                    shading: DVec3::ZERO,
+                    direction: sample.direction,
+                    distance: sample.distance,
+                    footprint,
+                },
+                transparent_budget,
+                rng,
+                evaluator_workspace,
+            )?
+        } else {
+            DVec3::ONE
+        };
+        Ok(sample.radiance * visibility)
+    })?;
+    Ok((radiance, sample.direction))
 }
 
 /// The transmittance of a shadow ray: opaque hits block it, transparent surfaces and medium boundaries pass it, and each
@@ -9746,7 +9770,7 @@ fn collect_lights_impl(
                 spread: Spread::new(data.spread),
                 use_mis: data.use_multiple_importance_sampling,
                 volume_factor: data.volume_factor.max(0.0),
-                use_sun_shadow: None,
+                use_shadow: data.use_shadow,
                 volume_radius_squared,
                 ray_mask: node.resolved_ray_visibility().mask(),
                 camera_shape_eligible,
@@ -12063,7 +12087,7 @@ mod volume_extinction_tests {
             soft_falloff: false,
             use_mis: false,
             volume_factor: 1.0,
-            use_sun_shadow: None,
+            use_shadow: Some(true),
             volume_radius_squared: f64::INFINITY,
             ray_mask: crate::model::RayVisibility::default().mask(),
             camera_shape_eligible: true,
@@ -12111,7 +12135,7 @@ mod volume_extinction_tests {
             soft_falloff: false,
             use_mis: false,
             volume_factor: 1.0,
-            use_sun_shadow: None,
+            use_shadow: Some(true),
             volume_radius_squared: f64::INFINITY,
             ray_mask: crate::model::RayVisibility::default().mask(),
             camera_shape_eligible: true,
@@ -12146,7 +12170,7 @@ mod volume_extinction_tests {
             soft_falloff: false,
             use_mis: false,
             volume_factor: 1.0,
-            use_sun_shadow: None,
+            use_shadow: Some(true),
             volume_radius_squared: f64::INFINITY,
             ray_mask: crate::model::RayVisibility::default().mask(),
             camera_shape_eligible: true,
@@ -12623,7 +12647,7 @@ mod sampling_tests {
                 area: None,
                 use_mis: true,
                 volume_factor: 1.0,
-                use_sun_shadow: None,
+                use_shadow: Some(true),
                 volume_radius_squared: f64::INFINITY,
                 ray_mask: crate::model::RayVisibility::default().mask(),
                 camera_shape_eligible: true,
@@ -12737,7 +12761,7 @@ mod sampling_tests {
                     camera_shape_eligible: true,
                     use_mis: true,
                     volume_factor: 1.0,
-                    use_sun_shadow: None,
+                    use_shadow: Some(true),
                     volume_radius_squared: f64::INFINITY,
                 };
                 for receiver in [
@@ -12821,7 +12845,7 @@ mod sampling_tests {
             camera_shape_eligible: true,
             use_mis: true,
             volume_factor: 1.0,
-            use_sun_shadow: None,
+            use_shadow: Some(true),
             volume_radius_squared: f64::INFINITY,
         };
         let mut rng = Pcg32::for_sample(0x5e0, 0, 0, 0);
@@ -12860,7 +12884,7 @@ mod sampling_tests {
                 area,
                 use_mis: true,
                 volume_factor: 1.0,
-                use_sun_shadow: None,
+                use_shadow: Some(true),
                 volume_radius_squared: f64::INFINITY,
                 ray_mask: crate::model::RayVisibility::default().mask(),
                 camera_shape_eligible: true,
@@ -12936,7 +12960,7 @@ mod sampling_tests {
             }),
             use_mis: true,
             volume_factor: 1.0,
-            use_sun_shadow: None,
+            use_shadow: Some(true),
             volume_radius_squared: f64::INFINITY,
             ray_mask: crate::model::RayVisibility::default().mask(),
             camera_shape_eligible: true,

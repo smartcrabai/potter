@@ -3137,7 +3137,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "light.data",
-            "Point, sun, spot, and area light data",
+            "Point, sun, spot, and area light data with configurable shadow casting via use_shadow",
             "Light",
             &["light.create", "light.update"],
             [true, true, true, true, false, false, false],
