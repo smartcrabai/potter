@@ -1,0 +1,1156 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "engine": "CYCLES",
+  "resolution": [
+    192,
+    192
+  ],
+  "samples": 256,
+  "seed": 17,
+  "linear_exr": "path.exr",
+  "cases": [
+    {
+      "name": "sheen_ashikhmin",
+      "mode": {
+        "distribution": "ASHIKHMIN"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Roughness": 0.43,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        20,
+        36,
+        1
+      ],
+      "linear_rgba": [
+        0.00029975143560376536,
+        0.0002180695491915685,
+        0.0001234791477347446,
+        1.0
+      ]
+    },
+    {
+      "name": "sheen_microfiber",
+      "mode": {
+        "distribution": "MICROFIBER"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Roughness": 0.43,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        50,
+        36,
+        1
+      ],
+      "linear_rgba": [
+        0.01674788569410642,
+        0.006133162830438878,
+        0.002212661447831326,
+        1.0
+      ]
+    },
+    {
+      "name": "subsurface_burley",
+      "mode": {
+        "falloff": "BURLEY"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Radius": [
+          0.85,
+          0.31,
+          0.12
+        ],
+        "Scale": 0.24,
+        "Roughness": 0.36,
+        "IOR": 1.38,
+        "Anisotropy": 0.22,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        80,
+        36,
+        1
+      ],
+      "linear_rgba": [
+        4.657367918226454,
+        1.6569500366846721,
+        0.49708320366011727,
+        1.0
+      ]
+    },
+    {
+      "name": "subsurface_random_walk",
+      "mode": {
+        "falloff": "RANDOM_WALK"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Radius": [
+          0.85,
+          0.31,
+          0.12
+        ],
+        "Scale": 0.24,
+        "Roughness": 0.36,
+        "IOR": 1.38,
+        "Anisotropy": 0.22,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        110,
+        36,
+        1
+      ],
+      "linear_rgba": [
+        3.22157351175944,
+        1.8853949308395386,
+        0.6155311001671685,
+        1.0
+      ]
+    },
+    {
+      "name": "subsurface_random_walk_skin",
+      "mode": {
+        "falloff": "RANDOM_WALK_SKIN"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Radius": [
+          0.85,
+          0.31,
+          0.12
+        ],
+        "Scale": 0.24,
+        "Roughness": 0.36,
+        "IOR": 1.38,
+        "Anisotropy": 0.22,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        140,
+        36,
+        1
+      ],
+      "linear_rgba": [
+        3.3555671638912625,
+        1.8895871771706476,
+        0.9153887629508972,
+        1.0
+      ]
+    },
+    {
+      "name": "subsurface_random_walk_legacy",
+      "mode": {
+        "falloff": "RANDOM_WALK_LEGACY"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Radius": [
+          0.85,
+          0.31,
+          0.12
+        ],
+        "Scale": 0.24,
+        "Roughness": 0.36,
+        "IOR": 1.38,
+        "Anisotropy": 0.22,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        170,
+        36,
+        1
+      ],
+      "linear_rgba": [
+        1.8486674494213529,
+        1.1063153743743896,
+        0.5468537443213992,
+        1.0
+      ]
+    },
+    {
+      "name": "translucent",
+      "mode": {},
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        20,
+        66,
+        1
+      ],
+      "linear_rgba": [
+        0.7054781781302558,
+        0.07947742773426904,
+        0.011489168223407533,
+        1.0
+      ]
+    },
+    {
+      "name": "refraction_beckmann",
+      "mode": {
+        "distribution": "BECKMANN"
+      },
+      "inputs": {
+        "Color": [
+          0.74,
+          0.88,
+          0.96,
+          1.0
+        ],
+        "Roughness": 0.13,
+        "IOR": 1.43,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        50,
+        66,
+        1
+      ],
+      "linear_rgba": [
+        0.33513113856315613,
+        0.0724063366651535,
+        0.04700159985158178,
+        1.0
+      ]
+    },
+    {
+      "name": "refraction_ggx",
+      "mode": {
+        "distribution": "GGX"
+      },
+      "inputs": {
+        "Color": [
+          0.74,
+          0.88,
+          0.96,
+          1.0
+        ],
+        "Roughness": 0.13,
+        "IOR": 1.43,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        80,
+        66,
+        1
+      ],
+      "linear_rgba": [
+        0.04820237681269646,
+        0.4620167447461022,
+        0.20731594496303135,
+        1.0
+      ]
+    },
+    {
+      "name": "toon_diffuse",
+      "mode": {
+        "component": "DIFFUSE"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Size": 0.38,
+        "Smooth": 0.17,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        110,
+        66,
+        1
+      ],
+      "linear_rgba": [
+        2.174538599120246,
+        1.1511114968193903,
+        0.6097919940948486,
+        1.0
+      ]
+    },
+    {
+      "name": "toon_glossy",
+      "mode": {
+        "component": "GLOSSY"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Size": 0.38,
+        "Smooth": 0.17,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        140,
+        66,
+        1
+      ],
+      "linear_rgba": [
+        1.7110997670226626,
+        1.340479228231642,
+        0.8783634404341379,
+        1.0
+      ]
+    },
+    {
+      "name": "metallic_beckmann_f82",
+      "mode": {
+        "distribution": "BECKMANN",
+        "fresnel_type": "F82"
+      },
+      "inputs": {
+        "Base Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Edge Tint": [
+          0.84,
+          0.63,
+          0.43,
+          1.0
+        ],
+        "Roughness": 0.27,
+        "Anisotropy": 0.32,
+        "Rotation": 0.21,
+        "Thin Film Thickness": 280.0,
+        "Thin Film IOR": 1.34,
+        "IOR": [
+          2.4,
+          2.8,
+          3.1
+        ],
+        "Extinction": [
+          3.2,
+          2.5,
+          2.1
+        ],
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        170,
+        66,
+        1
+      ],
+      "linear_rgba": [
+        0.7734118319220014,
+        0.6199234288910197,
+        1.076180025572992,
+        1.0
+      ]
+    },
+    {
+      "name": "metallic_ggx_f82",
+      "mode": {
+        "distribution": "GGX",
+        "fresnel_type": "F82"
+      },
+      "inputs": {
+        "Base Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Edge Tint": [
+          0.84,
+          0.63,
+          0.43,
+          1.0
+        ],
+        "Roughness": 0.27,
+        "Anisotropy": 0.32,
+        "Rotation": 0.21,
+        "Thin Film Thickness": 280.0,
+        "Thin Film IOR": 1.34,
+        "IOR": [
+          2.4,
+          2.8,
+          3.1
+        ],
+        "Extinction": [
+          3.2,
+          2.5,
+          2.1
+        ],
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        20,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        12.71623236603207,
+        0.47930239472124314,
+        0.14571173095868695,
+        1.0
+      ]
+    },
+    {
+      "name": "metallic_multi_ggx_f82",
+      "mode": {
+        "distribution": "MULTI_GGX",
+        "fresnel_type": "F82"
+      },
+      "inputs": {
+        "Base Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Edge Tint": [
+          0.84,
+          0.63,
+          0.43,
+          1.0
+        ],
+        "Roughness": 0.27,
+        "Anisotropy": 0.32,
+        "Rotation": 0.21,
+        "Thin Film Thickness": 280.0,
+        "Thin Film IOR": 1.34,
+        "IOR": [
+          2.4,
+          2.8,
+          3.1
+        ],
+        "Extinction": [
+          3.2,
+          2.5,
+          2.1
+        ],
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        50,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        9.036652233865526,
+        0.34675733662313885,
+        0.10104275256809261,
+        1.0
+      ]
+    },
+    {
+      "name": "metallic_beckmann_conductor",
+      "mode": {
+        "distribution": "BECKMANN",
+        "fresnel_type": "PHYSICAL_CONDUCTOR"
+      },
+      "inputs": {
+        "Base Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Edge Tint": [
+          0.84,
+          0.63,
+          0.43,
+          1.0
+        ],
+        "Roughness": 0.27,
+        "Anisotropy": 0.32,
+        "Rotation": 0.21,
+        "Thin Film Thickness": 280.0,
+        "Thin Film IOR": 1.34,
+        "IOR": [
+          2.4,
+          2.8,
+          3.1
+        ],
+        "Extinction": [
+          3.2,
+          2.5,
+          2.1
+        ],
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        80,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        1.2179166122029226,
+        0.1439662863396936,
+        0.07363922293815348,
+        1.0
+      ]
+    },
+    {
+      "name": "metallic_ggx_conductor",
+      "mode": {
+        "distribution": "GGX",
+        "fresnel_type": "PHYSICAL_CONDUCTOR"
+      },
+      "inputs": {
+        "Base Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Edge Tint": [
+          0.84,
+          0.63,
+          0.43,
+          1.0
+        ],
+        "Roughness": 0.27,
+        "Anisotropy": 0.32,
+        "Rotation": 0.21,
+        "Thin Film Thickness": 280.0,
+        "Thin Film IOR": 1.34,
+        "IOR": [
+          2.4,
+          2.8,
+          3.1
+        ],
+        "Extinction": [
+          3.2,
+          2.5,
+          2.1
+        ],
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        110,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        0.31037287579642403,
+        0.08184604263967937,
+        0.09886922728684214,
+        1.0
+      ]
+    },
+    {
+      "name": "metallic_multi_ggx_conductor",
+      "mode": {
+        "distribution": "MULTI_GGX",
+        "fresnel_type": "PHYSICAL_CONDUCTOR"
+      },
+      "inputs": {
+        "Base Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Edge Tint": [
+          0.84,
+          0.63,
+          0.43,
+          1.0
+        ],
+        "Roughness": 0.27,
+        "Anisotropy": 0.32,
+        "Rotation": 0.21,
+        "Thin Film Thickness": 280.0,
+        "Thin Film IOR": 1.34,
+        "IOR": [
+          2.4,
+          2.8,
+          3.1
+        ],
+        "Extinction": [
+          3.2,
+          2.5,
+          2.1
+        ],
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        140,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        0.14457957074046135,
+        0.08645847605334388,
+        0.15916803065273497,
+        1.0
+      ]
+    },
+    {
+      "name": "holdout",
+      "mode": {},
+      "inputs": {},
+      "probe": [
+        170,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "neighbor_rgba": [
+        0.05880008265376091,
+        0.49980080127716064,
+        0.548799991607666,
+        1.0
+      ]
+    },
+    {
+      "name": "hair_reflection",
+      "mode": {
+        "component": "Reflection"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Offset": 0.037,
+        "RoughnessU": 0.24,
+        "RoughnessV": 0.51,
+        "Tangent": [
+          1.0,
+          0.15,
+          0.0
+        ]
+      },
+      "probe": [
+        20,
+        126,
+        1
+      ],
+      "linear_rgba": [
+        1.9866731564203899,
+        0.255967915058136,
+        0.06015221319264836,
+        1.0
+      ]
+    },
+    {
+      "name": "hair_transmission",
+      "mode": {
+        "component": "Transmission"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Offset": 0.037,
+        "RoughnessU": 0.24,
+        "RoughnessV": 0.51,
+        "Tangent": [
+          1.0,
+          0.15,
+          0.0
+        ]
+      },
+      "probe": [
+        50,
+        126,
+        1
+      ],
+      "linear_rgba": [
+        0.3689214487870534,
+        0.04834889620542526,
+        0.01550982054322958,
+        1.0
+      ]
+    },
+    {
+      "name": "principled_hair_chiang_reflectance",
+      "mode": {
+        "model": "CHIANG",
+        "parametrization": "COLOR"
+      },
+      "inputs": {
+        "Color": [
+          0.34,
+          0.12,
+          0.07,
+          1.0
+        ],
+        "Tint": [
+          0.88,
+          0.54,
+          0.31,
+          1.0
+        ],
+        "Melanin": 0.52,
+        "Melanin Redness": 0.64,
+        "Absorption Coefficient": [
+          0.31,
+          0.73,
+          1.27
+        ],
+        "Aspect Ratio": 0.73,
+        "Roughness": 0.34,
+        "Radial Roughness": 0.29,
+        "Coat": 0.23,
+        "IOR": 1.48,
+        "Offset": 0.031,
+        "Random Color": 0.12,
+        "Random Roughness": 0.14,
+        "Random": 0.37,
+        "Reflection": 0.83,
+        "Transmission": 0.71,
+        "Secondary Reflection": 0.62,
+        "Tangent": [
+          1.0,
+          0.15,
+          0.0
+        ]
+      },
+      "probe": [
+        80,
+        126,
+        1
+      ],
+      "linear_rgba": [
+        0.3811576267083486,
+        0.48869897921880084,
+        0.17017258207003275,
+        1.0
+      ]
+    },
+    {
+      "name": "principled_hair_chiang_melanin",
+      "mode": {
+        "model": "CHIANG",
+        "parametrization": "MELANIN"
+      },
+      "inputs": {
+        "Color": [
+          0.34,
+          0.12,
+          0.07,
+          1.0
+        ],
+        "Tint": [
+          0.88,
+          0.54,
+          0.31,
+          1.0
+        ],
+        "Melanin": 0.52,
+        "Melanin Redness": 0.64,
+        "Absorption Coefficient": [
+          0.31,
+          0.73,
+          1.27
+        ],
+        "Aspect Ratio": 0.73,
+        "Roughness": 0.34,
+        "Radial Roughness": 0.29,
+        "Coat": 0.23,
+        "IOR": 1.48,
+        "Offset": 0.031,
+        "Random Color": 0.12,
+        "Random Roughness": 0.14,
+        "Random": 0.37,
+        "Reflection": 0.83,
+        "Transmission": 0.71,
+        "Secondary Reflection": 0.62,
+        "Tangent": [
+          1.0,
+          0.15,
+          0.0
+        ]
+      },
+      "probe": [
+        110,
+        126,
+        1
+      ],
+      "linear_rgba": [
+        0.4035896526442634,
+        0.12113167842229207,
+        0.024858244849989813,
+        1.0
+      ]
+    },
+    {
+      "name": "principled_hair_chiang_absorption",
+      "mode": {
+        "model": "CHIANG",
+        "parametrization": "ABSORPTION"
+      },
+      "inputs": {
+        "Color": [
+          0.34,
+          0.12,
+          0.07,
+          1.0
+        ],
+        "Tint": [
+          0.88,
+          0.54,
+          0.31,
+          1.0
+        ],
+        "Melanin": 0.52,
+        "Melanin Redness": 0.64,
+        "Absorption Coefficient": [
+          0.31,
+          0.73,
+          1.27
+        ],
+        "Aspect Ratio": 0.73,
+        "Roughness": 0.34,
+        "Radial Roughness": 0.29,
+        "Coat": 0.23,
+        "IOR": 1.48,
+        "Offset": 0.031,
+        "Random Color": 0.12,
+        "Random Roughness": 0.14,
+        "Random": 0.37,
+        "Reflection": 0.83,
+        "Transmission": 0.71,
+        "Secondary Reflection": 0.62,
+        "Tangent": [
+          1.0,
+          0.15,
+          0.0
+        ]
+      },
+      "probe": [
+        140,
+        126,
+        1
+      ],
+      "linear_rgba": [
+        0.2838194966316223,
+        0.05910034001701408,
+        0.08430888752142589,
+        1.0
+      ]
+    },
+    {
+      "name": "principled_hair_huang_reflectance",
+      "mode": {
+        "model": "HUANG",
+        "parametrization": "COLOR"
+      },
+      "inputs": {
+        "Color": [
+          0.34,
+          0.12,
+          0.07,
+          1.0
+        ],
+        "Tint": [
+          0.88,
+          0.54,
+          0.31,
+          1.0
+        ],
+        "Melanin": 0.52,
+        "Melanin Redness": 0.64,
+        "Absorption Coefficient": [
+          0.31,
+          0.73,
+          1.27
+        ],
+        "Aspect Ratio": 0.73,
+        "Roughness": 0.34,
+        "Radial Roughness": 0.29,
+        "Coat": 0.23,
+        "IOR": 1.48,
+        "Offset": 0.031,
+        "Random Color": 0.12,
+        "Random Roughness": 0.14,
+        "Random": 0.37,
+        "Reflection": 0.83,
+        "Transmission": 0.71,
+        "Secondary Reflection": 0.62,
+        "Tangent": [
+          1.0,
+          0.15,
+          0.0
+        ]
+      },
+      "probe": [
+        170,
+        126,
+        1
+      ],
+      "linear_rgba": [
+        0.136387394534217,
+        0.3287849889861213,
+        0.3336801826953888,
+        1.0
+      ]
+    },
+    {
+      "name": "principled_hair_huang_melanin",
+      "mode": {
+        "model": "HUANG",
+        "parametrization": "MELANIN"
+      },
+      "inputs": {
+        "Color": [
+          0.34,
+          0.12,
+          0.07,
+          1.0
+        ],
+        "Tint": [
+          0.88,
+          0.54,
+          0.31,
+          1.0
+        ],
+        "Melanin": 0.52,
+        "Melanin Redness": 0.64,
+        "Absorption Coefficient": [
+          0.31,
+          0.73,
+          1.27
+        ],
+        "Aspect Ratio": 0.73,
+        "Roughness": 0.34,
+        "Radial Roughness": 0.29,
+        "Coat": 0.23,
+        "IOR": 1.48,
+        "Offset": 0.031,
+        "Random Color": 0.12,
+        "Random Roughness": 0.14,
+        "Random": 0.37,
+        "Reflection": 0.83,
+        "Transmission": 0.71,
+        "Secondary Reflection": 0.62,
+        "Tangent": [
+          1.0,
+          0.15,
+          0.0
+        ]
+      },
+      "probe": [
+        20,
+        156,
+        1
+      ],
+      "linear_rgba": [
+        0.10508894092506832,
+        0.06357902909318607,
+        0.0473257377743721,
+        1.0
+      ]
+    },
+    {
+      "name": "principled_hair_huang_absorption",
+      "mode": {
+        "model": "HUANG",
+        "parametrization": "ABSORPTION"
+      },
+      "inputs": {
+        "Color": [
+          0.34,
+          0.12,
+          0.07,
+          1.0
+        ],
+        "Tint": [
+          0.88,
+          0.54,
+          0.31,
+          1.0
+        ],
+        "Melanin": 0.52,
+        "Melanin Redness": 0.64,
+        "Absorption Coefficient": [
+          0.31,
+          0.73,
+          1.27
+        ],
+        "Aspect Ratio": 0.73,
+        "Roughness": 0.34,
+        "Radial Roughness": 0.29,
+        "Coat": 0.23,
+        "IOR": 1.48,
+        "Offset": 0.031,
+        "Random Color": 0.12,
+        "Random Roughness": 0.14,
+        "Random": 0.37,
+        "Reflection": 0.83,
+        "Transmission": 0.71,
+        "Secondary Reflection": 0.62,
+        "Tangent": [
+          1.0,
+          0.15,
+          0.0
+        ]
+      },
+      "probe": [
+        50,
+        156,
+        1
+      ],
+      "linear_rgba": [
+        0.352944725089603,
+        0.04959612629479832,
+        0.018094504872957867,
+        1.0
+      ]
+    },
+    {
+      "name": "ray_portal",
+      "mode": {},
+      "inputs": {
+        "Color": [
+          0.92,
+          0.87,
+          0.73,
+          1.0
+        ],
+        "Position": [
+          0.0,
+          0.0,
+          2.0
+        ],
+        "Direction": [
+          0.684,
+          0.0,
+          -0.73
+        ]
+      },
+      "probe": [
+        96,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        0.06441889040999943,
+        0.015587983135547902,
+        0.0015672219968918297,
+        1.0
+      ]
+    }
+  ]
+}

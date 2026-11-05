@@ -1269,6 +1269,18 @@ def _restore_texture_node_mapping(node, texture_mapping, color_mapping, owner):
 
 
 
+def _node_socket_key(tree, node, socket):
+    if node.bl_idname in ("NodeGroupInput", "NodeGroupOutput"):
+        return socket.identifier if tree.bl_rna.identifier == "GeometryNodeTree" else socket.name
+    if node.bl_idname in ("GeometryNodeSimulationInput", "GeometryNodeSimulationOutput"):
+        return socket.name or socket.identifier
+    return socket.identifier
+
+
+
+
+
+
 def tree_dump(tree):
     if tree is None:
         return None
@@ -1285,14 +1297,7 @@ def tree_dump(tree):
             except Exception:
                 default = None
             socket_type = getattr(socket, "bl_socket_idname", getattr(socket, "bl_idname", socket.type))
-            if node.bl_idname in ("NodeGroupInput", "NodeGroupOutput"):
-                identifier = (socket.identifier
-                              if tree.bl_rna.identifier == "GeometryNodeTree" else socket.name)
-            elif node.bl_idname in ("GeometryNodeSimulationInput",
-                                    "GeometryNodeSimulationOutput"):
-                identifier = socket.name
-            else:
-                identifier = socket.identifier
+            identifier = _node_socket_key(tree, node, socket)
             sockets.append({"name": socket.name, "identifier": identifier, "type": socket_type,
                             "enabled": socket.enabled, "default": default})
         custom_properties = custom_props(node)
@@ -1311,8 +1316,19 @@ def tree_dump(tree):
         if node.bl_idname == "ShaderNodeValToRGB":
             properties["color_ramp"] = _color_ramp_settings(node.color_ramp)
         if node.bl_idname == "GeometryNodeMenuSwitch":
-            properties["potter_menu_items"] = [
-                item.name for item in getattr(node, "enum_items", ())]
+            # GraphNode inputs are keyed, so keep the enum order paired with its stable socket IDs.
+            menu_items = list(getattr(node, "enum_items", ()))
+            menu_sockets = [
+                socket for socket in node.inputs
+                if socket.identifier != "Menu" and socket.name
+            ]
+            properties["potter_menu_items"] = [item.name for item in menu_items]
+            if (len(menu_sockets) == len(menu_items)
+                    and all(socket.name == item.name and socket.identifier
+                            for socket, item in zip(menu_sockets, menu_items))
+                    and len({socket.identifier for socket in menu_sockets}) == len(menu_sockets)):
+                properties["potter_menu_item_identifiers"] = [
+                    socket.identifier for socket in menu_sockets]
         if node.bl_idname in ("ShaderNodeRGB", "ShaderNodeValue", "ShaderNodeNormal"):
             properties["potter_output_defaults"] = [
                 {"identifier": socket.identifier, "default": plain(socket.default_value)}
@@ -1344,6 +1360,16 @@ def tree_dump(tree):
         if simple_material:
             properties = {"potter_simple_material": True}
             sockets = []
+        properties["internal_links"] = [
+            {"from_socket": _node_socket_key(tree, node, link.from_socket),
+             "to_socket": _node_socket_key(tree, node, link.to_socket)}
+            for link in node.internal_links
+        ]
+        properties["input_socket_flags"] = {
+            _node_socket_key(tree, node, socket): {
+                "enabled": bool(socket.enabled), "hide_value": bool(socket.hide_value)}
+            for socket in node.inputs if _node_socket_key(tree, node, socket)
+        }
         nodes.append({"name": node.name, "potter_id": node_id,
                       "type": potter_node_type(node.bl_idname, tree.bl_rna.identifier), "label": node.label,
                       "location": plain(node.location), "inputs": sockets,
@@ -1353,17 +1379,8 @@ def tree_dump(tree):
     for link in tree.links:
         from_node = link.from_node
         to_node = link.to_node
-        geometry_tree = tree.bl_rna.identifier == "GeometryNodeTree"
-        from_socket = link.from_socket.identifier
-        if (from_node.bl_idname in ("GeometryNodeSimulationInput",
-                                    "GeometryNodeSimulationOutput")
-                or (from_node.bl_idname == "NodeGroupInput" and not geometry_tree)):
-            from_socket = link.from_socket.name
-        to_socket = link.to_socket.identifier
-        if (to_node.bl_idname in ("GeometryNodeSimulationInput",
-                                  "GeometryNodeSimulationOutput")
-                or (to_node.bl_idname == "NodeGroupOutput" and not geometry_tree)):
-            to_socket = link.to_socket.name
+        from_socket = _node_socket_key(tree, from_node, link.from_socket)
+        to_socket = _node_socket_key(tree, to_node, link.to_socket)
         entry = {
             "from_node": from_node.name,
             "from_socket": from_socket,
@@ -1372,7 +1389,7 @@ def tree_dump(tree):
         }
         links.append(entry)
         if link.to_socket.is_multi_input:
-            key = (link.to_node.name, link.to_socket.identifier)
+            key = (link.to_node.name, _node_socket_key(tree, to_node, link.to_socket))
             multi_input_positions.setdefault(key, []).append(
                 (len(links) - 1, entry, link.multi_input_sort_id))
     for entries in multi_input_positions.values():
@@ -3454,7 +3471,62 @@ def _eevee_volumetric_end(scene):
 
 def _eevee_gi_cubemap_resolution(scene):
     eevee = getattr(scene, "eevee", None)
-    return int(getattr(eevee, "gi_cubemap_resolution", 512)) if eevee is not None else 512
+    value = getattr(eevee, "gi_cubemap_resolution", None) if eevee is not None else None
+    return int(value) if value is not None else None
+
+def _rna_optional_bool(owner, name):
+    value = getattr(owner, name, None) if owner is not None else None
+    return bool(value) if value is not None else None
+
+
+def _rna_optional_float(owner, name):
+    value = getattr(owner, name, None) if owner is not None else None
+    return float(value) if value is not None else None
+
+
+def _rna_optional_int(owner, name):
+    value = getattr(owner, name, None) if owner is not None else None
+    return int(value) if value is not None else None
+
+
+def _eevee_has_local_volume_probe_grids(scene):
+    # Object.lightprobe_cache is not exposed through RNA; this records visible source Grid probes conservatively.
+    for view_layer in scene.view_layers:
+        for obj in view_layer.objects:
+            if obj.hide_render:
+                continue
+            if obj.type == "LIGHT_PROBE" and getattr(obj.data, "type", None) == "VOLUME":
+                return True
+    return False
+
+
+def _eevee_raytracing_settings(scene):
+    eevee = getattr(scene, "eevee", None)
+    raytracing = getattr(eevee, "ray_tracing_options", None) if eevee is not None else None
+    return {
+        "eevee_use_raytracing": _rna_optional_bool(eevee, "use_raytracing"),
+        "eevee_use_fast_gi": _rna_optional_bool(eevee, "use_fast_gi"),
+        "eevee_clamp_surface_indirect": _rna_optional_float(eevee, "clamp_surface_indirect"),
+        "eevee_raytracing_method": getattr(eevee, "ray_tracing_method", None) if eevee is not None else None,
+        "eevee_raytracing_resolution_scale": _rna_optional_int(raytracing, "resolution_scale"),
+        "eevee_raytracing_screen_trace_quality": _rna_optional_float(raytracing, "screen_trace_quality"),
+        "eevee_raytracing_screen_trace_thickness": _rna_optional_float(raytracing, "screen_trace_thickness"),
+        "eevee_raytracing_trace_max_roughness": _rna_optional_float(raytracing, "trace_max_roughness"),
+        "eevee_raytracing_use_backface_hit": _rna_optional_bool(raytracing, "use_backface_hit"),
+        "eevee_raytracing_backface_radiance_scale": _rna_optional_float(raytracing, "backface_radiance_scale"),
+        "eevee_raytracing_use_denoise": _rna_optional_bool(raytracing, "use_denoise"),
+        "eevee_raytracing_denoise_spatial": _rna_optional_bool(raytracing, "denoise_spatial"),
+        "eevee_raytracing_denoise_temporal": _rna_optional_bool(raytracing, "denoise_temporal"),
+        "eevee_raytracing_denoise_bilateral": _rna_optional_bool(raytracing, "denoise_bilateral"),
+        "eevee_fast_gi_bias": _rna_optional_float(eevee, "fast_gi_bias"),
+        "eevee_fast_gi_resolution": _rna_optional_int(eevee, "fast_gi_resolution"),
+        "eevee_fast_gi_step_count": _rna_optional_int(eevee, "fast_gi_step_count"),
+        "eevee_fast_gi_ray_count": _rna_optional_int(eevee, "fast_gi_ray_count"),
+        "eevee_fast_gi_quality": _rna_optional_float(eevee, "fast_gi_quality"),
+        "eevee_fast_gi_distance": _rna_optional_float(eevee, "fast_gi_distance"),
+        "eevee_fast_gi_thickness_near": _rna_optional_float(eevee, "fast_gi_thickness_near"),
+        "eevee_fast_gi_method": getattr(eevee, "fast_gi_method", None) if eevee is not None else None,
+    }
 
 
 def _cryptomatte_accurate(scene):
@@ -3701,6 +3773,415 @@ def blender_color_look(value):
     return _BLENDER_LOOK_BY_POTTER.get(str(value), value)
 
 
+_CYCLES_HAIR_RAY_FLAGS = (
+    ("camera", "visible_camera"), ("diffuse", "visible_diffuse"),
+    ("glossy", "visible_glossy"), ("transmission", "visible_transmission"),
+    ("shadow", "visible_shadow"), ("volume_scatter", "visible_volume_scatter"),
+)
+
+
+def _cycles_particle_hair_enabled(obj):
+    for modifier in obj.modifiers:
+        if modifier.type != "PARTICLE_SYSTEM" or not modifier.show_render:
+            continue
+        settings = modifier.particle_system.settings
+        if settings.type == "HAIR" and settings.render_type == "PATH":
+            return True
+    return False
+
+
+def _cycles_hair_ray_visibility(obj, parent=None):
+    return {
+        flag: bool(getattr(obj, property_name))
+        and (parent is None or bool(getattr(parent, property_name)))
+        for flag, property_name in _CYCLES_HAIR_RAY_FLAGS
+    }
+
+
+def _cycles_hair_ray_visible(obj, parent=None):
+    return any(_cycles_hair_ray_visibility(obj, parent).values())
+
+
+def _cycles_hair_is_culled(scene, depsgraph, instance, obj):
+    if not scene.render.use_simplify:
+        return False
+    camera = depsgraph.scene_eval.camera
+    if (camera is None or camera.data is None
+            or camera.data.type not in ("PERSP", "ORTHO")
+            or scene.render.use_multiview):
+        return False
+
+    cycles_scene = scene.cycles
+    cycles_object = obj.cycles
+    use_camera_cull = (cycles_scene.use_camera_cull
+                       and cycles_object.use_camera_cull)
+    if use_camera_cull:
+        raise RuntimeError(
+            "exact Cycles Hair provenance is unavailable when Cycles camera culling is active: "
+            "the render callback exposes the depsgraph but not Cycles Camera.worldtondc"
+        )
+
+    margin = float(cycles_scene.distance_cull_margin)
+    if (not cycles_scene.use_distance_cull or margin == 0.0
+            or not cycles_object.use_distance_cull):
+        return False
+
+    try:
+        corners = [Vector(corner) for corner in obj.bound_box]
+    except (AttributeError, TypeError, ValueError):
+        corners = []
+    if len(corners) != 8:
+        corners = [Vector((0.0, 0.0, 0.0)) for _ in range(8)]
+    world_corners = [instance.matrix_world @ corner for corner in corners]
+    bounds_min = [min(point[axis] for point in world_corners) for axis in range(3)]
+    bounds_max = [max(point[axis] for point in world_corners) for axis in range(3)]
+    camera_position = camera.matrix_world.translation
+    closest = [
+        max(min(bounds_max[axis], camera_position[axis]), bounds_min[axis])
+        for axis in range(3)
+    ]
+
+    def f32(value):
+        return struct.unpack("=f", struct.pack("=f", value))[0]
+
+    distance_squared = f32(0.0)
+    for axis in range(3):
+        delta = f32(camera_position[axis] - closest[axis])
+        distance_squared = f32(distance_squared + f32(delta * delta))
+    return distance_squared > f32(margin * margin)
+
+
+def _cycles_object_modified_for_hair(real_object, scene):
+    if real_object.type == "META" or real_object.is_modified(scene, "RENDER"):
+        return True
+    return any(slot.link == "OBJECT" for slot in real_object.material_slots)
+
+
+def _cycles_source_object_name(real_object):
+    source = real_object.original
+    if source is None:
+        source = real_object
+    datablock = bpy.data.objects.get(source.name_full)
+    if datablock is None or datablock.as_pointer() != source.as_pointer():
+        raise RuntimeError(
+            "Cycles Hair geometry references a source Object that the bridge cannot map exactly"
+        )
+    return source.name_full
+
+
+def _cycles_source_material_name(material):
+    source = material.original
+    if source is None:
+        source = material
+    datablock = bpy.data.materials.get(source.name_full)
+    if datablock is None or datablock.as_pointer() != source.as_pointer():
+        raise RuntimeError(
+            "Cycles Hair representative references a Material that the bridge cannot map exactly"
+        )
+    return source.name_full
+
+
+def _cycles_source_curve_indices(scene, obj, real_object):
+    data = obj.data
+    if data is None or data.bl_rna.identifier != "Curves":
+        return None
+
+    source_object = real_object.original
+    if source_object is None:
+        source_object = real_object
+    source_data = source_object.data
+    if source_data is None or source_data.bl_rna.identifier != "Curves":
+        return None
+    source_count = len(source_data.curves)
+    evaluated_count = len(data.curves)
+    evaluated_source = data.original
+    if evaluated_source is None:
+        evaluated_source = data
+    if (not real_object.is_modified(scene, "RENDER")
+            and evaluated_source.as_pointer() == source_data.as_pointer()
+            and source_count == evaluated_count):
+        return list(range(evaluated_count))
+
+    attributes = getattr(data, "attributes", None)
+    original_indices = attributes.get("orig_index") if attributes is not None else None
+    if (original_indices is None or original_indices.domain != "CURVE"
+            or original_indices.data_type != "INT" or len(original_indices.data) != evaluated_count):
+        return None
+    indices = [int(item.value) for item in original_indices.data]
+    if any(index < 0 or index >= source_count for index in indices):
+        return None
+    return indices
+
+
+def _cycles_hair_instance_key(instance, real_object, use_particle_hair):
+    real_object_name = _cycles_source_object_name(real_object)
+    if instance.is_instance:
+        parent = instance.parent
+        parent_name = _cycles_source_object_name(parent) if parent is not None else None
+        persistent_id = [int(value) for value in instance.persistent_id]
+        if len(persistent_id) != 8:
+            raise RuntimeError("Cycles Hair instance persistent_id must contain eight integers")
+    else:
+        parent_name = real_object_name
+        persistent_id = [0] * 8
+    return {
+        "real_object": real_object_name,
+        "parent": parent_name,
+        "persistent_id": persistent_id,
+        "is_instance": bool(instance.is_instance),
+        "use_particle_hair": bool(use_particle_hair),
+    }
+
+
+def _cycles_evaluated_hair_curves(obj, real_object):
+    data = obj.data
+    if data is None or data.bl_rna.identifier != "Curves":
+        return None
+    source_object = real_object.original
+    if source_object is None:
+        source_object = real_object
+    source_data = source_object.data
+    if source_data is not None and source_data.as_pointer() == data.as_pointer():
+        return None
+    return hair_curves_dump(data)
+
+
+def _cycles_hair_shadow_member(scene, instance, obj, real_object, use_particle_hair):
+    material = obj.material_slots[0].material if len(obj.material_slots) else None
+    parent = instance.parent if instance.is_instance else None
+    return {
+        "instance": _cycles_hair_instance_key(instance, real_object, use_particle_hair),
+        "object_to_world": matrix_rows(instance.matrix_world),
+        "object_color": plain(obj.color),
+        "object_pass_index": int(obj.pass_index),
+        "object_random_id": int(instance.random_id),
+        "slot_0_material": _cycles_source_material_name(material) if material else None,
+        "ray_visibility": _cycles_hair_ray_visibility(obj, parent),
+    }
+
+
+
+
+def _cycles_hair_shadow_groups_from_depsgraph(scene, view_layer, depsgraph):
+    if depsgraph.mode != "RENDER":
+        raise RuntimeError("Cycles Hair provenance requires a RENDER dependency graph")
+    if depsgraph.scene_eval.original.as_pointer() != scene.as_pointer():
+        raise RuntimeError("Cycles Hair provenance callback returned the wrong Scene")
+    if depsgraph.view_layer_eval.name != view_layer.name:
+        raise RuntimeError("Cycles Hair provenance callback returned the wrong View Layer")
+
+    groups = []
+    groups_by_geometry_key = {}
+    instance_keys_by_geometry_key = {}
+    for instance in depsgraph.object_instances:
+        obj = instance.object
+        data = obj.data
+        if data is None:
+            continue
+        hair_invocations = []
+        if data.bl_rna.identifier == "Curves" and instance.show_self:
+            hair_invocations.append(False)
+        if instance.show_particles and _cycles_particle_hair_enabled(obj):
+            hair_invocations.append(True)
+        if not hair_invocations:
+            continue
+        if not (obj.type in ("VOLUME", "CURVES", "POINTCLOUD", "LIGHT")
+                or data.bl_rna.identifier == "Mesh"):
+            continue
+        parent = instance.parent if instance.is_instance else None
+        ray_visibility = _cycles_hair_ray_visibility(obj, parent)
+        if not any(ray_visibility.values()):
+            continue
+        if _cycles_hair_is_culled(scene, depsgraph, instance, obj):
+            continue
+
+        real_object = instance.instance_object if instance.is_instance else obj
+        real_object_data = real_object.data
+        is_real_object_data = (
+            real_object_data is not None
+            and real_object_data.as_pointer() == data.as_pointer()
+        )
+        if is_real_object_data and _cycles_object_modified_for_hair(real_object, scene):
+            geometry_key = real_object.as_pointer()
+            geometry_key_description = {
+                "kind": "object",
+                "node": _cycles_source_object_name(real_object),
+            }
+        else:
+            geometry_key = data.as_pointer()
+            geometry_key_description = {
+                "kind": "data",
+                "uses_source_data": bool(is_real_object_data),
+            }
+
+        group = groups_by_geometry_key.get(geometry_key)
+        if group is None:
+            group = {
+                "view_layer": view_layer.name,
+                "geometry_key": geometry_key_description,
+                "representative": _cycles_source_object_name(real_object),
+                "member_nodes": [],
+                "members": [],
+                "source_curve_indices": None,
+                "evaluated_hair_curves": None,
+            }
+            groups_by_geometry_key[geometry_key] = group
+            instance_keys_by_geometry_key[geometry_key] = set()
+            groups.append(group)
+
+        for use_particle_hair in hair_invocations:
+            member = _cycles_hair_shadow_member(
+                scene, instance, obj, real_object, use_particle_hair)
+            instance_key = member["instance"]
+            identity = (
+                instance_key["real_object"], instance_key["parent"],
+                tuple(instance_key["persistent_id"]), instance_key["is_instance"],
+                instance_key["use_particle_hair"],
+            )
+            if identity in instance_keys_by_geometry_key[geometry_key]:
+                continue
+            instance_keys_by_geometry_key[geometry_key].add(identity)
+            if instance_key["real_object"] not in group["member_nodes"]:
+                group["member_nodes"].append(instance_key["real_object"])
+            group["members"].append(member)
+            if len(group["members"]) == 1:
+                group["source_curve_indices"] = _cycles_source_curve_indices(
+                    scene, obj, real_object)
+                group["evaluated_hair_curves"] = _cycles_evaluated_hair_curves(
+                    obj, real_object)
+    return groups
+
+
+def _cycles_object_may_render_hair(obj, seen_objects, seen_collections):
+    if obj.hide_render or not _cycles_hair_ray_visible(obj):
+        return False
+    pointer = obj.as_pointer()
+    if pointer in seen_objects:
+        return False
+    seen_objects.add(pointer)
+
+    data = obj.data
+    if data is not None and data.bl_rna.identifier == "Curves":
+        return True
+
+    instance_collection = getattr(obj, "instance_collection", None)
+    if (instance_collection is not None
+            and _cycles_collection_may_render_hair(
+                instance_collection, seen_objects, seen_collections)):
+        return True
+
+    for modifier in obj.modifiers:
+        if not modifier.show_render:
+            continue
+        if modifier.type == "NODES":
+            return True
+        if modifier.type != "PARTICLE_SYSTEM":
+            continue
+        settings = modifier.particle_system.settings
+        if settings.type == "HAIR" and settings.render_type == "PATH":
+            return True
+        if settings.render_type == "OBJECT":
+            instance_object = getattr(settings, "instance_object", None)
+            if (instance_object is not None
+                    and _cycles_object_may_render_hair(
+                        instance_object, seen_objects, seen_collections)):
+                return True
+        elif settings.render_type == "COLLECTION":
+            instance_collection = getattr(settings, "instance_collection", None)
+            if (instance_collection is not None
+                    and _cycles_collection_may_render_hair(
+                        instance_collection, seen_objects, seen_collections)):
+                return True
+    return False
+
+
+def _cycles_collection_may_render_hair(collection, seen_objects, seen_collections):
+    if collection.hide_render:
+        return False
+    pointer = collection.as_pointer()
+    if pointer in seen_collections:
+        return False
+    seen_collections.add(pointer)
+    for obj in collection.objects:
+        if _cycles_object_may_render_hair(obj, seen_objects, seen_collections):
+            return True
+    return any(
+        _cycles_collection_may_render_hair(child, seen_objects, seen_collections)
+        for child in collection.children
+    )
+
+
+def _cycles_layer_collection_may_render_hair(layer_collection, seen_objects, seen_collections):
+    if layer_collection.exclude or layer_collection.collection.hide_render:
+        return False
+    for obj in layer_collection.collection.objects:
+        if _cycles_object_may_render_hair(obj, seen_objects, seen_collections):
+            return True
+    return any(
+        _cycles_layer_collection_may_render_hair(child, seen_objects, seen_collections)
+        for child in layer_collection.children
+    )
+
+
+def _cycles_view_layer_may_render_hair(view_layer):
+    return _cycles_layer_collection_may_render_hair(
+        view_layer.layer_collection, set(), set()
+    )
+
+
+def _cycles_hair_shadow_groups_for_view_layer(scene, view_layer):
+    if not _cycles_view_layer_may_render_hair(view_layer):
+        return []
+    from cycles import engine as cycles_engine
+
+    original_render = cycles_engine.render
+    original_engine = scene.render.engine
+    original_compositing = scene.render.use_compositing
+    original_sequencer = scene.render.use_sequencer
+    captures = []
+    handler_names = (
+        "depsgraph_update_pre", "depsgraph_update_post",
+        "frame_change_pre", "frame_change_post",
+        "render_init", "render_pre", "render_post", "render_write", "render_complete",
+        "render_cancel", "render_stats", "render_aa_pre", "render_aa_post",
+    )
+    handlers = []
+
+    def capture_render(_engine, depsgraph):
+        captures.append(
+            _cycles_hair_shadow_groups_from_depsgraph(scene, view_layer, depsgraph)
+        )
+
+    try:
+        for name in handler_names:
+            callbacks = getattr(bpy.app.handlers, name, None)
+            if callbacks is not None:
+                handlers.append((callbacks, list(callbacks)))
+                callbacks.clear()
+        # The callbacks-only render must not run scene File Output, sequencer, or user handlers during import.
+        scene.render.engine = "CYCLES"
+        scene.render.use_compositing = False
+        scene.render.use_sequencer = False
+        cycles_engine.render = capture_render
+        with bpy.context.temp_override(scene=scene, view_layer=view_layer):
+            result = bpy.ops.render.render(write_still=False, layer=view_layer.name)
+        if "FINISHED" not in result:
+            raise RuntimeError("Cycles Hair provenance render callback did not finish")
+    finally:
+        cycles_engine.render = original_render
+        scene.render.engine = original_engine
+        scene.render.use_compositing = original_compositing
+        scene.render.use_sequencer = original_sequencer
+        for callbacks, saved in handlers:
+            callbacks[:] = saved
+
+    if not captures or any(capture != captures[0] for capture in captures[1:]):
+        raise RuntimeError(
+            "Cycles Hair provenance did not produce one consistent render dependency graph"
+        )
+    return captures[0]
+
+
 def dump_scene(scene):
     layers = []
     view_layer_ids = _id_map(scene, "potter.view_layer_ids_json")
@@ -3714,6 +4195,13 @@ def dump_scene(scene):
         walk(view_layer.layer_collection)
         layers.append({"name": view_layer.name, "potter_id": view_layer_ids.get(view_layer.name),
                        "excluded_collections": excluded})
+    cycles_hair_shadow_groups = None
+    if scene.camera is not None:
+        cycles_hair_shadow_groups = []
+        for view_layer in scene.view_layers:
+            cycles_hair_shadow_groups.extend(
+                _cycles_hair_shadow_groups_for_view_layer(scene, view_layer)
+            )
     world = scene.world
     world_info = None
     if world:
@@ -3732,6 +4220,16 @@ def dump_scene(scene):
         world_info = {"name": world.name_full, "potter_id": world.get("potter.id"),
                       "library": library_reference(world), "color": color,
                       "background_color": background_color, "strength": strength,
+                      "sun_threshold": _rna_optional_float(world, "sun_threshold"),
+                      "sun_angle": _rna_optional_float(world, "sun_angle"),
+                      "use_sun_shadow": _rna_optional_bool(world, "use_sun_shadow"),
+                      "sun_shadow_maximum_resolution": _rna_optional_float(
+                          world, "sun_shadow_maximum_resolution"),
+                      "sun_shadow_jitter_overblur": _rna_optional_float(
+                          world, "sun_shadow_jitter_overblur"),
+                      "sun_shadow_filter_radius": _rna_optional_float(
+                          world, "sun_shadow_filter_radius"),
+                      "use_sun_shadow_jitter": _rna_optional_bool(world, "use_sun_shadow_jitter"),
                       "nodes": tree_dump(world.node_tree),
                       "custom_properties": custom_props(world), "fake_user": bool(world.use_fake_user),
                       "users": int(world.users)}
@@ -3747,6 +4245,7 @@ def dump_scene(scene):
         samples = int(scene.eevee.taa_render_samples)
     cycles = getattr(scene, "cycles", None)
     dicing_camera = getattr(cycles, "dicing_camera", None)
+    cycles_curves = getattr(scene, "cycles_curves", None)
     return {"name": scene.name_full, "potter_id": scene.get("potter.id"),
             "frame_current": float(scene.frame_current) + float(getattr(scene, "frame_subframe", 0.0)),
             "frame_start": int(scene.frame_start), "frame_end": int(scene.frame_end), "fps": int(scene.render.fps),
@@ -3775,17 +4274,23 @@ def dump_scene(scene):
                                                           "audio_codec", "PCM")),
                 "film_transparent": bool(scene.render.film_transparent),
                 "filter_size": float(scene.render.filter_size),
+                "use_high_quality_normals": getattr(scene.render, "use_high_quality_normals", None),
                 "engine": "path" if render_engine == "CYCLES" else "realtime",
                 "engine_native": render_engine,
                 "dicing_rate": float(getattr(cycles, "dicing_rate", 1.0)),
                 "preview_dicing_rate": float(getattr(cycles, "preview_dicing_rate", 8.0)),
                 "max_subdivisions": int(getattr(cycles, "max_subdivisions", 12)),
+                "cycles_curves_shape": (cycles_curves.shape.lower()
+                                        if cycles_curves is not None else None),
+                "cycles_curves_subdivisions": (int(cycles_curves.subdivisions)
+                                               if cycles_curves is not None else None),
                 "offscreen_dicing_scale": float(getattr(cycles, "offscreen_dicing_scale", 4.0)),
                 "dicing_camera": dicing_camera.name_full if dicing_camera else None,
                 "passes": _render_passes(scene),
                 "cryptomatte_accurate": _cryptomatte_accurate(scene),
                 "eevee_light_threshold": _eevee_light_threshold(scene),
                 "eevee_gi_cubemap_resolution": _eevee_gi_cubemap_resolution(scene),
+                **_eevee_raytracing_settings(scene),
                 "eevee_use_volumetric_shadows": _eevee_use_volumetric_shadows(scene),
                 "eevee_volumetric_tile_size": _eevee_volumetric_tile_size(scene),
                 "eevee_volumetric_samples": _eevee_volumetric_samples(scene),
@@ -3799,7 +4304,9 @@ def dump_scene(scene):
             "use_compositing": bool(getattr(scene.render, "use_compositing", False)),
             "compositor": _scene_compositor(scene),
             "color_management": _color_management_dump(scene),
+            "eevee_has_local_volume_probe_grids": _eevee_has_local_volume_probe_grids(scene),
             "view_layers": layers,
+            "cycles_hair_shadow_groups": cycles_hair_shadow_groups,
             "display_shading": _display_shading_dump(scene),
             "markers": [{"name": marker.name, "frame": int(marker.frame)} for marker in scene.timeline_markers],
             "rigid_body_world": _rigid_body_world_dump(scene),
@@ -3906,6 +4413,7 @@ def material_dump(material):
     emission_strength = 0.0
     transmission = 0.0
     ior = 1.5
+    raytrace_refraction = getattr(material, "use_raytrace_refraction", None)
     if material.use_nodes and material.node_tree:
         shader = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
         if shader:
@@ -3940,6 +4448,7 @@ def material_dump(material):
             "metallic": metallic, "roughness": roughness,
             "emission_color": emission_color, "emission_strength": emission_strength,
             "transmission": transmission, "ior": ior,
+            "use_raytrace_refraction": (bool(raytrace_refraction) if raytrace_refraction is not None else None),
             "thickness_mode": "slab" if getattr(material, "thickness_mode", "SPHERE") == "SLAB" else "sphere",
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
             "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
@@ -4066,6 +4575,7 @@ def dump_all():
                         "drivers": animation_drivers_dump(x, data_owner=True),
                         "library": library_reference(x), "type": x.type,
                         "color": plain(x.color), "energy": float(x.energy), "shadow_soft_size": float(x.shadow_soft_size),
+                        "use_shadow": getattr(x, "use_shadow", None),
                         "sun_angle": float(getattr(x, "angle", math.radians(0.526))),
                         "soft_falloff": bool(getattr(x, "use_soft_falloff", True)),
                         "use_multiple_importance_sampling": bool(x.cycles.use_multiple_importance_sampling),
@@ -6272,19 +6782,33 @@ def _restore_node_tree_interface(tree, raw, id_lookup, owner):
     socket_map = {}
     if interface is None:
         return socket_map
-    for direction, entries in (("INPUT", raw.get("interface", {}).get("inputs", [])),
-                               ("OUTPUT", raw.get("interface", {}).get("outputs", []))):
-        for entry in entries:
-            socket_type = entry.get("socket_type")
-            if not socket_type:
-                raise ValueError("%s has an interface socket without a socket type" % owner)
-            try:
-                socket = interface.new_socket(name=entry["name"], in_out=direction,
-                                              socket_type=socket_type)
-                socket_map[entry.get("id", "")] = socket.identifier
-            except Exception as error:
-                raise ValueError("%s cannot restore interface socket %s" %
-                                 (owner, entry.get("name", ""))) from error
+    interface_entries = [
+        ("INPUT", entry) for entry in raw.get("interface", {}).get("inputs", [])
+    ]
+    interface_entries.extend(
+        ("OUTPUT", entry) for entry in raw.get("interface", {}).get("outputs", [])
+    )
+    interface_ids = [entry.get("id") for _, entry in interface_entries]
+    if all(
+        isinstance(identifier, str)
+        and identifier.startswith("Socket_")
+        and identifier[7:].isascii()
+        and identifier[7:].isdigit()
+        for identifier in interface_ids
+    ) and len(set(interface_ids)) == len(interface_ids):
+        # Blender-generated interface identifiers encode creation order across both directions.
+        interface_entries.sort(key=lambda item: int(item[1]["id"][7:]))
+    for direction, entry in interface_entries:
+        socket_type = entry.get("socket_type")
+        if not socket_type:
+            raise ValueError("%s has an interface socket without a socket type" % owner)
+        try:
+            socket = interface.new_socket(name=entry["name"], in_out=direction,
+                                          socket_type=socket_type)
+            socket_map[entry.get("id", "")] = socket.identifier
+        except Exception as error:
+            raise ValueError("%s cannot restore interface socket %s" %
+                             (owner, entry.get("name", ""))) from error
     # A geometry graph with no declared outputs has an implicit Geometry output that its group output node links to.
     if tree.bl_idname == "GeometryNodeTree" and not raw.get("interface", {}).get("outputs"):
         socket = interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
@@ -6338,8 +6862,9 @@ def _restore_node_tree(tree, raw, id_lookup, owner, socket_map=None, group_socke
         return identifier
 
     nodes = {}
-    # Saved socket identifiers of Bake items, per node name, mapped to the identifiers Blender assigned.
+    # Saved dynamic socket identifiers, per node name, mapped to the identifiers Blender assigned.
     identifier_remaps = {}
+    input_socket_flag_sources = []
     for source in raw.get("nodes", []):
         try:
             node = tree.nodes.new(blender_node_type(source["type"], tree.bl_rna.identifier))
@@ -6352,11 +6877,17 @@ def _restore_node_tree(tree, raw, id_lookup, owner, socket_map=None, group_socke
             node.location = source["location"]
         node_properties = dict(source.get("properties", {}))
         menu_items = node_properties.pop("potter_menu_items", None)
+        menu_item_identifiers = node_properties.pop("potter_menu_item_identifiers", None)
+        if menu_item_identifiers is not None and menu_items is None:
+            raise ValueError("%s has menu item identifiers without menu items on node %s" %
+                             (owner, node.name))
         node_properties.pop("enum_items", None)
         group_tree_reference = (node_properties.pop("node_tree", None)
                                 if node.bl_idname in ("ShaderNodeGroup", "GeometryNodeGroup")
                                 else None)
         output_defaults = node_properties.pop("potter_output_defaults", [])
+        node_properties.pop("internal_links", None)
+        input_socket_flags = node_properties.pop("input_socket_flags", None)
         restore_curve_mapping = (
             node.bl_idname in _NODE_CURVE_MAPPING_TYPES and "mapping" in node_properties)
         curve_mapping_settings = (node_properties.pop("mapping")
@@ -6406,10 +6937,46 @@ def _restore_node_tree(tree, raw, id_lookup, owner, socket_map=None, group_socke
         if menu_items is not None:
             if node.bl_idname != "GeometryNodeMenuSwitch" or not isinstance(menu_items, list):
                 raise ValueError("%s has invalid menu items on node %s" % (owner, node.name))
-            for name in menu_items:
-                if not isinstance(name, str):
-                    raise ValueError("%s has invalid menu item on node %s" % (owner, node.name))
-                node.enum_items.new(name)
+            if any(not isinstance(name, str) for name in menu_items):
+                raise ValueError("%s has invalid menu item on node %s" % (owner, node.name))
+            if menu_item_identifiers is not None and (
+                    not isinstance(menu_item_identifiers, list)
+                    or len(menu_item_identifiers) != len(menu_items)
+                    or any(not isinstance(identifier, str) or not identifier
+                           for identifier in menu_item_identifiers)
+                    or len(set(menu_item_identifiers)) != len(menu_item_identifiers)):
+                raise ValueError("%s has invalid menu item identifiers on node %s" %
+                                 (owner, node.name))
+            items = node.enum_items
+            while len(items) > len(menu_items):
+                items.remove(items[len(items) - 1])
+            occupied_names = set(menu_items)
+            occupied_names.update(item.name for item in items)
+            for index in range(len(items)):
+                temporary_name = "\x01potter_menu_%d" % index
+                while temporary_name in occupied_names:
+                    temporary_name = "_" + temporary_name
+                occupied_names.add(temporary_name)
+                items[index].name = temporary_name
+            for index, name in enumerate(menu_items):
+                if index < len(items):
+                    items[index].name = name
+                else:
+                    items.new(name)
+            menu_sockets = [
+                socket for socket in node.inputs
+                if socket.identifier != "Menu" and socket.name
+            ]
+            if (len(menu_sockets) != len(menu_items)
+                    or any(socket.name != name
+                           for socket, name in zip(menu_sockets, menu_items))):
+                raise ValueError("%s cannot restore menu item sockets on node %s" %
+                                 (owner, node.name))
+            if menu_item_identifiers is not None:
+                identifier_remaps[node.name] = {
+                    source_id: socket.identifier
+                    for source_id, socket in zip(menu_item_identifiers, menu_sockets)
+                }
         set_id(node, source.get("potter_id"))
         custom_properties = dict(source.get("custom_properties", {}))
         if simple_material:
@@ -6443,6 +7010,8 @@ def _restore_node_tree(tree, raw, id_lookup, owner, socket_map=None, group_socke
                 raise ValueError("%s cannot restore input %s on node %s" %
                                  (owner, socket_source.get("name"), node.name)) from error
         nodes[node.name] = node
+        if input_socket_flags is not None:
+            input_socket_flag_sources.append((node, input_socket_flags))
     multi_input_links = {}
     for source in raw.get("links", []):
         from_node = nodes.get(source.get("from_node"))
@@ -6479,6 +7048,16 @@ def _restore_node_tree(tree, raw, id_lookup, owner, socket_map=None, group_socke
             links[index].swap_multi_input_sort_id(links[-index - 1])
     if tree.bl_idname == "GeometryNodeTree":
         _restore_node_tree_interface_defaults(tree, raw, id_lookup, owner, socket_map)
+    for node, socket_flags in input_socket_flag_sources:
+        for key, flags in socket_flags.items():
+            actual_key = identifier_remaps.get(node.name, {}).get(key, key)
+            socket = next((value for value in node.inputs
+                           if _node_socket_key(tree, node, value) == actual_key), None)
+            if socket is not None:
+                try:
+                    socket.hide_value = flags["hide_value"]
+                except Exception:
+                    pass
     return socket_map
 
 
@@ -9748,6 +10327,13 @@ def export_doc(doc, target, pack, scene_hash, context):
         scene.render.film_transparent = bool(render.get("film_transparent", False))
         scene.render.filter_size = float(render.get("filter_size", 1.5))
         scene.render.use_sequencer = bool(render.get("use_sequencer", False))
+        high_quality_normals = render.get("use_high_quality_normals")
+        if high_quality_normals is not None:
+            if type(high_quality_normals) is not bool:
+                raise ValueError("use_high_quality_normals must be a boolean or null")
+            if not hasattr(scene.render, "use_high_quality_normals"):
+                raise ValueError("Blender build does not expose RenderSettings.use_high_quality_normals")
+            scene.render.use_high_quality_normals = high_quality_normals
         available_engines = {
             item.identifier
             for item in scene.render.bl_rna.properties["engine"].enum_items
@@ -9770,6 +10356,23 @@ def export_doc(doc, target, pack, scene_hash, context):
             if "transparent_max_bounces" in render:
                 scene.cycles.transparent_max_bounces = int(render["transparent_max_bounces"])
         scene.render.engine = engine
+        cycles_curves = getattr(scene, "cycles_curves", None)
+        curve_shape = render.get("cycles_curves_shape")
+        if cycles_curves is not None:
+            if curve_shape is not None:
+                if curve_shape == "ribbons":
+                    cycles_curves.shape = "RIBBONS"
+                elif curve_shape == "thick":
+                    cycles_curves.shape = "THICK"
+                elif curve_shape == "thick_linear":
+                    cycles_curves.shape = "THICK_LINEAR"
+                else:
+                    raise ValueError("unsupported cycles_curves_shape: " + str(curve_shape))
+            curve_subdivisions = render.get("cycles_curves_subdivisions")
+            if curve_subdivisions is not None:
+                if type(curve_subdivisions) is not int or not 0 <= curve_subdivisions <= 24:
+                    raise ValueError("cycles_curves_subdivisions must be an integer in 0..24")
+                cycles_curves.subdivisions = curve_subdivisions
         if hasattr(scene, "cycles"):
             scene.cycles.blur_glossy = float(render.get("filter_glossy", 1.0))
             scene.cycles.dicing_rate = float(render.get("dicing_rate", 1.0))
@@ -9783,6 +10386,15 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.cycles.seed = int(render.get("seed", 0))
         elif hasattr(scene, "eevee"):
             scene.eevee.taa_render_samples = int(render.get("samples", 64))
+        resolution = render.get("eevee_gi_cubemap_resolution")
+        if resolution is not None:
+            if type(resolution) is not int or resolution not in (128, 256, 512, 1024, 2048, 4096):
+                raise ValueError("eevee_gi_cubemap_resolution must be a Blender enum value")
+            eevee = getattr(scene, "eevee", None)
+            if eevee is None or not hasattr(eevee, "gi_cubemap_resolution"):
+                raise ValueError("Blender build does not expose SceneEEVEE.gi_cubemap_resolution")
+            eevee.gi_cubemap_resolution = str(resolution)
+
         if hasattr(scene, "eevee"):
             scene.eevee.light_threshold = float(render.get("eevee_light_threshold", 0.01))
             scene.eevee.use_volumetric_shadows = bool(render.get("eevee_use_volumetric_shadows", False))
@@ -9798,6 +10410,86 @@ def export_doc(doc, target, pack, scene_hash, context):
             )
             scene.eevee.volumetric_start = float(render.get("eevee_volumetric_start", 0.1))
             scene.eevee.volumetric_end = float(render.get("eevee_volumetric_end", 100.0))
+
+        eevee = getattr(scene, "eevee", None)
+        raytracing = getattr(eevee, "ray_tracing_options", None) if eevee is not None else None
+        raytracing_values = {
+            "eevee_raytracing_resolution_scale": (raytracing, "resolution_scale", True),
+            "eevee_raytracing_screen_trace_quality": (raytracing, "screen_trace_quality", False),
+            "eevee_raytracing_screen_trace_thickness": (raytracing, "screen_trace_thickness", False),
+            "eevee_raytracing_trace_max_roughness": (raytracing, "trace_max_roughness", False),
+            "eevee_raytracing_use_backface_hit": (raytracing, "use_backface_hit", False),
+            "eevee_raytracing_backface_radiance_scale": (raytracing, "backface_radiance_scale", False),
+            "eevee_raytracing_use_denoise": (raytracing, "use_denoise", False),
+            "eevee_raytracing_denoise_spatial": (raytracing, "denoise_spatial", False),
+            "eevee_raytracing_denoise_temporal": (raytracing, "denoise_temporal", False),
+            "eevee_raytracing_denoise_bilateral": (raytracing, "denoise_bilateral", False),
+        }
+        for key, (owner, prop, enum_value) in raytracing_values.items():
+            value = render.get(key)
+            if value is None:
+                continue
+            if owner is None or not hasattr(owner, prop):
+                raise ValueError("Blender build does not expose RaytraceEEVEE." + prop)
+            if enum_value:
+                if type(value) is not int or value not in (1, 2, 4, 8, 16):
+                    raise ValueError(key + " must be 1, 2, 4, 8, or 16")
+                value = str(value)
+            elif type(value) is bool:
+                pass
+            elif type(value) is int or type(value) is float:
+                value = float(value)
+            else:
+                raise ValueError(key + " has the wrong type")
+            setattr(owner, prop, value)
+
+        eevee_values = {
+            "eevee_use_raytracing": ("use_raytracing", "bool"),
+            "eevee_use_fast_gi": ("use_fast_gi", "bool"),
+            "eevee_raytracing_method": ("ray_tracing_method", "ray_method"),
+            "eevee_fast_gi_bias": ("fast_gi_bias", "float"),
+            "eevee_fast_gi_resolution": ("fast_gi_resolution", "resolution"),
+            "eevee_fast_gi_step_count": ("fast_gi_step_count", "int"),
+            "eevee_fast_gi_ray_count": ("fast_gi_ray_count", "int"),
+            "eevee_fast_gi_quality": ("fast_gi_quality", "float"),
+            "eevee_fast_gi_distance": ("fast_gi_distance", "float"),
+            "eevee_fast_gi_thickness_near": ("fast_gi_thickness_near", "float"),
+            "eevee_fast_gi_method": ("fast_gi_method", "fast_gi_method"),
+            "eevee_clamp_surface_indirect": ("clamp_surface_indirect", "float"),
+        }
+        for key, (prop, kind) in eevee_values.items():
+            value = render.get(key)
+            if value is None:
+                continue
+            if eevee is None or not hasattr(eevee, prop):
+                raise ValueError("Blender build does not expose SceneEEVEE." + prop)
+            if kind == "bool":
+                if type(value) is not bool:
+                    raise ValueError(key + " must be a boolean")
+            elif kind in ("resolution", "int"):
+                if type(value) is not int:
+                    raise ValueError(key + " must be an integer")
+                if kind == "resolution":
+                    if value not in (1, 2, 4, 8, 16):
+                        raise ValueError(key + " must be 1, 2, 4, 8, or 16")
+                    value = str(value)
+                elif key == "eevee_fast_gi_step_count" and not 1 <= value <= 64:
+                    raise ValueError(key + " must be in 1..=64")
+                elif key == "eevee_fast_gi_ray_count" and not 1 <= value <= 16:
+                    raise ValueError(key + " must be in 1..=16")
+            elif kind == "float":
+                if type(value) not in (int, float):
+                    raise ValueError(key + " must be a number")
+                value = float(value)
+            elif kind == "ray_method":
+                if value not in ("probe", "screen"):
+                    raise ValueError(key + " must be probe or screen")
+                value = value.upper()
+            elif kind == "fast_gi_method":
+                if value not in ("ambient_occlusion_only", "global_illumination"):
+                    raise ValueError(key + " must be ambient_occlusion_only or global_illumination")
+                value = "AMBIENT_OCCLUSION_ONLY" if value == "ambient_occlusion_only" else "GLOBAL_ILLUMINATION"
+            setattr(eevee, prop, value)
         unit = item.get("unit", {})
         try:
             scene.unit_settings.system = unit.get("system", "metric").upper()
@@ -10074,6 +10766,8 @@ def export_doc(doc, target, pack, scene_hash, context):
             light.color = raw.get("color", [1.0, 1.0, 1.0])
             light.energy = raw.get("energy", 1000.0)
             light.shadow_soft_size = raw.get("radius", 0.1)
+            if raw.get("use_shadow") is not None:
+                light.use_shadow = raw["use_shadow"]
             if raw.get("light_type") == "sun":
                 light.angle = float(raw.get("sun_angle", math.radians(0.526)))
             if raw.get("light_type") in ("point", "spot"):
@@ -10107,6 +10801,23 @@ def export_doc(doc, target, pack, scene_hash, context):
             continue
         world = bpy.data.worlds.new(compatibility_name(doc, "World", world_id, world_id))
         world.color = item["color"]
+        threshold = item.get("eevee_sun_threshold")
+        if threshold is not None:
+            if not hasattr(world, "sun_threshold"):
+                raise RuntimeError("Blender World.sun_threshold is unavailable")
+            world.sun_threshold = float(threshold)
+        for field, property_name in (
+                ("eevee_sun_angle", "sun_angle"),
+                ("eevee_use_sun_shadow", "use_sun_shadow"),
+                ("eevee_sun_shadow_maximum_resolution", "sun_shadow_maximum_resolution"),
+                ("eevee_sun_shadow_jitter_overblur", "sun_shadow_jitter_overblur"),
+                ("eevee_sun_shadow_filter_radius", "sun_shadow_filter_radius"),
+                ("eevee_use_sun_shadow_jitter", "use_sun_shadow_jitter")):
+            value = item.get(field)
+            if value is not None:
+                if not hasattr(world, property_name):
+                    raise RuntimeError(f"Blender World.{property_name} is unavailable")
+                setattr(world, property_name, value)
         world.use_nodes = True
         source = compatibility_block(doc, "worlds", "World", world_id)
         set_id(world.node_tree, item.get("node_tree"))
@@ -10137,6 +10848,10 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.roughness = viewport["roughness"] if viewport else item["roughness"]
         mat.metallic = viewport["metallic"] if viewport else item["metallic"]
         mat.use_backface_culling = not bool(item.get("double_sided", True))
+        if item.get("use_raytrace_refraction") is not None:
+            _set_required(
+                mat, "use_raytrace_refraction", item["use_raytrace_refraction"],
+                "material " + item["name"])
         mat.use_transparent_shadow = bool(item.get("use_transparent_shadow", True))
         mat.cycles.use_bump_map_correction = bool(item.get("use_bump_map_correction", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
@@ -10907,6 +11622,17 @@ def export_doc(doc, target, pack, scene_hash, context):
     for obj in object_map.values():
         _ensure_multires_sculpt_layers(obj)
 
+    # Preserve registered Blender IDs that have no real users when the file is saved.
+    for registry, blocks in (
+            (doc.get("materials", {}), material_map),
+            (doc.get("worlds", {}), world_map),
+            (doc.get("node_groups", {}), group_map)):
+        for identifier in registry:
+            block = blocks.get(identifier)
+            if (block is not None and getattr(block, "library", None) is None
+                    and getattr(block, "users", 0) == 0
+                    and hasattr(block, "use_fake_user") and not block.use_fake_user):
+                block.use_fake_user = True
     output_dir = os.path.dirname(os.path.abspath(target))
     os.makedirs(output_dir, exist_ok=True)
     if pack:

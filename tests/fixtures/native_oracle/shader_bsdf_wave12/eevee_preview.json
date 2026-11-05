@@ -1,0 +1,201 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "engine": "BLENDER_EEVEE",
+  "resolution": [
+    192,
+    192
+  ],
+  "samples": 64,
+  "seed": 17,
+  "linear_exr": "eevee_preview.exr",
+  "cases": [
+    {
+      "name": "toon_diffuse_eevee",
+      "mode": {
+        "component": "DIFFUSE"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Size": 0.38,
+        "Smooth": 0.17,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        20,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        3.2825520833333335,
+        0.6060655381944444,
+        0.1832004123263889,
+        1.0
+      ],
+      "normal_linked": true
+    },
+    {
+      "name": "toon_glossy_eevee",
+      "mode": {
+        "component": "GLOSSY"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Size": 0.38,
+        "Smooth": 0.17,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        50,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        3.508029513888889,
+        0.7784830729166666,
+        0.2603895399305556,
+        1.0
+      ],
+      "normal_linked": true
+    },
+    {
+      "name": "hair_eevee",
+      "mode": {
+        "component": "Transmission"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Offset": 0.037,
+        "RoughnessU": 0.24,
+        "RoughnessV": 0.51,
+        "Tangent": [
+          1.0,
+          0.15,
+          0.0
+        ]
+      },
+      "probe": [
+        80,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        3.1460503472222223,
+        0.8378363715277778,
+        0.3164605034722222,
+        1.0
+      ]
+    },
+    {
+      "name": "principled_hair_eevee",
+      "mode": {
+        "model": "HUANG",
+        "parametrization": "ABSORPTION"
+      },
+      "inputs": {
+        "Color": [
+          0.34,
+          0.12,
+          0.07,
+          1.0
+        ],
+        "Tint": [
+          0.88,
+          0.54,
+          0.31,
+          1.0
+        ],
+        "Melanin": 0.52,
+        "Melanin Redness": 0.64,
+        "Absorption Coefficient": [
+          0.31,
+          0.73,
+          1.27
+        ],
+        "Aspect Ratio": 0.73,
+        "Roughness": 0.34,
+        "Radial Roughness": 0.29,
+        "Coat": 0.23,
+        "IOR": 1.48,
+        "Offset": 0.031,
+        "Random Color": 0.12,
+        "Random Roughness": 0.14,
+        "Random": 0.37,
+        "Reflection": 0.83,
+        "Transmission": 0.71,
+        "Secondary Reflection": 0.62,
+        "Tangent": [
+          1.0,
+          0.15,
+          0.0
+        ]
+      },
+      "probe": [
+        110,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        0.039313422309027776,
+        0.010861714680989584,
+        0.004596710205078125,
+        1.0
+      ]
+    },
+    {
+      "name": "ray_portal_eevee",
+      "mode": {},
+      "inputs": {
+        "Color": [
+          0.92,
+          0.87,
+          0.73,
+          1.0
+        ],
+        "Position": [
+          0.0,
+          0.0,
+          2.0
+        ],
+        "Direction": [
+          0.684,
+          0.0,
+          -0.73
+        ]
+      },
+      "probe": [
+        140,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        0.2429470486111111,
+        0.05923122829861111,
+        0.3850368923611111,
+        1.0
+      ]
+    }
+  ]
+}

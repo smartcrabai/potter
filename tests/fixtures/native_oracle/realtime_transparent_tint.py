@@ -6,16 +6,17 @@ Which buffers keep it depends on the material's render method:
 - BLENDED: `ForwardPipeline::use_colored_transparency` is set by `GPU_MATFLAG_TRANSPARENT_MAYBE_COLORED`, so the forward
   pass keeps the transmittance per channel and `eevee_forward_resolve.bsl.hh` multiplies the background by it channel
   by channel. A pixel behind the pane is the background times the Color.
-- DITHERED (Blender's default): the deferred pass dithers the surface and stores one alpha, `1 - average(transmittance)`
-  (`eevee_surf_deferred.bsl.hh`, `out_color.a`). A pixel behind the pane is the background times the Color's mean.
+- DITHERED (Blender's default): the depth prepass discards each sample when average(transmittance) is greater than the
+  hashed threshold from primitive-interpolated world position (`eevee_surf_depth.bsl.hh`,
+  `eevee_transparency.bsl.hh`). The final-render hash scale is 0.1 and its threshold gets a per-sample base-7 Halton
+  offset. A discarded sample passes the background unchanged; a kept pure-Transparent fragment shades black.
 
 The backdrop is an emitter of strength 1 with a black base, so its radiance is exactly 1 and needs no light, and no
 shadow tints it a second time. The pane is a Transparent BSDF with the Color `TINT` as its only closure, covering the
 whole frame one unit above the backdrop.
 
-Arguments after `--`: blend_out, image_out, json_out, method (BLENDED or DITHERED), an optional render flag (default 1),
-and an optional shift of the whole scene along y (default 0). With the render flag 0 the generator writes only the .blend,
-so the test needs no render for the scene.
+Arguments after `--`: blend_out, image_out, json_out, method (BLENDED, MIX, or DITHERED), an optional render flag (default 1),
+and an optional shift of the whole scene along y (default 0). With the render flag 0 the generator writes only the .blend.
 """
 
 import json

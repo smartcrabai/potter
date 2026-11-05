@@ -1,10 +1,21 @@
 pub mod raster;
 
 mod bvh;
+mod eevee_advanced_bsdf;
+mod eevee_blue_noise;
+mod eevee_blue_noise_ba;
+mod eevee_blue_noise_green;
+mod eevee_fast_gi;
 mod eevee_ltc;
+mod eevee_raytrace;
+mod eevee_raytrace_denoise;
+mod eevee_raytrace_generate;
 mod eevee_transmission;
 mod eevee_transmission_tables;
 mod eevee_volume_resolve;
+mod hair_bsdf;
+mod hair_geometry;
+mod hair_intersect;
 mod light_model;
 mod path;
 mod pick;

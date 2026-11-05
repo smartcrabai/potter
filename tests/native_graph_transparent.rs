@@ -30,8 +30,8 @@ use native_oracle::{
     TestResult, apply_operations, checked, import_blend, pot, read_scene, run_blender_arguments,
     write_script,
 };
-use potter_core::image::{ImageData, ImageInterpolation, load_image_data, sample};
-use potter_core::model::Image;
+use potter_core::image::{ImageData, ImageInterpolation, decode_pixels, load_image_data, sample};
+use potter_core::model::{Image, ImageColorspace};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
@@ -158,6 +158,13 @@ fn assert_patch_matches(actual: &[f64], wanted: &[f64], renderer: &str) {
     }
 }
 
+fn center_exr_alpha(blend: &Path) -> TestResult<f64> {
+    let exr = blend.with_file_name("blender.exr");
+    let (width, height, pixels) = decode_pixels(&fs::read(exr)?, ImageColorspace::Linear)?;
+    assert_eq!((width, height), (64, 64));
+    Ok(pixels[32 * 64 + 32][3])
+}
+
 #[test]
 fn dithered_graph_transparency_matches_cycles_in_the_path_tracer() -> TestResult {
     let Some(blender) = blender_executable() else {
@@ -253,6 +260,16 @@ fn a_tinted_transparent_bsdf_tints_camera_and_shadow_rays_as_cycles_does() -> Te
     let (project, _) = import_scene(&blender, root.path(), &blend)?;
     let frame = potter_frame(&project, root.path(), "path", &[])?;
     assert_patch_matches(&patch_mean(&frame), &wanted, "Cycles");
+    let blender_alpha = center_exr_alpha(&blend)?;
+    assert_eq!(
+        blender_alpha, 1.0,
+        "Blender's opaque floor must own film alpha"
+    );
+    assert_eq!(
+        sample(&frame, [0.5, 0.5], false)[3],
+        blender_alpha,
+        "a tinted Transparent pass ending at the opaque floor must remain opaque"
+    );
     Ok(())
 }
 
@@ -364,26 +381,19 @@ fn an_opaque_textured_gltf_material_keeps_its_base_alpha_out_of_its_graph() -> T
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
 
-    // Film alpha is 1 where the triangle is hit and 0 elsewhere, so every covered pixel must be opaque.
+    // These camera-ray pixel centers lie inside the unit triangle; only its silhouette has fractional sample coverage.
     let frame = potter_frame(&project, directory.path(), "opaque", &[])?;
-    let mut covered = Vec::new();
-    for row in 0..64 {
-        for column in 0..64 {
-            let u = (f64::from(column) + 0.5) / 64.0;
-            let v = (f64::from(row) + 0.5) / 64.0;
-            let alpha = sample(&frame, [u, v], false)[3];
-            if alpha > 0.01 {
-                covered.push(alpha);
-            }
-        }
+    for (column, row) in [(37_u32, 26_u32), (46, 26), (37, 17)] {
+        let uv = [
+            (f64::from(column) + 0.5) / 64.0,
+            (f64::from(row) + 0.5) / 64.0,
+        ];
+        let alpha = sample(&frame, uv, false)[3];
+        assert_eq!(
+            alpha.to_bits(),
+            1.0_f64.to_bits(),
+            "OPAQUE base alpha must not reduce interior alpha at {uv:?}"
+        );
     }
-    assert!(
-        !covered.is_empty(),
-        "the triangle must cover part of the frame"
-    );
-    assert!(
-        covered.iter().all(|alpha| *alpha > 0.99),
-        "an OPAQUE material must render opaque; covered alphas are {covered:?}"
-    );
     Ok(())
 }

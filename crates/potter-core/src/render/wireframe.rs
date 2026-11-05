@@ -924,6 +924,7 @@ mod oracle_tests {
             layer_uvs: Vec::new(),
             layer_tangents: Vec::new(),
             normals: None,
+            smooth_shading: false,
             layer_colors: Vec::new(),
             lit_per_pixel: false,
             ray_mask: crate::model::RayVisibility::default().mask(),

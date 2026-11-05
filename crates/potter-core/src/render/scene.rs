@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use glam::{DMat3, DMat4, DVec3};
+use glam::{DMat3, DMat4, DVec3, Mat3, Vec3};
 use serde::Serialize;
 
 use crate::{
@@ -17,22 +17,41 @@ use crate::{
         uv_layers::{self, UvStore},
     },
     image::ImageData,
-    model::{Id, Material, Node, RayKind, RayVisibility, SceneDoc},
+    model::{
+        CyclesCurveShape, CyclesHairShadowGeometryKey, CyclesHairShadowGroup,
+        CyclesHairShadowMember, Id, LightData, LightType, Material, Node, RayKind, RayVisibility,
+        SceneDoc, World,
+    },
+    render::eevee_advanced_bsdf::{
+        MAX_EEVEE_SUBSURFACE_CLOSURES, eevee_brdf_f82_tint_lut, eevee_gbuffer_closure_color,
+    },
     shader::{
-        BsdfParams, EvaluatorWorkspace, GeometryAttribute, GeometryAttributeValues, HitContext,
-        HitUvLayers, PreparedMaterial, ShaderClosure, SurfaceShading, dielectric_f0,
-        evaluate_displacement_with_workspace_semantics, evaluate_surface_with_workspace_semantics,
+        BsdfModel, BsdfParams, EEVEE_CLOSURE_DIFFUSE, EEVEE_CLOSURE_EMISSION,
+        EEVEE_CLOSURE_REFLECTION, EEVEE_CLOSURE_REFRACTION, EEVEE_CLOSURE_SHADER_TO_RGBA,
+        EEVEE_CLOSURE_SUBSURFACE, EEVEE_CLOSURE_TRANSLUCENT, EEVEE_CLOSURE_TRANSPARENCY,
+        EeveeGBufferBin, EeveeGBufferCandidate, EeveeGBufferLayout, EeveeGBufferLobe,
+        EeveeGBufferMode, EvaluatorWorkspace, GeometryAttribute, GeometryAttributeValues,
+        GlassDistribution, HitContext, HitFootprint, HitUvLayers, PreparedMaterial, ShaderClosure,
+        SurfaceShading, dielectric_f0, evaluate_displacement_with_workspace_semantics,
+        evaluate_surface_with_workspace, evaluate_surface_with_workspace_semantics,
         fill_color_layers, heaviest, make_orthonormals,
     },
 };
 
-use super::world_probe::WorldProbe;
+use super::eevee_advanced_bsdf::{
+    EeveeGBufferContext, EeveeSubsurfaceClosure, EeveeSubsurfaceSample, eevee_gbuffer_ior,
+    eevee_gbuffer_normal, eevee_gbuffer_roughness, eevee_gbuffer_thickness, eevee_holdout_weight,
+    eevee_metallic_brdf, eevee_subsurface_gbuffer_profile, eevee_subsurface_radius,
+};
+use super::eevee_fast_gi::FastGiSh;
+use super::eevee_raytrace::EeveeRayTracingSettings;
+use super::eevee_raytrace_generate::{RayGenerateInput, RayLobe, RayThickness, ThicknessMode};
+use super::hair_intersect::{HairBvh, HairCurveRenderMode};
+use super::world_probe::{EeveeWorldSun, WorldProbe, WorldProbeMode};
 use super::{
     bvh::{Bvh, BvhHit, WalkRay},
     eevee_ltc::Emitter,
-    eevee_transmission::{
-        self, GlassClosures, GlassLight, Thickness, irradiance_probe_radiance, probe_radiance,
-    },
+    eevee_transmission::{self, GlassClosures, GlassLight, Thickness, irradiance_probe_radiance},
     light_model::{
         AreaShape, area_irradiance_per_radiance, area_radiance, area_shape,
         area_visibility_samples, emitter_radiance, local_light_influence, point_intensity,
@@ -44,8 +63,10 @@ use super::{
         thin_subsurface_transmission_weight, without_subsurface,
     },
     raster::{
-        AlphaMode, Line, Mode, SurfaceHit, SurfaceSample, SurfaceShader, SurfaceShaderWorker,
-        Triangle, ViewBasis, ambient_visibility, blend_color, blend_corner_normals, blend_uv,
+        AlphaMode, EeveeDitherSample, EeveeRaytraceBin, EeveeRaytraceFeedback,
+        EeveeRaytraceLayerFlags, EeveeRaytraceLayerSummary, EeveeRaytraceSample, Line, Mode,
+        SurfaceHit, SurfaceSample, SurfaceShader, SurfaceShaderWorker, Triangle, ViewBasis,
+        ambient_visibility, blend_color, blend_corner_normals, blend_uv,
     },
     studio,
     wireframe::{PointSphere, WireEdge, WireEdgeBuilder, WirePoint},
@@ -105,6 +126,8 @@ pub(super) struct MaterialColors {
 #[derive(Clone, Debug)]
 struct MaterialColor {
     material_index: usize,
+    /// Identifies the cached prepared material for deferred-layer closure-flag reuse.
+    material_id: Option<Id>,
     material_pass_index: Option<f64>,
     render_layer: Option<usize>,
     available_mask: Option<Arc<[u64]>>,
@@ -115,22 +138,34 @@ impl MaterialColors {
     fn insert(
         &mut self,
         material_index: usize,
+        material_id: Option<&Id>,
         material_pass_index: Option<f64>,
         render_layer: Option<usize>,
         available_mask: Option<Arc<[u64]>>,
     ) {
-        let entry = MaterialColor {
-            material_index,
-            material_pass_index,
-            render_layer,
-            available_mask,
-        };
         match self
             .entries
             .binary_search_by_key(&material_index, |stored| stored.material_index)
         {
-            Ok(position) => self.entries[position] = entry,
-            Err(position) => self.entries.insert(position, entry),
+            Ok(position) => {
+                let entry = &mut self.entries[position];
+                if entry.material_id.is_none() {
+                    entry.material_id = material_id.cloned();
+                }
+                entry.material_pass_index = material_pass_index;
+                entry.render_layer = render_layer;
+                entry.available_mask = available_mask;
+            }
+            Err(position) => self.entries.insert(
+                position,
+                MaterialColor {
+                    material_index,
+                    material_id: material_id.cloned(),
+                    material_pass_index,
+                    render_layer,
+                    available_mask,
+                },
+            ),
         }
     }
 
@@ -157,10 +192,22 @@ pub(super) struct ElementRecord {
     pub uv_available_mask: Option<u8>,
 }
 
+pub(super) struct HairCurveInstance {
+    pub curve: super::hair_intersect::HairCurveGeometry,
+    pub point_normals: super::hair_geometry::HairCurvePointNormals,
+    pub shadow_transparency: Arc<super::hair_geometry::HairCurveShadowTransparency>,
+    pub material_index: usize,
+    pub object_index: u32,
+    pub element_index: u32,
+    pub curve_random: Option<f64>,
+    pub ray_mask: u8,
+}
+
 pub(super) struct Geometry {
+    pub hair_curve_instances: Vec<HairCurveInstance>,
+    pub hair_curve_bvh: HairBvh,
     pub triangles: Vec<Triangle>,
     pub lines: Vec<Line>,
-    /// Mesh edges for the wireframe preview, each once; empty outside Wire.
     pub wire_edges: Vec<WireEdge>,
     /// Loose vertices of a mesh with no edges or faces, and point-cloud points, for the wireframe preview.
     pub wire_points: Vec<WirePoint>,
@@ -422,6 +469,752 @@ fn shadow_origin(point: DVec3, normal: DVec3, direction: DVec3) -> DVec3 {
     point + normal * (side * SHADOW_EPSILON)
 }
 
+fn cycles_hash_uint2(kx: u32, ky: u32) -> u32 {
+    let mut a = 0xdead_beef_u32.wrapping_add((2 << 2) + 13);
+    let mut b = a;
+    let mut c = a;
+    a = a.wrapping_add(kx);
+    b = b.wrapping_add(ky);
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(14));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(11));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(25));
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(16));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(4));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(14));
+    c ^= b;
+    c.wrapping_sub(b.rotate_left(24))
+}
+
+fn cycles_curve_random(curve_index: usize) -> Option<f64> {
+    let index = u32::try_from(curve_index).ok()?;
+    let random = cycles_hash_uint2(index, 0);
+    Some(f64::from((random as f32) * (1.0_f32 / u32::MAX as f32)))
+}
+
+fn hair_curve_geometry_error(
+    node_id: &Id,
+    error: &super::hair_geometry::HairCurveGeometryError,
+) -> PotError {
+    use super::hair_geometry::HairCurveGeometryError;
+
+    match error {
+        HairCurveGeometryError::Attribute(attribute) => PotError::new(
+            ErrorCode::SceneInvalid,
+            format!("hair curve attribute {attribute} is invalid"),
+        ),
+        HairCurveGeometryError::Curve(curve_index) => PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "hair curve spline data is invalid",
+            serde_json::json!({
+                "feature_id":"render.hair.curve_data",
+                "node_id":node_id.as_str(),
+                "curve_index":curve_index,
+            }),
+        ),
+        HairCurveGeometryError::Transform => PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "path-traced hair requires an invertible affine object transform",
+            serde_json::json!({
+                "feature_id":"render.hair.object_transform",
+                "node_id":node_id.as_str(),
+            }),
+        ),
+    }
+}
+struct HairCurveBakeObject {
+    node_id: Id,
+    object_to_world: DMat4,
+    world_to_local: Option<DMat4>,
+    object_color: [f64; 4],
+    object_pass_index: f64,
+    object_random_number: Option<f64>,
+}
+
+impl HairCurveBakeObject {
+    fn from_record(object: &ObjectRecord) -> Self {
+        Self {
+            node_id: object.node_id.clone(),
+            object_to_world: object.object_to_world,
+            world_to_local: object.world_to_local,
+            object_color: object.object_color,
+            object_pass_index: object.object_pass_index,
+            object_random_number: object.object_random_number,
+        }
+    }
+
+    fn from_live_node(doc: &SceneDoc, snapshot: &Snapshot, node_id: &Id) -> Result<Self> {
+        let node = doc.nodes.get(node_id).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "Cycles Hair representative node is missing",
+            )
+        })?;
+        let evaluated = snapshot.nodes.get(node_id).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "Cycles Hair representative transform is missing",
+            )
+        })?;
+        let object_to_world = DMat4::from_cols_array(&evaluated.world_matrix);
+        let world_to_local = object_inverse(object_to_world).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Cycles Hair shadow bake requires an invertible representative transform",
+                serde_json::json!({
+                    "feature_id":"render.hair.object_transform",
+                    "node_id":node_id.as_str(),
+                }),
+            )
+        })?;
+        let object_color = object_info_color(node);
+        if object_color.iter().any(|value| !value.is_finite()) {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "Cycles Hair representative Object Info color is non-finite",
+                serde_json::json!({
+                    "feature_id":"render.hair.shadow_cache_provenance",
+                    "node_id":node_id.as_str(),
+                }),
+            ));
+        }
+        Ok(Self {
+            node_id: node_id.clone(),
+            object_to_world,
+            world_to_local: Some(world_to_local),
+            object_color,
+            object_pass_index: object_info_pass_index(node),
+            object_random_number: Some(f64::from(crate::blender_rng::cycles_object_random_number(
+                &node.name,
+            ))),
+        })
+    }
+
+    fn from_member_context(member: &crate::model::CyclesHairShadowMember) -> Result<Self> {
+        let node_id = &member.instance.real_object_node_id;
+        let matrix = cycles_hair_object_matrix(member.object_to_world);
+        if matrix
+            .to_cols_array()
+            .iter()
+            .any(|value| !value.is_finite())
+            || member.object_color.iter().any(|value| !value.is_finite())
+        {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "Cycles Hair member context contains non-finite object data",
+                serde_json::json!({
+                    "feature_id":"render.hair.shadow_cache_provenance",
+                    "node_id":node_id.as_str(),
+                }),
+            ));
+        }
+        let world_to_local = object_inverse(matrix).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Cycles Hair member context requires an invertible object transform",
+                serde_json::json!({
+                    "feature_id":"render.hair.object_transform",
+                    "node_id":node_id.as_str(),
+                }),
+            )
+        })?;
+        Ok(Self {
+            node_id: node_id.clone(),
+            object_to_world: matrix,
+            world_to_local: Some(world_to_local),
+            object_color: member.object_color,
+            object_pass_index: f64::from(member.object_pass_index),
+            object_random_number: Some(f64::from(
+                crate::blender_rng::cycles_object_random_number_from_signed_id(
+                    member.object_random_id,
+                ),
+            )),
+        })
+    }
+}
+
+fn cycles_hair_object_matrix(rows: [[f64; 4]; 4]) -> DMat4 {
+    DMat4::from_cols_array(&[
+        rows[0][0], rows[1][0], rows[2][0], rows[3][0], rows[0][1], rows[1][1], rows[2][1],
+        rows[3][1], rows[0][2], rows[1][2], rows[2][2], rows[3][2], rows[0][3], rows[1][3],
+        rows[2][3], rows[3][3],
+    ])
+}
+type CyclesHairMemberIndices = BTreeMap<usize, BTreeMap<Id, Vec<usize>>>;
+
+fn cycles_hair_shadow_group_index(
+    scene: &crate::model::Scene,
+    snapshot: &Snapshot,
+    node_id: &Id,
+    data_id: Option<&Id>,
+    member_indices: &CyclesHairMemberIndices,
+) -> Result<Option<usize>> {
+    let Some(groups) = scene.cycles_hair_shadow_groups.as_deref() else {
+        return Ok(None);
+    };
+    let mut first: Option<usize> = None;
+    for (index, group) in groups.iter().enumerate() {
+        if snapshot
+            .view_layer
+            .as_ref()
+            .is_some_and(|view_layer| &group.view_layer_id != view_layer)
+            || !member_indices
+                .get(&index)
+                .is_some_and(|members| members.contains_key(node_id))
+        {
+            continue;
+        }
+        let geometry_matches = match &group.geometry_key {
+            CyclesHairShadowGeometryKey::Data {
+                data_id: Some(source_data_id),
+            } => data_id == Some(source_data_id),
+            CyclesHairShadowGeometryKey::Data { data_id: None } => true,
+            CyclesHairShadowGeometryKey::Object {
+                node_id: object_node_id,
+            } => object_node_id == node_id,
+        };
+        if !geometry_matches {
+            continue;
+        }
+        if let Some(first_index) = first {
+            if !equivalent_cycles_hair_shadow_groups(&groups[first_index], group) {
+                return Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    "multiple distinct Cycles Hair shadow groups match the current object context",
+                    serde_json::json!({
+                        "feature_id":"render.hair.shadow_cache_provenance",
+                        "node_id":node_id.as_str(),
+                        "view_layers":[
+                            groups[first_index].view_layer_id.as_str(),
+                            group.view_layer_id.as_str(),
+                        ],
+                    }),
+                ));
+            }
+        } else {
+            first = Some(index);
+        }
+    }
+    let Some(first) = first else {
+        if member_indices
+            .values()
+            .any(|members| members.contains_key(node_id))
+        {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Cycles Hair shadow provenance no longer matches the current node data",
+                serde_json::json!({
+                    "feature_id":"render.hair.shadow_cache_provenance",
+                    "node_id":node_id.as_str(),
+                    "data_id":data_id.map(Id::as_str),
+                }),
+            ));
+        }
+        return Ok(None);
+    };
+    Ok(Some(first))
+}
+
+fn equivalent_cycles_hair_shadow_groups(
+    left: &CyclesHairShadowGroup,
+    right: &CyclesHairShadowGroup,
+) -> bool {
+    left.geometry_key == right.geometry_key
+        && left.representative_node_id == right.representative_node_id
+        && left.member_node_ids == right.member_node_ids
+        && left.members == right.members
+        && left.source_curve_indices == right.source_curve_indices
+        && left.evaluated_hair_curves == right.evaluated_hair_curves
+        && left.source_input_fingerprint == right.source_input_fingerprint
+}
+
+/// Cycles uses an object-keyed Hair geometry cache for modified objects, metaballs, or object-linked material slots.
+fn cycles_hair_geometry_key_is_object(
+    node: &Node,
+    data_block: Option<&crate::model::DataBlock>,
+) -> bool {
+    data_block.is_some_and(|data| data.data_type == "metaball")
+        || node
+            .modifiers
+            .iter()
+            .any(|modifier| modifier.is_active(crate::eval::EvaluationPurpose::Render))
+        || (0..crate::model::material_slot_count(
+            node.materials.len(),
+            data_block.map_or(0, |data| data.materials.len()),
+        ))
+            .any(|slot| {
+                crate::model::material_link_at(node.materials.len(), &node.material_links, slot)
+                    == crate::model::MaterialLink::Object
+            })
+}
+
+struct HairPathMember {
+    object_index: u32,
+    material_index: usize,
+    ray_mask: u8,
+    prepared_curves: Vec<Option<super::hair_geometry::PreparedHairCurve>>,
+}
+
+fn append_hair_instance_object(
+    objects: &mut Vec<ObjectRecord>,
+    base_object_index: u32,
+    member: &CyclesHairShadowMember,
+    material_index: usize,
+    materials: &[Material],
+    force_context: bool,
+) -> Result<u32> {
+    if !member.instance.is_instance && !force_context {
+        return Ok(base_object_index);
+    }
+    let base_index = usize::try_from(base_object_index.checked_sub(1).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "hair base object index is invalid",
+        )
+    })?)
+    .map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "hair object index exceeds platform limits",
+        )
+    })?;
+    let object_to_world = cycles_hair_object_matrix(member.object_to_world);
+    if !object_to_world
+        .to_cols_array()
+        .iter()
+        .all(|value| value.is_finite())
+        || member.object_color.iter().any(|value| !value.is_finite())
+    {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Cycles Hair member context contains non-finite object data",
+            serde_json::json!({
+                "feature_id":"render.hair.shadow_cache_provenance",
+                "node_id":member.instance.real_object_node_id.as_str(),
+            }),
+        ));
+    }
+    let world_to_local = object_inverse(object_to_world).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Cycles Hair member transform must be invertible",
+            serde_json::json!({
+                "feature_id":"render.hair.object_transform",
+                "node_id":member.instance.real_object_node_id.as_str(),
+            }),
+        )
+    })?;
+    let index = if member.instance.is_instance {
+        u32::try_from(objects.len() + 1).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "too many objects for the ID buffer",
+            )
+        })?
+    } else {
+        base_object_index
+    };
+    if member.instance.is_instance {
+        let mut object = objects.get(base_index).cloned().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "hair instance base object record is missing",
+            )
+        })?;
+        update_hair_member_object_record(
+            &mut object,
+            index,
+            member,
+            object_to_world,
+            world_to_local,
+            material_index,
+            materials,
+        );
+        objects.push(object);
+    } else {
+        let object = objects.get_mut(base_index).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "hair base object record is missing",
+            )
+        })?;
+        update_hair_member_object_record(
+            object,
+            index,
+            member,
+            object_to_world,
+            world_to_local,
+            material_index,
+            materials,
+        );
+    }
+    Ok(index)
+}
+
+fn update_hair_member_object_record(
+    object: &mut ObjectRecord,
+    index: u32,
+    member: &CyclesHairShadowMember,
+    object_to_world: DMat4,
+    world_to_local: DMat4,
+    material_index: usize,
+    materials: &[Material],
+) {
+    object.index = index;
+    object.node_id = member.instance.real_object_node_id.clone();
+    object.object_to_world = object_to_world;
+    object.world_to_local = Some(world_to_local);
+    object.object_color = member.object_color;
+    object.object_pass_index = f64::from(member.object_pass_index);
+    object.object_random_number = Some(f64::from(
+        crate::blender_rng::cycles_object_random_number_from_signed_id(member.object_random_id),
+    ));
+    if let Some(material) = materials.get(material_index) {
+        object.material_colors.insert(
+            material_index,
+            None,
+            material.pass_index.map(f64::from),
+            None,
+            None,
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HairCurveBakeContext<'a> {
+    doc: &'a SceneDoc,
+    object: &'a HairCurveBakeObject,
+    material: &'a Material,
+    prepared: &'a PreparedMaterial,
+    images: &'a BTreeMap<String, ImageData>,
+    warnings: &'a RefCell<Vec<serde_json::Value>>,
+}
+
+fn bake_cycles_hair_shadow_transparency(
+    context: HairCurveBakeContext<'_>,
+    curve: &super::hair_geometry::PreparedHairCurve,
+    key_count: usize,
+    curve_random: Option<f64>,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<super::hair_geometry::HairCurveShadowTransparency> {
+    if !context.material.use_transparent_shadow || !context.prepared.is_transparent() {
+        return Ok(super::hair_geometry::HairCurveShadowTransparency::new(
+            None, false,
+        ));
+    }
+    let world_to_local = context.object.world_to_local.ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "hair shader evaluation requires an invertible object transform",
+            serde_json::json!({
+                "feature_id":"render.hair.object_transform",
+                "node_id":context.object.node_id.as_str(),
+            }),
+        )
+    })?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(key_count).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "hair shadow transparency key allocation failed",
+        )
+    })?;
+    for key_index in 0..key_count {
+        let (span, u) = if key_index + 1 == key_count {
+            (key_count - 2, 1.0)
+        } else {
+            (key_index, 0.0)
+        };
+        let sample = curve
+            .curve
+            .sample_local_for_shadow_bake(span, u)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "Cycles hair shadow bake could not sample a source key",
+                )
+            })?;
+        let point = context
+            .object
+            .object_to_world
+            .transform_point3(sample.position);
+        let tangent = context
+            .object
+            .object_to_world
+            .transform_vector3(sample.tangent);
+        let curve_normal = curve.point_normals.at(span, u).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "Cycles hair shadow bake could not sample a source point normal",
+            )
+        })?;
+        let view = DVec3::Y.cross(tangent).normalize_or_zero();
+        let mut hit_context = HitContext::new(&context.doc.node_groups)
+            .with_images(context.images)
+            .with_warnings(context.warnings);
+        hit_context.position = point;
+        hit_context.object = world_to_local.transform_point3(point);
+        hit_context.object_to_world = context.object.object_to_world;
+        hit_context.world_to_object = world_to_local;
+        hit_context.object_color = context.object.object_color;
+        hit_context.object_pass_index = context.object.object_pass_index;
+        hit_context.object_random_number = context.object.object_random_number;
+        hit_context.material_pass_index = context.material.pass_index.map(f64::from);
+        hit_context.normal = view;
+        hit_context.geometric_normal = view;
+        hit_context.view_direction = view;
+        hit_context.light_falloff_distance = Some(0.0);
+        hit_context.path_traced = true;
+        hit_context.hair_curve_hit = true;
+        hit_context = hit_context
+            .with_footprint(HitFootprint {
+                dp: 0.0,
+                geometric_normal: view,
+            })
+            .with_hair_context(tangent, Some(curve_normal), curve_random);
+        let shading = evaluate_surface_with_workspace(
+            context.material,
+            context.prepared,
+            &hit_context,
+            evaluator_workspace,
+        )?;
+        values.push(cycles_curve_shadow_value(&shading));
+    }
+    Ok(super::hair_geometry::HairCurveShadowTransparency::new(
+        Some(values),
+        false,
+    ))
+}
+
+fn cycles_curve_shadow_value(shading: &SurfaceShading) -> f32 {
+    let (extinction, has_transparent_flag) = super::path::cycles_shadow_extinction(
+        shading
+            .closures
+            .iter()
+            .map(|closure| (closure.weight, closure.params)),
+    );
+    if !has_transparent_flag {
+        return 0.0;
+    }
+    ((extinction[0] + extinction[1] + extinction[2]) / 3.0).clamp(0.0, 1.0)
+}
+
+fn validate_cycles_hair_shadow_group_freshness(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    group: &CyclesHairShadowGroup,
+) -> Result<()> {
+    let captured = group.source_input_fingerprint.as_deref();
+    let current = doc.cycles_hair_shadow_source_fingerprint(&snapshot.scene_id, group)?;
+    if let Some(captured) = captured {
+        if current.as_deref() == Some(captured) {
+            return Ok(());
+        }
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Cycles Hair evaluated geometry dependencies changed; reimport from Blender",
+            serde_json::json!({
+                "feature_id":"render.hair.shadow_cache_provenance",
+                "node_id":group.representative_node_id.as_str(),
+                "captured_fingerprint":captured,
+                "current_fingerprint":current,
+            }),
+        ));
+    }
+    let has_instance = group
+        .members
+        .iter()
+        .any(|member| member.instance.is_instance && !member.instance.use_particle_hair);
+    let has_render_modifier = group.members.iter().any(|member| {
+        doc.nodes
+            .get(&member.instance.real_object_node_id)
+            .is_some_and(|node| {
+                node.modifiers
+                    .iter()
+                    .any(|modifier| modifier.is_active(crate::eval::EvaluationPurpose::Render))
+            })
+    });
+    if group.evaluated_hair_curves.is_some()
+        || has_instance
+        || has_render_modifier
+        || group
+            .members
+            .iter()
+            .filter(|member| !member.instance.use_particle_hair)
+            .count()
+            > 1
+    {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Cycles Hair geometry dependency closure was not captured; reimport from Blender",
+            serde_json::json!({
+                "feature_id":"render.hair.shadow_cache_provenance",
+                "node_id":group.representative_node_id.as_str(),
+            }),
+        ));
+    }
+    Ok(())
+}
+fn bake_cycles_hair_shadow_group(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    group: &CyclesHairShadowGroup,
+    hair_data: &crate::model::HairCurvesData,
+    evaluated_to_source: Option<&[u32]>,
+    scene_render_mode: HairCurveRenderMode,
+    ribbon_subdivisions: usize,
+    default_surface: &Material,
+    images: &BTreeMap<String, ImageData>,
+    warnings: &RefCell<Vec<serde_json::Value>>,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<Vec<Arc<super::hair_geometry::HairCurveShadowTransparency>>> {
+    validate_cycles_hair_shadow_group_freshness(doc, snapshot, group)?;
+    let representative = group.members.first().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Cycles Hair shadow group has no representative member",
+            serde_json::json!({
+                "feature_id":"render.hair.shadow_cache_provenance",
+                "node_id":group.representative_node_id.as_str(),
+            }),
+        )
+    })?;
+    let representative_node_id = &representative.instance.real_object_node_id;
+    let bake_object = if representative.instance.is_instance {
+        HairCurveBakeObject::from_member_context(representative)?
+    } else {
+        HairCurveBakeObject::from_live_node(doc, snapshot, representative_node_id)?
+    };
+    let prepared_curves = super::hair_geometry::prepare_cycles_hair_curve_geometry(
+        hair_data,
+        bake_object.object_to_world,
+        scene_render_mode,
+        ribbon_subdivisions,
+    )
+    .map_err(|error| hair_curve_geometry_error(&group.representative_node_id, &error))?;
+    let representative_node = doc.nodes.get(representative_node_id).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "Cycles Hair representative object is missing",
+        )
+    })?;
+    let representative_data = representative_node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id));
+    let material_id = if group.evaluated_hair_curves.is_some() {
+        representative.slot_0_material_id.as_ref()
+    } else {
+        snapshot
+            .slot_material(
+                representative_node_id,
+                representative_node,
+                representative_data,
+                0,
+            )
+            .or(representative.slot_0_material_id.as_ref())
+    };
+    let material = match material_id {
+        Some(material_id) => doc.materials.get(material_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "Cycles Hair shadow representative material is missing",
+                serde_json::json!({
+                    "feature_id":"render.hair.shadow_cache_provenance",
+                    "node_id":group.representative_node_id.as_str(),
+                    "material_id":material_id.as_str(),
+                }),
+            )
+        })?,
+        None => default_surface,
+    };
+    let prepared_material = PreparedMaterial::new(material, &doc.node_groups);
+    let curve_count = evaluated_to_source.map_or(hair_data.curves.len(), <[u32]>::len);
+    let mut shadow_transparency = Vec::new();
+    shadow_transparency
+        .try_reserve_exact(curve_count)
+        .map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "Cycles Hair shadow cache allocation failed",
+            )
+        })?;
+    for evaluated_curve_index in 0..curve_count {
+        let source_curve_index = evaluated_to_source
+            .map(|indices| indices[evaluated_curve_index])
+            .map_or(Some(evaluated_curve_index), |index| {
+                usize::try_from(index).ok()
+            })
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    "Cycles Hair source curve index cannot be represented",
+                    serde_json::json!({
+                        "feature_id":"render.hair.shadow_cache_provenance",
+                        "node_id":group.representative_node_id.as_str(),
+                        "evaluated_curve_index":evaluated_curve_index,
+                    }),
+                )
+            })?;
+        let curve_data = hair_data.curves.get(source_curve_index).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Cycles Hair source curve mapping references unavailable geometry",
+                serde_json::json!({
+                    "feature_id":"render.hair.shadow_cache_provenance",
+                    "node_id":group.representative_node_id.as_str(),
+                    "source_curve_index":source_curve_index,
+                }),
+            )
+        })?;
+        let prepared_curve = prepared_curves.get(source_curve_index).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "Cycles Hair prepared source curve is missing",
+            )
+        })?;
+        let curve_random = cycles_curve_random(evaluated_curve_index).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "hair curve index exceeds Cycles' random attribute range",
+            )
+        })?;
+        let transparency = if curve_data.points.len() > 1 {
+            bake_cycles_hair_shadow_transparency(
+                HairCurveBakeContext {
+                    doc,
+                    object: &bake_object,
+                    material,
+                    prepared: &prepared_material,
+                    images,
+                    warnings,
+                },
+                prepared_curve,
+                curve_data.points.len(),
+                Some(curve_random),
+                evaluator_workspace,
+            )?
+        } else {
+            super::hair_geometry::HairCurveShadowTransparency::new(None, false)
+        };
+        shadow_transparency.push(Arc::new(transparency));
+    }
+    Ok(shadow_transparency)
+}
+
+fn eevee_world_volume_absorption_refusal(scene_id: &Id) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        "EEVEE World.Volume is not evaluated, so its absorption cannot be checked for WorldSun extraction; reimport without a World.Volume connection",
+        serde_json::json!({"feature_id":"render.world.volume_absorption","scene_id":scene_id.as_str()}),
+    )
+}
+
 pub(super) fn extract_geometry(
     doc: &SceneDoc,
     snapshot: &Snapshot,
@@ -451,6 +1244,31 @@ pub(super) fn extract_geometry_with_semantics(
         .scenes
         .get(&snapshot.scene_id)
         .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
+    let source_mesh_attribute_precision = if math_semantics
+        == crate::node_kernels::MathSemantics::Eevee
+        && matches!(mode, Mode::Beauty)
+    {
+        scene.render.use_high_quality_normals.map_or(
+            MeshAttributePrecision::Unknown,
+            MeshAttributePrecision::Known,
+        )
+    } else {
+        MeshAttributePrecision::NotApplicable
+    };
+    if matches!(mode, Mode::Beauty)
+        && math_semantics == crate::node_kernels::MathSemantics::Eevee
+        && super::path::scene_has_world_volume(doc, &snapshot.scene_id)
+    {
+        return Err(eevee_world_volume_absorption_refusal(&snapshot.scene_id));
+    }
+
+    let blender_imported = doc.compatibility.contains_key("blender_adapter");
+    let curve_render_mode = match scene.render.cycles_curves_shape.as_ref() {
+        Some(CyclesCurveShape::Ribbons) => HairCurveRenderMode::Ribbon,
+        Some(CyclesCurveShape::Thick) | None => HairCurveRenderMode::Thick,
+        Some(CyclesCurveShape::ThickLinear) => HairCurveRenderMode::ThickLinear,
+    };
+    let curve_ribbon_subdivisions = scene.render.cycles_curves_subdivisions.unwrap_or(2) as usize;
     let view_layer = snapshot
         .view_layer
         .as_ref()
@@ -467,6 +1285,96 @@ pub(super) fn extract_geometry_with_semantics(
         &mut visited,
         &mut visible_nodes,
     );
+    let mut instanced_hair_nodes = HashSet::new();
+    let mut hair_member_indices = CyclesHairMemberIndices::new();
+    let mut hair_group_nodes = HashSet::new();
+    if path_traced
+        && matches!(mode, Mode::Beauty)
+        && let Some(groups) = scene.cycles_hair_shadow_groups.as_deref()
+    {
+        for (group_index, group) in groups.iter().enumerate() {
+            if snapshot
+                .view_layer
+                .as_ref()
+                .is_some_and(|view_layer_id| view_layer_id != &group.view_layer_id)
+            {
+                continue;
+            }
+            let mut members_by_node = BTreeMap::<Id, Vec<usize>>::new();
+            for (member_index, member) in group.members.iter().enumerate() {
+                if member.instance.use_particle_hair {
+                    continue;
+                }
+                hair_group_nodes.insert(member.instance.real_object_node_id.clone());
+                members_by_node
+                    .entry(member.instance.real_object_node_id.clone())
+                    .or_default()
+                    .push(member_index);
+                if member.instance.is_instance {
+                    let source_has_hair = doc
+                        .nodes
+                        .get(&member.instance.real_object_node_id)
+                        .and_then(|node| node.data.as_ref())
+                        .and_then(|data_id| doc.data_blocks.get(data_id))
+                        .is_some_and(|data| data.hair_curves.is_some());
+                    if source_has_hair || group.evaluated_hair_curves.is_some() {
+                        instanced_hair_nodes.insert(member.instance.real_object_node_id.clone());
+                    }
+                }
+            }
+            if !members_by_node.is_empty() {
+                hair_member_indices.insert(group_index, members_by_node);
+            }
+        }
+    }
+    if path_traced && matches!(mode, Mode::Beauty) && scene.cycles_hair_shadow_groups.is_some() {
+        for (node_id, node) in &doc.nodes {
+            let has_hair = node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id))
+                .is_some_and(|data| data.hair_curves.is_some());
+            let has_instance_path = snapshot
+                .instance_paths
+                .get(node_id)
+                .is_some_and(|paths| paths.iter().any(|path| !path.is_empty()));
+            let has_group = scene
+                .cycles_hair_shadow_groups
+                .as_deref()
+                .is_some_and(|groups| {
+                    groups.iter().any(|group| {
+                        snapshot
+                            .view_layer
+                            .as_ref()
+                            .is_none_or(|view_layer_id| &group.view_layer_id == view_layer_id)
+                            && group.member_node_ids.contains(node_id)
+                    })
+                });
+            if has_hair && has_instance_path && !has_group {
+                instanced_hair_nodes.insert(node_id.clone());
+            }
+        }
+    }
+    if path_traced
+        && matches!(mode, Mode::Beauty)
+        && blender_imported
+        && scene.cycles_hair_shadow_groups.is_none()
+    {
+        for (node_id, node) in &doc.nodes {
+            let has_hair = node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id))
+                .is_some_and(|data| data.hair_curves.is_some());
+            let has_instance_path = snapshot
+                .instance_paths
+                .get(node_id)
+                .is_some_and(|paths| paths.iter().any(|path| !path.is_empty()));
+            if has_hair && has_instance_path {
+                instanced_hair_nodes.insert(node_id.clone());
+            }
+        }
+    }
 
     // Workbench's Solid shades faces with no material as Blender's empty default material:
     // colour 0.8, roughness 0.4, metallic 0 (`DNA_material_types.h`; `BKE_material_default_empty`
@@ -480,10 +1388,21 @@ pub(super) fn extract_geometry_with_semantics(
     } else {
         Material::default()
     };
+    let default_prepared = PreparedMaterial::new(&default_surface, &doc.node_groups);
     let mut materials = vec![default_surface];
-    let mut prepared = vec![PreparedMaterial::default()];
+    let mut prepared = vec![default_prepared];
     let mut material_indices =
         std::collections::BTreeMap::<(Id, Option<usize>, Option<Arc<[u64]>>), usize>::new();
+    let mut hair_curve_instances = Vec::new();
+    let mut hair_shadow_caches =
+        BTreeMap::<usize, Vec<Arc<super::hair_geometry::HairCurveShadowTransparency>>>::new();
+    let mut legacy_hair_shadow_caches = BTreeMap::<
+        Id,
+        (
+            Id,
+            Vec<Arc<super::hair_geometry::HairCurveShadowTransparency>>,
+        ),
+    >::new();
     let mut triangles = Vec::new();
     let mut lines = Vec::new();
     let mut wire_edges = Vec::new();
@@ -505,11 +1424,15 @@ pub(super) fn extract_geometry_with_semantics(
         })
     });
     for (node_id, node) in &doc.nodes {
-        if !visible_nodes.contains(node_id)
-            || !snapshot.node_is_visible(node_id, node)
-            || (matches!(mode, Mode::Beauty)
-                && !crate::exchange::evaluated_visibility(snapshot, node_id, node).1)
-        {
+        let base_visible = visible_nodes.contains(node_id)
+            && snapshot.node_is_visible(node_id, node)
+            && (!matches!(mode, Mode::Beauty)
+                || crate::exchange::evaluated_visibility(snapshot, node_id, node).1);
+        let hair_instance_only = path_traced
+            && matches!(mode, Mode::Beauty)
+            && !base_visible
+            && instanced_hair_nodes.contains(node_id);
+        if !base_visible && !hair_instance_only {
             continue;
         }
         let ray_visibility = node.resolved_ray_visibility();
@@ -520,13 +1443,87 @@ pub(super) fn extract_geometry_with_semantics(
             .data
             .as_ref()
             .and_then(|data_id| doc.data_blocks.get(data_id));
+        let path_curves_enabled = path_traced && matches!(mode, Mode::Beauty);
+        let source_hair = data_block.and_then(|data| data.hair_curves.as_ref());
+        let source_material_id = snapshot.slot_material(node_id, node, data_block, 0);
+        let hair_shadow_group_index = if path_curves_enabled {
+            cycles_hair_shadow_group_index(
+                scene,
+                snapshot,
+                node_id,
+                node.data.as_ref(),
+                &hair_member_indices,
+            )?
+        } else {
+            None
+        };
+        let hair_shadow_group = hair_shadow_group_index
+            .and_then(|index| scene.cycles_hair_shadow_groups.as_ref()?.get(index));
+        let evaluated_hair =
+            hair_shadow_group.and_then(|group| group.evaluated_hair_curves.as_ref());
+        let member_material_id = hair_shadow_group.and_then(|group| {
+            group
+                .members
+                .iter()
+                .find(|member| {
+                    member.instance.real_object_node_id == *node_id
+                        && !member.instance.use_particle_hair
+                })
+                .and_then(|member| member.slot_0_material_id.as_ref())
+        });
+        let material_id = if evaluated_hair.is_some() {
+            member_material_id.or(source_material_id)
+        } else {
+            source_material_id.or(member_material_id)
+        };
+        let hair_shadow_curve_indices = if evaluated_hair.is_some() {
+            None
+        } else {
+            hair_shadow_group.and_then(|group| group.source_curve_indices.as_deref())
+        };
+        let hair = evaluated_hair.or(source_hair);
+        if path_curves_enabled
+            && blender_imported
+            && hair_shadow_group_index.is_none()
+            && source_hair.is_some()
+            && node
+                .modifiers
+                .iter()
+                .any(|modifier| modifier.is_active(crate::eval::EvaluationPurpose::Render))
+        {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "renderable Blender Hair modifier geometry was not captured; reimport from Blender",
+                serde_json::json!({
+                    "feature_id":"render.hair.evaluated_geometry",
+                    "node_id":node_id.as_str(),
+                }),
+            ));
+        }
+        if path_curves_enabled
+            && blender_imported
+            && hair.is_some()
+            && snapshot
+                .instance_paths
+                .get(node_id)
+                .is_some_and(|paths| paths.iter().any(|path| !path.is_empty()))
+            && (scene.cycles_hair_shadow_groups.is_none() || hair_shadow_group_index.is_none())
+        {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Blender Hair instance transforms were not captured; reimport from Blender",
+                serde_json::json!({
+                    "feature_id":"render.hair.shadow_cache_provenance",
+                    "node_id":node_id.as_str(),
+                }),
+            ));
+        }
         let volume = node
             .data
             .as_ref()
             .and_then(|data_id| snapshot.volume_data.get(data_id))
             .or_else(|| data_block.and_then(|data| data.volume.as_ref()));
         let strokes = snapshot.strokes.get(node_id);
-        let hair = data_block.and_then(|data| data.hair_curves.as_ref());
         if let Some(crate::geom::volume::VolumeSource::File(source)) =
             volume.map(|volume| &volume.source)
             && source.format != "vdb"
@@ -572,8 +1569,16 @@ pub(super) fn extract_geometry_with_semantics(
         } else {
             None
         };
-        let mesh = snapshot.meshes.get(node_id).or(raster_volume_mesh.as_ref());
-        if mesh.is_none() && strokes.is_none() && hair.is_none() && volume.is_none() {
+        let mesh = (!(hair_instance_only || evaluated_hair.is_some()))
+            .then(|| snapshot.meshes.get(node_id).or(raster_volume_mesh.as_ref()))
+            .flatten();
+        if mesh.is_none()
+            && strokes.is_none()
+            && hair.is_none()
+            && volume.is_none()
+            && !hair_instance_only
+            && !hair_group_nodes.contains(node_id)
+        {
             continue;
         }
         let evaluated = snapshot.nodes.get(node_id).ok_or_else(|| {
@@ -759,14 +1764,23 @@ pub(super) fn extract_geometry_with_semantics(
                     serde_json::json!({ "node_id": node_id }),
                 )
             })?;
+            let face_smooth_flags = smooth_face_flags(mesh)?;
             let face_normal_data = corner_normals(
                 mesh,
+                &vertex_positions,
                 matrix,
                 node_id,
                 snapshot.adaptive_normals.get(node_id).map(Vec::as_slice),
                 has_uv_map_tangent,
+                source_mesh_attribute_precision,
                 &mut warnings,
             );
+            if !face_normal_data.precision_matches {
+                return Err(unknown_mesh_attribute_precision_error(
+                    &snapshot.scene_id,
+                    node_id,
+                ));
+            }
             let mut mikk_tangents = if has_uv_map_tangent && !uv_store.layers.is_empty() {
                 Some(mesh_mikk_tangents(
                     mesh,
@@ -775,11 +1789,24 @@ pub(super) fn extract_geometry_with_semantics(
                     &uv_store,
                     face_normal_data.local.as_deref(),
                     matrix,
+                    source_mesh_attribute_precision,
                 )?)
             } else {
                 None
+            };
+            if mikk_tangents
+                .as_ref()
+                .is_some_and(|tangents| !tangents.precision_matches)
+            {
+                return Err(unknown_mesh_attribute_precision_error(
+                    &snapshot.scene_id,
+                    node_id,
+                ));
             }
-            .map(Vec::into_iter);
+            let mut mikk_tangents = mikk_tangents
+                .take()
+                .map(|tangents| tangents.by_triangle)
+                .map(Vec::into_iter);
             let face_normals = face_normal_data.world;
             let mut triangle_offset = 0_usize;
             let mut corner_base = 0_usize;
@@ -809,7 +1836,9 @@ pub(super) fn extract_geometry_with_semantics(
                     binding.uv.render_index.map(usize::from)
                 });
                 let uv_available_mask = binding.map(|binding| binding.uv.available_mask);
-                let face_corner_normals = face_normals[face_index].as_deref();
+                let face_normal_values = face_normals[face_index].as_ref();
+                let face_corner_normals = face_normal_values.and_then(FaceNormalValues::as_corners);
+                let face_smooth = face_smooth_flags[face_index];
                 if matches!(mode, Mode::Wire) {
                     let positions: Option<Vec<DVec3>> = face
                         .vertices
@@ -879,6 +1908,7 @@ pub(super) fn extract_geometry_with_semantics(
                     })?;
                     object.material_colors.insert(
                         material_index,
+                        material_id.filter(|_| material_index != 0),
                         materials
                             .get(material_index)
                             .and_then(|material| material.pass_index.map(f64::from)),
@@ -992,7 +2022,7 @@ pub(super) fn extract_geometry_with_semantics(
                         continue;
                     }
                     let corner_normals =
-                        face_corner_normals.and_then(|normals| corner_values(normals, corners));
+                        face_normal_values.and_then(|values| values.triangle_values(corners));
                     let normal = raw_normal.normalize();
                     let center = (positions[0] + positions[1] + positions[2]) / 3.0;
                     let lit_per_pixel = !path_traced
@@ -1010,10 +2040,26 @@ pub(super) fn extract_geometry_with_semantics(
                                 weight: 1.0,
                                 params,
                             }];
-                            shade(
-                                doc, snapshot, center, center, normal, normal, normal, &closures,
-                                mode, None, thickness, None,
-                            )
+                            shade(&SurfaceShadeContext {
+                                doc,
+                                snapshot,
+                                receiver: Receiver {
+                                    point: center,
+                                    shadow_point: center,
+                                    geometric: normal,
+                                    view: normal,
+                                },
+                                normal,
+                                closures: &closures,
+                                mode,
+                                shadow: None,
+                                object_thickness: thickness,
+                                world: None,
+                                world_sun: None,
+                                gbuffer: None,
+                                eevee_raytrace_feedback: EeveeRaytraceFeedback::default(),
+                                material_refraction: Some(false),
+                            })?
                         };
                     let triangle = Triangle {
                         positions,
@@ -1040,8 +2086,7 @@ pub(super) fn extract_geometry_with_semantics(
                                 _ => match material.alpha_mode.as_str() {
                                     "blend" => AlphaMode::Blend,
                                     "clip" => AlphaMode::Clip,
-                                    // Potter keeps the DITHERED graph's expected coverage in the existing opacity/tint
-                                    // model while retaining its separate depth-writing class for camera light shapes.
+                                    // EEVEE DITHERED graph materials use the source per-sample hashed depth-prepass coverage.
                                     "opaque"
                                         if matches!(mode, Mode::Beauty)
                                             && material.node_tree.is_some() =>
@@ -1063,6 +2108,7 @@ pub(super) fn extract_geometry_with_semantics(
                         layer_uvs,
                         layer_tangents,
                         normals: corner_normals,
+                        smooth_shading: face_smooth,
                         layer_colors,
                         lit_per_pixel,
                         ray_mask: ray_visibility.mask(),
@@ -1361,11 +2407,448 @@ pub(super) fn extract_geometry_with_semantics(
             ]
             .into_iter()
             .fold(0.0_f64, f64::max);
-            let color = snapshot
-                .slot_material(node_id, node, data_block, 0)
-                .and_then(|material_id| doc.materials.get(material_id))
+            let material_index = if let Some(id) = material_id {
+                let key = (id.clone(), None, None);
+                if let Some(index) = material_indices.get(&key).copied() {
+                    index
+                } else if let Some(material) = doc.materials.get(id) {
+                    let index = materials.len();
+                    materials.push(material.clone());
+                    prepared.push(PreparedMaterial::new(material, &doc.node_groups));
+                    material_indices.insert(key, index);
+                    index
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            if let Some(object) = objects.last_mut() {
+                object.material_colors.insert(
+                    material_index,
+                    material_id.filter(|_| material_index != 0),
+                    materials
+                        .get(material_index)
+                        .and_then(|material| material.pass_index.map(f64::from)),
+                    None,
+                    None,
+                );
+            }
+            let color = materials
+                .get(material_index)
                 .map_or([0.6, 0.6, 0.6, 1.0], |material| material.base_color);
-            for (curve_index, curve) in hair.curves.iter().enumerate() {
+            let legacy_shared_hair_shadow = path_curves_enabled
+                && blender_imported
+                && scene.cycles_hair_shadow_groups.is_none()
+                && node.data.is_some()
+                && !cycles_hair_geometry_key_is_object(node, data_block);
+            let point_count = hair
+                .curves
+                .iter()
+                .try_fold(0usize, |count, curve| count.checked_add(curve.points.len()));
+            let point_count = point_count.ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "hair point count exceeds platform limits",
+                )
+            })?;
+            let curve_types = hair.attributes.get("curve_type");
+            if curve_types.is_some_and(|attribute| {
+                attribute.domain != "CURVE"
+                    || attribute.data_type != "INT8"
+                    || attribute.values.len() != hair.curves.len()
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair curve_type attribute has an invalid domain, type, or length",
+                ));
+            }
+            let radius_values = hair.attributes.get("radius");
+            if radius_values.is_some_and(|attribute| {
+                attribute.domain != "POINT"
+                    || attribute.data_type != "FLOAT"
+                    || attribute.values.len() != point_count
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair radius attribute has an invalid domain, type, or length",
+                ));
+            }
+            let cyclic_values = hair.attributes.get("cyclic");
+            if cyclic_values.is_some_and(|attribute| {
+                attribute.domain != "CURVE"
+                    || attribute.data_type != "BOOLEAN"
+                    || attribute.values.len() != hair.curves.len()
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair cyclic attribute has an invalid domain, type, or length",
+                ));
+            }
+            let normal_modes = hair.attributes.get("normal_mode");
+            if normal_modes.is_some_and(|attribute| {
+                attribute.domain != "CURVE"
+                    || attribute.data_type != "INT8"
+                    || attribute.values.len() != hair.curves.len()
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair normal_mode attribute has an invalid domain, type, or length",
+                ));
+            }
+            let resolutions = hair.attributes.get("resolution");
+            if resolutions.is_some_and(|attribute| {
+                attribute.domain != "CURVE"
+                    || attribute.data_type != "INT"
+                    || attribute.values.len() != hair.curves.len()
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair resolution attribute has an invalid domain, type, or length",
+                ));
+            }
+            let tilt_values = hair.attributes.get("tilt");
+            if tilt_values.is_some_and(|attribute| {
+                attribute.domain != "POINT"
+                    || attribute.data_type != "FLOAT"
+                    || attribute.values.len() != point_count
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair tilt attribute has an invalid domain, type, or length",
+                ));
+            }
+            let custom_normal_values = hair.attributes.get("custom_normal");
+            if custom_normal_values.is_some_and(|attribute| {
+                attribute.domain != "POINT"
+                    || attribute.data_type != "FLOAT_VECTOR"
+                    || attribute.values.len() != point_count
+            }) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "hair custom_normal attribute has an invalid domain, type, or length",
+                ));
+            }
+            let hair_path_matrix = if hair_instance_only {
+                let member = hair_shadow_group
+                    .and_then(|group| {
+                        group.members.iter().find(|member| {
+                            member.instance.real_object_node_id == *node_id
+                                && !member.instance.use_particle_hair
+                        })
+                    })
+                    .ok_or_else(|| {
+                        PotError::with_details(
+                            ErrorCode::UnsupportedFeature,
+                            "instanced Cycles Hair transform was not captured",
+                            serde_json::json!({
+                                "feature_id":"render.hair.shadow_cache_provenance",
+                                "node_id":node_id.as_str(),
+                            }),
+                        )
+                    })?;
+                cycles_hair_object_matrix(member.object_to_world)
+            } else {
+                matrix
+            };
+            let mut prepared_cycles_curves = if path_curves_enabled {
+                Some(
+                    super::hair_geometry::prepare_cycles_hair_curve_geometry(
+                        hair,
+                        hair_path_matrix,
+                        curve_render_mode,
+                        curve_ribbon_subdivisions,
+                    )
+                    .map_err(|error| hair_curve_geometry_error(node_id, &error))?,
+                )
+            } else {
+                None
+            };
+            let path_render_mode = prepared_cycles_curves
+                .as_ref()
+                .and_then(|curves| curves.first())
+                .map(|prepared| prepared.curve.render_mode);
+            let has_renderable_curve = hair.curves.iter().any(|curve| curve.points.len() > 1);
+            let needs_curve_settings = has_renderable_curve
+                && path_render_mode
+                    .is_some_and(|render_mode| render_mode != HairCurveRenderMode::ThickLinear);
+            let missing_shape = scene.render.cycles_curves_shape.is_none();
+            let missing_ribbon_subdivisions = has_renderable_curve
+                && path_render_mode
+                    .is_some_and(|render_mode| render_mode == HairCurveRenderMode::Ribbon)
+                && scene.render.cycles_curves_subdivisions.is_none();
+            if blender_imported
+                && needs_curve_settings
+                && (missing_shape || missing_ribbon_subdivisions)
+            {
+                let mut required_settings = Vec::new();
+                if missing_shape {
+                    required_settings.push("cycles_curves.shape");
+                }
+                if missing_ribbon_subdivisions {
+                    required_settings.push("cycles_curves.subdivisions");
+                }
+                return Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    "Cycles Hair Curves settings affecting the render shape were not captured; reimport from Blender",
+                    serde_json::json!({
+                        "feature_id":"render.cycles_curves.settings",
+                        "node_id":node_id.as_str(),
+                        "required_settings":required_settings,
+                    }),
+                ));
+            }
+            if let Some(group_index) = hair_shadow_group_index
+                && !hair_shadow_caches.contains_key(&group_index)
+            {
+                let group = hair_shadow_group.ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "Cycles Hair shadow group disappeared during extraction",
+                    )
+                })?;
+                let shadow_cache = bake_cycles_hair_shadow_group(
+                    doc,
+                    snapshot,
+                    group,
+                    hair,
+                    hair_shadow_curve_indices,
+                    curve_render_mode,
+                    curve_ribbon_subdivisions,
+                    &materials[0],
+                    images,
+                    &shader_warnings,
+                    &mut evaluator_workspace,
+                )?;
+                hair_shadow_caches.insert(group_index, shadow_cache);
+            }
+            let cached_hair_shadow =
+                hair_shadow_group_index.and_then(|index| hair_shadow_caches.get(&index));
+            let local_hair_bake_object = if path_curves_enabled && cached_hair_shadow.is_none() {
+                let object = objects.last().ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "hair curve has no owning object record",
+                    )
+                })?;
+                Some(HairCurveBakeObject::from_record(object))
+            } else {
+                None
+            };
+            let mut path_members = Vec::new();
+            if path_curves_enabled {
+                if let Some(group) = hair_shadow_group {
+                    let group_index = hair_shadow_group_index.ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "Cycles Hair path member group index is missing",
+                        )
+                    })?;
+                    let members_for_node = hair_member_indices
+                        .get(&group_index)
+                        .and_then(|members| members.get(node_id))
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::InternalError,
+                                "Cycles Hair path member projection is missing",
+                            )
+                        })?;
+                    path_members
+                        .try_reserve_exact(members_for_node.len())
+                        .map_err(|_| {
+                            PotError::new(
+                                ErrorCode::LimitExceeded,
+                                "Cycles Hair instance allocation failed",
+                            )
+                        })?;
+                    let mut use_prepared_for_first_member = hair_instance_only;
+                    for &member_index in members_for_node {
+                        let member = group.members.get(member_index).ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::InternalError,
+                                "Cycles Hair member index is out of range",
+                            )
+                        })?;
+                        if evaluated_hair.is_some()
+                            && member
+                                .slot_0_material_id
+                                .as_ref()
+                                .is_some_and(|member_id| Some(member_id) != material_id)
+                        {
+                            return Err(PotError::with_details(
+                                ErrorCode::UnsupportedFeature,
+                                "Cycles Hair member material differs from its cache group",
+                                serde_json::json!({
+                                    "feature_id":"render.hair.shadow_cache_provenance",
+                                    "node_id":node_id.as_str(),
+                                }),
+                            ));
+                        }
+                        let member_object_index = append_hair_instance_object(
+                            &mut objects,
+                            object_index,
+                            member,
+                            material_index,
+                            &materials,
+                            hair_instance_only,
+                        )?;
+                        let use_prepared_curves = if hair_instance_only {
+                            let use_prepared = use_prepared_for_first_member;
+                            use_prepared_for_first_member = false;
+                            use_prepared
+                        } else {
+                            !member.instance.is_instance
+                        };
+                        let member_curves = if use_prepared_curves {
+                            prepared_cycles_curves.take().ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::InternalError,
+                                    "Cycles Hair member geometry was not prepared for a path hit",
+                                )
+                            })?
+                        } else {
+                            super::hair_geometry::prepare_cycles_hair_curve_geometry(
+                                hair,
+                                cycles_hair_object_matrix(member.object_to_world),
+                                curve_render_mode,
+                                curve_ribbon_subdivisions,
+                            )
+                            .map_err(|error| hair_curve_geometry_error(node_id, &error))?
+                        };
+                        path_members.push(HairPathMember {
+                            object_index: member_object_index,
+                            material_index,
+                            ray_mask: if member.instance.is_instance {
+                                member.ray_visibility.mask()
+                            } else {
+                                ray_visibility.mask()
+                            },
+                            prepared_curves: member_curves.into_iter().map(Some).collect(),
+                        });
+                    }
+                    if path_members.is_empty() {
+                        return Err(PotError::with_details(
+                            ErrorCode::UnsupportedFeature,
+                            "Cycles Hair group has no renderable curve member for this object",
+                            serde_json::json!({
+                                "feature_id":"render.hair.shadow_cache_provenance",
+                                "node_id":node_id.as_str(),
+                            }),
+                        ));
+                    }
+                } else {
+                    let member_curves = prepared_cycles_curves.take().ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "Cycles hair geometry was not prepared for a path hit",
+                        )
+                    })?;
+                    path_members.push(HairPathMember {
+                        object_index,
+                        material_index,
+                        ray_mask: ray_visibility.mask(),
+                        prepared_curves: member_curves.into_iter().map(Some).collect(),
+                    });
+                }
+            }
+            let curve_count = hair_shadow_curve_indices.map_or(hair.curves.len(), <[u32]>::len);
+            let mut legacy_shadow_values = if legacy_shared_hair_shadow {
+                Some(Vec::new())
+            } else {
+                None
+            };
+            if let Some(values) = &mut legacy_shadow_values {
+                values.try_reserve_exact(curve_count).map_err(|_| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "legacy hair shadow cache allocation failed",
+                    )
+                })?;
+            }
+            let identity_curve_order = curve_count == hair.curves.len()
+                && hair_shadow_curve_indices.is_none_or(|indices| {
+                    indices.iter().enumerate().all(|(index, source_index)| {
+                        usize::try_from(*source_index).ok() == Some(index)
+                    })
+                });
+            if let Some(indices) = hair_shadow_curve_indices {
+                let mut seen = BTreeSet::new();
+                if indices
+                    .iter()
+                    .any(|source_index| !seen.insert(*source_index))
+                {
+                    return Err(PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        "Cycles Hair evaluated curves duplicate source indices without evaluated geometry",
+                        serde_json::json!({
+                            "feature_id":"render.hair.shadow_cache_provenance",
+                            "node_id":node_id.as_str(),
+                        }),
+                    ));
+                }
+            }
+            let source_point_offsets = if identity_curve_order {
+                None
+            } else {
+                let mut offsets = Vec::new();
+                offsets.try_reserve_exact(hair.curves.len()).map_err(|_| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "hair source point-offset allocation failed",
+                    )
+                })?;
+                let mut offset = 0usize;
+                for source_curve in &hair.curves {
+                    offsets.push(offset);
+                    offset = offset
+                        .checked_add(source_curve.points.len())
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::LimitExceeded,
+                                "hair point offset exceeds platform limits",
+                            )
+                        })?;
+                }
+                Some(offsets)
+            };
+            let mut identity_point_offset = 0usize;
+            for evaluated_curve_index in 0..curve_count {
+                let source_curve_index = if let Some(indices) = hair_shadow_curve_indices {
+                    usize::try_from(indices[evaluated_curve_index]).map_err(|_| {
+                        PotError::with_details(
+                            ErrorCode::UnsupportedFeature,
+                            "Cycles Hair source curve index cannot be represented",
+                            serde_json::json!({
+                                "feature_id":"render.hair.shadow_cache_provenance",
+                                "node_id":node_id.as_str(),
+                                "evaluated_curve_index":evaluated_curve_index,
+                            }),
+                        )
+                    })?
+                } else {
+                    evaluated_curve_index
+                };
+                let curve = hair.curves.get(source_curve_index).ok_or_else(|| {
+                    PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        "Cycles Hair source curve mapping references unavailable geometry",
+                        serde_json::json!({
+                            "feature_id":"render.hair.shadow_cache_provenance",
+                            "node_id":node_id.as_str(),
+                            "source_curve_index":source_curve_index,
+                        }),
+                    )
+                })?;
+                let point_offset = if let Some(offsets) = &source_point_offsets {
+                    *offsets.get(source_curve_index).ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "hair source point offset is missing",
+                        )
+                    })?
+                } else {
+                    identity_point_offset
+                };
                 if !curve.radius.is_finite()
                     || curve.radius < 0.0
                     || curve
@@ -1380,57 +2863,278 @@ pub(super) fn extract_geometry_with_semantics(
                     ));
                 }
                 if curve.points.is_empty() {
+                    if let Some(values) = &mut legacy_shadow_values {
+                        values.push(Arc::new(
+                            super::hair_geometry::HairCurveShadowTransparency::new(None, false),
+                        ));
+                    }
                     continue;
                 }
-                let element_index = u32::try_from(elements.len() + 1).map_err(|_| {
+                let _curve_type = curve_types
+                    .and_then(|attribute| attribute.values.get(source_curve_index))
+                    .map_or(Some(0), serde_json::Value::as_i64)
+                    .and_then(|curve_type| u8::try_from(curve_type).ok())
+                    .ok_or_else(|| {
+                        PotError::new(ErrorCode::SceneInvalid, "hair curve_type is invalid")
+                    })?;
+                let curve_random =
+                    Some(cycles_curve_random(evaluated_curve_index).ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::LimitExceeded,
+                            "hair curve index exceeds Cycles' random attribute range",
+                        )
+                    })?);
+                let _cyclic = cyclic_values
+                    .and_then(|attribute| attribute.values.get(source_curve_index))
+                    .map_or(Some(false), serde_json::Value::as_bool)
+                    .ok_or_else(|| {
+                        PotError::new(ErrorCode::SceneInvalid, "hair cyclic value is invalid")
+                    })?;
+                let _normal_mode = normal_modes
+                    .and_then(|attribute| attribute.values.get(source_curve_index))
+                    .map_or(Some(0), serde_json::Value::as_i64)
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or_else(|| {
+                        PotError::new(ErrorCode::SceneInvalid, "hair normal_mode is invalid")
+                    })?;
+                let _resolution = resolutions
+                    .and_then(|attribute| attribute.values.get(source_curve_index))
+                    .map_or(Some(12usize), |value| {
+                        value.as_i64().and_then(|value| usize::try_from(value).ok())
+                    })
+                    .ok_or_else(|| {
+                        PotError::new(ErrorCode::SceneInvalid, "hair resolution is invalid")
+                    })?;
+                if radius_values.is_some_and(|attribute| {
+                    attribute.values[point_offset..point_offset + curve.points.len()]
+                        .iter()
+                        .any(|value| {
+                            value
+                                .as_f64()
+                                .is_none_or(|radius| !radius.is_finite() || radius < 0.0)
+                        })
+                }) {
+                    return Err(PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        "hair curve contains invalid radius data",
+                    ));
+                }
+                let element_index = if hair_instance_only {
+                    None
+                } else {
+                    let index = u32::try_from(elements.len() + 1).map_err(|_| {
+                        PotError::new(
+                            ErrorCode::LimitExceeded,
+                            "too many elements for the ID buffer",
+                        )
+                    })?;
+                    elements.push(ElementRecord {
+                        index,
+                        node_id: node_id.clone(),
+                        domain: "hair_curve".to_owned(),
+                        element_id: format!("h{evaluated_curve_index}"),
+                        uv_render: None,
+                        uv_available_mask: None,
+                    });
+                    Some(index)
+                };
+                let radius = curve.radius * radius_scale;
+                if !hair_instance_only {
+                    for point in &curve.points {
+                        let position = matrix.transform_point3(DVec3::from_array(*point));
+                        let extent = DVec3::splat(radius);
+                        bounds = Some(match bounds {
+                            Some((current_min, current_max)) => (
+                                current_min.min(position - extent),
+                                current_max.max(position + extent),
+                            ),
+                            None => (position - extent, position + extent),
+                        });
+                    }
+                    let segment_count = curve.points.len().saturating_sub(1).max(1);
+                    for segment in 0..segment_count {
+                        let start =
+                            matrix.transform_point3(DVec3::from_array(curve.points[segment]));
+                        let end = if segment + 1 < curve.points.len() {
+                            matrix.transform_point3(DVec3::from_array(curve.points[segment + 1]))
+                        } else {
+                            start
+                        };
+                        lines.push(Line {
+                            start,
+                            end,
+                            radius_start: radius,
+                            radius_end: radius,
+                            color,
+                            object_index,
+                            element_index: element_index.ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::InternalError,
+                                    "hair line element is missing",
+                                )
+                            })?,
+                            ray_mask: ray_visibility.mask(),
+                        });
+                    }
+                }
+                if path_curves_enabled && curve.points.len() > 1 {
+                    for path_member in &mut path_members {
+                        let prepared_curve_data = path_member
+                            .prepared_curves
+                            .get_mut(source_curve_index)
+                            .and_then(Option::take)
+                            .ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::InternalError,
+                                    "Cycles hair member geometry was not prepared for a path hit",
+                                )
+                            })?;
+                        let shadow_transparency = if let Some(cache) = cached_hair_shadow {
+                            cache.get(evaluated_curve_index).cloned().ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::InternalError,
+                                    "Cycles Hair shadow cache is missing an evaluated curve",
+                                )
+                            })?
+                        } else {
+                            let hair_bake_object =
+                                local_hair_bake_object.as_ref().ok_or_else(|| {
+                                    PotError::new(
+                                        ErrorCode::InternalError,
+                                        "hair curve bake context was not prepared",
+                                    )
+                                })?;
+                            Arc::new(bake_cycles_hair_shadow_transparency(
+                                HairCurveBakeContext {
+                                    doc,
+                                    object: hair_bake_object,
+                                    material: materials
+                                        .get(path_member.material_index)
+                                        .ok_or_else(|| {
+                                            PotError::new(
+                                                ErrorCode::InternalError,
+                                                "hair curve material was not prepared",
+                                            )
+                                        })?,
+                                    prepared: prepared.get(path_member.material_index).ok_or_else(
+                                        || {
+                                            PotError::new(
+                                                ErrorCode::InternalError,
+                                                "hair curve prepared material was not prepared",
+                                            )
+                                        },
+                                    )?,
+                                    images,
+                                    warnings: &shader_warnings,
+                                },
+                                &prepared_curve_data,
+                                curve.points.len(),
+                                curve_random,
+                                &mut evaluator_workspace,
+                            )?)
+                        };
+                        let curve_geometry = prepared_curve_data.curve;
+                        let point_normals = prepared_curve_data.point_normals;
+                        let (curve_min, curve_max) =
+                            curve_geometry.world_bounds().ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::EvaluationFailed,
+                                    "Blender hair curve bounds evaluation failed",
+                                )
+                            })?;
+                        bounds = Some(match bounds {
+                            Some((current_min, current_max)) => {
+                                (current_min.min(curve_min), current_max.max(curve_max))
+                            }
+                            None => (curve_min, curve_max),
+                        });
+                        let path_element_index =
+                            if !hair_instance_only && path_member.object_index == object_index {
+                                element_index.ok_or_else(|| {
+                                    PotError::new(
+                                        ErrorCode::InternalError,
+                                        "hair base element is missing",
+                                    )
+                                })?
+                            } else {
+                                let index = u32::try_from(elements.len() + 1).map_err(|_| {
+                                    PotError::new(
+                                        ErrorCode::LimitExceeded,
+                                        "too many elements for the ID buffer",
+                                    )
+                                })?;
+                                elements.push(ElementRecord {
+                                    index,
+                                    node_id: node_id.clone(),
+                                    domain: "hair_curve".to_owned(),
+                                    element_id: format!("h{evaluated_curve_index}"),
+                                    uv_render: None,
+                                    uv_available_mask: None,
+                                });
+                                index
+                            };
+                        if let Some(values) = &mut legacy_shadow_values {
+                            values.push(Arc::clone(&shadow_transparency));
+                        }
+                        hair_curve_instances.push(HairCurveInstance {
+                            curve: curve_geometry,
+                            point_normals,
+                            shadow_transparency,
+                            material_index: path_member.material_index,
+                            object_index: path_member.object_index,
+                            element_index: path_element_index,
+                            curve_random,
+                            ray_mask: path_member.ray_mask,
+                        });
+                    }
+                } else if path_curves_enabled && let Some(values) = &mut legacy_shadow_values {
+                    values.push(Arc::new(
+                        super::hair_geometry::HairCurveShadowTransparency::new(None, false),
+                    ));
+                }
+                if identity_curve_order {
+                    identity_point_offset = identity_point_offset
+                        .checked_add(curve.points.len())
+                        .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::LimitExceeded,
+                            "hair point offset exceeds platform limits",
+                        )
+                    })?;
+                }
+            }
+            if let Some(values) = legacy_shadow_values {
+                let data_id = node.data.as_ref().ok_or_else(|| {
                     PotError::new(
-                        ErrorCode::LimitExceeded,
-                        "too many elements for the ID buffer",
+                        ErrorCode::InternalError,
+                        "shared legacy hair cache has no source data ID",
                     )
                 })?;
-                elements.push(ElementRecord {
-                    index: element_index,
-                    node_id: node_id.clone(),
-                    domain: "hair_curve".to_owned(),
-                    element_id: format!("h{curve_index}"),
-                    uv_render: None,
-                    uv_available_mask: None,
-                });
-                let radius = curve.radius * radius_scale;
-                for point in &curve.points {
-                    let position = matrix.transform_point3(DVec3::from_array(*point));
-                    let extent = DVec3::splat(radius);
-                    bounds = Some(match bounds {
-                        Some((current_min, current_max)) => (
-                            current_min.min(position - extent),
-                            current_max.max(position + extent),
-                        ),
-                        None => (position - extent, position + extent),
-                    });
-                }
-                let segment_count = curve.points.len().saturating_sub(1).max(1);
-                for segment in 0..segment_count {
-                    let start = matrix.transform_point3(DVec3::from_array(curve.points[segment]));
-                    let end = if segment + 1 < curve.points.len() {
-                        matrix.transform_point3(DVec3::from_array(curve.points[segment + 1]))
-                    } else {
-                        start
-                    };
-                    lines.push(Line {
-                        start,
-                        end,
-                        radius_start: radius,
-                        radius_end: radius,
-                        color,
-                        object_index,
-                        element_index,
-                        ray_mask: ray_visibility.mask(),
-                    });
+                if let Some((first_node_id, first_values)) = legacy_hair_shadow_caches.get(data_id)
+                {
+                    if first_values != &values {
+                        return Err(PotError::with_details(
+                            ErrorCode::UnsupportedFeature,
+                            "shared Blender Hair shadow values differ but their Cycles representative was not captured; reimport from Blender",
+                            serde_json::json!({
+                                "feature_id":"render.hair.shadow_cache_provenance",
+                                "data_id":data_id.as_str(),
+                                "first_node_id":first_node_id.as_str(),
+                                "node_id":node_id.as_str(),
+                            }),
+                        ));
+                    }
+                } else {
+                    legacy_hair_shadow_caches.insert(data_id.clone(), (node_id.clone(), values));
                 }
             }
         }
     }
+    let hair_curve_bvh =
+        HairBvh::build_splines(hair_curve_instances.iter().map(|curve| &curve.curve));
     let mut geometry = Geometry {
+        hair_curve_instances,
+        hair_curve_bvh,
         triangles,
         lines,
         wire_edges,
@@ -1492,23 +3196,25 @@ fn build_point_shadow_maps(
         .collect();
     let mut maps = BTreeMap::new();
     for (id, node) in &doc.nodes {
-        let Some(light) = node
-            .data
-            .as_ref()
-            .and_then(|data_id| doc.data_blocks.get(data_id))
-            .and_then(|block| block.light.as_ref())
-        else {
-            continue;
-        };
-        if !matches!(
-            light.light_type,
-            crate::model::LightType::Point | crate::model::LightType::Spot
-        ) {
-            continue;
-        }
         let Some(evaluated) = snapshot.nodes.get(id) else {
             continue;
         };
+        let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+            node.data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id))
+                .and_then(|block| block.light.as_ref())
+        }) else {
+            continue;
+        };
+        if light.use_shadow == Some(false)
+            || !matches!(
+                light.light_type,
+                crate::model::LightType::Point | crate::model::LightType::Spot
+            )
+        {
+            continue;
+        }
         let position =
             DMat4::from_cols_array(&evaluated.world_matrix).transform_point3(DVec3::ZERO);
         maps.insert(id.clone(), PointShadowMap::build(position, &opaque)?);
@@ -1913,24 +3619,84 @@ fn collect_collection_nodes(
     }
 }
 
-struct FaceNormalData {
-    world: Vec<Option<Vec<DVec3>>>,
-    local: Option<Vec<Option<Vec<DVec3>>>>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MeshAttributePrecision {
+    NotApplicable,
+    Unknown,
+    Known(bool),
 }
 
-/// Corner normals in object and world space; `None` marks a flat face. A mesh whose corner normals
-/// cannot be built keeps flat face normals and records a warning.
+#[derive(Clone, Debug, PartialEq)]
+enum FaceNormalValues {
+    Constant(DVec3),
+    Corners(Vec<DVec3>),
+}
+
+impl FaceNormalValues {
+    fn as_corners(&self) -> Option<&[DVec3]> {
+        match self {
+            Self::Constant(_) => None,
+            Self::Corners(normals) => Some(normals),
+        }
+    }
+
+    fn constant(&self) -> Option<DVec3> {
+        match self {
+            Self::Constant(normal) => Some(*normal),
+            Self::Corners(_) => None,
+        }
+    }
+
+    fn triangle_values(&self, corners: [Option<usize>; 3]) -> Option<[DVec3; 3]> {
+        match self {
+            Self::Constant(normal) => Some([*normal; 3]),
+            Self::Corners(normals) => corner_values(normals, corners),
+        }
+    }
+}
+
+struct FaceNormalData {
+    /// Flat source normals stay a single value; smooth faces keep their corner array.
+    world: Vec<Option<FaceNormalValues>>,
+    local: Option<Vec<Option<FaceNormalValues>>>,
+    precision_matches: bool,
+}
+
+struct MeshTangentData {
+    by_triangle: Vec<Vec<[DVec3; 3]>>,
+    precision_matches: bool,
+}
+
+fn unknown_mesh_attribute_precision_error(scene_id: &Id, node_id: &Id) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        "realtime mesh shading requires the source mesh attribute precision setting",
+        serde_json::json!({
+            "feature_id": "render.eevee.mesh_attribute_precision",
+            "scene_id": scene_id.as_str(),
+            "node_id": node_id.as_str(),
+            "setting": "use_high_quality_normals",
+        }),
+    )
+}
+
+/// Corner normals in object and world space. Packed flat normals remain a per-face constant.
 fn corner_normals(
     mesh: &crate::geom::Mesh,
+    vertex_positions: &BTreeMap<u32, DVec3>,
     matrix: DMat4,
     node_id: &Id,
     adaptive_normals: Option<&[Option<DVec3>]>,
     keep_local: bool,
+    precision: MeshAttributePrecision,
     warnings: &mut Vec<serde_json::Value>,
 ) -> FaceNormalData {
     let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
     let mut local = match render_corner_normals(mesh, &positions) {
-        Ok(faces) => faces,
+        Ok(faces) => faces
+            .into_iter()
+            .map(|face| face.map(FaceNormalValues::Corners))
+            .collect::<Vec<_>>(),
         Err(error) => {
             warnings.push(serde_json::json!({
                 "code": "shading.corner_normals_failed",
@@ -1940,31 +3706,73 @@ fn corner_normals(
                 "node_id": node_id,
             }));
             let flat_faces = vec![None; mesh.faces.len()];
-            return FaceNormalData {
-                world: flat_faces.clone(),
-                local: keep_local.then_some(flat_faces),
-            };
+            if precision == MeshAttributePrecision::NotApplicable {
+                return FaceNormalData {
+                    world: flat_faces.clone(),
+                    local: keep_local.then_some(flat_faces),
+                    precision_matches: true,
+                };
+            }
+            flat_faces
         }
     };
+    if precision != MeshAttributePrecision::NotApplicable && local.iter().any(Option::is_none) {
+        let mut face_points = Vec::with_capacity(
+            mesh.faces
+                .iter()
+                .map(|face| face.vertices.len())
+                .max()
+                .unwrap_or(0),
+        );
+        for (face_index, face) in mesh.faces.iter().enumerate() {
+            if local[face_index].is_some() {
+                continue;
+            }
+            face_points.clear();
+            for vertex_id in &face.vertices {
+                let Some(position) = vertex_positions.get(vertex_id).copied() else {
+                    face_points.clear();
+                    break;
+                };
+                face_points.push(position);
+            }
+            if face_points.len() == face.vertices.len() {
+                local[face_index] = Some(FaceNormalValues::Constant(
+                    crate::geom::normals::face_normal(&face_points),
+                ));
+            }
+        }
+    }
+    let mut vertex_indices: Option<BTreeMap<u32, usize>> = None;
     if let Some(normals) = adaptive_normals.filter(|normals| normals.len() == mesh.vertices.len())
         && let Ok(smooth_faces) = smooth_face_flags(mesh)
         && smooth_faces.iter().any(|smooth| *smooth)
     {
-        let vertex_indices: BTreeMap<u32, usize> = mesh
-            .vertices
-            .iter()
-            .enumerate()
-            .map(|(index, vertex)| (vertex.id, index))
-            .collect();
+        let indices = vertex_indices.get_or_insert_with(|| {
+            mesh.vertices
+                .iter()
+                .enumerate()
+                .map(|(index, vertex)| (vertex.id, index))
+                .collect::<BTreeMap<_, _>>()
+        });
         for (face_index, (face, smooth)) in mesh.faces.iter().zip(smooth_faces).enumerate() {
             if !smooth {
                 continue;
             }
-            let Some(face_normals) = local.get_mut(face_index).and_then(Option::as_mut) else {
+            if let Some(normal) = local[face_index]
+                .as_ref()
+                .and_then(FaceNormalValues::constant)
+            {
+                local[face_index] =
+                    Some(FaceNormalValues::Corners(vec![normal; face.vertices.len()]));
+            }
+            let Some(FaceNormalValues::Corners(face_normals)) =
+                local.get_mut(face_index).and_then(Option::as_mut)
+            else {
                 continue;
             };
             for (corner, vertex_id) in face.vertices.iter().enumerate() {
-                if let Some(normal) = vertex_indices
+                if let Some(normal) = indices
                     .get(vertex_id)
                     .and_then(|index| normals.get(*index))
                     .copied()
@@ -1975,35 +3783,110 @@ fn corner_normals(
             }
         }
     }
-    // Inverse-transpose keeps normals perpendicular to the surface under non-uniform scale.
+    // Source keeps these raw for MikkTSpace; its normal VBO is quantized before the world transform.
     let normal_matrix = DMat3::from_mat4(matrix).inverse().transpose();
+    let transform = |normal: DVec3, high_quality: Option<bool>| {
+        let normal = high_quality.map_or(normal, |high_quality| {
+            source_quantized_mesh_attribute(normal, high_quality)
+        });
+        (normal_matrix * normal).normalize_or_zero()
+    };
+    let mut world = vec![None; mesh.faces.len()];
+    let mut precision_matches = true;
     let mut degenerate = false;
-    let world = local
-        .iter()
-        .map(|face| {
-            let world: Vec<DVec3> = face
-                .as_ref()?
-                .iter()
-                .map(|normal| (normal_matrix * normal).normalize_or_zero())
-                .collect();
-            let valid = world
-                .iter()
-                .all(|normal| normal.is_finite() && *normal != DVec3::ZERO);
-            degenerate |= !valid;
-            valid.then_some(world)
-        })
-        .collect();
+    for face_index in 0..mesh.faces.len() {
+        match local[face_index].as_ref() {
+            Some(FaceNormalValues::Corners(local_normals)) => {
+                let face_world: Vec<DVec3> = local_normals
+                    .iter()
+                    .map(|normal| {
+                        transform(
+                            *normal,
+                            match precision {
+                                MeshAttributePrecision::Known(high_quality) => Some(high_quality),
+                                MeshAttributePrecision::Unknown => Some(false),
+                                MeshAttributePrecision::NotApplicable => None,
+                            },
+                        )
+                    })
+                    .collect();
+                if precision == MeshAttributePrecision::Unknown {
+                    let high_quality_world: Vec<DVec3> = local_normals
+                        .iter()
+                        .map(|normal| transform(*normal, Some(true)))
+                        .collect();
+                    if face_world != high_quality_world {
+                        precision_matches = false;
+                        continue;
+                    }
+                }
+                let valid = face_world
+                    .iter()
+                    .all(|normal| normal.is_finite() && *normal != DVec3::ZERO);
+                degenerate |= !valid;
+                if valid {
+                    world[face_index] = Some(FaceNormalValues::Corners(face_world));
+                }
+            }
+            Some(FaceNormalValues::Constant(local_normal)) => {
+                let face_world = transform(
+                    *local_normal,
+                    match precision {
+                        MeshAttributePrecision::Known(high_quality) => Some(high_quality),
+                        MeshAttributePrecision::Unknown => Some(false),
+                        MeshAttributePrecision::NotApplicable => None,
+                    },
+                );
+                if precision == MeshAttributePrecision::Unknown
+                    && face_world != transform(*local_normal, Some(true))
+                {
+                    precision_matches = false;
+                    continue;
+                }
+                let valid = face_world.is_finite() && face_world != DVec3::ZERO;
+                degenerate |= !valid;
+                if valid {
+                    world[face_index] = Some(FaceNormalValues::Constant(face_world));
+                }
+            }
+            None => {}
+        }
+    }
     if degenerate {
         warnings.push(serde_json::json!({
             "code": "shading.corner_normals_failed",
-            "message": "smooth shading normals became zero-length under the object transform; affected faces were shaded flat",
+            "message": "mesh shading normals became zero-length under the object transform; affected faces were shaded flat",
             "node_id": node_id,
         }));
     }
     FaceNormalData {
         world,
         local: keep_local.then_some(local),
+        precision_matches,
     }
+}
+/// Blender's mesh VBO truncates normalized f32 components before SNORM decoding.
+fn source_quantized_mesh_attribute(value: DVec3, high_quality: bool) -> DVec3 {
+    DVec3::from_array(value.to_array().map(|component| {
+        let component = component as f32;
+        let decoded = if high_quality {
+            let code =
+                ((component * 32767.0) as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            (code as f32 / 32767.0).max(-1.0)
+        } else {
+            let code = ((component * 511.0) as i32).clamp(-512, 511);
+            (code as f32 / 511.0).max(-1.0)
+        };
+        f64::from(decoded)
+    }))
+}
+
+#[cfg(test)]
+fn mesh_vertex_positions(mesh: &Mesh) -> BTreeMap<u32, DVec3> {
+    mesh.vertices
+        .iter()
+        .map(|vertex| (vertex.id, vertex.co))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2014,7 +3897,28 @@ fn world_face_normals(
     adaptive_normals: Option<&[Option<DVec3>]>,
     warnings: &mut Vec<serde_json::Value>,
 ) -> Vec<Option<Vec<DVec3>>> {
-    corner_normals(mesh, matrix, node_id, adaptive_normals, false, warnings).world
+    let vertex_positions = mesh_vertex_positions(mesh);
+    let data = corner_normals(
+        mesh,
+        &vertex_positions,
+        matrix,
+        node_id,
+        adaptive_normals,
+        false,
+        MeshAttributePrecision::NotApplicable,
+        warnings,
+    );
+    data.world
+        .into_iter()
+        .enumerate()
+        .map(|(face_index, normals)| match normals {
+            Some(FaceNormalValues::Corners(corners)) => Some(corners),
+            Some(FaceNormalValues::Constant(normal)) => {
+                Some(vec![normal; mesh.faces[face_index].vertices.len()])
+            }
+            None => None,
+        })
+        .collect()
 }
 struct MikkGeometry<'a> {
     positions: &'a [[[f32; 3]; 3]],
@@ -2049,18 +3953,22 @@ impl mikktspace::Geometry for MikkGeometry<'_> {
     }
 }
 
-/// Calculates mesh-space Mikk tangents for every UV layer, then applies Cycles' inverse-transpose
-/// object-normal transform to each corner before hits interpolate them.
+/// Calculates raw-local Mikk tangents for every UV layer, then packs the output mesh tangent
+/// attribute before applying its object-normal transform for hit interpolation.
 fn mesh_mikk_tangents(
     mesh: &Mesh,
     triangles: &[[u32; 3]],
     vertex_positions: &BTreeMap<u32, DVec3>,
     uv_store: &UvStore,
-    local_face_normals: Option<&[Option<Vec<DVec3>>]>,
+    local_face_normals: Option<&[Option<FaceNormalValues>]>,
     matrix: DMat4,
-) -> Result<Vec<Vec<[DVec3; 3]>>> {
+    precision: MeshAttributePrecision,
+) -> Result<MeshTangentData> {
     if triangles.is_empty() {
-        return Ok(Vec::new());
+        return Ok(MeshTangentData {
+            by_triangle: Vec::new(),
+            precision_matches: true,
+        });
     }
     let mut positions = Vec::with_capacity(triangles.len());
     let mut normals = Vec::with_capacity(triangles.len());
@@ -2105,8 +4013,8 @@ fn mesh_mikk_tangents(
             let flat_normal = mikk_face_normal(mikk_positions);
             let mikk_normals = local_face_normals
                 .and_then(|faces| faces.get(face_index))
-                .and_then(Option::as_deref)
-                .and_then(|face_normals| corner_values(face_normals, corners))
+                .and_then(Option::as_ref)
+                .and_then(|face_normals| face_normals.triangle_values(corners))
                 .map_or([flat_normal; 3], |normals| normals.map(mikk_vec3));
             positions.push(mikk_positions);
             normals.push(mikk_normals);
@@ -2131,6 +4039,13 @@ fn mesh_mikk_tangents(
     }
 
     let normal_matrix = DMat3::from_mat4(matrix).inverse().transpose();
+    let transform = |tangent: DVec3, high_quality: Option<bool>| {
+        let tangent = high_quality.map_or(tangent, |high_quality| {
+            source_quantized_mesh_attribute(tangent, high_quality)
+        });
+        normal_matrix * tangent
+    };
+    let mut precision_matches = true;
     let mut tangents_by_triangle: Vec<Vec<[DVec3; 3]>> = (0..triangles.len())
         .map(|_| Vec::with_capacity(uv_store.layers.len()))
         .collect();
@@ -2144,8 +4059,19 @@ fn mesh_mikk_tangents(
         let _ = mikktspace::generate_tangents(&mut geometry);
         for (target, corners) in tangents_by_triangle.iter_mut().zip(geometry.tangents) {
             target.push(corners.map(|tangent| {
-                let world = normal_matrix
-                    * DVec3::new(tangent[0] as f64, tangent[1] as f64, tangent[2] as f64);
+                let tangent = DVec3::new(tangent[0] as f64, tangent[1] as f64, tangent[2] as f64);
+                let world = match precision {
+                    MeshAttributePrecision::NotApplicable => transform(tangent, None),
+                    MeshAttributePrecision::Known(high_quality) => {
+                        transform(tangent, Some(high_quality))
+                    }
+                    MeshAttributePrecision::Unknown => {
+                        let low_quality = transform(tangent, Some(false));
+                        let high_quality = transform(tangent, Some(true));
+                        precision_matches &= low_quality == high_quality;
+                        low_quality
+                    }
+                };
                 if world.is_finite() {
                     world
                 } else {
@@ -2154,7 +4080,10 @@ fn mesh_mikk_tangents(
             }));
         }
     }
-    Ok(tangents_by_triangle)
+    Ok(MeshTangentData {
+        by_triangle: tangents_by_triangle,
+        precision_matches,
+    })
 }
 
 fn mikk_vec3(value: DVec3) -> [f32; 3] {
@@ -2250,6 +4179,135 @@ struct SceneShaderWorker<'a> {
     core: SceneShaderCore<'a>,
 }
 
+struct EeveeWorldSunLight {
+    light: LightData,
+    volume_energy: f64,
+    matrix: DMat4,
+    ray_visibility: RayVisibility,
+    use_shadows: bool,
+    shadow_radius: Option<f64>,
+}
+#[derive(Clone, Copy)]
+pub(super) struct EeveeWorldSunVolumeLight {
+    pub(super) radiance: DVec3,
+    pub(super) matrix: DMat4,
+    pub(super) volume_energy: f64,
+    pub(super) use_sun_shadow: bool,
+    pub(super) shadow_radius: Option<f64>,
+}
+
+#[derive(Default)]
+struct EeveeWorldSunState {
+    light: Option<EeveeWorldSunLight>,
+    unsupported_shadow_map_settings: bool,
+}
+
+fn eevee_world_sun_settings_refusal(scene_id: &Id, setting: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!(
+            "EEVEE extracted WorldSun needs source setting `{setting}`; reimport the Blender scene or set it explicitly"
+        ),
+        serde_json::json!({
+            "feature_id":"render.eevee.world_sun.settings",
+            "scene_id":scene_id.as_str(),
+            "setting":setting,
+        }),
+    )
+}
+pub(super) fn ensure_eevee_global_world_probe_available(
+    scene_id: &Id,
+    local_volume_probe_grids: Option<bool>,
+) -> Result<()> {
+    if local_volume_probe_grids == Some(false) {
+        return Ok(());
+    }
+    let message = if local_volume_probe_grids == Some(true) {
+        "EEVEE global World SH cannot substitute for visible local VOLUME probe grids; local volume-probe irradiance is not represented"
+    } else {
+        "EEVEE world-probe irradiance cannot be used because source participation in local VOLUME probe grids is unknown; reimport the Blender scene to recover it"
+    };
+    Err(PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        message,
+        serde_json::json!({
+            "feature_id":"render.eevee.world_probe.local_volume_grids",
+            "scene_id":scene_id.as_str(),
+            "setting":"eevee_has_local_volume_probe_grids",
+        }),
+    ))
+}
+
+// Transform::operator float4x4 reconstructs the Duff basis columns from the BSL's transposed rows.
+fn eevee_world_sun_matrix(direction: Vec3) -> DMat4 {
+    let z_sign = if direction.z >= 0.0 { 1.0 } else { -1.0 };
+    let a = -1.0 / (z_sign + direction.z);
+    let b = direction.x * direction.y * a;
+    let basis = Mat3::from_cols(
+        Vec3::new(
+            1.0 + z_sign * direction.x * direction.x * a,
+            z_sign * b,
+            -z_sign * direction.x,
+        ),
+        Vec3::new(b, z_sign + direction.y * direction.y * a, -direction.y),
+        direction,
+    );
+    let to_double =
+        |axis: Vec3| DVec3::new(f64::from(axis.x), f64::from(axis.y), f64::from(axis.z));
+    DMat4::from_cols(
+        to_double(basis.x_axis).extend(0.0),
+        to_double(basis.y_axis).extend(0.0),
+        to_double(basis.z_axis).extend(0.0),
+        DVec3::ZERO.extend(1.0),
+    )
+}
+fn eevee_world_sun_light(
+    world: &World,
+    source: EeveeWorldSun,
+) -> std::result::Result<EeveeWorldSunLight, &'static str> {
+    let sun_angle = world.eevee_sun_angle.ok_or("eevee_sun_angle")?;
+    let use_shadows = world.eevee_use_sun_shadow.ok_or("eevee_use_sun_shadow")?;
+    let shadow_radius = if use_shadows {
+        let jitter = world
+            .eevee_use_sun_shadow_jitter
+            .ok_or("eevee_use_sun_shadow_jitter")?;
+        let overblur = if jitter {
+            world
+                .eevee_sun_shadow_jitter_overblur
+                .ok_or("eevee_sun_shadow_jitter_overblur")?
+                / 100.0
+        } else {
+            1.0
+        };
+        let half_angle = sun_angle.min(179.9_f64.to_radians()) * 0.5;
+        let shadow_angle = if half_angle > 0.0 {
+            (half_angle * overblur).max(1.0e-8)
+        } else {
+            0.0
+        };
+        Some(shadow_angle.tan())
+    } else {
+        None
+    };
+    let mut ray_visibility = RayVisibility::default();
+    ray_visibility.set(RayKind::Camera, false);
+    Ok(EeveeWorldSunLight {
+        light: LightData {
+            light_type: LightType::Sun,
+            color: source.radiance.to_array().map(f64::from),
+            energy: std::f64::consts::FRAC_1_PI * (1.0 + 1.0 / sun_disc_radius(sun_angle).powi(2)),
+            sun_angle,
+            use_shadow: Some(use_shadows),
+            ..LightData::default()
+        },
+        matrix: eevee_world_sun_matrix(source.direction),
+        ray_visibility,
+        volume_energy: 1.0,
+        use_shadows,
+        shadow_radius,
+    })
+}
+
 struct SceneShaderCore<'a> {
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
@@ -2257,11 +4315,19 @@ struct SceneShaderCore<'a> {
     geometry: super::path::SharedGeometry<'a>,
     mode: Mode,
     math_semantics: crate::node_kernels::MathSemantics,
+    /// Captured Blender EEVEE settings, or a precise refusal when imported state is unknown.
+    eevee_raytracing_settings: Result<Option<EeveeRayTracingSettings>>,
+    /// Cached source-compiled flags for the frame's two deferred material layers.
+    eevee_raytrace_layer_flags: Result<Option<EeveeRaytraceLayerSummary>>,
+    /// Forward EEVEE chooses RGB transparency targets scene-wide from compiled material flags.
+    eevee_colored_transparency: bool,
     /// The camera's view space, in which Solid's studio lights are fixed.
     view: &'a ViewBasis,
     evaluator_workspace: RefCell<EvaluatorWorkspace>,
     /// Lazily populated once per render and shared by the serial pass and all band workers.
     world_probe: Arc<OnceLock<Result<Option<Arc<WorldProbe>>>>>,
+    /// Source `WorldSun` as an ephemeral native direct light, shared by the render workers.
+    world_sun: Arc<OnceLock<Result<EeveeWorldSunState>>>,
 }
 
 /// The per-pixel shader for `mode`, or `None` when the raster outputs unlit or per-triangle colour.
@@ -2299,7 +4365,48 @@ pub(super) fn surface_shader_with_semantics<'a>(
         Mode::Beauty if geometry.shadows.is_some() => {}
         _ => return None,
     }
-    Some(Box::new(SceneShader {
+    scene_shader_with_semantics(doc, snapshot, images, geometry, mode, view, math_semantics)
+        .into_surface_shader()
+}
+
+pub(super) fn scene_shader_with_semantics<'a>(
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    images: &'a BTreeMap<String, ImageData>,
+    geometry: &'a Geometry,
+    mode: Mode,
+    view: &'a ViewBasis,
+    math_semantics: crate::node_kernels::MathSemantics,
+) -> SceneShader<'a> {
+    let eevee_colored_transparency = math_semantics == crate::node_kernels::MathSemantics::Eevee
+        && geometry_uses_eevee_colored_transparency(geometry);
+    let eevee_raytracing_settings = doc
+        .scenes
+        .get(&snapshot.scene_id)
+        .map_or(Ok(None), |scene| {
+            if !matches!(mode, Mode::Beauty)
+                || math_semantics != crate::node_kernels::MathSemantics::Eevee
+            {
+                return Ok(None);
+            }
+            let blender_imported = doc
+                .compatibility
+                .get("blender_adapter")
+                .is_some_and(serde_json::Value::is_object);
+            EeveeRayTracingSettings::from_render_settings(
+                &scene.render,
+                blender_imported,
+                snapshot.scene_id.as_str(),
+            )
+        });
+    let eevee_raytrace_layer_flags = if matches!(mode, Mode::Beauty)
+        && math_semantics == crate::node_kernels::MathSemantics::Eevee
+    {
+        eevee_registered_raytrace_layer_summary(doc, snapshot, geometry).map(Some)
+    } else {
+        Ok(None)
+    };
+    SceneShader {
         core: SceneShaderCore {
             doc,
             snapshot,
@@ -2307,17 +4414,64 @@ pub(super) fn surface_shader_with_semantics<'a>(
             geometry: super::path::SharedGeometry::of(geometry),
             mode,
             math_semantics,
+            eevee_colored_transparency,
+            eevee_raytracing_settings,
+            eevee_raytrace_layer_flags,
             view,
             evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
             world_probe: Arc::new(OnceLock::new()),
+            world_sun: Arc::new(OnceLock::new()),
         },
         warnings: &geometry.shader_warnings,
-    }))
+    }
+}
+
+impl<'a> SceneShader<'a> {
+    pub(super) fn into_surface_shader(self) -> Option<Box<dyn SurfaceShader + 'a>> {
+        match self.core.mode {
+            Mode::Solid => Some(Box::new(self)),
+            Mode::Beauty if self.core.geometry.shadows.is_some() => Some(Box::new(self)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn eevee_world_sun_volume_light(&self) -> Result<Option<EeveeWorldSunVolumeLight>> {
+        let sun = self.core.world_sun(self.warnings)?.light.as_ref();
+        Ok(sun.map(|sun| EeveeWorldSunVolumeLight {
+            radiance: DVec3::from_array(sun.light.color),
+            matrix: sun.matrix,
+            volume_energy: sun.volume_energy,
+            use_sun_shadow: sun.use_shadows,
+            shadow_radius: sun.shadow_radius,
+        }))
+    }
 }
 
 impl SurfaceShader for SceneShader<'_> {
     fn shade(&self, triangle: &Triangle, hit: &SurfaceHit<'_>) -> Result<SurfaceSample> {
         self.core.shade(self.warnings, triangle, hit)
+    }
+    fn needs_eevee_gbuffer_context(&self) -> bool {
+        matches!(self.core.mode, Mode::Beauty)
+            && self.core.math_semantics == crate::node_kernels::MathSemantics::Eevee
+    }
+    fn eevee_raytracing_settings(&self) -> Result<Option<EeveeRayTracingSettings>> {
+        self.core.eevee_raytracing_settings.clone()
+    }
+    fn eevee_raytrace_layer_flags(&self) -> Result<Option<EeveeRaytraceLayerSummary>> {
+        self.core.eevee_raytrace_layer_flags.clone()
+    }
+    fn eevee_raytrace_probe_radiance(
+        &self,
+        sample: &EeveeRaytraceSample,
+        bin: EeveeRaytraceBin,
+        world_direction: DVec3,
+    ) -> Result<DVec3> {
+        self.core
+            .eevee_raytrace_probe_radiance(sample, bin, world_direction)
+    }
+    fn eevee_fast_gi_volume_irradiance(&self, _point: DVec3) -> Result<Option<FastGiSh>> {
+        self.core.eevee_fast_gi_volume_irradiance()
     }
 
     fn worker(&self) -> Result<Option<Box<dyn SurfaceShaderWorker + Send + '_>>> {
@@ -2331,12 +4485,187 @@ impl SurfaceShader for SceneShader<'_> {
     }
 }
 
-/// The transparent tint the Beauty composite applies to a surface. EEVEE keeps a Transparent closure's colour per channel
-/// only for a BLENDED material (`ForwardPipeline::use_colored_transparency`, `GPU_MATFLAG_TRANSPARENT_MAYBE_COLORED`).
-/// A DITHERED material stores one alpha, `1 - average(transmittance)` (`eevee_surf_deferred.bsl.hh`, `out_color.a`), so
-/// its tint is the channel mean. `alpha_mode` `blend` is BLENDED; `opaque` and `clip` are DITHERED
-/// (`blend_bridge.py`, `surface_render_method`).
-fn beauty_tint(material: Option<&Material>, tint: [f64; 3]) -> [f64; 3] {
+/// Whether a camera-visible BLENDED surface submitted to EEVEE's forward pass enables RGB transparency targets.
+fn geometry_uses_eevee_colored_transparency(geometry: &Geometry) -> bool {
+    let enables_rgb_transparency = |material_index: usize| {
+        geometry
+            .materials
+            .get(material_index)
+            .zip(geometry.prepared.get(material_index))
+            .is_some_and(|(material, prepared)| {
+                material.alpha_mode == "blend"
+                    && (prepared.eevee_transparent_maybe_colored() || prepared.eevee_has_holdout())
+            })
+    };
+    geometry.triangles.iter().any(|triangle| {
+        triangle.ray_mask & RayKind::Camera.bit() != 0
+            && enables_rgb_transparency(triangle.material_index)
+    }) || geometry.hair_curve_instances.iter().any(|curve| {
+        curve.ray_mask & RayKind::Camera.bit() != 0
+            && enables_rgb_transparency(curve.material_index)
+    })
+}
+
+/// Mesh sync registers each used-with-fallback slot; hair curves and point clouds use only slot zero.
+/// (`material.cc:870-879`, `eevee_material.cc:443-455`). `Snapshot.slot_material` applies the
+/// evaluated object/data bindings, clamped exactly like `BKE_object_material_get_eval`.
+fn eevee_registered_raytrace_layer_summary(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    geometry: &Geometry,
+) -> Result<EeveeRaytraceLayerSummary> {
+    let default_flags = geometry
+        .prepared
+        .first()
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "deferred geometry has no prepared default surface material",
+            )
+        })?
+        .eevee_closure_flags()?;
+    let mut prepared_flags = BTreeMap::new();
+    for object in &geometry.objects {
+        for entry in &object.material_colors.entries {
+            if let Some(material_id) = &entry.material_id
+                && !prepared_flags.contains_key(material_id)
+                && let Some(prepared) = geometry.prepared.get(entry.material_index)
+            {
+                prepared_flags.insert(material_id.clone(), prepared.eevee_closure_flags()?);
+            }
+        }
+    }
+    let (mut opaque, mut refraction, mut has_refraction_material) = (0, 0, false);
+    for object in &geometry.objects {
+        let node = doc.nodes.get(&object.node_id).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "deferred geometry references an unmapped object",
+            )
+        })?;
+        let data = object
+            .data_id
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id));
+        for slot in 0..eevee_deferred_material_slot_count(snapshot, object, data) {
+            let material_id = snapshot.slot_material(&object.node_id, node, data, slot);
+            let Some(material) = material_id.and_then(|id| doc.materials.get(id)) else {
+                // Blender's empty slot uses its default surface material; it is not a refraction layer.
+                opaque |= match default_flags {
+                    0 => EEVEE_CLOSURE_EMISSION,
+                    flags => flags,
+                };
+                continue;
+            };
+            if material.alpha_mode == "blend" {
+                continue;
+            }
+            let use_refraction = material.use_raytrace_refraction.ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    "EEVEE ray tracing needs the material's raytrace-refraction setting to identify its deferred layer",
+                    serde_json::json!({
+                        "feature_id":"render.eevee.ray_tracing.refraction_material",
+                    }),
+                )
+            })?;
+            let material_id = material_id.ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "resolved deferred material has no material ID",
+                )
+            })?;
+            let flags = if let Some(flags) = prepared_flags.get(material_id).copied() {
+                flags
+            } else {
+                let flags =
+                    PreparedMaterial::new(material, &doc.node_groups).eevee_closure_flags()?;
+                prepared_flags.insert(material_id.clone(), flags);
+                flags
+            };
+            let flags = match flags {
+                0 => EEVEE_CLOSURE_EMISSION,
+                flags => flags,
+            };
+            if use_refraction {
+                refraction |= flags;
+                has_refraction_material = true;
+            } else {
+                opaque |= flags;
+            }
+        }
+    }
+    Ok(eevee_raytrace_layer_summary_from_masks(
+        opaque,
+        refraction,
+        has_refraction_material,
+    ))
+}
+
+fn eevee_deferred_material_slot_count(
+    snapshot: &Snapshot,
+    object: &ObjectRecord,
+    data: Option<&crate::model::DataBlock>,
+) -> usize {
+    if data.is_some_and(|data| data.data_type == "volume" || data.volume.is_some()) {
+        // Source volume passes use MAT_GEOM_VOLUME and never register deferred-layer materials.
+        return 0;
+    }
+    if data.is_some_and(|data| data.hair_curves.is_some() || data.pointcloud.is_some()) {
+        // EEVEE sync_curves/sync_pointcloud compile their single material_get slot zero.
+        return 1;
+    }
+    let Some(mesh) = snapshot.meshes.get(&object.node_id) else {
+        return 0;
+    };
+    // `Mesh::material_index_max` clamps to MAXMAT and returns None on empty faces; BKE's
+    // used-with-fallback count still registers slot zero. sync_mesh obtains this array before
+    // returning for an empty material geometry span (`eevee_sync.cc:222-227`).
+    let max_index = mesh
+        .faces
+        .iter()
+        .map(|face| face.material_index)
+        .max()
+        .unwrap_or(0)
+        .min(i16::MAX as u32);
+    usize::try_from(max_index).unwrap_or(0).saturating_add(1)
+}
+
+fn eevee_raytrace_layer_summary_from_masks(
+    opaque: u32,
+    refraction: u32,
+    has_refraction_material: bool,
+) -> EeveeRaytraceLayerSummary {
+    let layer_flags = |flags: u32| {
+        // DeferredLayer::end_sync omits SSS here; its broader transmission predicate includes it.
+        let has_transmit_closure =
+            flags & (EEVEE_CLOSURE_REFRACTION | EEVEE_CLOSURE_TRANSLUCENT) != 0;
+        EeveeRaytraceLayerFlags {
+            has_any_closure: flags != 0,
+            has_reflect_closure: flags & (EEVEE_CLOSURE_DIFFUSE | EEVEE_CLOSURE_REFLECTION) != 0,
+            has_transmit_closure,
+            // CLOSURE_TRANSMISSION includes SSS, while this separate pair handles transparency + ShaderToRGB.
+            has_transmission: flags
+                & (EEVEE_CLOSURE_SUBSURFACE | EEVEE_CLOSURE_REFRACTION | EEVEE_CLOSURE_TRANSLUCENT)
+                != 0
+                || flags & EEVEE_CLOSURE_TRANSPARENCY != 0
+                    && flags & EEVEE_CLOSURE_SHADER_TO_RGBA != 0,
+        }
+    };
+    EeveeRaytraceLayerSummary {
+        opaque: layer_flags(opaque),
+        refraction: has_refraction_material.then(|| layer_flags(refraction)),
+    }
+}
+
+/// The transparent tint the Beauty composite applies to a surface. EEVEE DITHERED uses mean transmittance; BLENDED
+/// forward uses the scene-wide target choice (`eevee_surf_forward.bsl.hh`): red-only when monochromatic, full RGB when
+/// `ForwardPipeline::use_colored_transparency` is enabled.
+fn beauty_tint(
+    material: Option<&Material>,
+    tint: [f64; 3],
+    eevee_monochromatic_transparency: bool,
+) -> [f64; 3] {
     // A transmittance is a fraction of the light: EEVEE clamps the Color at zero and saturates the result
     // (`gpu_shader_material_transparent.glsl`, `eevee_surf_deferred.bsl.hh`), so a tint above one or below zero is cut to
     // [0, 1] before it can amplify or invert the background.
@@ -2346,6 +4675,7 @@ fn beauty_tint(material: Option<&Material>, tint: [f64; 3]) -> [f64; 3] {
             let mean = (tint[0] + tint[1] + tint[2]) / 3.0;
             [mean; 3]
         }
+        Some(_) if eevee_monochromatic_transparency => [tint[0]; 3],
         _ => tint,
     }
 }
@@ -2358,10 +4688,14 @@ impl SceneShaderCore<'_> {
             images: self.images,
             geometry: self.geometry,
             mode: self.mode,
-            view: self.view,
             math_semantics: self.math_semantics,
+            eevee_colored_transparency: self.eevee_colored_transparency,
+            eevee_raytracing_settings: self.eevee_raytracing_settings.clone(),
+            eevee_raytrace_layer_flags: self.eevee_raytrace_layer_flags.clone(),
+            view: self.view,
             evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
-            world_probe: Arc::clone(&self.world_probe),
+            world_probe: self.world_probe.clone(),
+            world_sun: self.world_sun.clone(),
         }
     }
 
@@ -2370,21 +4704,163 @@ impl SceneShaderCore<'_> {
     /// (`LightProbeModule::sync_world`, `eevee_lightprobe.cc`). `None` means the scene has no world.
     fn world_probe(&self) -> Result<Option<&WorldProbe>> {
         let cached = self.world_probe.get_or_init(|| {
-            let world = self
-                .doc
-                .scenes
-                .get(&self.snapshot.scene_id)
+            let scene = self.doc.scenes.get(&self.snapshot.scene_id);
+            let world = scene
                 .and_then(|scene| scene.world.as_ref())
                 .and_then(|id| self.doc.worlds.get(id));
+            if self.math_semantics == crate::node_kernels::MathSemantics::Eevee
+                && super::path::scene_has_world_volume(self.doc, &self.snapshot.scene_id)
+            {
+                return Err(eevee_world_volume_absorption_refusal(
+                    &self.snapshot.scene_id,
+                ));
+            }
+            let local_volume_probe_grids =
+                scene.and_then(|scene| scene.eevee_has_local_volume_probe_grids);
+            if self.math_semantics == crate::node_kernels::MathSemantics::Eevee {
+                ensure_eevee_global_world_probe_available(
+                    &self.snapshot.scene_id,
+                    local_volume_probe_grids,
+                )?;
+            }
             world
                 .map(|world| {
-                    WorldProbe::build(world, &self.doc.node_groups, self.images).map(Arc::new)
+                    let mode = if self.math_semantics == crate::node_kernels::MathSemantics::Eevee {
+                        let resolution = scene
+                            .and_then(|scene| scene.render.eevee_gi_cubemap_resolution)
+                            .ok_or_else(|| {
+                                super::path::realtime_world_probe_resolution_refusal(
+                                    &self.snapshot.scene_id,
+                                )
+                            })?;
+                        let surface_indirect_clamp = scene
+                            .and_then(|scene| scene.render.eevee_clamp_surface_indirect)
+                            .ok_or_else(|| {
+                                PotError::with_details(
+                                    ErrorCode::UnsupportedFeature,
+                                    "EEVEE realtime world lighting needs the source clamp_surface_indirect setting; reimport the Blender scene to recover it",
+                                    serde_json::json!({"feature_id":"render.eevee.clamp_surface_indirect","scene_id":self.snapshot.scene_id.as_str()}),
+                                )
+                            })?;
+                        WorldProbeMode::Eevee {
+                            cubemap_resolution: resolution,
+                            surface_indirect_clamp: surface_indirect_clamp as f32,
+                        }
+                    } else {
+                        WorldProbeMode::Path
+                    };
+                    WorldProbe::build(world, &self.doc.node_groups, self.images, mode).map(Arc::new)
                 })
                 .transpose()
         });
         match cached {
             Ok(probe) => Ok(probe.as_deref()),
             Err(error) => Err(error.clone()),
+        }
+    }
+    fn eevee_fast_gi_volume_irradiance(&self) -> Result<Option<FastGiSh>> {
+        let probe = self.world_probe()?;
+        Ok(match probe {
+            Some(probe) => probe.fast_gi_sh(),
+            None if self.math_semantics == crate::node_kernels::MathSemantics::Eevee => {
+                Some(FastGiSh::ZERO)
+            }
+            None => None,
+        })
+    }
+
+    fn world_sun(&self, warnings: &RefCell<Vec<serde_json::Value>>) -> Result<&EeveeWorldSunState> {
+        let cached = self.world_sun.get_or_init(|| {
+            let state = self.build_world_sun()?;
+            if state.unsupported_shadow_map_settings {
+                let warning = serde_json::json!({
+                    "code":"UNSUPPORTED_FEATURE",
+                    "feature_id":"render.eevee.world_sun.shadow_map_settings",
+                    "message":"Native WorldSun shadows use the scene BVH; World.sun_shadow_maximum_resolution and World.sun_shadow_filter_radius are not represented.",
+                });
+                let mut recorded = warnings.borrow_mut();
+                if !recorded.contains(&warning) {
+                    recorded.push(warning);
+                }
+            }
+            Ok(state)
+        });
+
+        match cached {
+            Ok(state) => Ok(state),
+            Err(error) => Err(error.clone()),
+        }
+    }
+    fn build_world_sun(&self) -> Result<EeveeWorldSunState> {
+        if !matches!(self.mode, Mode::Beauty)
+            || self.math_semantics != crate::node_kernels::MathSemantics::Eevee
+        {
+            return Ok(EeveeWorldSunState::default());
+        }
+        let Some(scene) = self.doc.scenes.get(&self.snapshot.scene_id) else {
+            return Ok(EeveeWorldSunState::default());
+        };
+        let Some(world) = scene
+            .world
+            .as_ref()
+            .and_then(|world_id| self.doc.worlds.get(world_id))
+        else {
+            return Ok(EeveeWorldSunState::default());
+        };
+        if !world
+            .eevee_sun_threshold
+            .is_some_and(|threshold| threshold > 0.0)
+        {
+            return Ok(EeveeWorldSunState::default());
+        }
+        let Some(probe) = self.world_probe()? else {
+            return Ok(EeveeWorldSunState::default());
+        };
+        let Some(source_sun) = probe.world_sun() else {
+            return Ok(EeveeWorldSunState::default());
+        };
+        let light = eevee_world_sun_light(world, source_sun).map_err(|setting| {
+            eevee_world_sun_settings_refusal(&self.snapshot.scene_id, setting)
+        })?;
+        let unsupported_shadow_map_settings = light.use_shadows;
+        Ok(EeveeWorldSunState {
+            light: Some(light),
+            unsupported_shadow_map_settings,
+        })
+    }
+    fn eevee_raytrace_probe_radiance(
+        &self,
+        sample: &EeveeRaytraceSample,
+        bin: EeveeRaytraceBin,
+        world_direction: DVec3,
+    ) -> Result<DVec3> {
+        let Some(world) = self.world_probe()? else {
+            return Ok(DVec3::ZERO);
+        };
+        match bin.world_input.lobe {
+            RayLobe::Diffuse | RayLobe::BurleyBssrdf => Ok(prefiltered_world(
+                world,
+                sample.normal,
+                1.0,
+                irradiance_probe_radiance,
+            )),
+            RayLobe::Translucent
+                if bin.world_input.thickness.mode == ThicknessMode::Sphere
+                    && bin.world_input.thickness.value != 0.0 =>
+            {
+                Ok(world.average_irradiance())
+            }
+            RayLobe::Translucent => Ok(prefiltered_world(
+                world,
+                -sample.normal,
+                1.0,
+                irradiance_probe_radiance,
+            )),
+            _ => eevee_deferred_indirect_world(
+                world,
+                world_direction,
+                f64::from(bin.world_input.apparent_roughness()),
+            ),
         }
     }
 
@@ -2403,6 +4879,10 @@ impl SceneShaderCore<'_> {
                 color: [0.0; 4],
                 has_surface: false,
                 transparent_tint: [1.0; 3],
+                holdout_weight: 0.0,
+                subsurface: None,
+                eevee_raytrace: None,
+                eevee_dither: None,
             });
         }
         let graph_shading = if triangle.lit_per_pixel {
@@ -2426,9 +4906,15 @@ impl SceneShaderCore<'_> {
                 triangle.color[2],
                 alpha,
             ];
+            let mut params = shading_params(material, base, hit.normal);
+            if matches!(self.mode, Mode::Beauty) && hit.back_facing {
+                // EEVEE's `init_globals` face-forwards N and keeps the back-facing IOR context.
+                params.normal = -params.normal;
+                params.back_facing = true;
+            }
             fallback = [ShaderClosure {
                 weight: 1.0,
-                params: shading_params(material, base, hit.normal),
+                params,
             }];
             &fallback
         };
@@ -2487,6 +4973,31 @@ impl SceneShaderCore<'_> {
             );
             return Ok(SurfaceSample::opaque([lit.x, lit.y, lit.z, alpha]));
         }
+        let shading_normal = if matches!(self.mode, Mode::Beauty)
+            && self.math_semantics == crate::node_kernels::MathSemantics::Eevee
+            && hit.back_facing
+        {
+            -hit.normal
+        } else {
+            hit.normal
+        };
+        let thickness = object_for_index(self.geometry.objects, triangle.object_index)
+            .map_or(0.0, |object| object.thickness);
+        // Select BLENDED from the source Material before graph opacity is routed through Triangle coverage.
+        // Other EEVEE surfaces use deferred resolution; Triangle retains its separate mask semantics.
+        let gbuffer_route = if matches!(self.mode, Mode::Beauty)
+            && self.math_semantics == crate::node_kernels::MathSemantics::Eevee
+            && material.is_none_or(|material| material.alpha_mode != "blend")
+        {
+            Some(eevee_gbuffer_route(
+                graph_shading.as_ref(),
+                closures,
+                hit,
+                thickness,
+            )?)
+        } else {
+            None
+        };
         let camera_matrices = hit
             .camera_matrices
             .map(|matrices| (&matrices.0, &matrices.1))
@@ -2507,27 +5018,107 @@ impl SceneShaderCore<'_> {
             point_maps: &shadows.point_maps,
             occluders: shadows.transparent_casters.then_some(&occluders),
         });
-        let thickness = object_for_index(self.geometry.objects, triangle.object_index)
-            .map_or(0.0, |object| object.thickness);
-        let color = shade(
-            self.doc,
-            self.snapshot,
-            hit.point,
-            hit.shadow_point,
-            hit.normal,
-            hit.geometric,
-            hit.view,
+        let needs_world_probe = self.math_semantics != crate::node_kernels::MathSemantics::Eevee
+            || closures.iter().any(|closure| {
+                let features = closure.params.eevee_gbuffer_features();
+                features.has_diffuse()
+                    || features.has_reflection()
+                    || features.has_refraction()
+                    || features.has_subsurface()
+                    || features.has_translucent()
+                    || features.has_clearcoat()
+            });
+        let world = if needs_world_probe {
+            self.world_probe()?
+        } else {
+            None
+        };
+        let world_sun = if needs_world_probe {
+            self.world_sun(warnings)?.light.as_ref()
+        } else {
+            None
+        };
+        let mut color = shade(&SurfaceShadeContext {
+            doc: self.doc,
+            snapshot: self.snapshot,
+            receiver: Receiver {
+                point: hit.point,
+                shadow_point: hit.shadow_point,
+                geometric: hit.geometric,
+                view: hit.view,
+            },
+            normal: shading_normal,
             closures,
-            self.mode,
+            mode: self.mode,
             shadow,
-            thickness,
-            self.world_probe()?,
-        );
+            object_thickness: thickness,
+            world,
+            world_sun,
+            gbuffer: gbuffer_route.as_ref(),
+            eevee_raytrace_feedback: hit.eevee_raytrace_feedback,
+            material_refraction: material
+                .map_or(Some(false), |material| material.use_raytrace_refraction),
+        })?;
+        let holdout_weight = eevee_holdout_weight(closures);
+        if gbuffer_route.is_none() {
+            // Forward and native visualization samples carry their own Holdout association before raster composition.
+            let radiance_share = 1.0 - holdout_weight;
+            for channel in &mut color[..3] {
+                *channel *= radiance_share;
+            }
+        }
+        let subsurface = if matches!(self.mode, Mode::Beauty) {
+            eevee_subsurface_sample(
+                self.doc,
+                self.snapshot,
+                hit.point,
+                hit.shadow_point,
+                shading_normal,
+                hit.geometric,
+                hit.view,
+                closures,
+                gbuffer_route.as_ref(),
+                Some(&hit.eevee_raytrace_feedback),
+                shadow,
+                world,
+                world_sun,
+                triangle.object_index,
+                camera_matrices,
+                material.map_or(Some(false), |material| material.use_raytrace_refraction),
+            )?
+        } else {
+            None
+        };
+        let eevee_raytrace = self
+            .eevee_raytracing_settings
+            .as_ref()
+            .is_ok_and(Option::is_some)
+            .then(|| {
+                eevee_raytrace_sample(
+                    gbuffer_route.as_ref(),
+                    closures,
+                    hit,
+                    material.map_or(Some(false), |material| material.use_raytrace_refraction),
+                )
+            })
+            .transpose()?;
         occluders.finish()?;
         Ok(SurfaceSample {
             color,
             has_surface: true,
-            transparent_tint: beauty_tint(material, surface_tint(closures)),
+            transparent_tint: beauty_tint(
+                material,
+                surface_tint(closures),
+                self.math_semantics == crate::node_kernels::MathSemantics::Eevee
+                    && !self.eevee_colored_transparency,
+            ),
+            holdout_weight,
+            eevee_dither: gbuffer_route.as_ref().map(|route| EeveeDitherSample {
+                transparency: route.gbuffer_transparency,
+                alpha_reciprocal: route.gbuffer_alpha_reciprocal,
+            }),
+            subsurface,
+            eevee_raytrace,
         })
     }
 
@@ -2606,6 +5197,29 @@ impl SurfaceShaderWorker for SceneShaderWorker<'_> {
         warnings: &RefCell<Vec<serde_json::Value>>,
     ) -> Result<SurfaceSample> {
         self.core.shade(warnings, triangle, hit)
+    }
+
+    fn needs_eevee_gbuffer_context(&self) -> bool {
+        matches!(self.core.mode, Mode::Beauty)
+            && self.core.math_semantics == crate::node_kernels::MathSemantics::Eevee
+    }
+    fn eevee_raytracing_settings(&self) -> Result<Option<EeveeRayTracingSettings>> {
+        self.core.eevee_raytracing_settings.clone()
+    }
+    fn eevee_raytrace_layer_flags(&self) -> Result<Option<EeveeRaytraceLayerSummary>> {
+        self.core.eevee_raytrace_layer_flags.clone()
+    }
+    fn eevee_raytrace_probe_radiance(
+        &self,
+        sample: &EeveeRaytraceSample,
+        bin: EeveeRaytraceBin,
+        world_direction: DVec3,
+    ) -> Result<DVec3> {
+        self.core
+            .eevee_raytrace_probe_radiance(sample, bin, world_direction)
+    }
+    fn eevee_fast_gi_volume_irradiance(&self, _point: DVec3) -> Result<Option<FastGiSh>> {
+        self.core.eevee_fast_gi_volume_irradiance()
     }
 }
 /// EEVEE's default refraction thickness of an object: the smallest dimension of its bounds, in world units. EEVEE takes
@@ -3110,23 +5724,26 @@ fn opaque_share(closures: &[ShaderClosure]) -> f64 {
         .clamp(0.0, 1.0)
 }
 
-/// The transparent tint of a hit, as the composite applies it: a hit passes `(1 - opacity) * tint` of the light behind
-/// it. EEVEE accumulates every transparent closure into one transmittance, `g_transmittance += transmittance * weight`
-/// (`eevee_nodetree_lib.bsl.hh`, `closure_eval(ClosureTransparency)`), and Cycles sums the closures' transparent weights
-/// the same way. So a mix of closures passes `sum w (1 - alpha) tint`, and the tint is that over the pass chance.
+/// EEVEE's physical transparent tint excludes Holdout, whose closure has zero transmittance and a separate film-matte
+/// share (`gpu_shader_material_holdout.glsl`, `node_holdout`).
 fn surface_tint(closures: &[ShaderClosure]) -> [f64; 3] {
     if closures.is_empty() {
         return [1.0; 3];
     }
+    let holdout = eevee_holdout_weight(closures);
+    let physical_opacity = (opaque_share(closures) + holdout).clamp(0.0, 1.0);
     weighted_tint(
-        closures.iter().map(|closure| {
-            (
-                closure.weight,
-                closure.params.alpha,
-                closure.params.transparent_tint,
-            )
-        }),
-        opaque_share(closures),
+        closures
+            .iter()
+            .filter(|closure| !matches!(closure.params.model, BsdfModel::Holdout))
+            .map(|closure| {
+                (
+                    closure.weight,
+                    closure.params.alpha,
+                    closure.params.transparent_tint,
+                )
+            }),
+        physical_opacity,
     )
 }
 
@@ -3156,72 +5773,1591 @@ fn base_albedo(params: &BsdfParams) -> DVec3 {
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "flat material shading consumes explicit evaluated surface and light values"
-)]
-fn shade(
+fn eevee_gbuffer_candidates(
+    closures: &[ShaderClosure],
+    normal: DVec3,
+    view: DVec3,
+) -> Result<Vec<EeveeGBufferCandidate>> {
+    let mut candidates = Vec::with_capacity(closures.len().saturating_mul(5));
+    for (source_closure_index, closure) in closures.iter().enumerate() {
+        let params = &closure.params;
+        // EEVEE Hair preview's GPU Weight can be sourced from Secondary Reflection; graph weight still governs coverage.
+        let weight =
+            params.eevee_diffuse_weight.unwrap_or(closure.weight) * params.alpha.clamp(0.0, 1.0);
+        if params.standalone_glass {
+            if let Some(glass) = eevee_transmission::glass_closures(
+                params,
+                params.normal,
+                view,
+                DVec3::ONE,
+                Thickness::None,
+            ) {
+                push_eevee_gbuffer_candidate(
+                    &mut candidates,
+                    source_closure_index,
+                    EeveeGBufferLobe::Reflection,
+                    weight,
+                    glass.reflection,
+                );
+                push_eevee_gbuffer_candidate(
+                    &mut candidates,
+                    source_closure_index,
+                    if params.thin_wall {
+                        EeveeGBufferLobe::ThinRefraction
+                    } else {
+                        EeveeGBufferLobe::Refraction
+                    },
+                    weight,
+                    glass.transmission,
+                );
+            }
+            continue;
+        }
+        let features = params.eevee_gbuffer_features();
+        if features.compile_bin_count() == 0 {
+            continue;
+        }
+        if matches!(params.model, BsdfModel::Principled)
+            && features.has_diffuse()
+            && !features.has_reflection()
+        {
+            push_eevee_gbuffer_candidate(
+                &mut candidates,
+                source_closure_index,
+                EeveeGBufferLobe::Diffuse,
+                weight,
+                base_albedo(params),
+            );
+            continue;
+        }
+
+        match params.model {
+            BsdfModel::Principled => eevee_principled_gbuffer_candidates(
+                &mut candidates,
+                source_closure_index,
+                closure,
+                normal,
+                view,
+            ),
+            BsdfModel::Metallic(_) => {
+                let metallic_normal = normalize_fallback(params.normal, normal);
+                let color =
+                    eevee_metallic_brdf(params, metallic_normal, view).ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::EvaluationFailed,
+                            "EEVEE metallic closure has no conductor Fresnel inputs",
+                        )
+                    })?;
+                push_eevee_gbuffer_candidate(
+                    &mut candidates,
+                    source_closure_index,
+                    EeveeGBufferLobe::Reflection,
+                    weight,
+                    color,
+                );
+            }
+            BsdfModel::Refraction(_) => push_eevee_gbuffer_candidate(
+                &mut candidates,
+                source_closure_index,
+                if params.thin_wall {
+                    EeveeGBufferLobe::ThinRefraction
+                } else {
+                    EeveeGBufferLobe::Refraction
+                },
+                weight,
+                base_albedo(params),
+            ),
+            BsdfModel::Subsurface => {
+                if eevee_subsurface_radius(params).is_some() {
+                    push_eevee_gbuffer_candidate(
+                        &mut candidates,
+                        source_closure_index,
+                        EeveeGBufferLobe::Subsurface,
+                        weight,
+                        base_albedo(params),
+                    );
+                }
+            }
+            BsdfModel::Translucent => push_eevee_gbuffer_candidate(
+                &mut candidates,
+                source_closure_index,
+                EeveeGBufferLobe::Translucent,
+                weight,
+                base_albedo(params),
+            ),
+            BsdfModel::Sheen(_) => push_eevee_gbuffer_candidate(
+                &mut candidates,
+                source_closure_index,
+                EeveeGBufferLobe::Diffuse,
+                weight,
+                base_albedo(params).max(DVec3::ZERO),
+            ),
+            BsdfModel::Toon(_)
+            | BsdfModel::Holdout
+            | BsdfModel::Hair(_)
+            | BsdfModel::PrincipledHair(_)
+            | BsdfModel::RayPortal(_) => {}
+        }
+    }
+    Ok(candidates)
+}
+
+fn push_eevee_gbuffer_candidate(
+    candidates: &mut Vec<EeveeGBufferCandidate>,
+    source_closure_index: usize,
+    lobe: EeveeGBufferLobe,
+    weight: f64,
+    color: DVec3,
+) {
+    candidates.push(EeveeGBufferCandidate {
+        source_closure_index,
+        lobe,
+        weight: weight as f32,
+        color: color.to_array().map(|channel| channel as f32),
+    });
+}
+
+fn eevee_principled_gbuffer_candidates(
+    candidates: &mut Vec<EeveeGBufferCandidate>,
+    source_closure_index: usize,
+    closure: &ShaderClosure,
+    normal: DVec3,
+    view: DVec3,
+) {
+    let params = &closure.params;
+    let features = params.eevee_gbuffer_features();
+    let mut weight = closure.weight * params.alpha.clamp(0.0, 1.0);
+    let normal = normalize_fallback(params.normal, normal);
+    let coat_normal = normalize_fallback(params.coat_normal.unwrap_or(normal), normal);
+    let n_dot_v = normal.dot(view);
+    let base_color = base_albedo(params).max(DVec3::ZERO);
+    let clamped_base_color = base_color.min(DVec3::ONE);
+    let mut coat_tint = DVec3::from_array(params.coat_tint).max(DVec3::ZERO);
+
+    let mut sheen_data_color = DVec3::ZERO;
+    let sheen_weight = params.sheen_weight.max(0.0);
+    if sheen_weight > 0.0 {
+        let sheen_normal = if params.coat_weight > 0.0 {
+            normalize_fallback(
+                normal.lerp(coat_normal, params.coat_weight.clamp(0.0, 1.0)),
+                normal,
+            )
+        } else {
+            normal
+        };
+        let sheen_nv = sheen_normal.dot(view).clamp(0.0, 1.0);
+        let sheen_color = DVec3::from_array(params.sheen_tint).max(DVec3::ZERO)
+            * (sheen_weight * eevee_principled_sheen(sheen_nv, params.sheen_roughness));
+        sheen_data_color = sheen_color * weight;
+        weight *= (1.0 - sheen_color.max_element()).max(0.0);
+    }
+
+    let coat_weight = params.coat_weight.max(0.0);
+    let coat_roughness = params.coat_roughness.clamp(0.0, 1.0);
+    let coat_ior = params.coat_ior.max(1.0);
+    if features.has_clearcoat() && coat_weight > 0.0 {
+        let reflectance = eevee_transmission::eevee_bsdf_lut(
+            DVec3::splat(dielectric_f0(coat_ior, 0.5)),
+            DVec3::ONE,
+            coat_normal.dot(view),
+            coat_roughness,
+            coat_ior,
+            false,
+        )
+        .x;
+        push_eevee_gbuffer_candidate(
+            candidates,
+            source_closure_index,
+            EeveeGBufferLobe::Clearcoat,
+            weight * coat_weight * reflectance,
+            DVec3::ONE,
+        );
+        weight *= (1.0 - reflectance * coat_weight).max(0.0);
+        if coat_tint != DVec3::ONE {
+            let path_length = coat_ior / (coat_ior * coat_ior - (1.0 - n_dot_v * n_dot_v)).sqrt();
+            let tint = coat_tint.powf(path_length);
+            coat_tint = DVec3::ONE.lerp(tint, coat_weight.clamp(0.0, 1.0));
+        }
+    } else {
+        coat_tint = DVec3::ONE;
+    }
+
+    let metallic = params.metallic.clamp(0.0, 1.0);
+    let roughness = params.roughness.clamp(0.0, 1.0);
+    let transmission_weight = params.transmission.clamp(0.0, 1.0);
+    let mut reflection_color = DVec3::ZERO;
+    if metallic > 0.0 {
+        let metallic_reflectance =
+            eevee_principled_metallic_brdf(params, clamped_base_color, normal, view);
+        reflection_color = metallic_reflectance * (weight * metallic);
+        weight *= (1.0 - metallic).max(0.0);
+    }
+
+    if features.has_refraction() && transmission_weight > 0.0 {
+        if let Some(glass) =
+            eevee_transmission::glass_closures(params, normal, view, DVec3::ONE, Thickness::None)
+        {
+            let split_weight = (1.0 - metallic) * transmission_weight;
+            let reflectance = glass.reflection / split_weight;
+            let transmittance = glass.transmission / split_weight;
+            let lobe = if params.thin_wall {
+                EeveeGBufferLobe::ThinRefraction
+            } else {
+                EeveeGBufferLobe::Refraction
+            };
+            push_eevee_gbuffer_candidate(
+                candidates,
+                source_closure_index,
+                lobe,
+                weight * transmission_weight,
+                transmittance * coat_tint,
+            );
+            reflection_color += reflectance * (weight * transmission_weight);
+        }
+        weight *= (1.0 - transmission_weight).max(0.0);
+    }
+
+    let eta = eevee_principled_specular_eta(params);
+    let f0 = (DVec3::splat(dielectric_f0(
+        params.ior.max(1.0e-5),
+        params.specular_ior_level,
+    )) * DVec3::from_array(params.specular_tint).max(DVec3::ZERO))
+    .clamp(DVec3::ZERO, DVec3::ONE);
+    let reflectance = eevee_transmission::eevee_bsdf_lut(
+        f0,
+        DVec3::ONE,
+        n_dot_v,
+        roughness,
+        eta,
+        matches!(params.glass_distribution, GlassDistribution::MultiGgx),
+    );
+    push_eevee_gbuffer_candidate(
+        candidates,
+        source_closure_index,
+        EeveeGBufferLobe::Reflection,
+        1.0,
+        (reflection_color + reflectance * weight) * coat_tint,
+    );
+    weight *= (1.0 - reflectance.max_element()).max(0.0);
+
+    let mut diffuse_weight = 0.0;
+    let subsurface_weight = params.subsurface_weight.clamp(0.0, 1.0);
+    if subsurface_weight > 0.0 {
+        if params.thin_wall {
+            diffuse_weight = subsurface_weight
+                * weight
+                * (0.5 * (1.0 - params.subsurface_anisotropy)).clamp(0.0, 1.0);
+            if features.has_translucent() {
+                let anisotropy_plus_one = 1.0 + params.subsurface_anisotropy;
+                push_eevee_gbuffer_candidate(
+                    candidates,
+                    source_closure_index,
+                    EeveeGBufferLobe::Translucent,
+                    subsurface_weight * weight * (0.5 * anisotropy_plus_one).clamp(0.0, 1.0),
+                    base_color * coat_tint,
+                );
+            }
+        } else if features.has_subsurface() && eevee_subsurface_radius(params).is_some() {
+            let color =
+                clamped_base_color * (subsurface_weight * weight) * coat_tint + sheen_data_color;
+            push_eevee_gbuffer_candidate(
+                candidates,
+                source_closure_index,
+                EeveeGBufferLobe::Subsurface,
+                1.0,
+                color,
+            );
+        }
+        weight *= (1.0 - subsurface_weight).max(0.0);
+    }
+    if features.has_diffuse() {
+        push_eevee_gbuffer_candidate(
+            candidates,
+            source_closure_index,
+            EeveeGBufferLobe::Diffuse,
+            1.0,
+            base_color * (diffuse_weight + weight) * coat_tint + sheen_data_color,
+        );
+    }
+}
+
+fn eevee_principled_metallic_brdf(
+    params: &BsdfParams,
+    base_color: DVec3,
+    normal: DVec3,
+    view: DVec3,
+) -> DVec3 {
+    let f0 = base_color.clamp(DVec3::ZERO, DVec3::ONE);
+    let f82 = DVec3::from_array(params.specular_tint)
+        .max(DVec3::ZERO)
+        .min(DVec3::ONE);
+    eevee_brdf_f82_tint_lut(
+        f0,
+        f82,
+        normal.dot(view),
+        params.roughness,
+        matches!(params.glass_distribution, GlassDistribution::MultiGgx),
+    )
+}
+
+fn eevee_principled_specular_eta(params: &BsdfParams) -> f64 {
+    let ior = params.ior.max(1.0e-5);
+    let mut f0 = dielectric_f0(ior, 0.5);
+    let mut eta = ior;
+    let specular_ior_level = params.specular_ior_level.max(0.0);
+    if specular_ior_level.partial_cmp(&0.5) != Some(std::cmp::Ordering::Equal) {
+        f0 *= 2.0 * specular_ior_level;
+        let f = f0.clamp(0.0, 0.99).sqrt();
+        eta = (-f - 1.0) / (f - 1.0);
+        if ior < 1.0 {
+            eta = 1.0 / eta;
+        }
+    }
+    eta
+}
+
+fn eevee_principled_sheen(normal_dot_view: f64, roughness: f64) -> f64 {
+    let nv = normal_dot_view;
+    let roughness = roughness.clamp(0.0, 1.0);
+    let denominator = 35.6694 * roughness * roughness - 24.4269 * roughness * nv - 0.1405 * nv * nv
+        + 6.1211 * roughness
+        + 0.28105 * nv
+        - 0.1405;
+    let numerator = 58.5299 * roughness * roughness - 85.0941 * roughness * nv
+        + 9.8955 * nv * nv
+        + 1.9250 * roughness
+        + 74.2268 * nv
+        - 0.2246;
+    (denominator / numerator).clamp(0.0, 1.0)
+}
+
+fn normalize_fallback(value: DVec3, fallback: DVec3) -> DVec3 {
+    let normalized = value.normalize_or_zero();
+    if normalized == DVec3::ZERO {
+        fallback.normalize_or_zero()
+    } else {
+        normalized
+    }
+}
+fn eevee_gbuffer_alpha(closures: &[ShaderClosure]) -> (f32, f32, f32) {
+    let mut transmittance = [0.0_f32; 3];
+    for closure in closures {
+        let params = &closure.params;
+        if matches!(params.model, BsdfModel::Holdout) {
+            continue;
+        }
+        let (alpha, tint) = if matches!(params.model, BsdfModel::RayPortal(_)) {
+            (
+                0.0,
+                [
+                    params.base_color[0],
+                    params.base_color[1],
+                    params.base_color[2],
+                ],
+            )
+        } else if params.transparent_bsdf {
+            (0.0, params.transparent_tint.map(|channel| channel.max(0.0)))
+        } else {
+            (params.alpha.clamp(0.0, 1.0), params.transparent_tint)
+        };
+        let weight = closure.weight as f32;
+        let pass = 1.0 - alpha as f32;
+        for (sum, channel) in transmittance.iter_mut().zip(tint) {
+            *sum += (channel as f32 * pass) * weight;
+        }
+    }
+    let transparency = (transmittance[0] + transmittance[1] + transmittance[2]) / 3.0;
+    let alpha = 1.0 - transparency;
+    let alpha_reciprocal = if alpha.is_finite() && alpha != 0.0 {
+        alpha.recip()
+    } else {
+        0.0
+    };
+    (transparency, alpha, alpha_reciprocal)
+}
+
+struct EeveeGBufferRoute {
+    candidates: Vec<EeveeGBufferCandidate>,
+    layout: EeveeGBufferLayout,
+    frag_coord: [f32; 2],
+    sample_offset: [f32; 3],
+    normal: DVec3,
+    view: DVec3,
+    thickness: Thickness,
+    gbuffer_transparency: f32,
+    gbuffer_alpha: f32,
+    gbuffer_alpha_reciprocal: f32,
+}
+
+impl EeveeGBufferRoute {
+    fn context(&self, data_layer: usize) -> EeveeGBufferContext {
+        EeveeGBufferContext {
+            frag_coord: self.frag_coord,
+            sample_offset: self.sample_offset,
+            data_layer: data_layer as u32,
+        }
+    }
+}
+
+struct DecodedEeveeGBufferBin<'a> {
+    closure: &'a ShaderClosure,
+    color: DVec3,
+    normal: DVec3,
+    roughness: Option<f64>,
+    ior: Option<f64>,
+}
+
+fn eevee_gbuffer_route(
+    shading: Option<&SurfaceShading>,
+    closures: &[ShaderClosure],
+    hit: &SurfaceHit<'_>,
+    object_thickness: f64,
+) -> Result<EeveeGBufferRoute> {
+    let frag_coord = hit.gbuffer_frag_coord.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "EEVEE shading requires the raster G-buffer fragment coordinate",
+        )
+    })?;
+    let sample_offset = hit.gbuffer_sample_offset.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "EEVEE shading requires the raster G-buffer sample offset",
+        )
+    })?;
+    let closure_random = hit.gbuffer_closure_random.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "EEVEE shading requires the raster G-buffer closure random value",
+        )
+    })?;
+    let (gbuffer_transparency, gbuffer_alpha, gbuffer_alpha_reciprocal) =
+        eevee_gbuffer_alpha(closures);
+    let normal = if hit.back_facing {
+        -hit.normal
+    } else {
+        hit.normal
+    };
+    let candidates = eevee_gbuffer_candidates(closures, normal, hit.view)?;
+    let layout = if let Some(shading) = shading {
+        shading.eevee_gbuffer_layout(&candidates, closure_random, gbuffer_alpha_reciprocal)
+    } else {
+        let closure = closures.first().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "EEVEE shading has no closure for its compiled G-buffer layout",
+            )
+        })?;
+        closure
+            .params
+            .eevee_gbuffer_features()
+            .eevee_gbuffer_layout(&candidates, closure_random, gbuffer_alpha_reciprocal)
+    }
+    .map_err(|error| {
+        PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "EEVEE G-buffer candidates do not match the compiled material layout",
+            serde_json::json!({"feature_id":"render.eevee.gbuffer.layout","error":format!("{error:?}")}),
+        )
+    })?;
+    let thickness = layout
+        .bins
+        .iter()
+        .take(layout.bin_count)
+        .flatten()
+        .find(|bin| {
+            matches!(
+                bin.mode,
+                EeveeGBufferMode::Refraction
+                    | EeveeGBufferMode::RefractionColorless
+                    | EeveeGBufferMode::Translucent
+                    | EeveeGBufferMode::Subsurface
+                    | EeveeGBufferMode::ThinRefraction
+                    | EeveeGBufferMode::ThinRefractionColorless
+            )
+        })
+        .map_or(Thickness::None, |bin| {
+            let params = &closures[bin.source_closure_index].params;
+            eevee_gbuffer_thickness(Thickness::new(
+                params.thickness.unwrap_or(object_thickness),
+                params.thickness_slab,
+            ))
+        });
+    Ok(EeveeGBufferRoute {
+        candidates,
+        layout,
+        frag_coord,
+        sample_offset,
+        normal,
+        view: hit.view,
+        gbuffer_transparency,
+        gbuffer_alpha,
+        thickness,
+        gbuffer_alpha_reciprocal,
+    })
+}
+
+fn decode_eevee_gbuffer_bin<'a>(
+    route: &EeveeGBufferRoute,
+    closures: &'a [ShaderClosure],
+    bin: EeveeGBufferBin,
+) -> Result<DecodedEeveeGBufferBin<'a>> {
+    let candidate = route.candidates.get(bin.candidate_index).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "EEVEE G-buffer bin references a missing source candidate",
+        )
+    })?;
+    let closure = closures.get(bin.source_closure_index).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "EEVEE G-buffer bin references a missing source closure",
+        )
+    })?;
+    if candidate.source_closure_index != bin.source_closure_index || candidate.lobe != bin.lobe {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "EEVEE G-buffer bin does not match its selected source candidate",
+        ));
+    }
+    let data0_context = route.context(bin.data0_layer);
+    let resolved_color_scale = bin.weight * route.gbuffer_alpha_reciprocal;
+    let resolved_color = DVec3::from_array(
+        bin.color
+            .map(|channel| f64::from(channel * resolved_color_scale)),
+    );
+    let parameter_context = if matches!(
+        bin.mode,
+        EeveeGBufferMode::Reflection
+            | EeveeGBufferMode::Refraction
+            | EeveeGBufferMode::ThinRefraction
+    ) {
+        let data1_layer = bin.data1_layer.ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "EEVEE colored closure has no G-buffer parameter storage layer",
+            )
+        })?;
+        route.context(data1_layer)
+    } else {
+        data0_context
+    };
+    let packed_color = eevee_gbuffer_closure_color(resolved_color, data0_context);
+    let color = if matches!(
+        bin.mode,
+        EeveeGBufferMode::ReflectionColorless
+            | EeveeGBufferMode::RefractionColorless
+            | EeveeGBufferMode::ThinRefractionColorless
+    ) {
+        DVec3::splat(packed_color.z)
+    } else {
+        packed_color
+    };
+    let params = &closure.params;
+    let normal = if bin.lobe == EeveeGBufferLobe::Clearcoat {
+        params.coat_normal.unwrap_or(params.normal)
+    } else {
+        params.normal
+    };
+    let normal = eevee_gbuffer_normal(normalize_fallback(normal, route.normal));
+    let roughness = match bin.lobe {
+        EeveeGBufferLobe::Clearcoat => Some(params.coat_roughness),
+        EeveeGBufferLobe::Reflection | EeveeGBufferLobe::Refraction => Some(params.roughness),
+        EeveeGBufferLobe::ThinRefraction => {
+            let glass = eevee_transmission::glass_closures(
+                params,
+                params.normal,
+                route.view,
+                DVec3::ONE,
+                Thickness::None,
+            );
+            Some(
+                glass
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::EvaluationFailed,
+                            "EEVEE thin refraction bin has no source transmission roughness",
+                        )
+                    })?
+                    .transmission_roughness,
+            )
+        }
+        EeveeGBufferLobe::Diffuse
+        | EeveeGBufferLobe::Translucent
+        | EeveeGBufferLobe::Subsurface => None,
+    }
+    .map(|roughness| eevee_gbuffer_roughness(roughness, parameter_context));
+    let ior = (bin.lobe == EeveeGBufferLobe::Refraction)
+        .then_some(params.ior.max(1.0e-5))
+        .map(|ior| eevee_gbuffer_ior(ior, parameter_context));
+    Ok(DecodedEeveeGBufferBin {
+        closure,
+        color,
+        normal,
+        roughness,
+        ior,
+    })
+}
+
+fn eevee_raytrace_sample(
+    route: Option<&EeveeGBufferRoute>,
+    closures: &[ShaderClosure],
+    hit: &SurfaceHit<'_>,
+    material_refraction: Option<bool>,
+) -> Result<EeveeRaytraceSample> {
+    let mut bins = [None; 3];
+    if let Some(route) = route {
+        for bin in route
+            .layout
+            .bins
+            .iter()
+            .take(route.layout.bin_count)
+            .flatten()
+            .copied()
+        {
+            let decoded = decode_eevee_gbuffer_bin(route, closures, bin)?;
+            let lobe = match bin.mode {
+                EeveeGBufferMode::Diffuse => RayLobe::Diffuse,
+                EeveeGBufferMode::Reflection | EeveeGBufferMode::ReflectionColorless => {
+                    RayLobe::GgxReflection
+                }
+                EeveeGBufferMode::Refraction | EeveeGBufferMode::RefractionColorless => {
+                    RayLobe::GgxRefraction
+                }
+                EeveeGBufferMode::ThinRefraction | EeveeGBufferMode::ThinRefractionColorless => {
+                    RayLobe::ThinGlassTransmission
+                }
+                EeveeGBufferMode::Translucent => RayLobe::Translucent,
+                EeveeGBufferMode::Subsurface => RayLobe::BurleyBssrdf,
+            };
+            let roughness = decoded.roughness.unwrap_or(1.0) as f32;
+            let input = RayGenerateInput {
+                lobe,
+                normal: Vec3::new(
+                    decoded.normal.x as f32,
+                    decoded.normal.y as f32,
+                    decoded.normal.z as f32,
+                ),
+                view: Vec3::new(hit.view.x as f32, hit.view.y as f32, hit.view.z as f32),
+                roughness,
+                ior: decoded.ior.unwrap_or(1.0) as f32,
+                thickness: RayThickness {
+                    mode: match route.thickness {
+                        Thickness::Slab(_) | Thickness::None => ThicknessMode::Slab,
+                        Thickness::Sphere(_) => ThicknessMode::Sphere,
+                    },
+                    value: route.thickness.value() as f32,
+                },
+            };
+            let source_thickness = route.thickness;
+            let dominant_direction = match bin.lobe {
+                EeveeGBufferLobe::Diffuse | EeveeGBufferLobe::Subsurface => decoded.normal,
+                EeveeGBufferLobe::Translucent => {
+                    if matches!(source_thickness, Thickness::Sphere(value) if value != 0.0) {
+                        DVec3::ZERO
+                    } else {
+                        -decoded.normal
+                    }
+                }
+                EeveeGBufferLobe::Reflection | EeveeGBufferLobe::Clearcoat => {
+                    eevee_transmission::reflection_direction(
+                        decoded.normal,
+                        route.view,
+                        f64::from(roughness),
+                    )
+                }
+                EeveeGBufferLobe::ThinRefraction => {
+                    let oriented_normal = if decoded.normal.dot(route.view) < 0.0 {
+                        -decoded.normal
+                    } else {
+                        decoded.normal
+                    };
+                    eevee_transmission::reflection_direction(
+                        -oriented_normal,
+                        eevee_transmission::reflect(route.view, oriented_normal),
+                        f64::from(roughness),
+                    )
+                }
+                EeveeGBufferLobe::Refraction => {
+                    let ior = decoded.ior.unwrap_or(1.0);
+                    super::eevee_advanced_bsdf::eevee_refraction_probe_direction(
+                        decoded.normal,
+                        route.view,
+                        ior,
+                        f64::from(roughness),
+                        source_thickness,
+                    )
+                }
+            };
+            let Some(storage_bin) = bins.get_mut(bin.storage_layer) else {
+                return Err(PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "EEVEE ray-tracing G-buffer layer exceeds the source closure count",
+                ));
+            };
+            *storage_bin = Some(EeveeRaytraceBin {
+                world_input: input,
+                dominant_direction,
+                transmission: matches!(
+                    lobe,
+                    RayLobe::GgxRefraction | RayLobe::ThinGlassTransmission | RayLobe::Translucent
+                ),
+            });
+        }
+    }
+    Ok(EeveeRaytraceSample {
+        point: hit.point,
+        normal: route.map_or(hit.normal, |route| route.normal),
+        has_gbuffer_route: route.is_some(),
+        screen_refraction: material_refraction,
+        bins,
+    })
+}
+
+fn standalone_eevee_lighting(
+    context: &SurfaceShadeContext<'_>,
+    receiver: Receiver,
+    params: &BsdfParams,
+    thickness: Thickness,
+    ambient: f64,
+) -> Result<Option<DVec3>> {
+    let doc = context.doc;
+    let snapshot = context.snapshot;
+    let normal = context.normal;
+    let shadow = context.shadow;
+    let world = context.world;
+    let scene = doc.scenes.get(&snapshot.scene_id);
+    let light_threshold = scene.map_or(0.01, |scene| scene.render.eevee_light_threshold);
+    let mut result = DVec3::ZERO;
+    match params.model {
+        BsdfModel::Translucent => {
+            let mut color = base_albedo(params).max(DVec3::ZERO);
+            if thickness != Thickness::None {
+                color *= color;
+            }
+            if let Some(world) = world {
+                let environment = if matches!(thickness, Thickness::Sphere(value) if value != 0.0) {
+                    world.average_irradiance()
+                } else {
+                    prefiltered_world(world, -normal, 1.0, irradiance_probe_radiance)
+                };
+                result += color * environment * ambient;
+            }
+            for (id, light_node) in &doc.nodes {
+                let Some(evaluated) = snapshot.nodes.get(id) else {
+                    continue;
+                };
+                let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+                    light_node
+                        .data
+                        .as_ref()
+                        .and_then(|data_id| doc.data_blocks.get(data_id))
+                        .and_then(|block| block.light.as_ref())
+                }) else {
+                    continue;
+                };
+                let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+                let influence = light_influence_at(light, matrix, receiver.point, light_threshold);
+                if influence <= 0.0 {
+                    continue;
+                }
+                let contribution =
+                    with_light_shadow_setting(light, shadow, None, |shadow, point_shadow| {
+                        let direct_context = DirectLightContext {
+                            light,
+                            matrix,
+                            receiver,
+                            normal,
+                            ray_visibility: light_node.resolved_ray_visibility(),
+                            shadow,
+                            point_shadow,
+                            sun_shadow_radius: None,
+                        };
+                        translucent_direct_contribution(&direct_context, color, thickness)
+                    })?;
+                result += contribution * influence;
+            }
+            if let Some(sun) = context.world_sun {
+                let direct_context = world_sun_direct_context(sun, receiver, normal, shadow);
+                result += translucent_direct_contribution(&direct_context, color, thickness);
+            }
+        }
+        BsdfModel::Refraction(_) => {
+            let raw_color = base_albedo(params);
+            let mut color = raw_color.max(DVec3::ZERO);
+            if thickness != Thickness::None {
+                color *= color;
+            }
+            let roughness = params.roughness.clamp(0.0, 1.0);
+            let ior = params.ior.max(1.0e-5);
+            if let Some(world) = world {
+                let direction = super::eevee_advanced_bsdf::eevee_refraction_probe_direction(
+                    normal,
+                    receiver.view,
+                    ior,
+                    roughness,
+                    thickness,
+                );
+                let perceived = eevee_transmission::transmission_roughness(roughness, ior);
+                result += eevee_prefiltered_world(world, direction, perceived)? * color;
+            }
+            let glass = eevee_transmission::refraction_light(
+                normal,
+                receiver.view,
+                raw_color,
+                roughness,
+                ior,
+                thickness,
+            );
+            let mut direct_radiance = (DVec3::ZERO, DVec3::ZERO);
+            for (id, light_node) in &doc.nodes {
+                let Some(evaluated) = snapshot.nodes.get(id) else {
+                    continue;
+                };
+                let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+                    light_node
+                        .data
+                        .as_ref()
+                        .and_then(|data_id| doc.data_blocks.get(data_id))
+                        .and_then(|block| block.light.as_ref())
+                }) else {
+                    continue;
+                };
+                let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+                let influence = light_influence_at(light, matrix, receiver.point, light_threshold);
+                let visibility = light_node.resolved_ray_visibility();
+                if influence <= 0.0 || !visibility.allows(RayKind::Transmission) {
+                    continue;
+                }
+                let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
+                let (reflection, transmission) = with_light_shadow_setting(
+                    light,
+                    shadow,
+                    point_shadow,
+                    |shadow, point_shadow| {
+                        glass_direct_contribution(
+                            light,
+                            matrix,
+                            receiver,
+                            &glass,
+                            thickness,
+                            visibility,
+                            shadow,
+                            point_shadow,
+                        )
+                    },
+                )?;
+                direct_radiance.0 += reflection * influence;
+                direct_radiance.1 += transmission * influence;
+            }
+            result += glass.reflection * rgb9e5_roundtrip(direct_radiance.0)
+                + glass.transmission * rgb9e5_roundtrip(direct_radiance.1);
+        }
+        BsdfModel::Metallic(_) => {
+            let metallic_normal = normalize_fallback(params.normal, normal);
+            let Some(reflectance) = eevee_metallic_brdf(params, metallic_normal, receiver.view)
+            else {
+                return Ok(None);
+            };
+            let roughness = params.roughness.clamp(0.0, 1.0);
+            if let Some(world) = world {
+                let direction = super::eevee_advanced_bsdf::eevee_metallic_probe_direction(
+                    metallic_normal,
+                    receiver.view,
+                    roughness,
+                );
+                result += eevee_prefiltered_world(world, direction, roughness)? * reflectance;
+            }
+            for (id, light_node) in &doc.nodes {
+                let Some(evaluated) = snapshot.nodes.get(id) else {
+                    continue;
+                };
+                let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+                    light_node
+                        .data
+                        .as_ref()
+                        .and_then(|data_id| doc.data_blocks.get(data_id))
+                        .and_then(|block| block.light.as_ref())
+                }) else {
+                    continue;
+                };
+                let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+                let influence = light_influence_at(light, matrix, receiver.point, light_threshold);
+                if influence <= 0.0 {
+                    continue;
+                }
+                let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
+                let contribution = with_light_shadow_setting(
+                    light,
+                    shadow,
+                    point_shadow,
+                    |shadow, point_shadow| {
+                        let direct_context = DirectLightContext {
+                            light,
+                            matrix,
+                            receiver,
+                            normal: metallic_normal,
+                            ray_visibility: light_node.resolved_ray_visibility(),
+                            shadow,
+                            point_shadow,
+                            sun_shadow_radius: None,
+                        };
+                        metallic_direct_contribution(&direct_context, roughness, reflectance)
+                    },
+                )?;
+                result += contribution * influence;
+            }
+            if let Some(sun) = context.world_sun {
+                let direct_context =
+                    world_sun_direct_context(sun, receiver, metallic_normal, shadow);
+                result += metallic_direct_contribution(&direct_context, roughness, reflectance);
+            }
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some(result))
+}
+
+struct SurfaceShadeContext<'a> {
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    receiver: Receiver,
+    normal: DVec3,
+    closures: &'a [ShaderClosure],
+    mode: Mode,
+    shadow: ShadowContext<'a>,
+    object_thickness: f64,
+    world: Option<&'a WorldProbe>,
+    world_sun: Option<&'a EeveeWorldSunLight>,
+    gbuffer: Option<&'a EeveeGBufferRoute>,
+    eevee_raytrace_feedback: EeveeRaytraceFeedback,
+    material_refraction: Option<bool>,
+}
+
+fn shade_eevee_gbuffer(
+    context: &SurfaceShadeContext<'_>,
+    route: &EeveeGBufferRoute,
+) -> Result<[f64; 4]> {
+    let doc = context.doc;
+    let snapshot = context.snapshot;
+    let closures = context.closures;
+    let surface_receiver = &context.receiver;
+    let normal = context.normal;
+    let geometric = surface_receiver.geometric;
+    let point = surface_receiver.point;
+    let view = surface_receiver.view.try_normalize().unwrap_or(normal);
+    let opaque = opaque_share(closures);
+    let scene = doc.scenes.get(&snapshot.scene_id);
+    let light_threshold = scene.map_or(0.01, |scene| scene.render.eevee_light_threshold);
+    let receiver = Receiver {
+        view,
+        ..*surface_receiver
+    };
+    let mut reflected = DVec3::ZERO;
+    // The resolved layout has at most three bins; keep diffuse AO results on the stack and reuse only for identical
+    // decoded normals at this receiver.
+    let mut ambient_cache: [Option<(DVec3, f64)>; 3] = [None; 3];
+    let mut ambient_cache_len = 0;
+    let material_uses_refraction_layer = context.eevee_raytrace_feedback.refraction_active
+        && context.material_refraction == Some(true);
+
+    for bin in route
+        .layout
+        .bins
+        .iter()
+        .take(route.layout.bin_count)
+        .flatten()
+        .copied()
+    {
+        let decoded = decode_eevee_gbuffer_bin(route, closures, bin)?;
+        let feedback_radiance = if material_uses_refraction_layer {
+            &context.eevee_raytrace_feedback.refraction_radiance
+        } else {
+            &context.eevee_raytrace_feedback.radiance
+        };
+        let raytrace_radiance = feedback_radiance
+            .get(bin.storage_layer)
+            .copied()
+            .flatten()
+            .map(|radiance| {
+                DVec3::new(
+                    f64::from(radiance[0]),
+                    f64::from(radiance[1]),
+                    f64::from(radiance[2]),
+                )
+            });
+        let params = &decoded.closure.params;
+        let lobe_normal = decoded.normal;
+        let color = decoded.color;
+        let thickness = route.thickness;
+        // EEVEE's deferred light-probe path has no geometric-AO multiplier; evaluate local ambient visibility only
+        // for diffuse-family closures that consume it, and only once per identical receiver/normal input.
+        let ambient = if context.world.is_some()
+            && matches!(
+                bin.lobe,
+                EeveeGBufferLobe::Diffuse | EeveeGBufferLobe::Subsurface
+            ) {
+            if let Some(cached) = ambient_cache[..ambient_cache_len]
+                .iter()
+                .flatten()
+                .find(|(cached_normal, _)| *cached_normal == lobe_normal)
+                .map(|(_, value)| *value)
+            {
+                cached
+            } else {
+                let ambient = context.shadow.map_or(1.0, |shadow| {
+                    let facing = if geometric.dot(view) < 0.0 {
+                        -geometric
+                    } else {
+                        geometric
+                    };
+                    ambient_visibility(
+                        shadow.bvh,
+                        shadow.triangles,
+                        shadow.prepared_materials,
+                        point,
+                        facing,
+                        lobe_normal,
+                        1.0,
+                        shadow.has_volume_only,
+                    )
+                });
+                ambient_cache[ambient_cache_len] = Some((lobe_normal, ambient));
+                ambient_cache_len += 1;
+                ambient
+            }
+        } else {
+            1.0
+        };
+
+        match bin.lobe {
+            EeveeGBufferLobe::Diffuse | EeveeGBufferLobe::Subsurface => {
+                if bin.lobe == EeveeGBufferLobe::Diffuse
+                    || !matches!(params.model, BsdfModel::Subsurface)
+                {
+                    let direct =
+                        eevee_gbuffer_diffuse_direct(context, lobe_normal, view, light_threshold)?;
+                    let indirect = raytrace_radiance.unwrap_or_else(|| {
+                        context.world.map_or(DVec3::ZERO, |world| {
+                            prefiltered_world(world, lobe_normal, 1.0, irradiance_probe_radiance)
+                                * ambient
+                        })
+                    });
+                    reflected += (direct + indirect) * color;
+                }
+            }
+            EeveeGBufferLobe::Translucent => {
+                let environment = raytrace_radiance.unwrap_or_else(|| {
+                    context.world.map_or(DVec3::ZERO, |world| {
+                        if matches!(thickness, Thickness::Sphere(value) if value != 0.0) {
+                            world.average_irradiance()
+                        } else {
+                            prefiltered_world(world, -lobe_normal, 1.0, irradiance_probe_radiance)
+                        }
+                    })
+                });
+                let translucent_color = if thickness == Thickness::None {
+                    color
+                } else {
+                    color * color
+                };
+                let mut lobe = translucent_color * environment * ambient;
+                for (id, light_node) in &doc.nodes {
+                    let Some(evaluated) = snapshot.nodes.get(id) else {
+                        continue;
+                    };
+                    let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+                        light_node
+                            .data
+                            .as_ref()
+                            .and_then(|data_id| doc.data_blocks.get(data_id))
+                            .and_then(|block| block.light.as_ref())
+                    }) else {
+                        continue;
+                    };
+                    let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+                    let influence = light_influence_at(light, matrix, point, light_threshold);
+                    if influence <= 0.0 {
+                        continue;
+                    }
+                    let point_shadow = context.shadow.and_then(|shadow| shadow.point_maps.get(id));
+                    let contribution = with_light_shadow_setting(
+                        light,
+                        context.shadow,
+                        point_shadow,
+                        |shadow, point_shadow| {
+                            let direct_context = DirectLightContext {
+                                light,
+                                matrix,
+                                receiver,
+                                normal: lobe_normal,
+                                ray_visibility: light_node.resolved_ray_visibility(),
+                                shadow,
+                                point_shadow,
+                                sun_shadow_radius: None,
+                            };
+                            translucent_direct_contribution(
+                                &direct_context,
+                                translucent_color,
+                                thickness,
+                            )
+                        },
+                    )?;
+                    lobe += contribution * influence;
+                }
+                if let Some(sun) = context.world_sun {
+                    let direct_context =
+                        world_sun_direct_context(sun, receiver, lobe_normal, context.shadow);
+                    lobe += translucent_direct_contribution(
+                        &direct_context,
+                        translucent_color,
+                        thickness,
+                    );
+                }
+                reflected += lobe;
+            }
+            EeveeGBufferLobe::Reflection | EeveeGBufferLobe::Clearcoat => {
+                let roughness = decoded.roughness.ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        "EEVEE reflection bin has no packed roughness",
+                    )
+                })?;
+                let direction =
+                    eevee_transmission::reflection_direction(lobe_normal, view, roughness);
+                let environment = if let Some(radiance) = raytrace_radiance {
+                    radiance
+                } else {
+                    context.world.map_or(Ok(DVec3::ZERO), |world| {
+                        eevee_deferred_indirect_world(world, direction, roughness)
+                    })?
+                };
+                let mut lobe = environment * color;
+                let mut direct_radiance = DVec3::ZERO;
+                for (id, light_node) in &doc.nodes {
+                    let Some(evaluated) = snapshot.nodes.get(id) else {
+                        continue;
+                    };
+                    let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+                        light_node
+                            .data
+                            .as_ref()
+                            .and_then(|data_id| doc.data_blocks.get(data_id))
+                            .and_then(|block| block.light.as_ref())
+                    }) else {
+                        continue;
+                    };
+                    let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+                    let influence = light_influence_at(light, matrix, point, light_threshold);
+                    if influence <= 0.0 {
+                        continue;
+                    }
+                    let point_shadow = context.shadow.and_then(|shadow| shadow.point_maps.get(id));
+                    let raw_contribution = with_light_shadow_setting(
+                        light,
+                        context.shadow,
+                        point_shadow,
+                        |shadow, point_shadow| {
+                            let direct_context = DirectLightContext {
+                                light,
+                                matrix,
+                                receiver,
+                                normal: lobe_normal,
+                                ray_visibility: light_node.resolved_ray_visibility(),
+                                shadow,
+                                point_shadow,
+                                sun_shadow_radius: None,
+                            };
+                            metallic_direct_contribution(&direct_context, roughness, DVec3::ONE)
+                        },
+                    )?;
+                    let contribution = raw_contribution * influence;
+                    direct_radiance += contribution;
+                }
+                if let Some(sun) = context.world_sun {
+                    let direct_context =
+                        world_sun_direct_context(sun, receiver, lobe_normal, context.shadow);
+                    let contribution =
+                        metallic_direct_contribution(&direct_context, roughness, DVec3::ONE);
+                    direct_radiance += contribution;
+                }
+                let direct_store = rgb9e5_roundtrip(direct_radiance);
+                lobe += color * direct_store;
+                reflected += lobe;
+            }
+            EeveeGBufferLobe::Refraction | EeveeGBufferLobe::ThinRefraction => {
+                let roughness = decoded.roughness.ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        "EEVEE refraction bin has no packed roughness",
+                    )
+                })?;
+                let thin = bin.lobe == EeveeGBufferLobe::ThinRefraction;
+                let lobe_thickness = if thin { Thickness::None } else { thickness };
+                let (glass, direction, probe_roughness) = if thin {
+                    let oriented_normal = if lobe_normal.dot(view) < 0.0 {
+                        -lobe_normal
+                    } else {
+                        lobe_normal
+                    };
+                    let matrix =
+                        super::eevee_ltc::sample_matrix(oriented_normal.dot(view), roughness);
+                    let glass = GlassLight {
+                        oriented_normal,
+                        reflection: DVec3::ZERO,
+                        reflection_matrix: matrix,
+                        transmission: color,
+                        transmission_normal: -oriented_normal,
+                        transmission_matrix: matrix,
+                    };
+                    (
+                        glass,
+                        eevee_transmission::reflection_direction(
+                            -oriented_normal,
+                            eevee_transmission::reflect(view, oriented_normal),
+                            roughness,
+                        ),
+                        roughness,
+                    )
+                } else {
+                    let ior = decoded.ior.ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::EvaluationFailed,
+                            "EEVEE refraction bin has no packed IOR",
+                        )
+                    })?;
+                    let glass = eevee_transmission::refraction_light(
+                        lobe_normal,
+                        view,
+                        color,
+                        roughness,
+                        ior,
+                        lobe_thickness,
+                    );
+                    (
+                        glass,
+                        super::eevee_advanced_bsdf::eevee_refraction_probe_direction(
+                            lobe_normal,
+                            view,
+                            ior,
+                            roughness,
+                            lobe_thickness,
+                        ),
+                        eevee_transmission::transmission_roughness(roughness, ior),
+                    )
+                };
+                let environment = if let Some(radiance) = raytrace_radiance {
+                    radiance
+                } else {
+                    context.world.map_or(Ok(DVec3::ZERO), |world| {
+                        eevee_deferred_indirect_world(world, direction, probe_roughness)
+                    })?
+                };
+                let mut lobe = environment * glass.transmission;
+                let mut direct_radiance = DVec3::ZERO;
+                for (id, light_node) in &doc.nodes {
+                    let Some(evaluated) = snapshot.nodes.get(id) else {
+                        continue;
+                    };
+                    let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+                        light_node
+                            .data
+                            .as_ref()
+                            .and_then(|data_id| doc.data_blocks.get(data_id))
+                            .and_then(|block| block.light.as_ref())
+                    }) else {
+                        continue;
+                    };
+                    let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+                    let influence = light_influence_at(light, matrix, point, light_threshold);
+                    let ray_visibility = light_node.resolved_ray_visibility();
+                    if influence <= 0.0 || !ray_visibility.allows(RayKind::Transmission) {
+                        continue;
+                    }
+                    let point_shadow = context.shadow.and_then(|shadow| shadow.point_maps.get(id));
+                    let (_, transmission) = with_light_shadow_setting(
+                        light,
+                        context.shadow,
+                        point_shadow,
+                        |shadow, point_shadow| {
+                            glass_direct_contribution(
+                                light,
+                                matrix,
+                                receiver,
+                                &glass,
+                                lobe_thickness,
+                                ray_visibility,
+                                shadow,
+                                point_shadow,
+                            )
+                        },
+                    )?;
+                    direct_radiance += transmission * influence;
+                }
+                let direct_store = rgb9e5_roundtrip(direct_radiance);
+                let direct_color = glass.transmission * direct_store;
+                lobe += direct_color;
+
+                reflected += lobe;
+            }
+        }
+    }
+    let mut emitted = DVec3::ZERO;
+    for closure in closures {
+        let params = &closure.params;
+        if matches!(params.model, BsdfModel::Holdout) {
+            continue;
+        }
+        let lobe = BsdfParams {
+            reflectance: 1.0,
+            ..*params
+        };
+        let layers = principled_layers(&lobe, normal, view);
+        emitted += DVec3::from_array(params.emission_color)
+            * (closure.weight
+                * params.alpha.clamp(0.0, 1.0)
+                * params.emission_strength
+                * layers.lower());
+    }
+    let holdout = eevee_holdout_weight(closures);
+    // Deferred EEVEE adds resolved surface lighting without a Holdout multiplier; only raw emission carries (1 - H).
+    let reflected = reflected.max(DVec3::ZERO).min(DVec3::splat(1.0e20));
+    let result = if opaque > 0.0 {
+        (reflected * f64::from(route.gbuffer_alpha) + emitted * (1.0 - holdout)) / opaque
+    } else {
+        DVec3::ZERO
+    };
+    Ok([result.x, result.y, result.z, opaque])
+}
+
+fn eevee_gbuffer_diffuse_direct(
+    context: &SurfaceShadeContext<'_>,
+    normal: DVec3,
+    view: DVec3,
+    light_threshold: f64,
+) -> Result<DVec3> {
+    eevee_diffuse_direct(
+        context.doc,
+        context.snapshot,
+        Receiver {
+            view,
+            ..context.receiver
+        },
+        normal,
+        context.shadow,
+        context.world_sun,
+        light_threshold,
+    )
+}
+
+fn eevee_diffuse_direct(
     doc: &SceneDoc,
     snapshot: &Snapshot,
-    point: DVec3,
-    shadow_point: DVec3,
+    receiver: Receiver,
     normal: DVec3,
-    geometric: DVec3,
-    view: DVec3,
-    closures: &[ShaderClosure],
-    mode: Mode,
     shadow: ShadowContext<'_>,
-    object_thickness: f64,
-    world: Option<&WorldProbe>,
-) -> [f64; 4] {
+    world_sun: Option<&EeveeWorldSunLight>,
+    light_threshold: f64,
+) -> Result<DVec3> {
+    eevee_direct_lighting(
+        doc,
+        snapshot,
+        receiver,
+        normal,
+        shadow,
+        world_sun,
+        light_threshold,
+        diffuse_direct_contribution,
+    )
+}
+
+fn eevee_subsurface_transmission_direct(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    receiver: Receiver,
+    normal: DVec3,
+    thickness: Thickness,
+    shadow: ShadowContext<'_>,
+    world_sun: Option<&EeveeWorldSunLight>,
+    light_threshold: f64,
+) -> Result<DVec3> {
+    eevee_direct_lighting(
+        doc,
+        snapshot,
+        receiver,
+        normal,
+        shadow,
+        world_sun,
+        light_threshold,
+        |context| transmission_direct_contribution(context, DVec3::ONE, thickness, false),
+    )
+}
+
+pub(super) fn evaluate_light_shadow_setting<T: PartialEq>(
+    use_shadow: Option<bool>,
+    mut evaluate: impl FnMut(bool) -> Result<T>,
+) -> Result<T> {
+    if let Some(casts_shadows) = use_shadow {
+        evaluate(casts_shadows)
+    } else {
+        let shadowed = evaluate(true)?;
+        if shadowed == evaluate(false)? {
+            Ok(shadowed)
+        } else {
+            Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "direct lighting needs the imported light's source shadow setting; reimport from Blender to recover it",
+                serde_json::json!({"feature_id":"render.light.use_shadow"}),
+            ))
+        }
+    }
+}
+
+fn with_light_shadow_setting<T: PartialEq>(
+    light: &crate::model::LightData,
+    shadow: ShadowContext<'_>,
+    point_shadow: Option<&PointShadowMap>,
+    mut evaluate: impl FnMut(ShadowContext<'_>, Option<&PointShadowMap>) -> T,
+) -> Result<T> {
+    if light.use_shadow.is_none() && shadow.is_none() && point_shadow.is_none() {
+        return Ok(evaluate(None, None));
+    }
+    evaluate_light_shadow_setting(light.use_shadow, |casts_shadows| {
+        let (shadow, point_shadow) = if casts_shadows {
+            (shadow, point_shadow)
+        } else {
+            (None, None)
+        };
+        Ok(evaluate(shadow, point_shadow))
+    })
+}
+
+fn eevee_direct_lighting(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    receiver: Receiver,
+    normal: DVec3,
+    shadow: ShadowContext<'_>,
+    world_sun: Option<&EeveeWorldSunLight>,
+    light_threshold: f64,
+    mut evaluate: impl FnMut(&DirectLightContext<'_>) -> DVec3,
+) -> Result<DVec3> {
+    let mut result = DVec3::ZERO;
+    for (id, light_node) in &doc.nodes {
+        let Some(evaluated) = snapshot.nodes.get(id) else {
+            continue;
+        };
+        let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+            light_node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id))
+                .and_then(|block| block.light.as_ref())
+        }) else {
+            continue;
+        };
+        let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+        let influence = light_influence_at(light, matrix, receiver.point, light_threshold);
+        if influence <= 0.0 {
+            continue;
+        }
+        let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
+        let contribution =
+            with_light_shadow_setting(light, shadow, point_shadow, |shadow, point_shadow| {
+                let direct = DirectLightContext {
+                    light,
+                    matrix,
+                    receiver,
+                    normal,
+                    ray_visibility: light_node.resolved_ray_visibility(),
+                    shadow,
+                    point_shadow,
+                    sun_shadow_radius: None,
+                };
+                evaluate(&direct)
+            })?;
+        result += contribution * influence;
+    }
+    if let Some(sun) = world_sun {
+        let direct = world_sun_direct_context(sun, receiver, normal, shadow);
+        result += evaluate(&direct);
+    }
+    Ok(result)
+}
+
+fn shade(context: &SurfaceShadeContext<'_>) -> Result<[f64; 4]> {
+    if let Some(route) = context.gbuffer {
+        return shade_eevee_gbuffer(context, route);
+    }
+    let doc = context.doc;
+    let snapshot = context.snapshot;
+    let surface_receiver = &context.receiver;
+    let normal = context.normal;
+    let closures = context.closures;
+    let mode = context.mode;
+    let shadow = context.shadow;
+    let object_thickness = context.object_thickness;
+    let world = context.world;
+    let point = surface_receiver.point;
+    let shadow_point = surface_receiver.shadow_point;
+    let geometric = surface_receiver.geometric;
     let opaque = opaque_share(closures);
     if !matches!(mode, Mode::Beauty) {
         let albedo = heaviest(closures, |closure| closure.weight)
             .map_or(DVec3::ZERO, |closure| base_albedo(&closure.params));
-        return [albedo.x, albedo.y, albedo.z, opaque];
+        return Ok([albedo.x, albedo.y, albedo.z, opaque]);
     }
     let scene = doc.scenes.get(&snapshot.scene_id);
     // The view is the camera ray's reverse. An orthographic camera's rays are parallel, which is EEVEE's view too
     // (`world_incident_vector`); a perspective ray points at the camera. Without one, the normal.
-    let view = view.try_normalize().unwrap_or(normal);
+    let view = surface_receiver.view.try_normalize().unwrap_or(normal);
     // EEVEE's `eevee.light_threshold` sets each local light's influence radius; Blender's default is 0.01.
     let light_threshold = scene.map_or(0.01, |scene| scene.render.eevee_light_threshold);
     let receiver = Receiver {
-        point,
-        shadow_point,
-        geometric,
         view,
+        ..*surface_receiver
     };
-    // The diffuse environment depends on the normal alone, so every closure shares it.
-    // The diffuse environment depends on the normal alone, so every closure shares it.
-    let diffuse_environment =
-        world.map(|world| prefiltered_world(world, normal, 1.0, irradiance_probe_radiance));
-    // Ambient occlusion attenuates the environment (indirect) light only, as EEVEE's horizon scan does; EEVEE's direct
-    // light is never occluded by it. The hemisphere is the one the raster's occlusion pass casts (`ambient_visibility`).
-    let ambient = shadow.map_or(1.0, |scene| {
-        let facing = if geometric.dot(view) < 0.0 {
-            -geometric
-        } else {
-            geometric
-        };
-        ambient_visibility(
-            scene.bvh,
-            scene.triangles,
-            scene.prepared_materials,
-            point,
-            facing,
-            normal,
-            1.0,
-            scene.has_volume_only,
-        )
-    });
-    // A closure's reflective share is its weight times its alpha. The raster composite multiplies a straight colour
-    // by the opaque share (`render/raster.rs`, `composite_sample`), so the premultiplied sums are divided by it below.
+    // Ambient visibility modulates only diffuse-family indirect light; pure reflection/refraction and worldless
+    // materials have no consumer for this hemisphere query.
+    let needs_ambient = world.is_some()
+        && closures.iter().any(|closure| {
+            !matches!(closure.params.model, BsdfModel::Subsurface) && {
+                let features = closure.params.eevee_gbuffer_features();
+                features.has_diffuse() || features.has_subsurface() || features.has_translucent()
+            }
+        });
+    let ambient = if needs_ambient {
+        shadow.map_or(1.0, |scene| {
+            let facing = if geometric.dot(view) < 0.0 {
+                -geometric
+            } else {
+                geometric
+            };
+            ambient_visibility(
+                scene.bvh,
+                scene.triangles,
+                scene.prepared_materials,
+                point,
+                facing,
+                normal,
+                1.0,
+                scene.has_volume_only,
+            )
+        })
+    } else {
+        1.0
+    };
+    // EEVEE Hair preview may source diffuse radiance weight separately; raster coverage remains based on graph weights.
+    // `share` scales radiance and emission, while `opaque_share` independently supplies physical/film coverage.
     let mut reflected = DVec3::ZERO;
     let mut emitted = DVec3::ZERO;
     for closure in closures {
         let params = &closure.params;
-        let share = closure.weight * params.alpha.clamp(0.0, 1.0);
+        let share =
+            params.eevee_diffuse_weight.unwrap_or(closure.weight) * params.alpha.clamp(0.0, 1.0);
+        if matches!(params.model, BsdfModel::Holdout | BsdfModel::Subsurface) {
+            continue;
+        }
         // Reflectance weights the whole sum once, below, so the lobes take unit reflectance.
         let lobe = BsdfParams {
             reflectance: 1.0,
@@ -3242,102 +7378,132 @@ fn shade(
             params.thickness.unwrap_or(object_thickness),
             params.thickness_slab,
         );
-        let mut lobes = DVec3::ZERO;
-        // EEVEE packs each glass closure's summed direct radiance before multiplying its closure colour.
-        let mut glass_direct_radiance = (DVec3::ZERO, DVec3::ZERO);
-        if let (Some(world), Some(diffuse_environment)) = (world, diffuse_environment) {
-            let diffuse_albedo = if params.thin_wall {
-                let subsurface = params.subsurface_weight.clamp(0.0, 1.0);
-                let reflection = f64::midpoint(1.0, -params.subsurface_anisotropy).clamp(0.0, 1.0);
-                albedo * (1.0 - subsurface + subsurface * reflection)
-            } else {
-                albedo
-            };
-            let mut environment = diffuse_albedo * diffuse_environment * dielectric * lower;
-            let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
-            let specular_environment =
-                prefiltered_world(world, reflection, roughness, probe_radiance);
-            let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
-            let f0 = albedo * metallic + DVec3::splat(specular_f0 * dielectric);
-            environment += specular_environment * f0 * (1.0_f64 - roughness).powi(2) * lower;
-            lobes += environment * ambient;
-            if params.thin_wall && params.subsurface_weight > 0.0 {
-                let sphere_thickness = matches!(thickness, Thickness::Sphere(value) if value > 0.0);
-                let translucent_environment = if sphere_thickness {
-                    world.average_irradiance()
-                } else {
-                    prefiltered_world(world, -normal, 1.0, irradiance_probe_radiance)
-                };
-                let color = if sphere_thickness {
-                    albedo * albedo
+        let lobes = if let Some(lobes) =
+            standalone_eevee_lighting(context, receiver, params, thickness, ambient)?
+        {
+            lobes
+        } else {
+            let mut lobes = DVec3::ZERO;
+            // EEVEE packs each glass closure's summed direct radiance before multiplying its closure colour.
+            let mut glass_direct_radiance = (DVec3::ZERO, DVec3::ZERO);
+            if let Some(world) = world {
+                let diffuse_environment =
+                    prefiltered_world(world, normal, 1.0, irradiance_probe_radiance);
+                let diffuse_albedo = if params.thin_wall {
+                    let subsurface = params.subsurface_weight.clamp(0.0, 1.0);
+                    let reflection =
+                        f64::midpoint(1.0, -params.subsurface_anisotropy).clamp(0.0, 1.0);
+                    albedo * (1.0 - subsurface + subsurface * reflection)
                 } else {
                     albedo
                 };
-                lobes += color
-                    * thin_subsurface_transmission_weight(&lobe, &shading, false)
-                    * translucent_environment
-                    * ambient;
+                lobes += diffuse_albedo * diffuse_environment * dielectric * lower * ambient;
+                let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
+                let specular_environment = eevee_prefiltered_world(world, reflection, roughness)?;
+                let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
+                let f0 = albedo * metallic + DVec3::splat(specular_f0 * dielectric);
+                lobes += specular_environment * f0 * (1.0_f64 - roughness).powi(2) * lower;
+                if params.thin_wall && params.subsurface_weight > 0.0 {
+                    let sphere_thickness =
+                        matches!(thickness, Thickness::Sphere(value) if value > 0.0);
+                    let translucent_environment = if sphere_thickness {
+                        world.average_irradiance()
+                    } else {
+                        prefiltered_world(world, -normal, 1.0, irradiance_probe_radiance)
+                    };
+                    let color = if sphere_thickness {
+                        albedo * albedo
+                    } else {
+                        albedo
+                    };
+                    lobes += color
+                        * thin_subsurface_transmission_weight(&lobe, &shading, false)
+                        * translucent_environment
+                        * ambient;
+                }
+                // Refraction takes no occlusion: EEVEE's deferred combine multiplies no visibility into the transmission
+                // closure's probe read (`eevee_deferred_combine.bsl.hh`), so the glass environment is not attenuated.
+                if let Some(glass) =
+                    eevee_transmission::glass_closures(params, normal, view, lower, thickness)
+                {
+                    lobes += glass_environment(world, &glass)?;
+                }
             }
-            // Refraction takes no occlusion: EEVEE's deferred combine multiplies no visibility into the transmission
-            // closure's probe read (`eevee_deferred_combine.bsl.hh`), so the glass environment is not attenuated.
-            if let Some(glass) =
-                eevee_transmission::glass_closures(params, normal, view, lower, thickness)
-            {
-                lobes += glass_environment(world, &glass);
-            }
-        }
-        let glass = eevee_transmission::glass_light(params, normal, view, lower, thickness);
-        for (id, light_node) in &doc.nodes {
-            let Some(evaluated) = snapshot.nodes.get(id) else {
-                continue;
-            };
-            let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
-                light_node
-                    .data
-                    .as_ref()
-                    .and_then(|data_id| doc.data_blocks.get(data_id))
-                    .and_then(|block| block.light.as_ref())
-            }) else {
-                continue;
-            };
-            let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
-            let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
-            let influence = light_influence_at(light, matrix, point, light_threshold);
-            let ray_visibility = light_node.resolved_ray_visibility();
-            lobes += light_contribution(
-                light,
-                matrix,
-                point,
-                shadow_point,
-                normal,
-                geometric,
-                &lobe,
-                &shading,
-                shadow,
-                point_shadow,
-                ray_visibility,
-                thickness,
-            ) * influence;
-            if let Some(glass) = &glass {
-                let (reflection, transmission) = glass_direct_contribution(
+            let glass = eevee_transmission::glass_light(params, normal, view, lower, thickness);
+            for (id, light_node) in &doc.nodes {
+                let Some(evaluated) = snapshot.nodes.get(id) else {
+                    continue;
+                };
+                let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+                    light_node
+                        .data
+                        .as_ref()
+                        .and_then(|data_id| doc.data_blocks.get(data_id))
+                        .and_then(|block| block.light.as_ref())
+                }) else {
+                    continue;
+                };
+                let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+                let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
+                let influence = light_influence_at(light, matrix, point, light_threshold);
+                let ray_visibility = light_node.resolved_ray_visibility();
+                let contribution = with_light_shadow_setting(
                     light,
-                    matrix,
-                    receiver,
-                    glass,
-                    thickness,
-                    ray_visibility,
                     shadow,
                     point_shadow,
-                );
-                glass_direct_radiance.0 += reflection * influence;
-                glass_direct_radiance.1 += transmission * influence;
+                    |shadow, point_shadow| {
+                        light_contribution(
+                            light,
+                            matrix,
+                            point,
+                            shadow_point,
+                            normal,
+                            geometric,
+                            &lobe,
+                            &shading,
+                            shadow,
+                            point_shadow,
+                            ray_visibility,
+                            thickness,
+                            None,
+                        )
+                    },
+                )?;
+                lobes += contribution * influence;
+                if let Some(glass) = &glass {
+                    let (reflection, transmission) = with_light_shadow_setting(
+                        light,
+                        shadow,
+                        point_shadow,
+                        |shadow, point_shadow| {
+                            glass_direct_contribution(
+                                light,
+                                matrix,
+                                receiver,
+                                glass,
+                                thickness,
+                                ray_visibility,
+                                shadow,
+                                point_shadow,
+                            )
+                        },
+                    )?;
+                    glass_direct_radiance.0 += reflection * influence;
+                    glass_direct_radiance.1 += transmission * influence;
+                }
             }
-        }
-        if let Some(glass) = &glass {
-            let reflection = rgb9e5_roundtrip(glass_direct_radiance.0);
-            let transmission = rgb9e5_roundtrip(glass_direct_radiance.1);
-            lobes += glass.reflection * reflection + glass.transmission * transmission;
-        }
+            if let Some(sun) = context.world_sun {
+                lobes += world_sun_light_contribution(
+                    sun, receiver, normal, geometric, &lobe, &shading, shadow, thickness,
+                );
+            }
+            if let Some(glass) = &glass {
+                let reflection = rgb9e5_roundtrip(glass_direct_radiance.0);
+                let transmission = rgb9e5_roundtrip(glass_direct_radiance.1);
+                lobes += glass.reflection * reflection + glass.transmission * transmission;
+            }
+            lobes
+        };
         // Reflectance weights every reflective closure (ambient, direct, environment); Emission has none.
         reflected += lobes * (share * params.reflectance.clamp(0.0, 1.0));
         // Emission sits outside the reflectance weight and the clamp: Cycles' `EmissionNode` emits
@@ -3353,32 +7519,301 @@ fn shade(
     } else {
         (DVec3::ZERO, DVec3::ZERO)
     };
-    let reflected = reflected.max(DVec3::ZERO).min(DVec3::splat(1.0));
-    let result = reflected + emitted;
-    [result.x, result.y, result.z, opaque]
+    // EEVEE's safe_color preserves HDR radiance and caps it after all closures are combined.
+    let result = (reflected + emitted)
+        .max(DVec3::ZERO)
+        .min(DVec3::splat(1.0e20));
+    Ok([result.x, result.y, result.z, opaque])
+}
+
+fn eevee_subsurface_gbuffer_bin<'a>(
+    route: &EeveeGBufferRoute,
+    closures: &'a [ShaderClosure],
+) -> Result<Option<(EeveeGBufferBin, &'a ShaderClosure)>> {
+    for bin in route
+        .layout
+        .bins
+        .iter()
+        .take(route.layout.bin_count)
+        .flatten()
+        .copied()
+    {
+        if bin.lobe != EeveeGBufferLobe::Subsurface {
+            continue;
+        }
+        let candidate = route.candidates.get(bin.candidate_index).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "EEVEE subsurface bin references a missing source candidate",
+            )
+        })?;
+        let closure = closures.get(bin.source_closure_index).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "EEVEE subsurface bin references a missing source closure",
+            )
+        })?;
+        if candidate.source_closure_index != bin.source_closure_index || candidate.lobe != bin.lobe
+        {
+            return Err(PotError::new(
+                ErrorCode::EvaluationFailed,
+                "EEVEE subsurface bin does not match its selected source candidate",
+            ));
+        }
+        if matches!(closure.params.model, BsdfModel::Subsurface) {
+            return Ok(Some((bin, closure)));
+        }
+    }
+    Ok(None)
+}
+
+fn eevee_subsurface_shading_normal(evaluated: DVec3, geometric: DVec3) -> DVec3 {
+    let normal = evaluated.normalize_or_zero();
+    if normal == DVec3::ZERO {
+        geometric.normalize_or_zero()
+    } else {
+        normal
+    }
+}
+
+fn eevee_subsurface_sample(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    point: DVec3,
+    shadow_point: DVec3,
+    normal: DVec3,
+    geometric: DVec3,
+    view: DVec3,
+    closures: &[ShaderClosure],
+    route: Option<&EeveeGBufferRoute>,
+    raytrace_feedback: Option<&EeveeRaytraceFeedback>,
+    shadow: ShadowContext<'_>,
+    world: Option<&WorldProbe>,
+    world_sun: Option<&EeveeWorldSunLight>,
+    object_index: u32,
+    camera_matrices: Option<(&DMat4, &DMat4)>,
+    material_refraction: Option<bool>,
+) -> Result<Option<EeveeSubsurfaceSample>> {
+    let Some(route) = route else {
+        return Ok(None);
+    };
+    let Some((selected_bin, selected_closure)) = eevee_subsurface_gbuffer_bin(route, closures)?
+    else {
+        return Ok(None);
+    };
+    let params = &selected_closure.params;
+    let radius = eevee_subsurface_radius(params).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "selected EEVEE subsurface bin has no source profile radius",
+        )
+    })?;
+    let Some((_, world_to_camera)) = camera_matrices else {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "EEVEE subsurface requires the per-eye camera transform for view-space depth",
+            serde_json::json!({"feature_id":"render.eevee.subsurface.camera_transform"}),
+        ));
+    };
+    let depth = -world_to_camera.transform_point3(point).z;
+    if !depth.is_finite() || depth <= 0.0 {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "EEVEE subsurface hit has invalid view-space depth",
+        ));
+    }
+
+    let scene = doc.scenes.get(&snapshot.scene_id);
+    let light_threshold = scene.map_or(0.01, |scene| scene.render.eevee_light_threshold);
+    let view = view.try_normalize().unwrap_or(normal);
+    let shading_normal =
+        eevee_gbuffer_normal(eevee_subsurface_shading_normal(params.normal, geometric));
+    let opaque = opaque_share(closures);
+    let profile_color_scale = selected_bin.weight * route.gbuffer_alpha_reciprocal;
+    let profile_color = selected_bin
+        .color
+        .map(|channel| f64::from(channel * profile_color_scale));
+    let profile_color_before_pack = profile_color;
+    let profile_association_scale = if opaque > 0.0 {
+        f64::from(route.gbuffer_alpha) / opaque
+    } else {
+        0.0
+    };
+    let radius_context = route.context(selected_bin.data1_layer.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "EEVEE subsurface bin has no radius storage layer",
+        )
+    })?);
+    let (profile_color, profile_radius) = eevee_subsurface_gbuffer_profile(
+        profile_color_before_pack,
+        radius,
+        route.context(selected_bin.data0_layer),
+        radius_context,
+    );
+    let mut profiles = [None; MAX_EEVEE_SUBSURFACE_CLOSURES];
+    let profile = profiles
+        .get_mut(selected_bin.storage_layer)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "EEVEE subsurface bin exceeds the profile storage capacity",
+            )
+        })?;
+    *profile = Some(EeveeSubsurfaceClosure {
+        color: profile_color,
+        radius: profile_radius,
+    });
+
+    let thickness = route.thickness;
+    let receiver = Receiver {
+        point,
+        shadow_point,
+        geometric,
+        view,
+    };
+    let direct_front = eevee_diffuse_direct(
+        doc,
+        snapshot,
+        receiver,
+        shading_normal,
+        shadow,
+        world_sun,
+        light_threshold,
+    )?;
+    let transmission = super::eevee_advanced_bsdf::eevee_subsurface_transmission(
+        profile_radius,
+        thickness.value() as f32,
+    )
+    .map(f64::from);
+    let direct_back = if transmission.iter().any(|value| *value > 0.0) {
+        eevee_subsurface_transmission_direct(
+            doc,
+            snapshot,
+            receiver,
+            shading_normal,
+            thickness,
+            shadow,
+            world_sun,
+            light_threshold,
+        )?
+    } else {
+        DVec3::ZERO
+    };
+    let direct = direct_front + direct_back * DVec3::from_array(transmission);
+    let ambient = if world.is_some() {
+        shadow.map_or(1.0, |scene| {
+            let facing = if geometric.dot(view) < 0.0 {
+                -geometric
+            } else {
+                geometric
+            };
+            ambient_visibility(
+                scene.bvh,
+                scene.triangles,
+                scene.prepared_materials,
+                point,
+                facing,
+                shading_normal,
+                1.0,
+                scene.has_volume_only,
+            )
+        })
+    } else {
+        1.0
+    };
+    let indirect = raytrace_feedback
+        .and_then(|feedback| {
+            let radiance = if feedback.refraction_active && material_refraction == Some(true) {
+                &feedback.refraction_radiance
+            } else {
+                &feedback.radiance
+            };
+            radiance.get(selected_bin.storage_layer).copied().flatten()
+        })
+        .map_or_else(
+            || {
+                world.map_or(DVec3::ZERO, |world| {
+                    let Some(sh) = world.fast_gi_sh() else {
+                        return DVec3::ZERO;
+                    };
+                    let transmission = super::eevee_advanced_bsdf::eevee_subsurface_transmission(
+                        profile_radius,
+                        thickness.value() as f32,
+                    )
+                    .map(f64::from);
+                    let normal = shading_normal.as_vec3();
+                    let front = sh
+                        .evaluate_lambert(normal)
+                        .truncate()
+                        .to_array()
+                        .map(f64::from);
+                    let back = sh
+                        .evaluate_lambert(-normal)
+                        .truncate()
+                        .to_array()
+                        .map(f64::from);
+                    (DVec3::from_array(front)
+                        + DVec3::from_array(back) * DVec3::from_array(transmission))
+                        * ambient
+                })
+            },
+            |radiance| DVec3::from_array(radiance.map(f64::from)),
+        );
+    Ok(Some(EeveeSubsurfaceSample {
+        closures: profiles,
+        direct: direct.to_array().map(|value| value as f32),
+        indirect: indirect.to_array().map(|value| value as f32),
+        association_scale: profile_association_scale,
+        object_index,
+        depth,
+        split_radiance: false,
+    }))
 }
 
 /// The environment's share of the glass closures: the reflection at its mirror direction and the transmission at the
 /// probe direction, each blurred with its roughness as EEVEE's light probe is (`eevee_transmission`).
-fn glass_environment(world: &WorldProbe, closures: &GlassClosures) -> DVec3 {
-    let reflected = prefiltered_world(
+fn glass_environment(world: &WorldProbe, closures: &GlassClosures) -> Result<DVec3> {
+    let reflected = eevee_prefiltered_world(
         world,
         closures.reflection_direction,
         closures.reflection_roughness,
-        probe_radiance,
-    );
-    let transmitted = prefiltered_world(
+    )?;
+    let transmitted = eevee_prefiltered_world(
         world,
         closures.transmission_direction,
         closures.transmission_roughness,
-        probe_radiance,
-    );
-    reflected * closures.reflection + transmitted * closures.transmission
+    )?;
+    Ok(reflected * closures.reflection + transmitted * closures.transmission)
+}
+
+/// EEVEE specular reads use the roughness-prefiltered sphere-probe atlas, which is constructed in EEVEE mode.
+fn eevee_prefiltered_world(world: &WorldProbe, direction: DVec3, roughness: f64) -> Result<DVec3> {
+    world
+        .prefiltered_radiance(direction, roughness)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "EEVEE specular shading requires an EEVEE-filtered world probe",
+            )
+        })
+}
+
+/// The deferred split-indirect target stores the filtered, uncolored probe value in `UFLOAT_11_11_10` before the
+/// deferred combine multiplies by the closure color. Forward shading continues to use the unquantized atlas sample.
+fn eevee_deferred_indirect_world(
+    world: &WorldProbe,
+    direction: DVec3,
+    roughness: f64,
+) -> Result<DVec3> {
+    let radiance = eevee_prefiltered_world(world, direction, roughness)?;
+    let radiance = DVec3::from_array(radiance.to_array().map(|channel| f64::from(channel as f32)));
+    Ok(eevee_transmission::probe_radiance(radiance))
 }
 
 /// The world's filtered radiance along `axis` for `roughness`: five taps spread over a lobe of that roughness, read from
-/// the render's world probe. Each tap's texel is `stored` (the capture format of the probe it is read from) before the
-/// blur: a diffuse read stores irradiance and a glossy or glass read stores radiance (`eevee_transmission`).
+/// the render's world probe. EEVEE cube texels are already quantized at their SFLOAT16 store; `stored` models only a
+/// later per-tap radiance conversion needed by the caller (for example, diffuse irradiance), not a second probe store.
 fn prefiltered_world(
     world: &WorldProbe,
     axis: DVec3,
@@ -3424,6 +7859,7 @@ fn light_contribution(
     point_shadow: Option<&PointShadowMap>,
     lobes: RayVisibility,
     thickness: Thickness,
+    sun_shadow_radius: Option<f64>,
 ) -> DVec3 {
     let color = DVec3::from_array(light.color).max(DVec3::ZERO);
     let energy = light.energy.max(0.0);
@@ -3446,6 +7882,7 @@ fn light_contribution(
                 color,
                 light,
                 lobes,
+                sun_shadow_radius,
             )
         }
         crate::model::LightType::Point => {
@@ -3571,7 +8008,9 @@ fn light_contribution(
         && params.subsurface_weight > 0.0
         && lobes.mask() & RayKind::Diffuse.bit() != 0
     {
-        let Some(direct) = direct_emitter(light, matrix, point) else {
+        let Some(direct) =
+            direct_emitter_with_sun_shadow_radius(light, matrix, point, sun_shadow_radius)
+        else {
             return contribution;
         };
         let origin = transmission_origin(
@@ -3794,6 +8233,37 @@ fn sun_disc_directions(direction: DVec3, radius: f64) -> impl Iterator<Item = DV
     })
 }
 
+/// Keeps the direct-light disc and its independently jittered shadow disc on the same spiral samples.
+fn sun_disc_direction_pairs(
+    direction: DVec3,
+    shape_radius: f64,
+    shadow_radius: f64,
+) -> impl Iterator<Item = (DVec3, DVec3)> {
+    let (tangent, bitangent) = make_orthonormals(direction);
+    let golden_angle = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+    (0..SUN_DISC_SAMPLES).map(move |index| {
+        let radial = ((index as f64 + 0.5) / SUN_DISC_SAMPLES as f64).sqrt();
+        let angle = index as f64 * golden_angle;
+        let (cosine, sine) = (angle.cos(), angle.sin());
+        let sample = |radius: f64| {
+            (direction
+                + tangent * (radial * radius * cosine)
+                + bitangent * (radial * radius * sine))
+                .normalize_or_zero()
+        };
+        let shape = sample(shape_radius);
+        let shadow = if shape_radius
+            .partial_cmp(&shadow_radius)
+            .is_some_and(std::cmp::Ordering::is_eq)
+        {
+            shape
+        } else {
+            sample(shadow_radius)
+        };
+        (shape, shadow)
+    })
+}
+
 /// A sun's visibility at a receiver: the mean over rays from the receiver to the sun's disc, each blocked by an opaque
 /// occluder (`ray_transmittance`).
 fn sun_disc_visibility(
@@ -3878,6 +8348,15 @@ fn direct_emitter(
     matrix: DMat4,
     point: DVec3,
 ) -> Option<DirectEmitter> {
+    direct_emitter_with_sun_shadow_radius(light, matrix, point, None)
+}
+
+fn direct_emitter_with_sun_shadow_radius(
+    light: &crate::model::LightData,
+    matrix: DMat4,
+    point: DVec3,
+    sun_shadow_radius: Option<f64>,
+) -> Option<DirectEmitter> {
     let color = DVec3::from_array(light.color).max(DVec3::ZERO);
     let energy = light.energy.max(0.0);
     let position = matrix.transform_point3(DVec3::ZERO);
@@ -3885,6 +8364,7 @@ fn direct_emitter(
     match light.light_type {
         crate::model::LightType::Sun => {
             let radius = sun_disc_radius(light.sun_angle);
+            let shadow_radius = sun_shadow_radius.unwrap_or(radius);
             // `shape_radiance_get` for a sun: `(1 + 1 / r²) / π` per unit of irradiance.
             let inv_sin_squared = 1.0 + 1.0 / (radius * radius);
             Some(DirectEmitter {
@@ -3899,7 +8379,7 @@ fn direct_emitter(
                 axis,
                 area: None,
                 sun: true,
-                sun_radius: radius,
+                sun_radius: shadow_radius,
             })
         }
         crate::model::LightType::Point | crate::model::LightType::Spot => {
@@ -4197,6 +8677,232 @@ fn rgb9e5_roundtrip(radiance: DVec3) -> DVec3 {
     )
 }
 
+struct DirectLightContext<'a> {
+    light: &'a crate::model::LightData,
+    matrix: DMat4,
+    receiver: Receiver,
+    normal: DVec3,
+    ray_visibility: RayVisibility,
+    shadow: ShadowContext<'a>,
+    point_shadow: Option<&'a PointShadowMap>,
+    sun_shadow_radius: Option<f64>,
+}
+
+fn world_sun_shadow<'a>(sun: &EeveeWorldSunLight, shadow: ShadowContext<'a>) -> ShadowContext<'a> {
+    if sun.use_shadows { shadow } else { None }
+}
+
+fn world_sun_direct_context<'a>(
+    sun: &'a EeveeWorldSunLight,
+    receiver: Receiver,
+    normal: DVec3,
+    shadow: ShadowContext<'a>,
+) -> DirectLightContext<'a> {
+    DirectLightContext {
+        light: &sun.light,
+        matrix: sun.matrix,
+        receiver,
+        normal,
+        ray_visibility: sun.ray_visibility,
+        shadow: world_sun_shadow(sun, shadow),
+        point_shadow: None,
+        sun_shadow_radius: sun.shadow_radius,
+    }
+}
+
+fn world_sun_light_contribution(
+    sun: &EeveeWorldSunLight,
+    receiver: Receiver,
+    normal: DVec3,
+    geometric: DVec3,
+    params: &BsdfParams,
+    shading: &Layers,
+    shadow: ShadowContext<'_>,
+    thickness: Thickness,
+) -> DVec3 {
+    light_contribution(
+        &sun.light,
+        sun.matrix,
+        receiver.point,
+        receiver.shadow_point,
+        normal,
+        geometric,
+        params,
+        shading,
+        world_sun_shadow(sun, shadow),
+        None,
+        sun.ray_visibility,
+        thickness,
+        sun.shadow_radius,
+    )
+}
+
+fn translucent_direct_contribution(
+    context: &DirectLightContext<'_>,
+    color: DVec3,
+    thickness: Thickness,
+) -> DVec3 {
+    transmission_direct_contribution(context, color, thickness, true)
+}
+
+/// BSSRDF transmission uses a back-facing `LIGHT_DIFFUSE` lobe while retaining the material thickness for shadow origin.
+fn transmission_direct_contribution(
+    context: &DirectLightContext<'_>,
+    color: DVec3,
+    thickness: Thickness,
+    is_translucent_with_thickness: bool,
+) -> DVec3 {
+    if !context.ray_visibility.allows(RayKind::Diffuse) {
+        return DVec3::ZERO;
+    }
+    let Some(direct) = direct_emitter_with_sun_shadow_radius(
+        context.light,
+        context.matrix,
+        context.receiver.point,
+        context.sun_shadow_radius,
+    ) else {
+        return DVec3::ZERO;
+    };
+    let sphere = is_translucent_with_thickness
+        && matches!(thickness, Thickness::Sphere(value) if value != 0.0);
+    let lobe_normal = if sphere {
+        direct.direction
+    } else {
+        -context.normal
+    };
+    let facing = if sphere {
+        1.0
+    } else {
+        facing_attenuation(
+            direct.emitter.shape_radius(),
+            direct.direction,
+            direct.distance,
+            lobe_normal,
+            true,
+        )
+    };
+    let origin = transmission_origin(
+        context.receiver.point,
+        context.receiver.geometric,
+        direct.direction,
+        direct.shadow_distance,
+        thickness,
+    );
+    let visibility = match direct.area {
+        Some(shape) => area_transmitted_fraction(
+            context.shadow,
+            origin,
+            &shape,
+            (direct.centre, -direct.axis),
+            lobe_normal,
+        ),
+        None => transmitted_visibility(context.shadow, origin, &direct),
+    };
+    let form = direct.emitter.form_factor(
+        lobe_normal,
+        context.receiver.view,
+        [1.0, 0.0, 0.0, 1.0],
+        direct.to_centre,
+    );
+    let thickness_scale = if sphere {
+        1.0 / std::f64::consts::PI
+    } else {
+        1.0
+    };
+    color
+        * direct.radiance
+        * (direct.attenuation
+            * facing
+            * visibility
+            * form
+            * LightFactors::of(context.light).diffuse
+            * thickness_scale)
+}
+
+fn diffuse_direct_contribution(context: &DirectLightContext<'_>) -> DVec3 {
+    ltc_direct_contribution(
+        context,
+        super::eevee_ltc::IDENTITY,
+        DVec3::ONE,
+        RayKind::Diffuse,
+    )
+}
+
+fn metallic_direct_contribution(
+    context: &DirectLightContext<'_>,
+    roughness: f64,
+    color: DVec3,
+) -> DVec3 {
+    let cos_theta = context.normal.dot(context.receiver.view);
+    let matrix = super::eevee_ltc::sample_matrix(cos_theta, roughness);
+    ltc_direct_contribution(context, matrix, color, RayKind::Glossy)
+}
+
+fn ltc_direct_contribution(
+    context: &DirectLightContext<'_>,
+    matrix: super::eevee_ltc::PackedMatrix,
+    color: DVec3,
+    ray_kind: RayKind,
+) -> DVec3 {
+    if !context.ray_visibility.allows(ray_kind) {
+        return DVec3::ZERO;
+    }
+    let factors = LightFactors::of(context.light);
+    let light_factor = match ray_kind {
+        RayKind::Diffuse => factors.diffuse,
+        RayKind::Glossy => factors.specular,
+        _ => return DVec3::ZERO,
+    };
+    let Some(direct) = direct_emitter_with_sun_shadow_radius(
+        context.light,
+        context.matrix,
+        context.receiver.point,
+        context.sun_shadow_radius,
+    ) else {
+        return DVec3::ZERO;
+    };
+    let facing = facing_attenuation(
+        direct.emitter.shape_radius(),
+        direct.direction,
+        direct.distance,
+        context.normal,
+        false,
+    );
+    if facing <= 0.0 {
+        return DVec3::ZERO;
+    }
+    let visibility = match direct.area {
+        Some(shape) => area_visible_fraction(
+            context.shadow,
+            context.point_shadow,
+            context.receiver.shadow_point,
+            context.receiver.geometric,
+            &shape,
+            direct.centre,
+            -direct.axis,
+            context.receiver.point,
+            context.normal,
+        ),
+        None => visibility_for_light(
+            context.shadow,
+            context.point_shadow,
+            context.receiver.shadow_point,
+            context.receiver.geometric,
+            direct.direction,
+            direct.shadow_distance,
+            direct.sun_radius,
+        ),
+    };
+    let form = direct.emitter.form_factor(
+        context.normal,
+        context.receiver.view,
+        matrix,
+        direct.to_centre,
+    );
+    let unshadowed = direct.radiance * (direct.attenuation * facing * form * light_factor);
+    color * unshadowed * visibility
+}
+
 /// A sun's direct light, integrated over the sun's disc as EEVEE's sun is. The diffuse class is flat over the disc, so its
 /// centre value times the disc's mean visibility is its integral. The specular class is resolved over the disc: each sample
 /// of the disc (`sun_disc_directions`), weighted by its visibility, is one direction of the integral, so a glossy highlight
@@ -4211,6 +8917,7 @@ fn sun_lighting(
     color: DVec3,
     light: &crate::model::LightData,
     lobes: RayVisibility,
+    sun_shadow_radius: Option<f64>,
 ) -> DVec3 {
     let front_params = if params.thin_wall {
         *params
@@ -4221,17 +8928,20 @@ fn sun_lighting(
     let sphere_thickness =
         !params.thickness_slab && params.thickness.is_some_and(|value| value > 0.0);
     let factors = LightFactors::of(light);
-    let radius = sun_disc_radius(light.sun_angle);
+    let shape_radius = sun_disc_radius(light.sun_angle);
+    let shadow_radius = sun_shadow_radius.unwrap_or(shape_radius);
     let weight = energy / SUN_DISC_SAMPLES as f64;
     let mut mean_visibility = 0.0;
     let mut specular = DVec3::ZERO;
     let mut translucent = DVec3::ZERO;
-    for sample in sun_disc_directions(toward_light, radius) {
+    for (sample, shadow_sample) in
+        sun_disc_direction_pairs(toward_light, shape_radius, shadow_radius)
+    {
         let visibility = match shadow {
             Some(shadow) => ray_transmittance(
                 shadow,
-                shadow_origin(shadow_point, geometric, sample),
-                sample,
+                shadow_origin(shadow_point, geometric, shadow_sample),
+                shadow_sample,
                 f64::INFINITY,
                 true,
             ),
@@ -4355,14 +9065,20 @@ mod shading_normal_tests {
     use crate::error::{ErrorCode, PotError};
 
     use super::{
-        ColorSlotReferences, carried_color_layers, color_layer_references, corner_values,
-        extract_geometry, source_has_color_layer, subdivide_displaced, surface_shader,
-        triangle_corners, triangle_layer_colors, triangle_layer_uvs, world_face_normals,
+        ColorSlotReferences, FaceNormalValues, MeshAttributePrecision, blend_corner_normals,
+        carried_color_layers, color_layer_references, corner_normals, corner_values,
+        eevee_registered_raytrace_layer_summary, extract_geometry, extract_geometry_with_semantics,
+        mesh_mikk_tangents, mesh_vertex_positions, scene_shader_with_semantics,
+        source_has_color_layer, source_quantized_mesh_attribute, subdivide_displaced,
+        surface_shader, triangle_corners, triangle_layer_colors, triangle_layer_uvs,
+        world_face_normals,
     };
     use crate::render::principled_bsdf::{
         diffuse_coefficient, layers as principled_layers, specular_coefficient,
     };
-    use crate::render::raster::{Camera, Projection, StereoMode, ViewBasis};
+    use crate::render::raster::{
+        Camera, EeveeRaytraceFeedback, Projection, StereoMode, SurfaceShader, ViewBasis,
+    };
     use crate::shader::BsdfParams;
     use crate::{
         eval::{EvaluationContext, Snapshot},
@@ -4371,9 +9087,9 @@ mod shading_normal_tests {
             color_layers::{ColorDomain, ColorLayer, ColorStore},
             uv_layers::{UvLayer, UvStore},
         },
-        graph::{GraphKind, GraphNode, NodeGroup},
+        graph::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup},
         image::{ImageData, ImageInterpolation},
-        model::{Id, Material, MaterialLink, RayVisibility, SceneDoc, ViewportDisplay},
+        model::{Id, Material, MaterialLink, RayKind, RayVisibility, SceneDoc, ViewportDisplay},
         render::{
             light_model::{
                 AreaShape, area_irradiance_per_radiance, area_radiance, area_visibility_samples,
@@ -4486,6 +9202,147 @@ mod shading_normal_tests {
         mesh
     }
 
+    fn unknown_precision_scene(points: [DVec3; 3]) -> crate::error::Result<(SceneDoc, Snapshot)> {
+        let initial = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let applied = crate::ops::apply_batch(
+            &initial,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [
+                    {"op":"node.create","id":"body","kind":"plane","params":{"size":1.0}}
+                ]
+            }),
+        )?;
+        let mut doc = applied.doc;
+        let node_id = Id::new("body")?;
+        let data_id = doc
+            .nodes
+            .get(&node_id)
+            .and_then(|node| node.data.clone())
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "plane data is missing"))?;
+        let mesh = Mesh::from_positions_and_faces(points.to_vec(), vec![vec![0, 1, 2]])
+            .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.to_string()))?;
+        let data = doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "plane data block is missing")
+        })?;
+        data.mesh = Some(mesh);
+        for scene in doc.scenes.values_mut() {
+            scene.render.use_high_quality_normals = None;
+        }
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        Ok((doc, snapshot))
+    }
+
+    #[test]
+    fn unknown_source_precision_keeps_common_packed_axis_normals() -> crate::error::Result<()> {
+        let (doc, snapshot) = unknown_precision_scene([DVec3::ZERO, DVec3::X, DVec3::Y])?;
+        let geometry = extract_geometry_with_semantics(
+            &doc,
+            &snapshot,
+            Mode::Beauty,
+            false,
+            &BTreeMap::new(),
+            crate::node_kernels::MathSemantics::Eevee,
+        )?;
+        let triangle = geometry.triangles.first().ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "axis mesh triangle is missing")
+        })?;
+        assert_eq!(triangle.normals, Some([DVec3::Z; 3]));
+        assert!(!triangle.smooth_shading);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_source_precision_refuses_different_world_normals() -> crate::error::Result<()> {
+        let (doc, snapshot) =
+            unknown_precision_scene([DVec3::ZERO, DVec3::X, DVec3::new(0.0, 1.0, 2.0)])?;
+        let error = extract_geometry_with_semantics(
+            &doc,
+            &snapshot,
+            Mode::Beauty,
+            false,
+            &BTreeMap::new(),
+            crate::node_kernels::MathSemantics::Eevee,
+        )
+        .err()
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "different packed world normals were accepted without source precision",
+            )
+        })?;
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            error.details["feature_id"],
+            json!("render.eevee.mesh_attribute_precision")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_source_precision_does_not_change_path_or_solid_mesh_normals()
+    -> crate::error::Result<()> {
+        let (doc, snapshot) =
+            unknown_precision_scene([DVec3::ZERO, DVec3::X, DVec3::new(0.0, 1.0, 2.0)])?;
+        let solid = extract_geometry_with_semantics(
+            &doc,
+            &snapshot,
+            Mode::Solid,
+            false,
+            &BTreeMap::new(),
+            crate::node_kernels::MathSemantics::Eevee,
+        )?;
+        let path = extract_geometry(&doc, &snapshot, Mode::Beauty, true, &BTreeMap::new())?;
+        assert!(
+            solid
+                .triangles
+                .iter()
+                .chain(&path.triangles)
+                .all(|triangle| triangle.normals.is_none() && !triangle.smooth_shading)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_source_precision_checks_mikk_tangent_outputs() -> crate::error::Result<()> {
+        let mesh = single_face_mesh([DVec3::ZERO, DVec3::new(3.0, 4.0, 0.0), DVec3::Y], true);
+        let triangles = mesh
+            .tessellate()
+            .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.to_string()))?;
+        let vertex_positions = mesh_vertex_positions(&mesh);
+        let uv_store = UvStore {
+            layers: vec![UvLayer::new(
+                "UVMap",
+                vec![Some(vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])],
+            )],
+            ..UvStore::default()
+        };
+        let mut warnings = Vec::new();
+        let normals = corner_normals(
+            &mesh,
+            &vertex_positions,
+            DMat4::IDENTITY,
+            &node_id(),
+            None,
+            true,
+            MeshAttributePrecision::Unknown,
+            &mut warnings,
+        );
+        assert!(normals.precision_matches);
+        let tangents = mesh_mikk_tangents(
+            &mesh,
+            &triangles,
+            &vertex_positions,
+            &uv_store,
+            normals.local.as_deref(),
+            DMat4::from_scale(DVec3::new(4.0, 1.0, 1.0)),
+            MeshAttributePrecision::Unknown,
+        )?;
+        assert!(!tangents.precision_matches);
+        Ok(())
+    }
+
     #[test]
     fn absent_uv_rows_use_the_canonical_storage_default() {
         let store = UvStore {
@@ -4520,6 +9377,201 @@ mod shading_normal_tests {
             assert!(corner.abs_diff_eq(expected, 1e-9), "got {corner:?}");
         }
         assert_eq!(warnings, Vec::<serde_json::Value>::new());
+    }
+
+    #[test]
+    fn realtime_mesh_normals_quantize_each_vertex_before_fragment_interpolation() {
+        let mesh = single_face_mesh([DVec3::ZERO, DVec3::Y, DVec3::new(1.0, 0.0, -1.0)], true);
+        let vertex_positions = mesh_vertex_positions(&mesh);
+        let raw = [
+            DVec3::new(-100.25, -26.75, 500.5).normalize(),
+            DVec3::Z,
+            DVec3::new(-103.25, 0.0, 500.25).normalize(),
+        ];
+        let adaptive = raw.map(Some);
+        let mut warnings = Vec::new();
+        let data = corner_normals(
+            &mesh,
+            &vertex_positions,
+            DMat4::IDENTITY,
+            &node_id(),
+            Some(&adaptive),
+            true,
+            MeshAttributePrecision::Known(false),
+            &mut warnings,
+        );
+        let corners = data.world[0]
+            .as_ref()
+            .and_then(FaceNormalValues::as_corners)
+            .expect("smooth face has VBO normals");
+        let codes = [[-100, -26, 500], [0, 0, 511], [-103, 0, 500]];
+        let decoded = codes.map(|[x, y, z]| {
+            DVec3::new(
+                f64::from(x as f32 / 511.0),
+                f64::from(y as f32 / 511.0),
+                f64::from(z as f32 / 511.0),
+            )
+            .normalize()
+        });
+        for (actual, expected) in corners.iter().zip(decoded) {
+            assert!(actual.abs_diff_eq(expected, 1e-12), "got {actual:?}");
+        }
+        let local = data.local.as_ref().expect("Mikk keeps raw local normals");
+        assert_eq!(
+            local[0].as_ref().and_then(FaceNormalValues::as_corners),
+            Some(raw.as_slice())
+        );
+
+        let actual = blend_corner_normals(
+            [corners[0], corners[1], corners[2]],
+            [1.0 / 3.0; 3],
+            DVec3::Z,
+        );
+        let expected = (decoded[0] + decoded[1] + decoded[2]).normalize();
+        assert!(actual.abs_diff_eq(expected, 1e-12));
+        let interpolated_before_packing =
+            source_quantized_mesh_attribute((raw[0] + raw[1] + raw[2]) / 3.0, false).normalize();
+        assert!(!actual.abs_diff_eq(interpolated_before_packing, 1e-6));
+        let high_quality = corner_normals(
+            &mesh,
+            &vertex_positions,
+            DMat4::IDENTITY,
+            &node_id(),
+            Some(&adaptive),
+            false,
+            MeshAttributePrecision::Known(true),
+            &mut warnings,
+        );
+        let high_quality_codes = [[-6426, -1714, 32084], [0, 0, 32767], [-6623, 0, 32090]];
+        for (actual, [x, y, z]) in high_quality.world[0]
+            .as_ref()
+            .and_then(FaceNormalValues::as_corners)
+            .expect("high-quality normals use the 16-bit VBO")
+            .iter()
+            .zip(high_quality_codes)
+        {
+            let expected = DVec3::new(
+                f64::from(x as f32 / 32767.0),
+                f64::from(y as f32 / 32767.0),
+                f64::from(z as f32 / 32767.0),
+            )
+            .normalize();
+            assert!(actual.abs_diff_eq(expected, 1e-12), "got {actual:?}");
+        }
+        let high_quality_corners = high_quality.world[0]
+            .as_ref()
+            .and_then(FaceNormalValues::as_corners)
+            .expect("high-quality face keeps VBO normals");
+        assert!(!high_quality_corners[0].abs_diff_eq(raw[0], 1e-8));
+    }
+
+    #[test]
+    fn realtime_mesh_precision_packs_flat_face_normals() {
+        let points = [DVec3::ZERO, DVec3::Y, DVec3::new(1.0, 0.0, -1.0)];
+        let mesh = single_face_mesh(points, false);
+        let vertex_positions = mesh_vertex_positions(&mesh);
+        let mut warnings = Vec::new();
+        let data = corner_normals(
+            &mesh,
+            &vertex_positions,
+            DMat4::IDENTITY,
+            &node_id(),
+            None,
+            false,
+            MeshAttributePrecision::Known(false),
+            &mut warnings,
+        );
+        let actual = data.world[0]
+            .as_ref()
+            .and_then(FaceNormalValues::constant)
+            .expect("flat face has one VBO normal");
+        let face_normal = crate::geom::normals::face_normal(&points);
+        let expected = source_quantized_mesh_attribute(face_normal, false).normalize();
+        assert!(actual.abs_diff_eq(expected, 1e-12));
+    }
+
+    #[test]
+    fn realtime_mesh_tangents_pack_mikk_output_after_local_normal_generation() {
+        let points = [DVec3::ZERO, DVec3::new(3.0, 4.0, 0.0), DVec3::Y];
+        let mesh = single_face_mesh(points, true);
+        let triangles = mesh.tessellate().expect("triangle tessellates");
+        let vertex_positions = mesh
+            .vertices
+            .iter()
+            .map(|vertex| (vertex.id, vertex.co))
+            .collect::<BTreeMap<_, _>>();
+        let uv_store = UvStore {
+            layers: vec![UvLayer::new(
+                "UVMap",
+                vec![Some(vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])],
+            )],
+            ..UvStore::default()
+        };
+        let mut warnings = Vec::new();
+        let object_transform = DMat4::from_scale(DVec3::new(4.0, 1.0, 1.0));
+        let normals = corner_normals(
+            &mesh,
+            &vertex_positions,
+            DMat4::IDENTITY,
+            &node_id(),
+            None,
+            true,
+            MeshAttributePrecision::Known(false),
+            &mut warnings,
+        );
+        let local_normals = normals.local.as_deref();
+        let path_tangents = mesh_mikk_tangents(
+            &mesh,
+            &triangles,
+            &vertex_positions,
+            &uv_store,
+            local_normals,
+            object_transform,
+            MeshAttributePrecision::NotApplicable,
+        )
+        .expect("Path keeps unquantized Mikk tangents")
+        .by_triangle;
+        let low_quality = mesh_mikk_tangents(
+            &mesh,
+            &triangles,
+            &vertex_positions,
+            &uv_store,
+            local_normals,
+            object_transform,
+            MeshAttributePrecision::Known(false),
+        )
+        .expect("low-quality Source packs the Mikk output")
+        .by_triangle;
+        let high_quality = mesh_mikk_tangents(
+            &mesh,
+            &triangles,
+            &vertex_positions,
+            &uv_store,
+            local_normals,
+            object_transform,
+            MeshAttributePrecision::Known(true),
+        )
+        .expect("high-quality Source packs the Mikk output")
+        .by_triangle;
+
+        let path_tangent = path_tangents[0][0][0];
+        assert!(path_tangent.abs_diff_eq(DVec3::new(0.15, 0.8, 0.0), 1e-6));
+        assert!(low_quality[0][0][0].abs_diff_eq(
+            DVec3::new(
+                f64::from(306_f32 / 511.0) / 4.0,
+                f64::from(408_f32 / 511.0),
+                0.0,
+            ),
+            1e-12,
+        ));
+        assert!(high_quality[0][0][0].abs_diff_eq(
+            DVec3::new(
+                f64::from(19_660_f32 / 32_767.0) / 4.0,
+                f64::from(26_213_f32 / 32_767.0),
+                0.0,
+            ),
+            1e-12,
+        ));
     }
 
     #[test]
@@ -4761,7 +9813,11 @@ mod shading_normal_tests {
                     },
                     camera_matrices: None,
                     barycentric: [1.0 / 3.0; 3],
+                    gbuffer_frag_coord: None,
+                    gbuffer_sample_offset: None,
+                    gbuffer_closure_random: None,
                     view: DVec3::Z,
+                    eevee_raytrace_feedback: EeveeRaytraceFeedback::default(),
                 },
             )?
             .color;
@@ -4852,9 +9908,543 @@ mod shading_normal_tests {
             layer_tangents: Vec::new(),
             layer_colors: Vec::new(),
             normals: Some(normals),
+            smooth_shading: true,
             lit_per_pixel: false,
             ray_mask: RayVisibility::default().mask(),
         }
+    }
+    fn source_shader_material(
+        doc: &mut SceneDoc,
+        name: &str,
+        node_type: &str,
+        output_socket: &str,
+        inputs: &serde_json::Value,
+        use_raytrace_refraction: Option<bool>,
+    ) -> Material {
+        let graph_id = Id::new(format!("{name}_graph")).expect("valid graph id");
+        let shader_id = Id::new(format!("{name}_shader")).expect("valid shader id");
+        let output_id = Id::new(format!("{name}_output")).expect("valid output id");
+        let mut graph = NodeGroup::new(name, GraphKind::Shader);
+        let mut shader = GraphNode::new(node_type);
+        shader.inputs = inputs
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        graph.nodes.insert(shader_id.clone(), shader);
+        let mut output = GraphNode::new("ShaderNodeOutputMaterial");
+        output
+            .properties
+            .insert("is_active_output".to_owned(), json!(true));
+        graph.nodes.insert(output_id.clone(), output);
+        graph.links.push(GraphLink {
+            from_node: shader_id,
+            from_socket: output_socket.to_owned(),
+            to_node: output_id,
+            to_socket: "Surface".to_owned(),
+        });
+        doc.node_groups.insert(graph_id.clone(), graph);
+        Material {
+            name: name.to_owned(),
+            node_tree: Some(graph_id),
+            use_raytrace_refraction,
+            ..Material::default()
+        }
+    }
+    #[test]
+    fn eevee_registered_slots_route_unused_bindings_and_null_fallback() -> crate::error::Result<()>
+    {
+        let initial = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let applied = crate::ops::apply_batch(
+            &initial,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [
+                    {"op":"node.create","id":"body","kind":"plane","params":{"size":1.0}}
+                ]
+            }),
+        )?;
+        let mut doc = applied.doc;
+        let object_refraction_id = Id::new("object_refraction")?;
+        let data_refraction_id = Id::new("data_refraction")?;
+        let data_reflection_id = Id::new("data_reflection")?;
+        let outputless_id = Id::new("outputless")?;
+        let object_refraction = source_shader_material(
+            &mut doc,
+            "object_refraction_graph",
+            "ShaderNodeBsdfRefraction",
+            "BSDF",
+            &json!({}),
+            Some(false),
+        );
+        let data_refraction = source_shader_material(
+            &mut doc,
+            "data_refraction_graph",
+            "ShaderNodeBsdfRefraction",
+            "BSDF",
+            &json!({}),
+            Some(true),
+        );
+        let data_reflection = source_shader_material(
+            &mut doc,
+            "data_reflection_graph",
+            "ShaderNodeBsdfGlossy",
+            "BSDF",
+            &json!({}),
+            Some(true),
+        );
+        let outputless = source_volume_only_material(&mut doc, "outputless", true);
+        doc.materials
+            .insert(object_refraction_id.clone(), object_refraction);
+        doc.materials
+            .insert(data_refraction_id.clone(), data_refraction);
+        doc.materials
+            .insert(data_reflection_id.clone(), data_reflection);
+        doc.materials.insert(outputless_id.clone(), outputless);
+
+        let node_id = Id::new("body")?;
+        let data_id = doc
+            .nodes
+            .get(&node_id)
+            .and_then(|node| node.data.clone())
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "plane data is missing"))?;
+        let data = doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "plane data block is missing")
+        })?;
+        let face = data
+            .mesh
+            .as_mut()
+            .and_then(|mesh| mesh.faces.first_mut())
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "plane face is missing"))?;
+        face.material_index = 5;
+        data.materials = vec![
+            Some(data_refraction_id),
+            Some(data_reflection_id),
+            None,
+            Some(outputless_id),
+        ];
+        let node = doc
+            .nodes
+            .get_mut(&node_id)
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "plane object is missing"))?;
+        node.materials = vec![Some(object_refraction_id)];
+        node.material_links = vec![MaterialLink::Object];
+
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let images = BTreeMap::new();
+        let geometry = extract_geometry_with_semantics(
+            &doc,
+            &snapshot,
+            Mode::Beauty,
+            false,
+            &images,
+            crate::node_kernels::MathSemantics::Eevee,
+        )?;
+        let view = ViewBasis::from_camera(&Camera {
+            position: DVec3::new(0.0, 0.0, 2.5),
+            target: DVec3::ZERO,
+            up: DVec3::Y,
+            near: 0.1,
+            far: 100.0,
+            projection: Projection::Orthographic { height: 2.0 },
+            shift: [0.0; 2],
+            depth_of_field: None,
+            stereo_mode: StereoMode::None,
+            interocular_distance: 0.065,
+        })?;
+        let shader = scene_shader_with_semantics(
+            &doc,
+            &snapshot,
+            &images,
+            &geometry,
+            Mode::Beauty,
+            &view,
+            crate::node_kernels::MathSemantics::Eevee,
+        );
+        let summary = shader.eevee_raytrace_layer_flags()?.ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "EEVEE layer summary is missing")
+        })?;
+        assert!(summary.opaque.has_reflect_closure);
+        assert!(summary.opaque.has_transmit_closure);
+        let refraction = summary.refraction.ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "refraction layer is missing")
+        })?;
+        assert!(refraction.has_any_closure);
+        assert!(refraction.has_reflect_closure);
+        assert!(!refraction.has_transmit_closure);
+        assert!(!refraction.has_transmission);
+        Ok(())
+    }
+
+    fn source_simple_principled_material(doc: &mut SceneDoc, mut material: Material) -> Material {
+        let name = material.name.clone();
+        let graph_id = Id::new(format!("{name}_graph")).expect("valid simple graph id");
+        let principled_id = Id::new(format!("{name}_principled")).expect("valid principled id");
+        let output_id = Id::new(format!("{name}_output")).expect("valid output id");
+        let mut graph = NodeGroup::new(name, GraphKind::Shader);
+        let mut principled = GraphNode::new("ShaderNodeBsdfPrincipled");
+        principled
+            .properties
+            .insert("potter_simple_material".to_owned(), json!(true));
+        graph.nodes.insert(principled_id.clone(), principled);
+        let mut output = GraphNode::new("ShaderNodeOutputMaterial");
+        output
+            .properties
+            .insert("is_active_output".to_owned(), json!(true));
+        graph.nodes.insert(output_id.clone(), output);
+        graph.links.push(GraphLink {
+            from_node: principled_id,
+            from_socket: "BSDF".to_owned(),
+            to_node: output_id,
+            to_socket: "Surface".to_owned(),
+        });
+        doc.node_groups.insert(graph_id.clone(), graph);
+        material.node_tree = Some(graph_id);
+        material
+    }
+
+    fn source_volume_only_material(
+        doc: &mut SceneDoc,
+        name: &str,
+        use_raytrace_refraction: bool,
+    ) -> Material {
+        let graph_id = Id::new(format!("{name}_graph")).expect("valid graph id");
+        let volume_id = Id::new(format!("{name}_volume")).expect("valid volume node id");
+        let output_id = Id::new(format!("{name}_output")).expect("valid output id");
+        let mut graph = NodeGroup::new(name, GraphKind::Shader);
+        graph.nodes.insert(
+            volume_id.clone(),
+            GraphNode::new("ShaderNodeVolumePrincipled"),
+        );
+        let mut output = GraphNode::new("ShaderNodeOutputMaterial");
+        output
+            .properties
+            .insert("is_active_output".to_owned(), json!(true));
+        graph.nodes.insert(output_id.clone(), output);
+        graph.links.push(GraphLink {
+            from_node: volume_id,
+            from_socket: "Volume".to_owned(),
+            to_node: output_id,
+            to_socket: "Volume".to_owned(),
+        });
+        doc.node_groups.insert(graph_id.clone(), graph);
+        Material {
+            name: name.to_owned(),
+            node_tree: Some(graph_id),
+            use_raytrace_refraction: Some(use_raytrace_refraction),
+            ..Material::default()
+        }
+    }
+
+    fn source_registered_layer_summary(
+        doc: &mut SceneDoc,
+        materials: Vec<Material>,
+        face_material_index: u32,
+        ray_visibility: Option<RayVisibility>,
+    ) -> crate::error::Result<crate::render::raster::EeveeRaytraceLayerSummary> {
+        let mut slots = Vec::with_capacity(materials.len());
+        for (index, material) in materials.into_iter().enumerate() {
+            let material_id = Id::new(format!("source_slot_{index}"))?;
+            doc.materials.insert(material_id.clone(), material);
+            slots.push(Some(material_id));
+        }
+        let base_revision = doc.revision;
+        let applied = crate::ops::apply_batch(
+            doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": base_revision,
+                "operations": [
+                    {"op":"node.create","id":"source_body","kind":"plane","params":{"size":1.0}}
+                ]
+            }),
+        )?;
+        let mut doc = applied.doc;
+        let node_id = Id::new("source_body")?;
+        let data_id = doc
+            .nodes
+            .get(&node_id)
+            .and_then(|node| node.data.clone())
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "plane data is missing"))?;
+        let data = doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "plane data block is missing")
+        })?;
+        let face = data
+            .mesh
+            .as_mut()
+            .and_then(|mesh| mesh.faces.first_mut())
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "plane face is missing"))?;
+        face.material_index = face_material_index;
+        data.materials = slots;
+        let node = doc
+            .nodes
+            .get_mut(&node_id)
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "plane object is missing"))?;
+        node.ray_visibility = ray_visibility;
+
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let geometry = extract_geometry_with_semantics(
+            &doc,
+            &snapshot,
+            Mode::Beauty,
+            false,
+            &BTreeMap::new(),
+            crate::node_kernels::MathSemantics::Eevee,
+        )?;
+        eevee_registered_raytrace_layer_summary(&doc, &snapshot, &geometry)
+    }
+
+    #[test]
+    fn volume_only_slot_keeps_source_layer_emission_presence() -> crate::error::Result<()> {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let material = source_volume_only_material(&mut doc, "volume", true);
+        let summary = source_registered_layer_summary(&mut doc, vec![material], 0, None)?;
+        let refraction = summary.refraction.ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "refraction layer is missing")
+        })?;
+        assert!(refraction.has_any_closure);
+        assert!(!refraction.has_reflect_closure);
+        assert!(!refraction.has_transmit_closure);
+        Ok(())
+    }
+
+    #[test]
+    fn simple_material_fields_compile_through_source_principled_flags() -> crate::error::Result<()>
+    {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let generated_glass = source_simple_principled_material(
+            &mut doc,
+            Material {
+                name: "generated_glass".to_owned(),
+                transmission: 1.0,
+                use_raytrace_refraction: Some(true),
+                ..Material::default()
+            },
+        );
+        let clip = Material {
+            name: "simple_clip".to_owned(),
+            alpha_mode: "clip".to_owned(),
+            base_color: [0.7, 0.7, 0.7, 0.25],
+            alpha_threshold: 0.5,
+            ..Material::default()
+        };
+        let shader_to_rgb = source_shader_material(
+            &mut doc,
+            "simple_shader_to_rgb",
+            "ShaderNodeShaderToRGB",
+            "Color",
+            &json!({}),
+            Some(false),
+        );
+        let summary = source_registered_layer_summary(
+            &mut doc,
+            vec![clip, shader_to_rgb, generated_glass],
+            2,
+            None,
+        )?;
+        assert!(summary.opaque.has_transmission);
+        assert!(!summary.opaque.has_transmit_closure);
+        let refraction = summary.refraction.ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "refraction layer is missing")
+        })?;
+        assert!(refraction.has_transmit_closure);
+        assert!(refraction.has_reflect_closure);
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_layer_group_inputs_use_inlined_default_link_state() -> crate::error::Result<()> {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let child_id = Id::new("transparent_group".to_owned()).expect("valid group id");
+        let root_id = Id::new("group_material".to_owned()).expect("valid graph id");
+        let mut child = NodeGroup::new("Transparent Group", GraphKind::Shader);
+        child.interface = GraphInterface {
+            inputs: vec![GraphSocket {
+                id: "Color".to_owned(),
+                name: "Color".to_owned(),
+                socket_type: "NodeSocketColor".to_owned(),
+                default: json!([0.0, 0.0, 0.0, 1.0]),
+            }],
+            outputs: vec![GraphSocket {
+                id: "Shader".to_owned(),
+                name: "Shader".to_owned(),
+                socket_type: "shader".to_owned(),
+                default: serde_json::Value::Null,
+            }],
+        };
+        let input_id = Id::new("input".to_owned()).expect("valid node id");
+        let transparent_id = Id::new("transparent".to_owned()).expect("valid shader id");
+        let output_id = Id::new("group_output".to_owned()).expect("valid output id");
+        child
+            .nodes
+            .insert(input_id.clone(), GraphNode::new("NodeGroupInput"));
+        child.nodes.insert(
+            transparent_id.clone(),
+            GraphNode::new("ShaderNodeBsdfTransparent"),
+        );
+        let mut child_output = GraphNode::new("NodeGroupOutput");
+        child_output
+            .properties
+            .insert("is_active_output".to_owned(), json!(true));
+        child.nodes.insert(output_id.clone(), child_output);
+        child.links.push(GraphLink {
+            from_node: input_id,
+            from_socket: "Color".to_owned(),
+            to_node: transparent_id.clone(),
+            to_socket: "Color".to_owned(),
+        });
+        child.links.push(GraphLink {
+            from_node: transparent_id,
+            from_socket: "BSDF".to_owned(),
+            to_node: output_id,
+            to_socket: "Shader".to_owned(),
+        });
+        doc.node_groups.insert(child_id.clone(), child);
+
+        let group_node_id = Id::new("child".to_owned()).expect("valid node id");
+        let material_output_id = Id::new("output".to_owned()).expect("valid output id");
+        let mut root = NodeGroup::new("Group Material", GraphKind::Shader);
+        let mut group_node = GraphNode::new("ShaderNodeGroup");
+        group_node
+            .properties
+            .insert("node_tree".to_owned(), json!(child_id.as_str()));
+        group_node
+            .inputs
+            .insert("Color".to_owned(), json!([0.0, 0.0, 0.0, 1.0]));
+        root.nodes.insert(group_node_id.clone(), group_node);
+        let mut output = GraphNode::new("ShaderNodeOutputMaterial");
+        output
+            .properties
+            .insert("is_active_output".to_owned(), json!(true));
+        root.nodes.insert(material_output_id.clone(), output);
+        root.links.push(GraphLink {
+            from_node: group_node_id,
+            from_socket: "Shader".to_owned(),
+            to_node: material_output_id,
+            to_socket: "Surface".to_owned(),
+        });
+        doc.node_groups.insert(root_id.clone(), root);
+        let group_material = Material {
+            name: "Group Material".to_owned(),
+            node_tree: Some(root_id),
+            use_raytrace_refraction: Some(false),
+            ..Material::default()
+        };
+        let shader_to_rgb = source_shader_material(
+            &mut doc,
+            "shader_to_rgb",
+            "ShaderNodeShaderToRGB",
+            "Color",
+            &json!({}),
+            Some(false),
+        );
+        let summary = source_registered_layer_summary(
+            &mut doc,
+            vec![group_material, shader_to_rgb],
+            1,
+            None,
+        )?;
+        assert!(!summary.opaque.has_transmission);
+        assert!(!summary.opaque.has_transmit_closure);
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_layer_flags_keep_camera_hidden_zero_weight_reflection() -> crate::error::Result<()>
+    {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let refraction = source_shader_material(
+            &mut doc,
+            "visible_refraction",
+            "ShaderNodeBsdfRefraction",
+            "BSDF",
+            &json!({}),
+            Some(true),
+        );
+        let glossy = source_shader_material(
+            &mut doc,
+            "occluded_zero_weight_glossy",
+            "ShaderNodeBsdfGlossy",
+            "BSDF",
+            &json!({"Weight":0.0}),
+            Some(false),
+        );
+        let mut visibility = RayVisibility::default();
+        visibility.set(RayKind::Camera, false);
+        let summary = source_registered_layer_summary(
+            &mut doc,
+            vec![refraction, glossy],
+            1,
+            Some(visibility),
+        )?;
+        let refraction_layer = summary.refraction.ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "refraction layer is missing")
+        })?;
+        assert!(summary.opaque.has_reflect_closure);
+        assert!(refraction_layer.has_transmit_closure);
+        assert!(!refraction_layer.has_reflect_closure);
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_layer_transmission_union_keeps_shader_to_rgb_distinct() -> crate::error::Result<()>
+    {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let transparent = source_shader_material(
+            &mut doc,
+            "transparent",
+            "ShaderNodeBsdfTransparent",
+            "BSDF",
+            &json!({"Color":[1.0,1.0,1.0,1.0]}),
+            Some(false),
+        );
+        let shader_to_rgb = source_shader_material(
+            &mut doc,
+            "shader_to_rgb",
+            "ShaderNodeShaderToRGB",
+            "Color",
+            &json!({}),
+            Some(false),
+        );
+        let unused_refraction = source_shader_material(
+            &mut doc,
+            "unused_refraction_slot",
+            "ShaderNodeBsdfRefraction",
+            "BSDF",
+            &json!({}),
+            Some(true),
+        );
+        let summary = source_registered_layer_summary(
+            &mut doc,
+            vec![transparent, shader_to_rgb, unused_refraction],
+            1,
+            None,
+        )?;
+        assert!(summary.opaque.has_transmission);
+        assert!(!summary.opaque.has_transmit_closure);
+        assert!(summary.refraction.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_layer_sss_is_broad_transmission_not_a_transmit_closure() -> crate::error::Result<()>
+    {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let sss = source_shader_material(
+            &mut doc,
+            "subsurface",
+            "ShaderNodeSubsurfaceScattering",
+            "BSSRDF",
+            &json!({}),
+            Some(false),
+        );
+        let summary = source_registered_layer_summary(&mut doc, vec![sss], 0, None)?;
+        assert!(summary.opaque.has_reflect_closure);
+        assert!(!summary.opaque.has_transmit_closure);
+        assert!(summary.opaque.has_transmission);
+        Ok(())
     }
 
     #[test]
@@ -5223,7 +10813,7 @@ mod beauty_tint_tests {
     #[test]
     fn blended_material_keeps_each_channel() {
         assert_eq!(
-            beauty_tint(Some(&material("blend")), [0.2, 0.8, 0.4]),
+            beauty_tint(Some(&material("blend")), [0.2, 0.8, 0.4], false),
             [0.2, 0.8, 0.4]
         );
     }
@@ -5233,7 +10823,7 @@ mod beauty_tint_tests {
     fn dithered_material_takes_the_channel_mean() {
         let mean = (0.2 + 0.8 + 0.4) / 3.0;
         for alpha_mode in ["opaque", "clip"] {
-            for channel in beauty_tint(Some(&material(alpha_mode)), [0.2, 0.8, 0.4]) {
+            for channel in beauty_tint(Some(&material(alpha_mode)), [0.2, 0.8, 0.4], false) {
                 assert!((channel - mean).abs() < 1.0e-12, "{alpha_mode}: {channel}");
             }
         }
@@ -5244,16 +10834,16 @@ mod beauty_tint_tests {
     #[test]
     fn tints_are_clamped_before_use() {
         assert_eq!(
-            beauty_tint(Some(&material("blend")), [2.0, -1.0, 0.5]),
+            beauty_tint(Some(&material("blend")), [2.0, -1.0, 0.5], false),
             [1.0, 0.0, 0.5]
         );
-        let dithered = beauty_tint(Some(&material("clip")), [2.0, -1.0, 0.5]);
+        let dithered = beauty_tint(Some(&material("clip")), [2.0, -1.0, 0.5], false);
         assert!((dithered[0] - 0.5).abs() < 1.0e-12, "{dithered:?}");
     }
 
     #[test]
     fn no_material_keeps_the_tint_clamped() {
-        assert_eq!(beauty_tint(None, [0.5, 1.5, -0.2]), [0.5, 1.0, 0.0]);
+        assert_eq!(beauty_tint(None, [0.5, 1.5, -0.2], false), [0.5, 1.0, 0.0]);
     }
 
     /// Mix(0.5) of a Transparent (colour (0.2, 0.8, 0.4)) and an opaque Principled. The transparent closure passes
@@ -5308,5 +10898,536 @@ mod rgb9e5_tests {
 
         assert_eq!(summed.x, 946.0 / 524_288.0);
         assert_ne!(summed, separately_packed);
+    }
+}
+
+#[cfg(test)]
+mod cycles_hair_matrix_tests {
+    use glam::DVec3;
+
+    use super::cycles_hair_object_matrix;
+
+    #[test]
+    fn row_major_cycles_matrix_preserves_blender_translation() {
+        let matrix = cycles_hair_object_matrix([
+            [1.0, 0.0, 0.0, 3.0],
+            [0.0, 1.0, 0.0, 4.0],
+            [0.0, 0.0, 1.0, 5.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]);
+
+        assert_eq!(
+            matrix.transform_point3(DVec3::ZERO),
+            DVec3::new(3.0, 4.0, 5.0)
+        );
+        assert_eq!(matrix.transform_vector3(DVec3::X), DVec3::X);
+    }
+}
+#[cfg(test)]
+mod eevee_gbuffer_candidate_tests {
+    use glam::{DMat4, DVec3, Vec3};
+
+    use crate::{
+        graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
+        model::{Id, Material, Registry},
+        render::raster::{EeveeRaytraceFeedback, SurfaceHit},
+        shader::{
+            BsdfModel, BsdfParams, EeveeGBufferCandidate, EeveeGBufferFeatures, EeveeGBufferLobe,
+            HitContext, HitDifferentials, ShaderClosure, evaluate_surface,
+        },
+    };
+    use serde_json::json;
+
+    use super::super::eevee_raytrace_generate::generate_ray;
+
+    use super::{
+        EeveeGBufferMode, RayGenerateInput, RayLobe, RayThickness, ThicknessMode, beauty_tint,
+        decode_eevee_gbuffer_bin, eevee_gbuffer_alpha, eevee_gbuffer_candidates,
+        eevee_gbuffer_route, eevee_raytrace_sample, opaque_share,
+    };
+
+    #[test]
+    fn gbuffer_alpha_reciprocal_uses_raw_transmittance_and_excludes_holdout() {
+        let mut portal = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        portal.alpha = 0.0;
+        portal.transparent_tint = [0.8, 0.4, 0.2];
+        let mut holdout = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        holdout.model = BsdfModel::Holdout;
+        holdout.alpha = 0.0;
+        let closures = [
+            ShaderClosure {
+                weight: 0.5,
+                params: portal,
+            },
+            ShaderClosure {
+                weight: 0.5,
+                params: holdout,
+            },
+        ];
+        let (transparency, alpha, alpha_reciprocal) = eevee_gbuffer_alpha(&closures);
+        let expected_transparency = (0.4_f32 + 0.2 + 0.1) / 3.0;
+        assert_eq!(transparency.to_bits(), expected_transparency.to_bits());
+        let expected = 1.0_f32 - expected_transparency;
+        assert_eq!(alpha.to_bits(), expected.to_bits());
+        assert_eq!(alpha_reciprocal.to_bits(), expected.recip().to_bits());
+    }
+
+    #[test]
+    fn principled_reflection_candidate_keeps_the_source_closure() -> Result<(), String> {
+        let closure = ShaderClosure {
+            weight: 0.5,
+            params: BsdfParams::from_material(&Material::default(), DVec3::Z),
+        };
+        let candidates = eevee_gbuffer_candidates(&[closure], DVec3::Z, DVec3::Z)
+            .map_err(|error| format!("{error:?}"))?;
+        let reflection = candidates
+            .first()
+            .ok_or_else(|| "Principled emits base reflection".to_owned())?;
+        assert_eq!(reflection.source_closure_index, 0);
+        assert_eq!(reflection.lobe, EeveeGBufferLobe::Reflection);
+        assert_eq!(reflection.weight, 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn principled_distribution_controls_reflection_diffuse_and_coat_energy() -> Result<(), String> {
+        let evaluate = |distribution: Option<&str>, coat_weight: f64| {
+            let graph_id =
+                Id::new("distribution_graph".to_owned()).map_err(|error| format!("{error:?}"))?;
+            let principled_id =
+                Id::new("principled".to_owned()).map_err(|error| format!("{error:?}"))?;
+            let output_id = Id::new("output".to_owned()).map_err(|error| format!("{error:?}"))?;
+            let mut principled = GraphNode::new("ShaderNodeBsdfPrincipled");
+            if let Some(distribution) = distribution {
+                principled
+                    .properties
+                    .insert("distribution".to_owned(), json!(distribution));
+            }
+            for (socket, value) in [
+                ("Base Color", json!([0.12, 0.04, 0.8, 1.0])),
+                ("Metallic", json!(0.0)),
+                ("Roughness", json!(0.75)),
+                ("IOR", json!(1.5)),
+                ("Specular IOR Level", json!(0.5)),
+                ("Specular Tint", json!([1.0, 1.0, 1.0, 1.0])),
+                ("Transmission Weight", json!(0.0)),
+                ("Subsurface Weight", json!(0.0)),
+                ("Coat Weight", json!(coat_weight)),
+                ("Sheen Weight", json!(0.0)),
+            ] {
+                principled.inputs.insert(socket.to_owned(), value);
+            }
+
+            let mut graph = NodeGroup::new("Distribution", GraphKind::Shader);
+            graph.nodes.insert(principled_id.clone(), principled);
+            graph.nodes.insert(
+                output_id.clone(),
+                GraphNode::new("ShaderNodeOutputMaterial"),
+            );
+            graph.links.push(GraphLink {
+                from_node: principled_id,
+                from_socket: "BSDF".to_owned(),
+                to_node: output_id,
+                to_socket: "Surface".to_owned(),
+            });
+            let mut groups = Registry::new();
+            groups.insert(graph_id.clone(), graph);
+            let material = Material {
+                node_tree: Some(graph_id),
+                ..Material::default()
+            };
+            let hit_context = HitContext::new(&groups);
+            let shading =
+                evaluate_surface(&material, &hit_context).map_err(|error| format!("{error:?}"))?;
+            eevee_gbuffer_candidates(&shading.closures, DVec3::Z, DVec3::Z)
+                .map_err(|error| format!("{error:?}"))
+        };
+        let candidate = |candidates: &[EeveeGBufferCandidate], lobe: EeveeGBufferLobe| {
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.lobe == lobe)
+                .ok_or_else(|| format!("missing {lobe:?} candidate"))?;
+            Ok::<_, String>((
+                DVec3::from_array(candidate.color.map(f64::from)),
+                candidate.weight,
+            ))
+        };
+
+        let multi = evaluate(None, 0.0)?;
+        let ggx = evaluate(Some("GGX"), 0.0)?;
+        let (multi_reflection, _) = candidate(&multi, EeveeGBufferLobe::Reflection)?;
+        let (ggx_reflection, _) = candidate(&ggx, EeveeGBufferLobe::Reflection)?;
+        let (multi_diffuse, _) = candidate(&multi, EeveeGBufferLobe::Diffuse)?;
+        let (ggx_diffuse, _) = candidate(&ggx, EeveeGBufferLobe::Diffuse)?;
+        assert!(multi_reflection.max_element() > ggx_reflection.max_element());
+        assert!(multi_diffuse.max_element() < ggx_diffuse.max_element());
+
+        let base_color = DVec3::new(0.12, 0.04, 0.8);
+        for (reflection, diffuse) in [
+            (multi_reflection, multi_diffuse),
+            (ggx_reflection, ggx_diffuse),
+        ] {
+            let expected = base_color * (1.0 - reflection.max_element()).max(0.0);
+            assert!((diffuse - expected).max_element().abs() < 1.0e-6);
+        }
+
+        let multi_coat = evaluate(None, 0.4)?;
+        let ggx_coat = evaluate(Some("GGX"), 0.4)?;
+        let (_, multi_coat_weight) = candidate(&multi_coat, EeveeGBufferLobe::Clearcoat)?;
+        let (_, ggx_coat_weight) = candidate(&ggx_coat, EeveeGBufferLobe::Clearcoat)?;
+        assert_eq!(multi_coat_weight, ggx_coat_weight);
+        Ok(())
+    }
+
+    #[test]
+    fn blended_eevee_transparency_uses_the_scene_color_target() {
+        let material = Material {
+            alpha_mode: "blend".to_owned(),
+            ..Material::default()
+        };
+        let tint = [0.92, 0.87, 0.73];
+        assert_eq!(beauty_tint(Some(&material), tint, true), [0.92; 3]);
+        assert_eq!(beauty_tint(Some(&material), tint, false), tint);
+
+        let dithered = Material::default();
+        let mean = (tint[0] + tint[1] + tint[2]) / 3.0;
+        assert_eq!(beauty_tint(Some(&dithered), tint, true), [mean; 3]);
+    }
+
+    #[test]
+    fn principled_hair_gpu_weight_changes_radiance_without_changing_mix_coverage()
+    -> Result<(), String> {
+        let hair = |weight| {
+            let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+            params.model = BsdfModel::Principled;
+            params.base_color = [0.34, 0.12, 0.07, 1.0];
+            params.eevee_gbuffer_features = EeveeGBufferFeatures::diffuse_only();
+            params.eevee_diffuse_weight = Some(weight);
+            ShaderClosure {
+                weight: 0.5,
+                params,
+            }
+        };
+        let mut black_params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        black_params.model = BsdfModel::Principled;
+        black_params.base_color = [0.0; 4];
+        black_params.eevee_gbuffer_features = EeveeGBufferFeatures::diffuse_only();
+        let black = ShaderClosure {
+            weight: 0.5,
+            params: black_params,
+        };
+
+        for (gpu_weight, expected) in [(0.62, 0.62_f32), (0.31, 0.31_f32)] {
+            let closures = [hair(gpu_weight), black];
+            assert_eq!(opaque_share(&closures), 1.0);
+            let candidates = eevee_gbuffer_candidates(&closures, DVec3::Z, DVec3::Z)
+                .map_err(|error| format!("{error:?}"))?;
+            let hair_candidate = candidates
+                .iter()
+                .find(|candidate| candidate.source_closure_index == 0)
+                .ok_or_else(|| "Hair diffuse G-buffer candidate is missing".to_owned())?;
+            assert_eq!(hair_candidate.lobe, EeveeGBufferLobe::Diffuse);
+            assert_eq!(hair_candidate.weight, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rotated_camera_raytrace_producer_keeps_consumer_ray_in_source_world_frame()
+    -> Result<(), String> {
+        let mut params = BsdfParams::from_material(&Material::default(), DVec3::X);
+        params.model = BsdfModel::Principled;
+        params.normal = DVec3::X;
+        params.eevee_gbuffer_features = EeveeGBufferFeatures::diffuse_only();
+        let closures = [ShaderClosure {
+            weight: 1.0,
+            params,
+        }];
+        let world_to_view = DMat4::from_rotation_z(std::f64::consts::FRAC_PI_2);
+        let camera_matrices = (world_to_view.inverse(), world_to_view);
+        let hit = SurfaceHit {
+            point: DVec3::new(0.0, 0.0, -2.0),
+            shadow_point: DVec3::new(0.0, 0.0, -2.0),
+            normal: DVec3::X,
+            geometric: DVec3::X,
+            geometric_normal: DVec3::X,
+            back_facing: false,
+            realtime_differentials: HitDifferentials {
+                world_dx: DVec3::ZERO,
+                world_dy: DVec3::ZERO,
+                uv_dx: [0.0; 2],
+                uv_dy: [0.0; 2],
+            },
+            camera_matrices: Some(&camera_matrices),
+            barycentric: [1.0 / 3.0; 3],
+            gbuffer_frag_coord: Some([0.5, 0.5]),
+            gbuffer_sample_offset: Some([0.0; 3]),
+            gbuffer_closure_random: Some(0.5),
+            view: DVec3::X,
+            eevee_raytrace_feedback: EeveeRaytraceFeedback::default(),
+        };
+        let route = eevee_gbuffer_route(None, &closures, &hit, 0.825)
+            .map_err(|error| format!("{error:?}"))?;
+        let route_bin = route
+            .layout
+            .bins
+            .iter()
+            .flatten()
+            .copied()
+            .next()
+            .ok_or_else(|| "diffuse G-buffer route has no selected bin".to_owned())?;
+        assert_eq!(route_bin.mode, EeveeGBufferMode::Diffuse);
+        assert_eq!(route.thickness, super::Thickness::None);
+        let decoded = decode_eevee_gbuffer_bin(&route, &closures, route_bin)
+            .map_err(|error| format!("{error:?}"))?;
+        assert_ne!(
+            world_to_view.transform_vector3(decoded.normal),
+            decoded.normal
+        );
+        let sample = eevee_raytrace_sample(Some(&route), &closures, &hit, Some(false))
+            .map_err(|error| format!("{error:?}"))?;
+        let consumer_bin = sample.bins[route_bin.storage_layer]
+            .ok_or_else(|| "raytrace producer left the selected bin empty".to_owned())?;
+
+        let params = &decoded.closure.params;
+        let source_input = RayGenerateInput {
+            lobe: RayLobe::Diffuse,
+            normal: Vec3::new(
+                decoded.normal.x as f32,
+                decoded.normal.y as f32,
+                decoded.normal.z as f32,
+            ),
+            view: Vec3::new(hit.view.x as f32, hit.view.y as f32, hit.view.z as f32),
+            roughness: decoded.roughness.unwrap_or(1.0) as f32,
+            ior: decoded.ior.unwrap_or(1.0) as f32,
+            thickness: RayThickness {
+                mode: if params.thickness_slab {
+                    ThicknessMode::Slab
+                } else {
+                    ThicknessMode::Sphere
+                },
+                value: params.thickness.unwrap_or(0.0).max(0.0) as f32,
+            },
+        };
+        let noise = [0.23, 0.37];
+        let consumer_ray =
+            generate_ray(consumer_bin.world_input, noise).map_err(|error| format!("{error:?}"))?;
+        let source_world_ray =
+            generate_ray(source_input, noise).map_err(|error| format!("{error:?}"))?;
+        assert_eq!(consumer_ray.direction, source_world_ray.direction);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_transmission_ray_uses_quantized_source_thickness() -> Result<(), String> {
+        let material = Material {
+            base_color: [0.8, 0.3, 0.2, 1.0],
+            transmission: 1.0,
+            ..Material::default()
+        };
+        let mut params = BsdfParams::from_material(&material, DVec3::Z);
+        params.thickness = Some(1.0e-6);
+        let closures = [ShaderClosure {
+            weight: 1.0,
+            params,
+        }];
+        let hit = SurfaceHit {
+            point: DVec3::new(0.0, 0.0, -2.0),
+            shadow_point: DVec3::new(0.0, 0.0, -2.0),
+            normal: DVec3::Z,
+            geometric: DVec3::Z,
+            geometric_normal: DVec3::Z,
+            back_facing: false,
+            realtime_differentials: HitDifferentials {
+                world_dx: DVec3::ZERO,
+                world_dy: DVec3::ZERO,
+                uv_dx: [0.0; 2],
+                uv_dy: [0.0; 2],
+            },
+            camera_matrices: None,
+            barycentric: [1.0 / 3.0; 3],
+            gbuffer_frag_coord: Some([0.5, 0.5]),
+            gbuffer_sample_offset: Some([0.0; 3]),
+            gbuffer_closure_random: Some(0.5),
+            view: DVec3::Z,
+            eevee_raytrace_feedback: EeveeRaytraceFeedback::default(),
+        };
+        let route = eevee_gbuffer_route(None, &closures, &hit, 0.0)
+            .map_err(|error| format!("{error:?}"))?;
+        let bin = route
+            .layout
+            .bins
+            .iter()
+            .take(route.layout.bin_count)
+            .flatten()
+            .find(|bin| bin.lobe == EeveeGBufferLobe::Refraction)
+            .copied()
+            .ok_or_else(|| "refraction G-buffer route has no selected bin".to_owned())?;
+        assert_eq!(route.thickness, super::Thickness::None);
+
+        let sample = eevee_raytrace_sample(Some(&route), &closures, &hit, Some(false))
+            .map_err(|error| format!("{error:?}"))?;
+        let consumer_bin = sample.bins[bin.storage_layer]
+            .ok_or_else(|| "raytrace producer left the refraction bin empty".to_owned())?;
+        assert_eq!(consumer_bin.world_input.thickness.value, 0.0);
+        let noise = [0.23, 0.37];
+        let collapsed_ray =
+            generate_ray(consumer_bin.world_input, noise).map_err(|error| format!("{error:?}"))?;
+        assert_eq!(collapsed_ray.origin_offset, Vec3::ZERO);
+
+        let mut raw_input = consumer_bin.world_input;
+        raw_input.thickness = RayThickness {
+            mode: ThicknessMode::Sphere,
+            value: 1.0e-6,
+        };
+        let raw_ray = generate_ray(raw_input, noise).map_err(|error| format!("{error:?}"))?;
+        assert_ne!(raw_ray.origin_offset, Vec3::ZERO);
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod eevee_world_sun_tests {
+    use glam::{DVec3, Vec3};
+
+    use crate::{
+        eval::{EvaluationContext, Snapshot},
+        model::{Material, SceneDoc, World},
+        render::raster::Mode,
+        shader::{BsdfModel, BsdfParams, ShaderClosure},
+    };
+
+    use super::{
+        EeveeRaytraceFeedback, EeveeWorldSun, Receiver, SurfaceShadeContext, eevee_world_sun_light,
+        shade,
+    };
+
+    #[test]
+    fn extracted_world_sun_uses_native_surface_lighting_and_separate_shadow_angle()
+    -> Result<(), String> {
+        let world = World {
+            eevee_sun_angle: Some(0.4),
+            eevee_use_sun_shadow: Some(true),
+            eevee_use_sun_shadow_jitter: Some(true),
+            eevee_sun_shadow_jitter_overblur: Some(50.0),
+            ..World::default()
+        };
+        let sun = eevee_world_sun_light(
+            &world,
+            EeveeWorldSun {
+                radiance: Vec3::splat(2.0),
+                direction: Vec3::Z,
+            },
+        )
+        .map_err(str::to_owned)?;
+        assert!((sun.light.sun_angle - 0.4).abs() < f64::EPSILON);
+        let sun_radius = (0.4_f64 * 0.5).tan().clamp(0.001, 20.0);
+        let expected_surface_energy =
+            std::f64::consts::FRAC_1_PI * (1.0 + 1.0 / sun_radius.powi(2));
+        assert_eq!(sun.light.energy, expected_surface_energy);
+        let shadow_angle = 0.4_f64 * 0.5 * 0.5;
+        let shadow_radius = sun
+            .shadow_radius
+            .ok_or_else(|| "enabled source Sun shadow radius is missing".to_owned())?;
+        assert!((shadow_radius - shadow_angle.tan()).abs() < 1.0e-15);
+        assert!(sun.ray_visibility.allows(crate::model::RayKind::Diffuse));
+        assert!(sun.ray_visibility.allows(crate::model::RayKind::Glossy));
+        assert!(!sun.ray_visibility.allows(crate::model::RayKind::Camera));
+        assert!(
+            sun.ray_visibility
+                .allows(crate::model::RayKind::Transmission)
+        );
+        assert!(
+            sun.ray_visibility
+                .allows(crate::model::RayKind::VolumeScatter)
+        );
+        assert_eq!(sun.volume_energy, 1.0);
+
+        let no_shadow_world = World {
+            eevee_sun_angle: Some(0.0),
+            eevee_use_sun_shadow: Some(false),
+            ..World::default()
+        };
+        let sun = eevee_world_sun_light(
+            &no_shadow_world,
+            EeveeWorldSun {
+                radiance: Vec3::splat(2.0),
+                direction: Vec3::Z,
+            },
+        )
+        .map_err(str::to_owned)?;
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())
+            .map_err(|error| format!("{error:?}"))?;
+        let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        params.model = BsdfModel::Principled;
+        params.base_color = [1.0; 4];
+        params.reflectance = 1.0;
+        let closures = [ShaderClosure {
+            weight: 1.0,
+            params,
+        }];
+
+        let receiver = Receiver {
+            point: DVec3::ZERO,
+            shadow_point: DVec3::ZERO,
+            geometric: DVec3::Z,
+            view: DVec3::Z,
+        };
+        let lit = shade(&SurfaceShadeContext {
+            doc: &doc,
+            snapshot: &snapshot,
+            receiver,
+            normal: DVec3::Z,
+            closures: &closures,
+            mode: Mode::Beauty,
+            shadow: None,
+            object_thickness: 0.0,
+            world: None,
+            world_sun: Some(&sun),
+            gbuffer: None,
+            eevee_raytrace_feedback: EeveeRaytraceFeedback::default(),
+            material_refraction: Some(false),
+        })
+        .map_err(|error| format!("{error:?}"))?;
+        let unlit = shade(&SurfaceShadeContext {
+            doc: &doc,
+            snapshot: &snapshot,
+            receiver,
+            normal: DVec3::Z,
+            closures: &closures,
+            mode: Mode::Beauty,
+            shadow: None,
+            object_thickness: 0.0,
+            world: None,
+            world_sun: None,
+            gbuffer: None,
+            eevee_raytrace_feedback: EeveeRaytraceFeedback::default(),
+            material_refraction: Some(false),
+        })
+        .map_err(|error| format!("{error:?}"))?;
+        assert!(lit[0] > unlit[0]);
+        assert!(lit[1] > unlit[1]);
+        assert!(lit[2] > unlit[2]);
+        Ok(())
+    }
+    #[test]
+    fn extracted_world_sun_matrix_matches_native_duff_basis() -> Result<(), String> {
+        let world = World {
+            eevee_sun_angle: Some(0.0),
+            eevee_use_sun_shadow: Some(false),
+            ..World::default()
+        };
+        let sun = eevee_world_sun_light(
+            &world,
+            EeveeWorldSun {
+                radiance: Vec3::ONE,
+                direction: Vec3::X,
+            },
+        )
+        .map_err(str::to_owned)?;
+        assert_eq!(sun.matrix.x_axis.truncate(), -DVec3::Z);
+        assert_eq!(sun.matrix.y_axis.truncate(), DVec3::Y);
+        assert_eq!(sun.matrix.z_axis.truncate(), DVec3::X);
+        Ok(())
     }
 }

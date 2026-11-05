@@ -1045,7 +1045,23 @@ mod tests {
             "target": null,
             "snapshot": snapshot
         });
-        record["snapshot"]["schema_version"] = json!(2);
+        record["snapshot"]["schema_version"] = json!(17);
+        for field in [
+            "cycles_curves_shape",
+            "cycles_curves_subdivisions",
+            "eevee_gi_cubemap_resolution",
+        ] {
+            record["snapshot"]["scenes"]["scene_main"]["render"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        record["snapshot"]["scenes"]["scene_main"]["render"]["engine"] = json!("realtime");
+        record["snapshot"]["compatibility"]["blender_adapter"] = json!({"intermediate":{}});
+        record["snapshot"]["data_blocks"]["hair_data"] = json!({
+            "type":"hair_curves",
+            "hair_curves":{"curves":[]}
+        });
         let bytes = serde_json::to_vec(&record).unwrap();
         let digest = crate::hash::sha256(&bytes);
         let hex = digest.strip_prefix("sha256:").unwrap();
@@ -1059,8 +1075,21 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
 
         let (loaded, warnings) = super::read_history_blob(directory.path(), &digest).unwrap();
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(loaded.snapshot.schema_version, 17);
+        assert!(
+            warnings.iter().any(|warning| {
+                warning["code"] == "cycles_curves.settings_unavailable_migrated"
+            })
+        );
+        assert!(warnings.iter().any(|warning| {
+            warning["code"] == "render.eevee_gi_cubemap_resolution_unavailable_migrated"
+        }));
+        assert_eq!(
+            loaded.snapshot.scenes[&Id::from_static("scene_main")]
+                .render
+                .eevee_gi_cubemap_resolution,
+            None
+        );
+        assert_eq!(loaded.snapshot.schema_version, 18);
         assert_eq!(fs::read(&path).unwrap(), bytes);
 
         let mut corrupted = bytes;

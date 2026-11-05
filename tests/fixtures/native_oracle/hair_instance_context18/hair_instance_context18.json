@@ -1,0 +1,416 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "blender_build_hash": "d13f752e3b9c",
+  "engine": "CYCLES",
+  "device": "CPU",
+  "resolution": [
+    96,
+    96
+  ],
+  "resolution_percentage": 100,
+  "samples": 64,
+  "seed": 29,
+  "denoising": false,
+  "max_bounces": 2,
+  "diffuse_bounces": 1,
+  "glossy_bounces": 1,
+  "transmission_bounces": 0,
+  "volume_bounces": 0,
+  "transparent_max_bounces": 8,
+  "pixel_filter": "BOX",
+  "filter_width": 1.0,
+  "cycles_curves": {
+    "shape": "ribbons",
+    "subdivisions": 2
+  },
+  "view_transform": "Standard",
+  "view_look": "None",
+  "exposure": 0.0,
+  "gamma": 1.0,
+  "render": {
+    "film_transparent": false,
+    "threads_mode": "FIXED",
+    "threads": 1,
+    "image_format": "OPEN_EXR",
+    "image_color_mode": "RGBA",
+    "image_color_depth": "32",
+    "exr_codec": "ZIP"
+  },
+  "protocol": "CPU render; one fixed seed/sample count; 32-bit linear RGBA OPEN_EXR ZIP; no denoising; patch coordinates are analytically fixed from camera projection and sun displacement.",
+  "world": {
+    "background_color": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "background_strength": 0.0
+  },
+  "linear_exr": "hair_instance_context18.exr",
+  "scene": {
+    "camera": {
+      "type": "ORTHO",
+      "ortho_scale": 6.0,
+      "location": [
+        0.0,
+        0.0,
+        8.0
+      ],
+      "rotation_euler": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "receiver": {
+      "name": "Hair Instance Receiver",
+      "diffuse_color": [
+        0.72,
+        0.72,
+        0.72,
+        1.0
+      ],
+      "z": -0.05
+    },
+    "sun": {
+      "name": "Hair Instance Shadow Sun",
+      "energy": 2.0,
+      "angle": 0.0,
+      "rotation_euler": [
+        0.5235987901687622,
+        0.0,
+        0.0
+      ],
+      "shadow_offset_y": 0.5773502691896256
+    },
+    "shared_hair_data": {
+      "name": "Shared Physical Hair Curves",
+      "spline_type": "CATMULL_ROM",
+      "curve_count": 3,
+      "key_positions": [
+        [
+          -0.55,
+          -0.2,
+          0.0
+        ],
+        [
+          -0.2,
+          -0.2,
+          0.0
+        ],
+        [
+          0.2,
+          -0.2,
+          0.0
+        ],
+        [
+          0.55,
+          -0.2,
+          0.0
+        ],
+        [
+          -0.55,
+          0.0,
+          0.0
+        ],
+        [
+          -0.2,
+          0.0,
+          0.0
+        ],
+        [
+          0.2,
+          0.0,
+          0.0
+        ],
+        [
+          0.55,
+          0.0,
+          0.0
+        ],
+        [
+          -0.55,
+          0.2,
+          0.0
+        ],
+        [
+          -0.2,
+          0.2,
+          0.0
+        ],
+        [
+          0.2,
+          0.2,
+          0.0
+        ],
+        [
+          0.55,
+          0.2,
+          0.0
+        ]
+      ],
+      "radius": 0.075,
+      "material": "Object Info Colored Cycles Hair",
+      "closure": "ShaderNodeBsdfHair",
+      "closure_component": "Reflection",
+      "object_info_output_to_hair_color": "Object Index -> Map Range -> constant Color Ramp",
+      "pass_index_range": [
+        11,
+        22
+      ],
+      "object_info_color_used": false,
+      "object_info_random_used": true,
+      "object_info_random_to_hair_roughness_u": true,
+      "hair_bsdf_inputs": {
+        "Color": [
+          0.800000011920929,
+          0.800000011920929,
+          0.800000011920929,
+          1.0
+        ],
+        "Offset": 0.0,
+        "RoughnessU": 0.10000000149011612,
+        "RoughnessV": 1.0,
+        "Tangent": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "Weight": 0.0
+      },
+      "map_range": {
+        "from_min": 11.0,
+        "from_max": 22.0,
+        "to_min": 0.0,
+        "to_max": 1.0
+      },
+      "color_ramp": {
+        "interpolation": "CONSTANT",
+        "elements": [
+          {
+            "position": 0.0,
+            "color": [
+              0.949999988079071,
+              0.07999999821186066,
+              0.03999999910593033,
+              1.0
+            ]
+          },
+          {
+            "position": 1.0,
+            "color": [
+              0.03999999910593033,
+              0.6200000047683716,
+              0.9800000190734863,
+              1.0
+            ]
+          }
+        ]
+      }
+    },
+    "members": [
+      {
+        "name": "HairMemberRed",
+        "parent": "RedCollectionInstance",
+        "persistent_id": [
+          0,
+          2147483647,
+          2147483647,
+          2147483647,
+          2147483647,
+          2147483647,
+          2147483647,
+          2147483647
+        ],
+        "is_instance": true,
+        "use_particle_hair": false,
+        "object_to_world": [
+          [
+            1.0,
+            0.0,
+            0.0,
+            -1.2999999523162842
+          ],
+          [
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0,
+            1.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "object_color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "source_object_color": [
+          0.949999988079071,
+          0.07999999821186066,
+          0.03999999910593033,
+          1.0
+        ],
+        "object_pass_index": 11,
+        "object_random_id": -947307473,
+        "slot_0_material": "Object Info Colored Cycles Hair",
+        "ray_visibility": {
+          "camera": true,
+          "diffuse": true,
+          "glossy": true,
+          "transmission": true,
+          "volume_scatter": true,
+          "shadow": true
+        }
+      },
+      {
+        "name": "HairMemberBlue",
+        "parent": "BlueCollectionInstance",
+        "persistent_id": [
+          0,
+          2147483647,
+          2147483647,
+          2147483647,
+          2147483647,
+          2147483647,
+          2147483647,
+          2147483647
+        ],
+        "is_instance": true,
+        "use_particle_hair": false,
+        "object_to_world": [
+          [
+            1.0,
+            0.0,
+            0.0,
+            1.2999999523162842
+          ],
+          [
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0,
+            1.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "object_color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "source_object_color": [
+          0.03999999910593033,
+          0.6200000047683716,
+          0.9800000190734863,
+          1.0
+        ],
+        "object_pass_index": 22,
+        "object_random_id": 1875943739,
+        "slot_0_material": "Object Info Colored Cycles Hair",
+        "ray_visibility": {
+          "camera": true,
+          "diffuse": true,
+          "glossy": true,
+          "transmission": true,
+          "volume_scatter": true,
+          "shadow": false
+        }
+      }
+    ]
+  },
+  "probes": [
+    {
+      "name": "red_hair_hit",
+      "pixel": [
+        27,
+        48
+      ],
+      "radius": 2,
+      "linear_rgba": [
+        0.2919484257698059,
+        0.14036725230515004,
+        0.13368645645678043,
+        1.0
+      ]
+    },
+    {
+      "name": "blue_hair_hit",
+      "pixel": [
+        69,
+        48
+      ],
+      "radius": 2,
+      "linear_rgba": [
+        0.13670340914279222,
+        0.26304261744022367,
+        0.34470754384994506,
+        1.0
+      ]
+    },
+    {
+      "name": "red_shadow_visible",
+      "pixel": [
+        27,
+        57
+      ],
+      "radius": 2,
+      "linear_rgba": [
+        0.07791962400078774,
+        0.06979943523907423,
+        0.06952651780483393,
+        1.0
+      ]
+    },
+    {
+      "name": "blue_shadow_masked",
+      "pixel": [
+        69,
+        57
+      ],
+      "radius": 2,
+      "linear_rgba": [
+        0.3976555895805359,
+        0.40378212451934814,
+        0.4080441784858704,
+        1.0
+      ]
+    },
+    {
+      "name": "lit_receiver",
+      "pixel": [
+        48,
+        57
+      ],
+      "radius": 2,
+      "linear_rgba": [
+        0.3994902884960175,
+        0.39923238039016723,
+        0.40044469356536866,
+        1.0
+      ]
+    }
+  ]
+}

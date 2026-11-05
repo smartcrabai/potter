@@ -2,7 +2,7 @@
   "blender": "Blender 5.2.2 LTS / build date: 2026-09-15 / build time: 01:49:19 / build commit date: 2026-09-14 / build hash: d13f752e3b9c / branch: blender-v5.2-release",
   "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
   "machine": "arm64",
-  "generated_by": "Blender 5.2.2 EEVEE renders on macOS; EXR captures are exported with export_eevee_fixture.py, eevee_light_shape_transparency.py writes transparent-film shape captures, eevee_light_shape_fractional_base.py writes the base-only EXR, eevee_vse_light_shape_scene_strip.py and eevee_vse_light_shape_crossfade.py write saved VSE consumer EXRs, gamma_cross_native.py writes a native VSE GammaCross EXR and source .blend, eevee_light_shape_boundaries.py writes RGB f32le captures from Blender image.pixels, and compositor_camera_light_alpha.py writes camera-light AlphaOver and Blur File Output EXR consumers with their source .blend inputs; eevee_thin_wall.py writes four RGB f32le captures from Blender image.pixels. Script hashes identify rendering/export sources.",
+  "generated_by": "Blender 5.2.2 EEVEE renders on macOS; EXR captures are exported with export_eevee_fixture.py, eevee_light_shape_transparency.py writes transparent-film shape captures, eevee_light_shape_fractional_base.py writes the base-only EXR, eevee_vse_light_shape_scene_strip.py and eevee_vse_light_shape_crossfade.py write saved VSE consumer EXRs, gamma_cross_native.py writes a native VSE GammaCross EXR and source .blend, eevee_light_shape_boundaries.py writes RGB f32le captures from Blender image.pixels, and compositor_camera_light_alpha.py writes camera-light AlphaOver and Blur File Output EXR consumers with their source .blend inputs; eevee_thin_wall.py writes four RGB f32le captures from Blender image.pixels, and realtime_holdout_mix.py writes the mixed Holdout scene, EEVEE EXR and JSON pixel readback. Script hashes identify rendering/export sources.",
   "scripts": {
     "eevee_glass_direct.py": "380387923d1ea62355a282fcb30b464a30bb364d28cf3e1c9ea66571739941ef",
     "eevee_glass_transmission.py": "2559aa78052fd60d474fcf28d7d29555b6f1eb884f43c227874c4ea44c9eaf9b",
@@ -23,7 +23,8 @@
     "eevee_world_background.py": "3dfbc770812ece43429906a7d0425c9e32ef12d101701af8ab56b04f3591e29b",
     "gamma_cross_native.py": "3b4ac7b61b5c5fb91d5f8edcaebe998753d504caf8889f1dc5749396d4f2e51f",
     "export_eevee_fixture.py": "214d2ab63f343f7e59af8eaa7752217f7b26b574696e9c21b0518279ddd55606",
-    "compositor_camera_light_alpha.py": "74d4a6984b1e0150ece8453e779e01b86142e59d5a5423fbba3ba7f02c746076"
+    "compositor_camera_light_alpha.py": "74d4a6984b1e0150ece8453e779e01b86142e59d5a5423fbba3ba7f02c746076",
+    "realtime_holdout_mix.py": "ff5102a4c328dc408b8e2fdc49205e41039d4192234a56ff2be2607bfad3a463"
   },
   "fixtures": {
     "direct_influence_area.f32le": 196608,
@@ -71,6 +72,8 @@
     "vse_light_shape_scene_strip_replace.exr": 67283,
     "gamma_cross_native.blend": 86056,
     "gamma_cross_native.exr": 67292,
+    "holdout_mix.blend": 94462,
+    "holdout_mix.exr": 67318,
     "compositor_alpha_over_camera_light.exr": 67351,
     "compositor_alpha_over_scene.blend": 87655,
     "compositor_blur_hdr_saved.exr": 67320,

@@ -1,0 +1,327 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "blender_build_hash": "d13f752e3b9c",
+  "blender_binary": "/Applications/Blender.app/Contents/MacOS/Blender",
+  "blender_binary_sha256": "f5c1f2a0c0bca3389ec772d355242b700975ea84e66cbb3f5257a7bce8e5adeb",
+  "generator": "blender --background --factory-startup --python generate.py -- --eevee-refraction-layers-only <output-directory>",
+  "engine": "BLENDER_EEVEE",
+  "resolution": [
+    128,
+    64
+  ],
+  "samples": 64,
+  "seed": 17,
+  "linear_exr": "eevee_refraction_layers.exr",
+  "pixel_format": "32-bit RGBA OpenEXR ZIP",
+  "render": {
+    "resolution_percentage": 100,
+    "film_transparent": false,
+    "threads_mode": "FIXED",
+    "threads": 1,
+    "frame": 1
+  },
+  "view": {
+    "transform": "Standard",
+    "look": "None",
+    "exposure": 0.0,
+    "gamma": 1.0
+  },
+  "raytracing": {
+    "enabled": true,
+    "method": "SCREEN",
+    "resolution_scale": "1",
+    "screen_trace_quality": 1.0,
+    "screen_trace_thickness": 0.10000000149011612,
+    "trace_max_roughness": 0.5
+  },
+  "world": {
+    "background_color": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "strength": 0.0
+  },
+  "camera": {
+    "projection": "ORTHO",
+    "location": [
+      0.0,
+      0.0,
+      4.0
+    ],
+    "ortho_scale": 8.0,
+    "bounds": [
+      -4.0,
+      4.0,
+      -2.0,
+      2.0
+    ]
+  },
+  "geometry": {
+    "enabled_glass_bounds": [
+      -3.8,
+      -1.8,
+      -0.5,
+      1.8
+    ],
+    "disabled_glass_bounds": [
+      0.5,
+      -1.8,
+      3.8,
+      1.8
+    ],
+    "glass_z": 1.5,
+    "glass_x_slope": 0.25,
+    "backplate_bounds": [
+      -4.0,
+      -2.0,
+      4.0,
+      2.0
+    ],
+    "backplate_z": -0.5,
+    "flagged_emission_under_glass_bounds": [
+      -3.35,
+      -0.5,
+      -2.45,
+      0.5
+    ],
+    "flagged_principled_under_glass_bounds": [
+      -2.35,
+      -0.5,
+      -1.45,
+      0.5
+    ],
+    "resolved_sss_bounds": [
+      -1.25,
+      -0.7,
+      -0.55,
+      0.7
+    ],
+    "visible_opaque_sss_bounds": [
+      -0.45,
+      -0.35,
+      0.45,
+      0.35
+    ],
+    "unoccluded_backplate_bounds": [
+      3.8,
+      -2.0,
+      4.0,
+      2.0
+    ],
+    "opaque_target_z": 0.4
+  },
+  "materials": {
+    "enabled_glass": {
+      "name": "Enabled screen-refraction glass",
+      "node": "ShaderNodeBsdfRefraction",
+      "use_raytrace_refraction": true,
+      "ior": 1.45,
+      "roughness": 0.05,
+      "normal": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "thickness_mode": "SLAB",
+      "thickness": 0.25
+    },
+    "disabled_glass": {
+      "name": "Disabled screen-refraction glass",
+      "node": "ShaderNodeBsdfRefraction",
+      "use_raytrace_refraction": false,
+      "ior": 1.45,
+      "roughness": 0.05,
+      "normal": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "thickness_mode": "SLAB",
+      "thickness": 0.25
+    },
+    "flagged_emission": {
+      "name": "Flagged emission without transmission",
+      "node": "ShaderNodeEmission",
+      "use_raytrace_refraction": true,
+      "transmission": 0.0
+    },
+    "flagged_principled": {
+      "name": "Flagged Principled with zero transmission",
+      "node": "ShaderNodeBsdfPrincipled",
+      "use_raytrace_refraction": true,
+      "transmission_weight": 0.0
+    },
+    "opaque_sss": {
+      "name": "Opaque Burley SSS feedback target",
+      "use_raytrace_refraction": false,
+      "node": "BURLEY"
+    }
+  },
+  "light": {
+    "type": "SUN",
+    "energy": 4.0,
+    "angle": 0.0,
+    "rotation_euler": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "use_shadow": false
+  },
+  "cases": [
+    {
+      "name": "enabled_glass_over_flagged_emission",
+      "probe": [
+        17,
+        32,
+        1
+      ],
+      "world_location": [
+        -2.90625,
+        -0.03125
+      ],
+      "behavior": "enabled glass must see red opaque BACK",
+      "linear_rgba": [
+        0.79443359375,
+        0.024778578016493056,
+        0.009630839029947916,
+        1.0
+      ]
+    },
+    {
+      "name": "enabled_glass_over_principled_transmission_zero",
+      "probe": [
+        33,
+        32,
+        1
+      ],
+      "world_location": [
+        -1.90625,
+        -0.03125
+      ],
+      "behavior": "enabled glass must see red opaque BACK",
+      "linear_rgba": [
+        0.7951388888888888,
+        0.0247650146484375,
+        0.0096282958984375,
+        1.0
+      ]
+    },
+    {
+      "name": "enabled_glass_over_resolved_sss",
+      "probe": [
+        49,
+        32,
+        1
+      ],
+      "world_location": [
+        -0.90625,
+        -0.03125
+      ],
+      "behavior": "enabled glass must see the resolved opaque SSS feedback",
+      "linear_rgba": [
+        0.14990234375,
+        0.5573459201388888,
+        1.0764973958333333,
+        1.0
+      ]
+    },
+    {
+      "name": "disabled_glass_uses_world",
+      "probe": [
+        96,
+        32,
+        1
+      ],
+      "world_location": [
+        2.03125,
+        -0.03125
+      ],
+      "behavior": "disabled glass uses the black World probe",
+      "linear_rgba": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "name": "flagged_emission_visible",
+      "probe": [
+        64,
+        17,
+        1
+      ],
+      "world_location": [
+        0.03125,
+        0.90625
+      ],
+      "behavior": "flagged nontransmissive emission remains visible",
+      "linear_rgba": [
+        0.019989013671875,
+        0.7998046875,
+        0.0799560546875,
+        1.0
+      ]
+    },
+    {
+      "name": "flagged_principled_visible",
+      "probe": [
+        64,
+        46,
+        1
+      ],
+      "world_location": [
+        0.03125,
+        -0.90625
+      ],
+      "behavior": "flagged Principled transmission=0 remains visible",
+      "linear_rgba": [
+        0.2877604166666667,
+        0.10307481553819445,
+        1.8352864583333333,
+        1.0
+      ]
+    },
+    {
+      "name": "opaque_sss_visible",
+      "probe": [
+        64,
+        32,
+        1
+      ],
+      "world_location": [
+        0.03125,
+        -0.03125
+      ],
+      "behavior": "opaque SSS source target is visibly distinct",
+      "linear_rgba": [
+        0.1527642144097222,
+        0.5695529513888888,
+        1.12890625,
+        1.0
+      ]
+    },
+    {
+      "name": "red_backplate_visible",
+      "probe": [
+        126,
+        32,
+        1
+      ],
+      "world_location": [
+        3.90625,
+        -0.03125
+      ],
+      "behavior": "unoccluded emissive backplate color",
+      "linear_rgba": [
+        0.783203125,
+        0.02447509765625,
+        0.009783426920572916,
+        1.0
+      ]
+    }
+  ]
+}

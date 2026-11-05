@@ -1,0 +1,52 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "engine": "CYCLES",
+  "resolution": [
+    4,
+    4
+  ],
+  "samples": 4096,
+  "seed": 43,
+  "linear_exr": "path_skin_crop_seed43.exr",
+  "cases": [
+    {
+      "name": "subsurface_random_walk_skin",
+      "mode": {
+        "falloff": "RANDOM_WALK_SKIN"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Radius": [
+          0.85,
+          0.31,
+          0.12
+        ],
+        "Scale": 0.24,
+        "Roughness": 0.36,
+        "IOR": 1.38,
+        "Anisotropy": 0.22,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        1,
+        1,
+        1
+      ],
+      "linear_rgba": [
+        3.4422079457177057,
+        1.8628052473068237,
+        0.8278358379999796,
+        1.0
+      ]
+    }
+  ]
+}

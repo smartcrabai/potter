@@ -156,8 +156,19 @@ pub(crate) fn cycles_object_random_number(name: &str) -> f32 {
         };
         hash.wrapping_mul(37).wrapping_add(character)
     });
-    let random_id = cycles_hash_uint2(name_hash, 0);
+    cycles_object_random_number_from_id(cycles_hash_uint2(name_hash, 0))
+}
+
+/// Converts Cycles' captured object `random_id` to Object Info Random.
+#[must_use]
+pub(crate) fn cycles_object_random_number_from_id(random_id: u32) -> f32 {
     random_id as f32 * (1.0 / u32::MAX as f32)
+}
+
+/// Converts Blender's signed RNA view of Cycles' 32-bit object ID without changing its bits.
+#[must_use]
+pub(crate) fn cycles_object_random_number_from_signed_id(random_id: i32) -> f32 {
+    cycles_object_random_number_from_id(u32::from_ne_bytes(random_id.to_ne_bytes()))
 }
 
 fn cycles_hash_uint2(kx: u32, ky: u32) -> u32 {
@@ -185,7 +196,10 @@ fn cycles_hash_uint2(kx: u32, ky: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlenderRng, cycles_object_random_number, hash_frand, psys_frand};
+    use super::{
+        BlenderRng, cycles_object_random_number, cycles_object_random_number_from_id,
+        cycles_object_random_number_from_signed_id, hash_frand, psys_frand,
+    };
 
     #[test]
     fn direct_seed_matches_blender_rng_sequence() {
@@ -214,5 +228,16 @@ mod tests {
             cycles_object_random_number("Random Target"),
             0.451_880_46_f32
         );
+    }
+
+    #[test]
+    fn object_random_id_uses_cycles_unit_float_conversion() {
+        assert_eq!(cycles_object_random_number_from_id(0), 0.0);
+        assert_eq!(cycles_object_random_number_from_id(u32::MAX), 1.0);
+    }
+
+    #[test]
+    fn signed_object_random_id_preserves_its_u32_bits() {
+        assert_eq!(cycles_object_random_number_from_signed_id(-1), 1.0);
     }
 }

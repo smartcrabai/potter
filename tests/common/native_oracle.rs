@@ -30,6 +30,7 @@ const BUILD_SCRIPT: &str = include_str!("../fixtures/native_oracle/build_oracle.
 const DUMP_SCRIPT: &str = include_str!("../fixtures/native_oracle/dump_blend.py");
 const RENDER_SCRIPT: &str = include_str!("../fixtures/native_oracle/render_texture.py");
 
+#[must_use]
 pub fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
 }
@@ -100,6 +101,7 @@ pub fn losses(report: &Value) -> Vec<&Value> {
 }
 
 /// The feature ids of the losses in `report`.
+#[must_use]
 pub fn loss_features(report: &Value) -> Vec<String> {
     losses(report)
         .into_iter()
@@ -328,6 +330,7 @@ fn stored_corner(value: &Value) -> TestResult<StoredCorner> {
 
 /// Whether `mesh` holds allocated `normal_code` values. A missing `custom_normal` object, or one
 /// that keeps only basis metadata (`domain`, `type`, `corner_order`), means no allocated layer.
+#[must_use]
 pub fn has_normal_code_values(mesh: &Value) -> bool {
     !mesh["attributes"]["custom_normal"]["values"].is_null()
 }
@@ -499,12 +502,85 @@ pub fn assert_floats(actual: &[f64], expected: &[f64], tolerance: f64, label: &s
 /// samples used here decode to f32 values in [0.5, 1) for the upper half of the byte range, where
 /// one ulp is 2^-24 (about 6e-8); the sRGB encode has slope about 0.6 there, so one ulp of linear
 /// storage moves the encoded value by about 0.3 ulp of the encoded value.
+#[must_use]
 pub fn f32_ulp_tolerance(value: f64, ulps: f64) -> f64 {
     let magnitude = value.abs().max(f64::from(f32::MIN_POSITIVE));
     ulps * f64::from(f32::EPSILON) * magnitude.log2().floor().exp2()
 }
 
+/// One NEE RGB write per eight surface bounces, eight transparent passes conservatively treated as light hits, plus one terminal RGB write.
+pub const PATH_MAX_RGB_FILM_ADDITIONS_PER_SAMPLE: u32 = 8 + 8 + 1;
+/// Cycles' float32 forward-error bound for `additions` nonnegative film contributions.
+#[must_use]
+pub fn cycles_gamma_n(additions: u32) -> f64 {
+    let unit_roundoff = f64::from(f32::EPSILON) * 0.5;
+    let product = f64::from(additions) * unit_roundoff;
+    debug_assert!(product < 1.0);
+    product / (1.0 - product)
+}
+
+/// Source-derived RGB film accumulation and f32 output floor for paired Potter/Blender samples at one pixel.
+/// Pixels are ordered as Potter seed A/B followed by Blender seed A/B; alpha receives output conversion only.
+#[must_use]
+pub fn cycles_film_precision_floor_for_pixels(
+    pixel_groups: impl IntoIterator<Item = [[f64; 4]; 4]>,
+    channel: usize,
+    gamma_n: f64,
+) -> f64 {
+    let mut total = 0.0;
+    let mut count = 0.0;
+    for [potter_a, potter_b, blender_a, blender_b] in pixel_groups {
+        let contribution_magnitude = 0.5
+            * (potter_a[channel].abs()
+                + potter_b[channel].abs()
+                + blender_a[channel].abs()
+                + blender_b[channel].abs());
+        let output_rounding = 0.5
+            * (f32_ulp_tolerance(potter_a[channel], 0.5)
+                + f32_ulp_tolerance(potter_b[channel], 0.5)
+                + f32_ulp_tolerance(blender_a[channel], 0.5)
+                + f32_ulp_tolerance(blender_b[channel], 0.5));
+        total += (if channel < 3 {
+            gamma_n * contribution_magnitude
+        } else {
+            0.0
+        }) + output_rounding;
+        count += 1.0;
+    }
+    total / count
+}
+
+/// Source-derived film accumulation/output floor for the mean of two seed frames across a whole pixel region.
+#[must_use]
+pub fn cycles_film_precision_floor_for_frames(
+    potter_frames: [&[[f64; 4]]; 2],
+    blender_frames: [&[[f64; 4]]; 2],
+    channel: usize,
+    gamma_n: f64,
+) -> f64 {
+    let pixel_count = potter_frames[0].len();
+    assert!(
+        pixel_count > 0
+            && potter_frames[1].len() == pixel_count
+            && blender_frames[0].len() == pixel_count
+            && blender_frames[1].len() == pixel_count,
+        "film precision frames must have matching nonempty pixel arrays"
+    );
+    cycles_film_precision_floor_for_pixels(
+        (0..pixel_count).map(|index| {
+            [
+                potter_frames[0][index],
+                potter_frames[1][index],
+                blender_frames[0][index],
+                blender_frames[1][index],
+            ]
+        }),
+        channel,
+        gamma_n,
+    )
+}
 /// Whether two unit-length-ish vectors agree within `tolerance` in every component.
+#[must_use]
 pub fn vectors_close(actual: [f64; 3], expected: [f64; 3], tolerance: f64) -> bool {
     (0..3).all(|axis| (actual[axis] - expected[axis]).abs() <= tolerance)
 }
@@ -517,11 +593,13 @@ pub fn assert_rgba(actual: [f64; 4], expected: [f64; 4], tolerance: f64, label: 
 }
 
 /// The expected JSON's `oracle` section.
+#[must_use]
 pub fn oracle_section(expected: &Value) -> &Value {
     &expected["oracle"]
 }
 
 /// Face loop indices (`loop_start + k`) of every face, from the face sizes in order.
+#[must_use]
 pub fn face_loop_starts(face_sizes: &[usize]) -> Vec<usize> {
     let mut starts = Vec::with_capacity(face_sizes.len());
     let mut next = 0;

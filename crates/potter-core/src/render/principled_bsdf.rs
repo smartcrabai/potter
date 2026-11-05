@@ -1,5 +1,7 @@
-//! Principled BSDF lobe model for the path tracer, ported from Cycles v5.2.2 (Blender 5.2.2 is
+//! Principled and standalone BSDF kernels for the path tracer, ported from Cycles v5.2.2 (Blender 5.2.2 is
 //! the oracle). Pure functions: random draws stay in `path.rs`.
+//! Standalone sheen, subsurface, translucent, refraction, toon and metallic kernels use the same Cycles
+//! 5.2.2 closure evaluation, sampling and continuous-density conventions.
 //!
 //! Cycles sources (`intern/cycles`, tag v5.2.2):
 //! - `kernel/svm/closure.h` `svm_node_closure_bsdf`, `CLOSURE_BSDF_PRINCIPLED_ID`: metallic lobe
@@ -14,6 +16,10 @@
 //!   gain, `Fms` darkening), `bsdf_microfacet_eval` (height-correlated G2, `lambda`).
 //! - `node_shader_bsdf_principled.cc`: the default distribution is `SHD_GLOSSY_MULTI_GGX`, so
 //!   energy preservation is enabled for the specular and metallic lobes.
+//! - Standalone closures follow `bsdf_sheen.h`, `bsdf_ashikhmin_velvet.h`, `bsdf_toon.h`,
+//!   `bsdf_diffuse.h`, `bsdf_microfacet.h`, `bsdf_util.h`, and `bssrdf.h`.
+//!   `standalone_eval` returns the cosine-unweighted BSDF coefficient; `standalone_density` is its
+//!   PDF, and `standalone_sample` distinguishes continuous, singular and subsurface draws.
 //!
 //! Estimator contract: `evaluate_masked` is the continuous BSDF times reflectance: diffuse, specular,
 //! sheen and coat above the surface, with glass reflection above and glass transmission below it.
@@ -25,7 +31,7 @@
 //! draws, so MIS on that lobe matches Cycles' eval/pdf but is not an exact density. Singular glass
 //! lobes are delta samples and cannot be reached by light sampling.
 
-use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
 use glam::DVec3;
 
@@ -38,14 +44,28 @@ use super::principled_thin_film::{
     THICKNESS_CUTOFF, dielectric_fresnel as thin_film_dielectric_fresnel,
     f82_fresnel as thin_film_f82_fresnel,
 };
+use super::principled_thin_film_table::THIN_FILM_CMF;
 use super::subsurface::{channel_mask, raw_radius, subsurface_evaluated};
 use crate::model::RayKind;
 use crate::shader::{
-    AnisotropyModel, BsdfParams, GlassDistribution, dielectric_f0, make_orthonormals,
+    AnisotropyModel, BsdfModel, BsdfParams, GlassDistribution, MetallicFresnel, MetallicParameters,
+    MicrofacetDistribution, SheenDistribution, SubsurfaceMethod, ToonComponent, ToonParameters,
+    dielectric_f0, make_orthonormals,
 };
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
 const MIN_ROUGHNESS: f64 = 0.02;
+const F64_SIGN_BIT: u64 = 1 << 63;
+
+/// IEEE equality without a float comparison lint; NaN and signed-zero behavior match `==`.
+fn exact_f64_eq(left: f64, right: f64) -> bool {
+    if left.is_nan() || right.is_nan() {
+        return false;
+    }
+    let left_bits = left.to_bits();
+    let right_bits = right.to_bits();
+    left_bits == right_bits || ((left_bits | right_bits) & !F64_SIGN_BIT) == 0
+}
 
 /// Selection probabilities of the sampling branches, identical to the thresholds `path.rs` uses to
 /// pick a branch: subsurface, diffuse, sheen, coat, specular, transmission.
@@ -216,6 +236,36 @@ pub(crate) fn continuous_density(params: &BsdfParams, layers: &Layers, light: DV
         .iter()
         .map(|lobe| lobe.weight)
         .sum()
+}
+
+/// Cycles' `SD_BSDF_HAS_EVAL`: whether an active closure set has any non-singular BSDF to pair with direct-light sampling.
+pub(crate) fn bsdf_has_direct_eval(params: &BsdfParams, layers: &Layers) -> bool {
+    match params.model {
+        BsdfModel::Holdout
+        | BsdfModel::RayPortal(_)
+        | BsdfModel::Refraction(MicrofacetDistribution::MultiGgx) => false,
+        BsdfModel::Subsurface => {
+            params.thin_wall || standalone_subsurface_weights(params).1.max_element() > 0.0
+        }
+        BsdfModel::Refraction(distribution) => {
+            let microfacet = standalone_refraction_microfacet(params, layers, distribution);
+            microfacet.alpha_x * microfacet.alpha_y > GLASS_SINGULAR_ALPHA_SQUARED
+        }
+        BsdfModel::Metallic(metallic) => {
+            let microfacet = standalone_metallic_microfacet(params, layers, metallic.distribution);
+            microfacet.alpha_x * microfacet.alpha_y > GLASS_SINGULAR_ALPHA_SQUARED
+        }
+        BsdfModel::Principled => {
+            let normal = layers.normal;
+            [normal, -normal, layers.view, -layers.view]
+                .into_iter()
+                .flat_map(|light| continuous_lobes(params, layers, light))
+                .any(|lobe| {
+                    lobe.weight > 0.0 && lobe.roughness_squared > GLASS_SINGULAR_ALPHA_SQUARED
+                })
+        }
+        _ => true,
+    }
 }
 
 /// Density of a normal drawn from the isotropic GGX NDF and reflected around the half vector.
@@ -788,6 +838,8 @@ pub(crate) struct Layers {
     sheen: SheenLobe,
     pub(crate) lower: DVec3,
     glass: Option<GlassLobe>,
+    /// Cycles' glossy blur alpha (`bsdf_blur`) for the standalone microfacets and the principled hair; zero when unblurred.
+    pub(crate) glossy_blur_alpha: f64,
 }
 
 /// Sets up the sheen and coat layers of a shading point with normal `normal`, seen along `view`. The geometric normal
@@ -844,6 +896,7 @@ pub(crate) fn layers_at(
         sheen,
         lower,
         glass,
+        glossy_blur_alpha: 0.0,
     }
 }
 
@@ -901,6 +954,7 @@ impl Layers {
     pub(crate) fn blurred(&self, blur_alpha: f64) -> Self {
         let mut layers = *self;
         layers.specular_microfacet = layers.specular_microfacet.blurred(blur_alpha);
+        layers.glossy_blur_alpha = layers.glossy_blur_alpha.max(blur_alpha);
         if let Some(coat) = &mut layers.coat {
             coat.roughness = coat.roughness.powi(2).max(blur_alpha).sqrt();
         }
@@ -2174,6 +2228,1402 @@ pub(super) fn sample_specular_ggx_half(
     (tangent * local_half.x + bitangent * local_half.y + normal * local_half.z).normalize_or_zero()
 }
 
+/// The result of sampling one of the non-Principled standalone surface closures.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum StandaloneSample {
+    Continuous {
+        direction: DVec3,
+        ray: RayKind,
+    },
+    Delta {
+        direction: DVec3,
+        weight: DVec3,
+        ray: RayKind,
+        branch_pdf: f64,
+    },
+    Subsurface {
+        weight: DVec3,
+        method: SubsurfaceMethod,
+    },
+    Absorbed,
+}
+
+/// The standalone closure's BSDF coefficient, excluding the cosine of `light`.
+pub(crate) fn standalone_eval(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
+    match params.model {
+        BsdfModel::Sheen(SheenDistribution::Microfiber) => {
+            standalone_sheen_lobe(params, layers).value(light) * standalone_color(params)
+        }
+        BsdfModel::Sheen(SheenDistribution::Ashikhmin) => {
+            let Some((cosine_weighted, _)) = standalone_velvet_eval(params, layers, light) else {
+                return DVec3::ZERO;
+            };
+            cosine_weighted * standalone_color(params) / layers.normal.dot(light)
+        }
+        BsdfModel::Subsurface => {
+            let (_, diffuse_weight, _, _, _) = standalone_subsurface_weights(params);
+            if layers.specular.dot(light) > 0.0 {
+                diffuse_weight / PI
+            } else {
+                DVec3::ZERO
+            }
+        }
+        BsdfModel::Translucent => {
+            if layers.specular.dot(light) < 0.0 {
+                standalone_color(params) / PI
+            } else {
+                DVec3::ZERO
+            }
+        }
+        BsdfModel::Refraction(
+            distribution @ (MicrofacetDistribution::Beckmann | MicrofacetDistribution::Ggx),
+        ) => {
+            let microfacet = standalone_refraction_microfacet(params, layers, distribution);
+            let (cosine_weighted, _) =
+                microfacet_refraction_eval(microfacet, layers.view, light, standalone_eta(params));
+            let cosine = layers.specular.dot(light).abs();
+            if cosine > 0.0 {
+                cosine_weighted * standalone_color(params) / cosine
+            } else {
+                DVec3::ZERO
+            }
+        }
+        BsdfModel::Toon(toon) => {
+            let (cosine_weighted, _) = standalone_toon_eval(toon, layers, light);
+            let cosine = layers.normal.dot(light).abs();
+            if cosine > 0.0 {
+                cosine_weighted * standalone_color(params) / cosine
+            } else {
+                DVec3::ZERO
+            }
+        }
+        BsdfModel::Metallic(metallic) => {
+            let microfacet = standalone_metallic_microfacet(params, layers, metallic.distribution);
+            let (cosine_weighted, _) = microfacet_reflection_eval(
+                microfacet,
+                layers.view,
+                light,
+                standalone_metallic_fresnel(
+                    params,
+                    metallic,
+                    layers.view.dot((layers.view + light).normalize_or_zero()),
+                ),
+            );
+            let cosine = layers.specular.dot(light).abs();
+            if cosine > 0.0 {
+                cosine_weighted * standalone_metallic_gain(params, metallic, layers) / cosine
+            } else {
+                DVec3::ZERO
+            }
+        }
+        BsdfModel::Refraction(MicrofacetDistribution::MultiGgx) => {
+            unreachable!("the evaluator rejects Multi-GGX on the Refraction node")
+        }
+        BsdfModel::Principled
+        | BsdfModel::Holdout
+        | BsdfModel::Hair(_)
+        | BsdfModel::PrincipledHair(_)
+        | BsdfModel::RayPortal(_) => {
+            unreachable!("standalone BSDF kernels do not handle this closure model")
+        }
+    }
+}
+
+/// The standalone closure's continuous sample density in solid angle.
+pub(crate) fn standalone_density(params: &BsdfParams, layers: &Layers, light: DVec3) -> f64 {
+    match params.model {
+        BsdfModel::Sheen(SheenDistribution::Microfiber) => {
+            standalone_sheen_lobe(params, layers).density(light)
+        }
+        BsdfModel::Sheen(SheenDistribution::Ashikhmin) => {
+            standalone_velvet_eval(params, layers, light).map_or(0.0, |(_, pdf)| pdf)
+        }
+        BsdfModel::Subsurface => {
+            let (_, _, _, diffuse_probability, _) = standalone_subsurface_weights(params);
+            diffuse_probability * layers.specular.dot(light).max(0.0) / PI
+        }
+        BsdfModel::Translucent => (-layers.specular.dot(light)).max(0.0) / PI,
+        BsdfModel::Refraction(
+            distribution @ (MicrofacetDistribution::Beckmann | MicrofacetDistribution::Ggx),
+        ) => {
+            let microfacet = standalone_refraction_microfacet(params, layers, distribution);
+            microfacet_refraction_eval(microfacet, layers.view, light, standalone_eta(params)).1
+        }
+        BsdfModel::Toon(toon) => standalone_toon_eval(toon, layers, light).1,
+        BsdfModel::Metallic(metallic) => {
+            let microfacet = standalone_metallic_microfacet(params, layers, metallic.distribution);
+            let fresnel = standalone_metallic_fresnel(
+                params,
+                metallic,
+                layers.view.dot((layers.view + light).normalize_or_zero()),
+            );
+            microfacet_reflection_eval(microfacet, layers.view, light, fresnel).1
+        }
+        BsdfModel::Refraction(MicrofacetDistribution::MultiGgx) => {
+            unreachable!("the evaluator rejects Multi-GGX on the Refraction node")
+        }
+        BsdfModel::Principled
+        | BsdfModel::Holdout
+        | BsdfModel::Hair(_)
+        | BsdfModel::PrincipledHair(_)
+        | BsdfModel::RayPortal(_) => {
+            unreachable!("standalone BSDF kernels do not handle this closure model")
+        }
+    }
+}
+
+/// Cycles' post-setup closure `sample_weight`, excluding the outer mix/closure weight and reflective share.
+/// `path.rs` multiplies those scalar weights once when it selects among closures.
+pub(crate) fn standalone_selection_weight(params: &BsdfParams, layers: &Layers) -> f64 {
+    match params.model {
+        BsdfModel::Sheen(SheenDistribution::Microfiber) => {
+            standalone_color_sample_weight(params) * standalone_sheen_lobe(params, layers).weight.x
+        }
+        BsdfModel::Sheen(SheenDistribution::Ashikhmin)
+        | BsdfModel::Translucent
+        | BsdfModel::Refraction(MicrofacetDistribution::Beckmann | MicrofacetDistribution::Ggx)
+        | BsdfModel::Toon(_) => standalone_color_sample_weight(params),
+        BsdfModel::Subsurface => {
+            let color_weight = standalone_color_sample_weight(params);
+            if color_weight == 0.0 {
+                return 0.0;
+            }
+            standalone_subsurface_weights(params).4
+        }
+        BsdfModel::Metallic(metallic) => {
+            standalone_metallic_selection_weight(params, layers, metallic)
+        }
+        BsdfModel::Refraction(MicrofacetDistribution::MultiGgx) => {
+            unreachable!("the evaluator rejects Multi-GGX on the Refraction node")
+        }
+        BsdfModel::Principled
+        | BsdfModel::Holdout
+        | BsdfModel::Hair(_)
+        | BsdfModel::PrincipledHair(_)
+        | BsdfModel::RayPortal(_) => {
+            unreachable!("standalone BSDF kernels do not handle this closure model")
+        }
+    }
+}
+
+fn standalone_color_sample_weight(params: &BsdfParams) -> f64 {
+    (standalone_color(params).element_sum() / 3.0).abs()
+}
+fn standalone_metallic_selection_weight(
+    params: &BsdfParams,
+    layers: &Layers,
+    metallic: MetallicParameters,
+) -> f64 {
+    let microfacet = standalone_metallic_setup_microfacet(params, layers, metallic.distribution);
+    let cosine_i = microfacet.normal.dot(layers.view);
+    let roughness = (microfacet.alpha_x * microfacet.alpha_y).sqrt().sqrt();
+    let estimated_albedo = match metallic.fresnel {
+        MetallicFresnel::F82 if params.thin_film_thickness.max(1.0e-5) <= THICKNESS_CUTOFF => {
+            let f0 = standalone_color(params).clamp(DVec3::ZERO, DVec3::ONE);
+            f0.lerp(DVec3::ONE, ggx_gen_schlick_s_f82(roughness, cosine_i))
+        }
+        _ => standalone_metallic_fresnel(params, metallic, cosine_i),
+    };
+    let mut sample_weight = estimated_albedo.element_sum() / 3.0;
+    if metallic.distribution == MicrofacetDistribution::MultiGgx {
+        let energy = ggx_energy(roughness, cosine_i);
+        let darkening = standalone_metallic_gain(params, metallic, layers) * energy;
+        sample_weight *= darkening.element_sum() / 3.0;
+    }
+    sample_weight
+}
+
+/// Samples the standalone closure using the exact Cycles 5.2.2 distribution and geometric-normal rejection.
+pub(crate) fn standalone_sample(
+    params: &BsdfParams,
+    layers: &Layers,
+    geometric: DVec3,
+    random: [f64; 3],
+) -> StandaloneSample {
+    match params.model {
+        BsdfModel::Sheen(SheenDistribution::Microfiber) => {
+            let lobe = standalone_sheen_lobe(params, layers);
+            let direction = lobe.direction(random[0], random[1]);
+            if lobe.weight.max_element() <= 0.0 || geometric.dot(direction) <= 0.0 {
+                StandaloneSample::Absorbed
+            } else {
+                StandaloneSample::Continuous {
+                    direction,
+                    ray: RayKind::Diffuse,
+                }
+            }
+        }
+        BsdfModel::Sheen(SheenDistribution::Ashikhmin) => {
+            let direction = sample_uniform_hemisphere(layers.normal, random[0], random[1]);
+            let cosine_i = layers.normal.dot(layers.view);
+            let half = (layers.view + direction).normalize_or_zero();
+            let cosine_nh = layers.normal.dot(half);
+            let cosine_hi = layers.view.dot(half).abs();
+            // Cycles' sample rejects against geometric Ng, then checks the incoming half-vector; unlike eval, it does
+            // not reject a sampled direction solely for falling below the shading normal.
+            if cosine_i <= 1.0e-5
+                || geometric.dot(direction) <= 0.0
+                || !(cosine_nh.abs() < 1.0 - 1.0e-5 && cosine_hi > 1.0e-5)
+            {
+                StandaloneSample::Absorbed
+            } else {
+                StandaloneSample::Continuous {
+                    direction,
+                    ray: RayKind::Diffuse,
+                }
+            }
+        }
+        BsdfModel::Subsurface => {
+            let (subsurface_weight, _, subsurface_probability, _, _) =
+                standalone_subsurface_weights(params);
+            if random[0] < subsurface_probability {
+                StandaloneSample::Subsurface {
+                    weight: subsurface_weight / subsurface_probability,
+                    method: params.subsurface_method,
+                }
+            } else {
+                let direction = sample_cosine_hemisphere(layers.specular, random[1], random[2]);
+                if geometric.dot(direction) <= 0.0 {
+                    StandaloneSample::Absorbed
+                } else {
+                    StandaloneSample::Continuous {
+                        direction,
+                        ray: RayKind::Diffuse,
+                    }
+                }
+            }
+        }
+        BsdfModel::Translucent => {
+            let direction = sample_cosine_hemisphere(-layers.specular, random[0], random[1]);
+            if geometric.dot(direction) >= 0.0 {
+                StandaloneSample::Absorbed
+            } else {
+                StandaloneSample::Continuous {
+                    direction,
+                    ray: RayKind::Transmission,
+                }
+            }
+        }
+        BsdfModel::Refraction(
+            distribution @ (MicrofacetDistribution::Beckmann | MicrofacetDistribution::Ggx),
+        ) => standalone_refraction_sample(params, layers, geometric, distribution, random),
+        BsdfModel::Toon(toon) => standalone_toon_sample(toon, layers, geometric, random),
+        BsdfModel::Metallic(metallic) => {
+            standalone_metallic_sample(params, layers, geometric, metallic, random)
+        }
+        BsdfModel::Refraction(MicrofacetDistribution::MultiGgx) => {
+            unreachable!("the evaluator rejects Multi-GGX on the Refraction node")
+        }
+        BsdfModel::Principled
+        | BsdfModel::Holdout
+        | BsdfModel::Hair(_)
+        | BsdfModel::PrincipledHair(_)
+        | BsdfModel::RayPortal(_) => {
+            unreachable!("standalone BSDF kernels do not handle this closure model")
+        }
+    }
+}
+
+fn standalone_color(params: &BsdfParams) -> DVec3 {
+    DVec3::new(
+        params.base_color[0],
+        params.base_color[1],
+        params.base_color[2],
+    )
+}
+
+fn standalone_sheen_lobe(params: &BsdfParams, layers: &Layers) -> SheenLobe {
+    let normal = layers.normal;
+    let cosine = normal.dot(layers.view);
+    let off = SheenLobe {
+        normal,
+        tangent: DVec3::ZERO,
+        bitangent: DVec3::ZERO,
+        transform_a: 0.0,
+        transform_b: 0.0,
+        weight: DVec3::ZERO,
+    };
+    if cosine <= 0.0 {
+        return off;
+    }
+    let roughness = saturate(params.sheen_roughness).clamp(1.0e-3, 1.0);
+    let ltc = sheen_ltc(roughness, cosine);
+    if ltc.transform_a.abs() < 1.0e-5 || ltc.albedo < 1.0e-5 {
+        return off;
+    }
+    let (tangent, bitangent) = sheen_frame(normal, layers.view);
+    SheenLobe {
+        normal,
+        tangent,
+        bitangent,
+        transform_a: ltc.transform_a,
+        transform_b: ltc.transform_b,
+        weight: DVec3::splat(ltc.albedo),
+    }
+}
+
+fn standalone_velvet_eval(
+    params: &BsdfParams,
+    layers: &Layers,
+    light: DVec3,
+) -> Option<(f64, f64)> {
+    let normal = layers.normal;
+    let cosine_i = normal.dot(layers.view);
+    let cosine_o = normal.dot(light);
+    if cosine_i <= 0.0 || cosine_o <= 0.0 {
+        return None;
+    }
+    let half = (layers.view + light).normalize_or_zero();
+    let cosine_nh = normal.dot(half);
+    let cosine_hi = layers.view.dot(half).abs();
+    if !(cosine_nh.abs() < 1.0 - 1.0e-5 && cosine_hi > 1.0e-5) {
+        return None;
+    }
+    let sigma = params.sheen_roughness.clamp(0.0, 1.0).max(0.01);
+    let inverse_sigma_squared = 1.0 / (sigma * sigma);
+    let cosine_nh_div_hi = (cosine_nh / cosine_hi).max(1.0e-5);
+    let fac1 = 2.0 * (cosine_nh_div_hi * cosine_i).abs();
+    let fac2 = 2.0 * (cosine_nh_div_hi * cosine_o).abs();
+    let sine_nh_squared = 1.0 - cosine_nh * cosine_nh;
+    let sine_nh_fourth = sine_nh_squared * sine_nh_squared;
+    let cotangent_squared = cosine_nh * cosine_nh / sine_nh_squared;
+    let distribution =
+        (-cotangent_squared * inverse_sigma_squared).exp() * inverse_sigma_squared * (1.0 / PI)
+            / sine_nh_fourth;
+    let masking = 1.0_f64.min(fac1).min(fac2);
+    let cosine_weighted = 0.25 * (distribution * masking) / cosine_i;
+    Some((cosine_weighted, 0.5 / PI))
+}
+
+fn sample_uniform_hemisphere(normal: DVec3, u: f64, v: f64) -> DVec3 {
+    let (mut x, mut y) = concentric_disk(u, v);
+    let z = 1.0 - x * x - y * y;
+    let scale = (z + 1.0).max(0.0).sqrt();
+    x *= scale;
+    y *= scale;
+    let (tangent, bitangent) = make_orthonormals(normal);
+    tangent * x + bitangent * y + normal * z
+}
+
+fn sample_cosine_hemisphere(normal: DVec3, u: f64, v: f64) -> DVec3 {
+    let (x, y) = concentric_disk(u, v);
+    let cosine = (1.0 - x * x - y * y).max(0.0).sqrt();
+    let (tangent, bitangent) = make_orthonormals(normal);
+    tangent * x + bitangent * y + normal * cosine
+}
+
+fn standalone_subsurface_weights(params: &BsdfParams) -> (DVec3, DVec3, f64, f64, f64) {
+    let mask = channel_mask(raw_radius(params));
+    let active = DVec3::from_array(mask.map(|enabled| {
+        if enabled && params.subsurface_weight > 0.0 {
+            1.0
+        } else {
+            0.0
+        }
+    }));
+    let color = standalone_color(params);
+    let subsurface = color * active;
+    let diffuse = color * (DVec3::ONE - active);
+    let channel_count = mask.iter().filter(|&&enabled| enabled).count() as f64;
+    let subsurface_sample_weight = (subsurface.element_sum() / 3.0).abs() * channel_count;
+    let diffuse_sample_weight = (diffuse.element_sum() / 3.0).abs();
+    let total = subsurface_sample_weight + diffuse_sample_weight;
+    if total > 0.0 {
+        (
+            subsurface,
+            diffuse,
+            subsurface_sample_weight / total,
+            diffuse_sample_weight / total,
+            total,
+        )
+    } else {
+        (subsurface, diffuse, 0.0, 1.0, 0.0)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StandaloneMicrofacet {
+    distribution: MicrofacetDistribution,
+    normal: DVec3,
+    tangent: DVec3,
+    bitangent: DVec3,
+    alpha_x: f64,
+    alpha_y: f64,
+    anisotropic: bool,
+}
+
+impl StandaloneMicrofacet {
+    fn isotropic(distribution: MicrofacetDistribution, normal: DVec3, alpha: f64) -> Self {
+        let (tangent, bitangent) = make_orthonormals(normal);
+        Self {
+            distribution,
+            normal,
+            tangent,
+            bitangent,
+            alpha_x: alpha,
+            alpha_y: alpha,
+            anisotropic: false,
+        }
+    }
+
+    fn local(self, vector: DVec3) -> DVec3 {
+        DVec3::new(
+            self.tangent.dot(vector),
+            self.bitangent.dot(vector),
+            self.normal.dot(vector),
+        )
+    }
+}
+
+fn standalone_refraction_microfacet(
+    params: &BsdfParams,
+    layers: &Layers,
+    distribution: MicrofacetDistribution,
+) -> StandaloneMicrofacet {
+    let alpha = params
+        .roughness
+        .powi(2)
+        .clamp(0.0, 1.0)
+        .max(layers.glossy_blur_alpha);
+    match distribution {
+        MicrofacetDistribution::Beckmann | MicrofacetDistribution::Ggx => {
+            StandaloneMicrofacet::isotropic(distribution, layers.specular, alpha)
+        }
+        MicrofacetDistribution::MultiGgx => {
+            unreachable!("the evaluator rejects Multi-GGX on the Refraction node")
+        }
+    }
+}
+
+/// Cycles' setup alpha of a metallic closure, before the glossy blur. Its Fresnel albedo and multiscatter gain are
+/// fixed at setup (`sample_weight`, `energy_scale`), so they read this rather than [`standalone_metallic_microfacet`].
+fn standalone_metallic_setup_microfacet(
+    params: &BsdfParams,
+    layers: &Layers,
+    distribution: MicrofacetDistribution,
+) -> StandaloneMicrofacet {
+    let alpha = params.roughness.clamp(0.0, 1.0).powi(2);
+    let mut alpha_x = alpha;
+    let mut alpha_y = alpha;
+    let mut tangent_frame = None;
+    let anisotropy = params.anisotropy.clamp(0.0, 1.0);
+    if anisotropy > 0.0
+        && let Some(tangent) = params.anisotropic_tangent
+    {
+        let tangent = rotate_around_axis(
+            tangent,
+            layers.normal,
+            params.anisotropic_rotation * 2.0 * PI,
+        );
+        let aspect = (1.0 - 0.9 * anisotropy).sqrt();
+        alpha_x /= aspect;
+        alpha_y *= aspect;
+        tangent_frame = Some(tangent);
+    }
+    alpha_x = saturate(alpha_x);
+    alpha_y = saturate(alpha_y);
+    let Some(tangent) = tangent_frame.filter(|_| !exact_f64_eq(alpha_x, alpha_y)) else {
+        return StandaloneMicrofacet::isotropic(
+            distribution,
+            layers.specular,
+            alpha_x.max(alpha_y),
+        );
+    };
+    let bitangent = layers.specular.cross(tangent).normalize_or_zero();
+    if bitangent.length_squared() <= f64::EPSILON {
+        return StandaloneMicrofacet::isotropic(
+            distribution,
+            layers.specular,
+            alpha_x.max(alpha_y),
+        );
+    }
+    StandaloneMicrofacet {
+        distribution,
+        normal: layers.specular,
+        tangent: bitangent.cross(layers.specular),
+        bitangent,
+        alpha_x,
+        alpha_y,
+        anisotropic: true,
+    }
+}
+
+/// The metallic microfacet after Cycles' glossy blur: `bsdf_microfacet_blur` raises both axes to `max(blur, alpha)`.
+fn standalone_metallic_microfacet(
+    params: &BsdfParams,
+    layers: &Layers,
+    distribution: MicrofacetDistribution,
+) -> StandaloneMicrofacet {
+    let mut microfacet = standalone_metallic_setup_microfacet(params, layers, distribution);
+    microfacet.alpha_x = microfacet.alpha_x.max(layers.glossy_blur_alpha);
+    microfacet.alpha_y = microfacet.alpha_y.max(layers.glossy_blur_alpha);
+    microfacet
+}
+
+fn standalone_eta(params: &BsdfParams) -> f64 {
+    let ior = params.ior.max(1.0e-5);
+    if params.back_facing { 1.0 / ior } else { ior }
+}
+
+fn standalone_toon_parameters(toon: ToonParameters) -> (f64, f64, f64) {
+    let size = toon.size.clamp(1.0e-5, 1.0) * FRAC_PI_2;
+    let smooth = toon.smooth.clamp(0.0, 1.0) * FRAC_PI_2;
+    (size, smooth, (size + smooth).min(FRAC_PI_2))
+}
+
+fn toon_intensity(size: f64, smooth: f64, angle: f64) -> f64 {
+    if angle < size {
+        1.0
+    } else if angle < size + smooth && smooth != 0.0 {
+        1.0 - (angle - size) / smooth
+    } else {
+        0.0
+    }
+}
+
+fn sample_uniform_cone(normal: DVec3, one_minus_cos_angle: f64, u: f64, v: f64) -> DVec3 {
+    if one_minus_cos_angle > 0.0 {
+        let (mut x, mut y) = concentric_disk(u, v);
+        let radius_squared = x * x + y * y;
+        let cosine = 1.0 - radius_squared * one_minus_cos_angle;
+        let scale = (one_minus_cos_angle * (2.0 - one_minus_cos_angle * radius_squared))
+            .max(0.0)
+            .sqrt();
+        x *= scale;
+        y *= scale;
+        let (tangent, bitangent) = make_orthonormals(normal);
+        tangent * x + bitangent * y + normal * cosine
+    } else {
+        normal
+    }
+}
+
+fn standalone_toon_eval(toon: ToonParameters, layers: &Layers, light: DVec3) -> (DVec3, f64) {
+    let (size, smooth, sample_angle) = standalone_toon_parameters(toon);
+    let sample_pdf = 0.5 / (PI * (1.0 - sample_angle.cos()));
+    let normal = layers.normal;
+    let cosine_o = normal.dot(light);
+    if cosine_o <= 0.0 {
+        return (DVec3::ZERO, 0.0);
+    }
+    match toon.component {
+        ToonComponent::Diffuse => {
+            let angle = cosine_o.clamp(0.0, 1.0).acos();
+            if angle < sample_angle {
+                (
+                    DVec3::splat(sample_pdf * toon_intensity(size, smooth, angle)),
+                    sample_pdf,
+                )
+            } else {
+                (DVec3::ZERO, 0.0)
+            }
+        }
+        ToonComponent::Glossy => {
+            let cosine_i = normal.dot(layers.view);
+            if cosine_i <= 0.0 {
+                return (DVec3::ZERO, 0.0);
+            }
+            let reflection = 2.0 * cosine_i * normal - layers.view;
+            let cosine_ro = reflection.dot(light);
+            let angle = cosine_ro.max(0.0).clamp(0.0, 1.0).acos();
+            if angle < sample_angle {
+                (
+                    DVec3::splat(sample_pdf * toon_intensity(size, smooth, angle)),
+                    sample_pdf,
+                )
+            } else {
+                (DVec3::ZERO, 0.0)
+            }
+        }
+    }
+}
+
+fn standalone_toon_sample(
+    toon: ToonParameters,
+    layers: &Layers,
+    geometric: DVec3,
+    random: [f64; 3],
+) -> StandaloneSample {
+    let (_, _, sample_angle) = standalone_toon_parameters(toon);
+    let normal = layers.normal;
+    let (center, ray) = match toon.component {
+        ToonComponent::Diffuse => (normal, RayKind::Diffuse),
+        ToonComponent::Glossy => {
+            let cosine_i = normal.dot(layers.view);
+            if cosine_i <= 0.0 {
+                return StandaloneSample::Absorbed;
+            }
+            (2.0 * cosine_i * normal - layers.view, RayKind::Glossy)
+        }
+    };
+    let direction = sample_uniform_cone(center, 1.0 - sample_angle.cos(), random[0], random[1]);
+    if geometric.dot(direction) <= 0.0
+        || (toon.component == ToonComponent::Glossy && normal.dot(direction) <= 0.0)
+    {
+        return StandaloneSample::Absorbed;
+    }
+    StandaloneSample::Continuous { direction, ray }
+}
+
+fn standalone_microfacet_distribution(microfacet: StandaloneMicrofacet, half: DVec3) -> f64 {
+    let half = microfacet.local(half);
+    let cosine_squared = (half.z * half.z).min(1.0);
+    let one_minus_cosine_squared = 1.0 - cosine_squared;
+    let alpha_squared = microfacet.alpha_x * microfacet.alpha_y;
+    match (microfacet.distribution, microfacet.anisotropic) {
+        (MicrofacetDistribution::Beckmann, false) => {
+            1.0 / ((one_minus_cosine_squared / (cosine_squared * alpha_squared)).exp()
+                * PI
+                * alpha_squared
+                * cosine_squared.powi(2))
+        }
+        (MicrofacetDistribution::Ggx | MicrofacetDistribution::MultiGgx, false) => {
+            alpha_squared
+                / (PI * (one_minus_cosine_squared + alpha_squared * cosine_squared).powi(2))
+        }
+        (MicrofacetDistribution::Beckmann, true) => {
+            let scaled = DVec3::new(
+                half.x / microfacet.alpha_x,
+                half.y / microfacet.alpha_y,
+                half.z,
+            );
+            let cosine_squared = scaled.z * scaled.z;
+            (-(scaled.x * scaled.x + scaled.y * scaled.y) / cosine_squared).exp()
+                / (PI * alpha_squared * cosine_squared.powi(2))
+        }
+        (MicrofacetDistribution::Ggx | MicrofacetDistribution::MultiGgx, true) => {
+            let scaled = DVec3::new(
+                half.x / microfacet.alpha_x,
+                half.y / microfacet.alpha_y,
+                half.z,
+            );
+            1.0 / (PI * alpha_squared * scaled.length_squared().powi(2))
+        }
+    }
+}
+
+fn beckmann_lambda_from_alpha_tan(alpha_tan_squared: f64) -> f64 {
+    if alpha_tan_squared < 0.39 {
+        return 0.0;
+    }
+    let a = alpha_tan_squared.sqrt().recip();
+    ((0.396 * a - 1.259) * a + 1.0) / ((2.181 * a + 3.535) * a)
+}
+
+fn standalone_microfacet_lambda(microfacet: StandaloneMicrofacet, direction: DVec3) -> f64 {
+    let local = microfacet.local(direction);
+    let alpha_tan_squared = if microfacet.anisotropic {
+        ((microfacet.alpha_x * local.x).powi(2) + (microfacet.alpha_y * local.y).powi(2))
+            / local.z.powi(2)
+    } else {
+        microfacet.alpha_x * microfacet.alpha_y * (1.0 / local.z.powi(2) - 1.0).max(0.0)
+    };
+    match microfacet.distribution {
+        MicrofacetDistribution::Beckmann => beckmann_lambda_from_alpha_tan(alpha_tan_squared),
+        MicrofacetDistribution::Ggx | MicrofacetDistribution::MultiGgx => {
+            0.5 * ((1.0 + alpha_tan_squared).sqrt() - 1.0)
+        }
+    }
+}
+
+fn microfacet_reflection_eval(
+    microfacet: StandaloneMicrofacet,
+    view: DVec3,
+    light: DVec3,
+    fresnel: DVec3,
+) -> (DVec3, f64) {
+    let cosine_i = microfacet.normal.dot(view);
+    let cosine_o = microfacet.normal.dot(light);
+    if cosine_i <= 0.0
+        || cosine_o <= 0.0
+        || microfacet.alpha_x * microfacet.alpha_y <= GLASS_SINGULAR_ALPHA_SQUARED
+        || fresnel.max_element() <= 0.0
+    {
+        return (DVec3::ZERO, 0.0);
+    }
+    let half = (view + light).normalize_or_zero();
+    if half == DVec3::ZERO {
+        return (DVec3::ZERO, 0.0);
+    }
+    let distribution = standalone_microfacet_distribution(microfacet, half);
+    let lambda_i = standalone_microfacet_lambda(microfacet, view);
+    let lambda_o = standalone_microfacet_lambda(microfacet, light);
+    let common = distribution / cosine_i * 0.25;
+    (
+        fresnel * (common / (1.0 + lambda_i + lambda_o)),
+        common / (1.0 + lambda_i),
+    )
+}
+
+fn microfacet_refraction_eval(
+    microfacet: StandaloneMicrofacet,
+    view: DVec3,
+    light: DVec3,
+    eta: f64,
+) -> (DVec3, f64) {
+    let cosine_i = microfacet.normal.dot(view);
+    let cosine_o = microfacet.normal.dot(light);
+    if cosine_i <= 0.0
+        || cosine_o >= 0.0
+        || microfacet.alpha_x * microfacet.alpha_y <= GLASS_SINGULAR_ALPHA_SQUARED
+    {
+        return (DVec3::ZERO, 0.0);
+    }
+    let half_unscaled = -(eta * light + view);
+    let half_length = half_unscaled.length();
+    if half_length == 0.0 {
+        return (DVec3::ZERO, 0.0);
+    }
+    let half = half_unscaled / half_length;
+    let cosine_hi = half.dot(view);
+    let (fresnel, _) = dielectric_fresnel(cosine_hi, eta);
+    if fresnel >= 1.0 {
+        return (DVec3::ZERO, 0.0);
+    }
+    let distribution = standalone_microfacet_distribution(microfacet, half);
+    let lambda_i = standalone_microfacet_lambda(microfacet, view);
+    let lambda_o = standalone_microfacet_lambda(microfacet, light);
+    let common =
+        distribution / cosine_i * (eta / half_length).powi(2) * (cosine_hi * half.dot(light)).abs();
+    (
+        DVec3::splat(common / (1.0 + lambda_i + lambda_o)),
+        common / (1.0 + lambda_i),
+    )
+}
+
+fn sample_standalone_half(microfacet: StandaloneMicrofacet, view: DVec3, u: f64, v: f64) -> DVec3 {
+    let local_view = microfacet.local(view);
+    let local_half = match microfacet.distribution {
+        MicrofacetDistribution::Ggx | MicrofacetDistribution::MultiGgx => {
+            sample_visible_normal_anisotropic(
+                local_view,
+                microfacet.alpha_x,
+                microfacet.alpha_y,
+                u,
+                v,
+            )
+        }
+        MicrofacetDistribution::Beckmann => {
+            sample_visible_beckmann_normal(local_view, microfacet.alpha_x, microfacet.alpha_y, u, v)
+        }
+    };
+    (microfacet.tangent * local_half.x
+        + microfacet.bitangent * local_half.y
+        + microfacet.normal * local_half.z)
+        .normalize_or_zero()
+}
+
+fn sample_visible_beckmann_normal(
+    view: DVec3,
+    alpha_x: f64,
+    alpha_y: f64,
+    u: f64,
+    v: f64,
+) -> DVec3 {
+    let stretched = DVec3::new(alpha_x * view.x, alpha_y * view.y, view.z).normalize_or_zero();
+    let (mut slope_x, mut slope_y, cosine_phi, sine_phi);
+    if stretched.z >= 0.99999 {
+        let radius = (-u.ln()).sqrt();
+        let phi = 2.0 * PI * v;
+        slope_x = radius * phi.cos();
+        slope_y = radius * phi.sin();
+        cosine_phi = 1.0;
+        sine_phi = 0.0;
+    } else {
+        let cosine_theta = stretched.z;
+        let sine_theta = (1.0 - cosine_theta * cosine_theta).sqrt();
+        let tangent_theta = sine_theta / cosine_theta;
+        let cotangent_theta = 1.0 / tangent_theta;
+        let erf_a = cycles_fast_erf(cotangent_theta);
+        let exp_a2 = (-cotangent_theta * cotangent_theta).exp();
+        let inverse_sine_theta = 1.0 / sine_theta;
+        cosine_phi = stretched.x * inverse_sine_theta;
+        sine_phi = stretched.y * inverse_sine_theta;
+        let k = tangent_theta * (1.0 / PI.sqrt());
+        let y_approx = u * (1.0 + erf_a + k * (1.0 - erf_a * erf_a));
+        let y_exact = u * (1.0 + erf_a + k * exp_a2);
+        let b = if k > 0.0 {
+            (0.5 - (k * (k - y_approx + 1.0) + 0.25).sqrt()) / k
+        } else {
+            y_approx - 1.0
+        };
+        let mut inverse_erf = cycles_fast_erfinv(b);
+        let mut begin_x = -1.0;
+        let mut begin_y = -y_exact;
+        let mut end_x = erf_a;
+        let mut current_x = b;
+        let mut current_y = 1.0 + b + k * (-inverse_erf * inverse_erf).exp() - y_exact;
+        let mut iteration = 0;
+        while current_y.abs() > 1.0e-6 && iteration < 3 {
+            if begin_y.signum() == current_y.signum() {
+                begin_x = current_x;
+                begin_y = current_y;
+            } else {
+                end_x = current_x;
+            }
+            let newton_x = current_x - current_y / (1.0 - inverse_erf * tangent_theta);
+            current_x = if newton_x >= begin_x && newton_x <= end_x {
+                newton_x
+            } else {
+                f64::midpoint(begin_x, end_x)
+            };
+            inverse_erf = cycles_fast_erfinv(current_x);
+            current_y = 1.0 + current_x + k * (-inverse_erf * inverse_erf).exp() - y_exact;
+            iteration += 1;
+        }
+        slope_x = inverse_erf;
+        slope_y = cycles_fast_erfinv(2.0 * v - 1.0);
+    }
+    let rotated_x = cosine_phi * slope_x - sine_phi * slope_y;
+    let rotated_y = sine_phi * slope_x + cosine_phi * slope_y;
+    slope_x = alpha_x * rotated_x;
+    slope_y = alpha_y * rotated_y;
+    DVec3::new(-slope_x, -slope_y, 1.0).normalize_or_zero()
+}
+
+fn cycles_fast_erf(value: f64) -> f64 {
+    let a = value.abs();
+    if a >= 12.3 {
+        return value.signum();
+    }
+    let b = 1.0 - (1.0 - a);
+    let mut r = 0.000_043_063_8;
+    r = r * b + 0.000_276_567_2;
+    r = r * b + 0.000_152_014_3;
+    r = r * b + 0.009_270_527_2;
+    r = r * b + 0.042_282_012_3;
+    r = r * b + 0.070_523_078_4;
+    r = r * b + 1.0;
+    let r2 = r * r;
+    let r4 = r2 * r2;
+    let r8 = r4 * r4;
+    let r16 = r8 * r8;
+    value.signum() * (1.0 - 1.0 / r16)
+}
+
+fn cycles_fast_erfinv(value: f64) -> f64 {
+    let x = value.abs().min(0.999_999_94);
+    let mut w = -((1.0 - x) * (1.0 + x)).ln();
+    let p = if w < 5.0 {
+        w -= 2.5;
+        let mut p = 2.810_226_36e-8;
+        p = p * w + 3.432_739_39e-7;
+        p = p * w - 3.523_387_7e-6;
+        p = p * w - 4.391_506_54e-6;
+        p = p * w + 0.000_218_580_87;
+        p = p * w - 0.001_253_725_03;
+        p = p * w - 0.004_177_681_64;
+        p = p * w + 0.246_640_727;
+        p = p * w + 1.501_409_41;
+        p
+    } else {
+        w = w.sqrt() - 3.0;
+        let mut p = -0.000_200_214_257;
+        p = p * w + 0.000_100_950_558;
+        p = p * w + 0.001_349_343_22;
+        p = p * w - 0.003_673_428_44;
+        p = p * w + 0.005_739_507_73;
+        p = p * w - 0.007_622_461_3;
+        p = p * w + 0.009_438_870_47;
+        p = p * w + 1.001_674_06;
+        p = p * w + 2.832_976_82;
+        p
+    };
+    p * value
+}
+
+/// Cycles' `table_ggx_gen_schlick_s` z slices 7 and 8; F82 setup queries the table at z = 0.5.
+#[rustfmt::skip]
+const GGX_GEN_SCHLICK_S_F82_Z_SLICES: [f32; 512] = [
+    0.999_429_f32, 0.902_696_f32, 0.741_916_f32, 0.583_382_f32, 0.447_240_f32, 0.338_334_f32, 0.254_889_f32, 0.192_674_f32,
+    0.147_061_f32, 0.113_921_f32, 0.089_921_f32, 0.072_527_f32, 0.059_860_f32, 0.050_578_f32, 0.043_717_f32, 0.038_600_f32,
+    0.674_189_f32, 0.669_511_f32, 0.625_563_f32, 0.529_453_f32, 0.419_763_f32, 0.320_911_f32, 0.240_949_f32, 0.180_307_f32,
+    0.135_826_f32, 0.103_679_f32, 0.080_539_f32, 0.063_802_f32, 0.051_596_f32, 0.042_573_f32, 0.035_809_f32, 0.030_663_f32,
+    0.441_437_f32, 0.440_114_f32, 0.426_338_f32, 0.386_542_f32, 0.324_527_f32, 0.257_868_f32, 0.198_748_f32, 0.151_123_f32,
+    0.114_754_f32, 0.087_755_f32, 0.067_948_f32, 0.053_435_f32, 0.042_727_f32, 0.034_737_f32, 0.028_688_f32, 0.024_027_f32,
+    0.279_401_f32, 0.278_969_f32, 0.274_104_f32, 0.258_187_f32, 0.228_435_f32, 0.190_125_f32, 0.151_635_f32, 0.118_175_f32,
+    0.091_267_f32, 0.070_519_f32, 0.054_862_f32, 0.043_135_f32, 0.034_332_f32, 0.027_673_f32, 0.022_576_f32, 0.018_620_f32,
+    0.169_939_f32, 0.169_831_f32, 0.168_349_f32, 0.162_641_f32, 0.150_062_f32, 0.130_926_f32, 0.108_791_f32, 0.087_496_f32,
+    0.069_170_f32, 0.054_328_f32, 0.042_704_f32, 0.033_746_f32, 0.026_864_f32, 0.021_574_f32, 0.017_471_f32, 0.014_263_f32,
+    0.098_574_f32, 0.098_583_f32, 0.098_421_f32, 0.097_069_f32, 0.092_861_f32, 0.084_820_f32, 0.073_750_f32, 0.061_627_f32,
+    0.050_172_f32, 0.040_276_f32, 0.032_150_f32, 0.025_641_f32, 0.020_509_f32, 0.016_470_f32, 0.013_296_f32, 0.010_785_f32,
+    0.053_987_f32, 0.054_031_f32, 0.054_313_f32, 0.054_634_f32, 0.054_119_f32, 0.051_758_f32, 0.047_264_f32, 0.041_276_f32,
+    0.034_831_f32, 0.028_738_f32, 0.023_406_f32, 0.018_925_f32, 0.015_263_f32, 0.012_305_f32, 0.009_933_f32, 0.008_035_f32,
+    0.027_542_f32, 0.027_584_f32, 0.027_937_f32, 0.028_710_f32, 0.029_522_f32, 0.029_655_f32, 0.028_565_f32, 0.026_230_f32,
+    0.023_095_f32, 0.019_697_f32, 0.016_444_f32, 0.013_538_f32, 0.011_052_f32, 0.008_977_f32, 0.007_273_f32, 0.005_886_f32,
+    0.012_841_f32, 0.012_873_f32, 0.013_157_f32, 0.013_875_f32, 0.014_906_f32, 0.015_837_f32, 0.016_196_f32, 0.015_743_f32,
+    0.014_556_f32, 0.012_915_f32, 0.011_113_f32, 0.009_353_f32, 0.007_760_f32, 0.006_372_f32, 0.005_199_f32, 0.004_224_f32,
+    0.005_322_f32, 0.005_341_f32, 0.005_526_f32, 0.006_032_f32, 0.006_854_f32, 0.007_793_f32, 0.008_546_f32, 0.008_862_f32,
+    0.008_665_f32, 0.008_048_f32, 0.007_176_f32, 0.006_207_f32, 0.005_254_f32, 0.004_378_f32, 0.003_609_f32, 0.002_953_f32,
+    0.001_878_f32, 0.001_888_f32, 0.001_989_f32, 0.002_284_f32, 0.002_805_f32, 0.003_480_f32, 0.004_147_f32, 0.004_632_f32,
+    0.004_827_f32, 0.004_722_f32, 0.004_390_f32, 0.003_922_f32, 0.003_402_f32, 0.002_889_f32, 0.002_415_f32, 0.001_998_f32,
+    0.000_525_f32, 0.000_529_f32, 0.000_575_f32, 0.000_718_f32, 0.000_992_f32, 0.001_382_f32, 0.001_821_f32, 0.002_215_f32,
+    0.002_478_f32, 0.002_572_f32, 0.002_507_f32, 0.002_328_f32, 0.002_080_f32, 0.001_809_f32, 0.001_540_f32, 0.001_293_f32,
+    0.000_101_f32, 0.000_103_f32, 0.000_120_f32, 0.000_176_f32, 0.000_294_f32, 0.000_478_f32, 0.000_709_f32, 0.000_947_f32,
+    0.001_146_f32, 0.001_270_f32, 0.001_307_f32, 0.001_269_f32, 0.001_176_f32, 0.001_053_f32, 0.000_918_f32, 0.000_785_f32,
+    0.000_010_f32, 0.000_010_f32, 0.000_015_f32, 0.000_032_f32, 0.000_072_f32, 0.000_140_f32, 0.000_236_f32, 0.000_348_f32,
+    0.000_457_f32, 0.000_543_f32, 0.000_595_f32, 0.000_609_f32, 0.000_590_f32, 0.000_548_f32, 0.000_493_f32, 0.000_433_f32,
+    0.000_000_f32, 0.000_000_f32, 0.000_001_f32, 0.000_005_f32, 0.000_014_f32, 0.000_033_f32, 0.000_061_f32, 0.000_099_f32,
+    0.000_141_f32, 0.000_181_f32, 0.000_213_f32, 0.000_233_f32, 0.000_239_f32, 0.000_234_f32, 0.000_220_f32, 0.000_200_f32,
+    0.000_000_f32, 0.000_000_f32, 0.000_000_f32, 0.000_001_f32, 0.000_002_f32, 0.000_004_f32, 0.000_008_f32, 0.000_013_f32,
+    0.000_021_f32, 0.000_029_f32, 0.000_039_f32, 0.000_047_f32, 0.000_054_f32, 0.000_058_f32, 0.000_059_f32, 0.000_058_f32,
+    0.999_563_f32, 0.920_276_f32, 0.782_410_f32, 0.639_695_f32, 0.510_912_f32, 0.402_654_f32, 0.315_576_f32, 0.247_554_f32,
+    0.195_444_f32, 0.156_013_f32, 0.126_382_f32, 0.104_180_f32, 0.087_530_f32, 0.075_010_f32, 0.065_547_f32, 0.058_351_f32,
+    0.739_454_f32, 0.735_078_f32, 0.693_262_f32, 0.600_892_f32, 0.493_225_f32, 0.391_952_f32, 0.305_836_f32, 0.237_299_f32,
+    0.184_748_f32, 0.145_215_f32, 0.115_727_f32, 0.093_726_f32, 0.077_246_f32, 0.064_787_f32, 0.055_272_f32, 0.047_918_f32,
+    0.534_691_f32, 0.533_264_f32, 0.518_413_f32, 0.475_399_f32, 0.407_724_f32, 0.333_383_f32, 0.265_184_f32, 0.208_036_f32,
+    0.162_649_f32, 0.127_711_f32, 0.101_242_f32, 0.081_296_f32, 0.066_227_f32, 0.054_754_f32, 0.045_920_f32, 0.039_017_f32,
+    0.376_720_f32, 0.376_139_f32, 0.369_819_f32, 0.349_699_f32, 0.312_606_f32, 0.264_761_f32, 0.215_928_f32, 0.172_392_f32,
+    0.136_340_f32, 0.107_724_f32, 0.085_543_f32, 0.068_532_f32, 0.055_502_f32, 0.045_471_f32, 0.037_676_f32, 0.031_544_f32,
+    0.257_451_f32, 0.257_225_f32, 0.254_584_f32, 0.245_439_f32, 0.226_607_f32, 0.198_944_f32, 0.167_278_f32, 0.136_636_f32,
+    0.109_873_f32, 0.087_796_f32, 0.070_176_f32, 0.056_355_f32, 0.045_568_f32, 0.037_153_f32, 0.030_540_f32, 0.025_304_f32,
+    0.169_668_f32, 0.169_606_f32, 0.168_708_f32, 0.165_090_f32, 0.156_544_f32, 0.142_219_f32, 0.123_694_f32, 0.103_936_f32,
+    0.085_396_f32, 0.069_327_f32, 0.056_024_f32, 0.045_266_f32, 0.036_691_f32, 0.029_872_f32, 0.024_452_f32, 0.020_115_f32,
+    0.107_007_f32, 0.107_017_f32, 0.106_936_f32, 0.106_056_f32, 0.103_058_f32, 0.096_797_f32, 0.087_297_f32, 0.075_812_f32,
+    0.063_990_f32, 0.053_032_f32, 0.043_509_f32, 0.035_512_f32, 0.028_952_f32, 0.023_619_f32, 0.019_308_f32, 0.015_823_f32,
+    0.063_917_f32, 0.063_953_f32, 0.064_206_f32, 0.064_558_f32, 0.064_324_f32, 0.062_536_f32, 0.058_644_f32, 0.052_890_f32,
+    0.046_122_f32, 0.039_222_f32, 0.032_808_f32, 0.027_160_f32, 0.022_350_f32, 0.018_332_f32, 0.015_016_f32, 0.012_295_f32,
+    0.035_637_f32, 0.035_676_f32, 0.036_012_f32, 0.036_785_f32, 0.037_694_f32, 0.038_081_f32, 0.037_300_f32, 0.035_128_f32,
+    0.031_831_f32, 0.027_939_f32, 0.023_951_f32, 0.020_190_f32, 0.016_834_f32, 0.013_927_f32, 0.011_468_f32, 0.009_413_f32,
+    0.018_156_f32, 0.018_189_f32, 0.018_486_f32, 0.019_262_f32, 0.020_434_f32, 0.021_610_f32, 0.022_271_f32, 0.022_053_f32,
+    0.020_904_f32, 0.019_056_f32, 0.016_833_f32, 0.014_521_f32, 0.012_315_f32, 0.010_315_f32, 0.008_565_f32, 0.007_068_f32,
+    0.008_177_f32, 0.008_200_f32, 0.008_414_f32, 0.009_014_f32, 0.010_019_f32, 0.011_236_f32, 0.012_322_f32, 0.012_950_f32,
+    0.012_948_f32, 0.012_343_f32, 0.011_306_f32, 0.010_034_f32, 0.008_694_f32, 0.007_403_f32, 0.006_222_f32, 0.005_181_f32,
+    0.003_080_f32, 0.003_094_f32, 0.003_223_f32, 0.003_605_f32, 0.004_295_f32, 0.005_223_f32, 0.006_201_f32, 0.007_005_f32,
+    0.007_458_f32, 0.007_498_f32, 0.007_171_f32, 0.006_588_f32, 0.005_866_f32, 0.005_101_f32, 0.004_358_f32, 0.003_676_f32,
+    0.000_875_f32, 0.000_881_f32, 0.000_945_f32, 0.001_144_f32, 0.001_530_f32, 0.002_095_f32, 0.002_763_f32, 0.003_411_f32,
+    0.003_912_f32, 0.004_187_f32, 0.004_216_f32, 0.004_040_f32, 0.003_720_f32, 0.003_324_f32, 0.002_902_f32, 0.002_491_f32,
+    0.000_148_f32, 0.000_151_f32, 0.000_174_f32, 0.000_254_f32, 0.000_421_f32, 0.000_691_f32, 0.001_046_f32, 0.001_438_f32,
+    0.001_800_f32, 0.002_072_f32, 0.002_219_f32, 0.002_239_f32, 0.002_153_f32, 0.001_993_f32, 0.001_792_f32, 0.001_575_f32,
+    0.000_007_f32, 0.000_008_f32, 0.000_013_f32, 0.000_034_f32, 0.000_085_f32, 0.000_176_f32, 0.000_312_f32, 0.000_483_f32,
+    0.000_668_f32, 0.000_838_f32, 0.000_968_f32, 0.001_044_f32, 0.001_063_f32, 0.001_034_f32, 0.000_970_f32, 0.000_885_f32,
+    0.000_000_f32, 0.000_000_f32, 0.000_001_f32, 0.000_004_f32, 0.000_011_f32, 0.000_027_f32, 0.000_054_f32, 0.000_094_f32,
+    0.000_146_f32, 0.000_205_f32, 0.000_266_f32, 0.000_319_f32, 0.000_360_f32, 0.000_383_f32, 0.000_389_f32, 0.000_381_f32,
+];
+fn ggx_gen_schlick_s_f82(roughness: f64, cosine_i: f64) -> f64 {
+    let slice = |z_index: usize| lookup_ggx_gen_schlick_s_slice(z_index, roughness, cosine_i);
+    0.5 * slice(0) + 0.5 * slice(1)
+}
+
+fn lookup_ggx_gen_schlick_s_slice(z_index: usize, roughness: f64, cosine_i: f64) -> f64 {
+    let x = roughness.clamp(0.0, 1.0) * 15.0;
+    let x_index = (x.floor() as usize).min(15);
+    let x_next = (x_index + 1).min(15);
+    let x_fraction = x - x_index as f64;
+    let y = cosine_i.clamp(0.0, 1.0) * 15.0;
+    let y_index = (y.floor() as usize).min(15);
+    let y_next = (y_index + 1).min(15);
+    let y_fraction = y - y_index as f64;
+    let row = |index: usize| {
+        let offset = z_index * 256 + index * 16;
+        let d0 = f64::from(GGX_GEN_SCHLICK_S_F82_Z_SLICES[offset + x_index]);
+        if x_fraction == 0.0 {
+            return d0;
+        }
+        let d1 = f64::from(GGX_GEN_SCHLICK_S_F82_Z_SLICES[offset + x_next]);
+        (1.0 - x_fraction) * d0 + x_fraction * d1
+    };
+    let d0 = row(y_index);
+    if y_fraction == 0.0 {
+        return d0;
+    }
+    let d1 = row(y_next);
+    (1.0 - y_fraction) * d0 + y_fraction * d1
+}
+
+fn standalone_metallic_fresnel(
+    params: &BsdfParams,
+    metallic: MetallicParameters,
+    cosine: f64,
+) -> DVec3 {
+    let thickness = params.thin_film_thickness.max(1.0e-5);
+    let film_ior = params.thin_film_ior.max(1.0e-5);
+    match metallic.fresnel {
+        MetallicFresnel::F82 => {
+            let f0 = standalone_color(params).clamp(DVec3::ZERO, DVec3::ONE);
+            let tint = DVec3::from_array(metallic.edge_tint).clamp(DVec3::ZERO, DVec3::ONE);
+            let b = f82_tint_b(f0, tint);
+            if thickness > THICKNESS_CUTOFF {
+                thin_film_f82_fresnel(cosine, thickness, film_ior, f0, b)
+            } else {
+                f82_fresnel(cosine, f0, b)
+            }
+        }
+        MetallicFresnel::PhysicalConductor => {
+            let ior = DVec3::from_array(metallic.conductor_ior).max(DVec3::ZERO);
+            let extinction = DVec3::from_array(metallic.extinction).max(DVec3::ZERO);
+            if thickness > THICKNESS_CUTOFF {
+                physical_conductor_thin_film_fresnel(cosine, thickness, film_ior, ior, extinction)
+            } else {
+                physical_conductor_fresnel(cosine, ior, extinction)
+            }
+        }
+    }
+}
+
+fn physical_conductor_fresnel(cosine: f64, ior: DVec3, extinction: DVec3) -> DVec3 {
+    DVec3::from_array(std::array::from_fn(|channel| {
+        let n = ior[channel];
+        let k = extinction[channel];
+        let eta_squared = n * n;
+        let extinction_squared = k * k;
+        let two_n_k = 2.0 * n * k;
+        let t1 = eta_squared - extinction_squared - (1.0 - cosine * cosine);
+        let t2 = (t1 * t1 + two_n_k * two_n_k).sqrt();
+        let u_squared = f64::midpoint(t2, t1).max(0.0);
+        let v_squared = (0.5 * (t2 - t1)).max(0.0);
+        let u = u_squared.sqrt();
+        let v = v_squared.sqrt();
+        let rs = safe_ratio(
+            (cosine - u).powi(2) + v_squared,
+            (cosine + u).powi(2) + v_squared,
+        );
+        let t3 = (eta_squared - extinction_squared) * cosine;
+        let t4 = two_n_k * cosine;
+        let rp = safe_ratio(
+            (t3 - u).powi(2) + (t4 - v).powi(2),
+            (t3 + u).powi(2) + (t4 + v).powi(2),
+        );
+        f64::midpoint(rs, rp)
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct MetallicFilmComplex {
+    re: f64,
+    im: f64,
+}
+
+impl MetallicFilmComplex {
+    fn multiply(self, other: Self) -> Self {
+        Self {
+            re: self.re * other.re - self.im * other.im,
+            im: self.re * other.im + self.im * other.re,
+        }
+    }
+}
+
+fn physical_conductor_thin_film_fresnel(
+    cosine: f64,
+    thickness: f64,
+    film_ior: f64,
+    substrate_ior: DVec3,
+    extinction: DVec3,
+) -> DVec3 {
+    DVec3::from_array(std::array::from_fn(|channel| {
+        physical_conductor_thin_film_channel(
+            channel,
+            cosine,
+            thickness,
+            film_ior,
+            substrate_ior[channel],
+            extinction[channel],
+        )
+    }))
+}
+
+fn physical_conductor_thin_film_channel(
+    channel: usize,
+    cosine_incident: f64,
+    thickness: f64,
+    film_ior: f64,
+    substrate_n: f64,
+    substrate_k: f64,
+) -> f64 {
+    let film_ior = if thickness < 1.0 {
+        let x = saturate(thickness);
+        let smooth = x * x * (3.0 - 2.0 * x);
+        1.0 + (film_ior - 1.0) * smooth
+    } else {
+        film_ior
+    };
+    let Some((r12_s, r12_p, cos_theta_2, phase12_s, phase12_p)) =
+        thin_film_dielectric_interface(cosine_incident, film_ior)
+    else {
+        return 1.0;
+    };
+    if exact_f64_eq(r12_s, 1.0) && exact_f64_eq(r12_p, 1.0) {
+        return 1.0;
+    }
+    let (r23_s, r23_p, phase23_s, phase23_p) =
+        physical_conductor_film_interface(-cos_theta_2, film_ior, substrate_n, substrate_k);
+    let optical_path_difference = -2.0 * film_ior * thickness * cos_theta_2;
+    let phase_s = phase23_s.multiply(MetallicFilmComplex {
+        re: -phase12_s,
+        im: 0.0,
+    });
+    let phase_p = phase23_p.multiply(MetallicFilmComplex {
+        re: -phase12_p,
+        im: 0.0,
+    });
+    let reflectance_s =
+        metallic_film_airy_summation(channel, r12_s, r23_s, optical_path_difference, phase_s);
+    let reflectance_p =
+        metallic_film_airy_summation(channel, r12_p, r23_p, optical_path_difference, phase_p);
+    saturate(f64::midpoint(reflectance_s, reflectance_p))
+}
+
+fn thin_film_dielectric_interface(
+    cosine_incident: f64,
+    eta: f64,
+) -> Option<(f64, f64, f64, f64, f64)> {
+    let cosine_incident = cosine_incident.abs();
+    let eta_cosine_transmitted_squared = eta * eta - (1.0 - cosine_incident * cosine_incident);
+    if eta_cosine_transmitted_squared <= 0.0 {
+        return None;
+    }
+    let cosine_transmitted = -eta_cosine_transmitted_squared.sqrt() / eta;
+    let r_s =
+        (cosine_incident + eta * cosine_transmitted) / (cosine_incident - eta * cosine_transmitted);
+    let r_p =
+        (cosine_transmitted + eta * cosine_incident) / (eta * cosine_incident - cosine_transmitted);
+    Some((
+        r_s * r_s,
+        r_p * r_p,
+        cosine_transmitted,
+        if r_s >= 0.0 { 1.0 } else { -1.0 },
+        if r_p >= 0.0 { 1.0 } else { -1.0 },
+    ))
+}
+
+fn physical_conductor_film_interface(
+    cosine_incident: f64,
+    ambient_ior: f64,
+    substrate_n: f64,
+    substrate_k: f64,
+) -> (f64, f64, MetallicFilmComplex, MetallicFilmComplex) {
+    let ambient_ior_squared = ambient_ior * ambient_ior;
+    let substrate_n_squared = substrate_n * substrate_n;
+    let substrate_k_squared = substrate_k * substrate_k;
+    let two_n_k = 2.0 * substrate_n * substrate_k;
+    let t1 = substrate_n_squared
+        - substrate_k_squared
+        - ambient_ior_squared * (1.0 - cosine_incident * cosine_incident);
+    let t2 = (t1 * t1 + two_n_k * two_n_k).sqrt();
+    let u_squared = f64::midpoint(t2, t1).max(0.0);
+    let v_squared = (0.5 * (t2 - t1)).max(0.0);
+    let u = u_squared.sqrt();
+    let v = v_squared.sqrt();
+    let ambient_cosine = ambient_ior * cosine_incident;
+    let reflectance_s = safe_ratio(
+        (ambient_cosine - u).powi(2) + v_squared,
+        (ambient_cosine + u).powi(2) + v_squared,
+    );
+    let t3 = (substrate_n_squared - substrate_k_squared) * cosine_incident;
+    let t4 = two_n_k * cosine_incident;
+    let reflectance_p = safe_ratio(
+        (t3 - ambient_ior * u).powi(2) + (t4 - ambient_ior * v).powi(2),
+        (t3 + ambient_ior * u).powi(2) + (t4 + ambient_ior * v).powi(2),
+    );
+    let phase_s = metallic_film_unit_complex(
+        -u_squared - v_squared + ambient_cosine.powi(2),
+        -2.0 * ambient_cosine * v,
+    );
+    let phase_p = metallic_film_unit_complex(
+        ((substrate_n_squared + substrate_k_squared) * cosine_incident).powi(2)
+            - ambient_ior_squared * (u_squared + v_squared),
+        2.0 * ambient_ior
+            * cosine_incident
+            * (two_n_k * u - (substrate_n_squared - substrate_k_squared) * v),
+    );
+    (reflectance_s, reflectance_p, phase_s, phase_p)
+}
+
+fn metallic_film_unit_complex(re: f64, im: f64) -> MetallicFilmComplex {
+    let magnitude = (re * re + im * im).sqrt();
+    if magnitude == 0.0 {
+        MetallicFilmComplex { re: 1.0, im: 0.0 }
+    } else {
+        MetallicFilmComplex {
+            re: re / magnitude,
+            im: im / magnitude,
+        }
+    }
+}
+
+fn metallic_film_airy_summation(
+    channel: usize,
+    reflectance_12: f64,
+    reflectance_23: f64,
+    optical_path_difference: f64,
+    phasor: MetallicFilmComplex,
+) -> f64 {
+    let transmission_12_squared = 1.0 - reflectance_12;
+    let round_trip_reflectance = reflectance_12 * reflectance_23;
+    let round_trip_root = round_trip_reflectance.sqrt();
+    let single_reflection = transmission_12_squared * transmission_12_squared * reflectance_23
+        / (1.0 - round_trip_reflectance);
+    let mut reflectance = single_reflection + reflectance_12;
+    let mut coefficient = single_reflection - transmission_12_squared;
+    let mut accumulator = phasor;
+    for order in 1..4 {
+        coefficient *= round_trip_root;
+        let sensitivity =
+            metallic_film_sensitivity(channel, f64::from(order) * optical_path_difference);
+        reflectance +=
+            coefficient * 2.0 * (accumulator.re * sensitivity.re + accumulator.im * sensitivity.im);
+        accumulator = accumulator.multiply(phasor);
+    }
+    reflectance
+}
+
+fn metallic_film_sensitivity(channel: usize, optical_path_difference: f64) -> MetallicFilmComplex {
+    let x = saturate(TAU * optical_path_difference / 60_000.0) * 511.0;
+    let index = (x as usize).min(511);
+    let next = (index + 1).min(511);
+    let fraction = x - index as f64;
+    let first = THIN_FILM_CMF[index];
+    let second = THIN_FILM_CMF[next];
+    MetallicFilmComplex {
+        re: f64::from(f32::from_bits(first[channel])) * (1.0 - fraction)
+            + f64::from(f32::from_bits(second[channel])) * fraction,
+        im: f64::from(f32::from_bits(first[channel + 3])) * (1.0 - fraction)
+            + f64::from(f32::from_bits(second[channel + 3])) * fraction,
+    }
+}
+
+fn safe_ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator == 0.0 {
+        0.0
+    } else {
+        numerator / denominator
+    }
+}
+
+fn standalone_metallic_fss(params: &BsdfParams, metallic: MetallicParameters) -> DVec3 {
+    match metallic.fresnel {
+        MetallicFresnel::F82 => {
+            let f0 = standalone_color(params).clamp(DVec3::ZERO, DVec3::ONE);
+            let tint = DVec3::from_array(metallic.edge_tint).clamp(DVec3::ZERO, DVec3::ONE);
+            f82_fss(f0, f82_tint_b(f0, tint))
+        }
+        MetallicFresnel::PhysicalConductor => {
+            let ior = DVec3::from_array(metallic.conductor_ior).max(DVec3::ZERO);
+            let extinction = DVec3::from_array(metallic.extinction).max(DVec3::ZERO);
+            let f0 = physical_conductor_fresnel(1.0, ior, extinction);
+            let f82 = physical_conductor_fresnel(1.0 / 7.0, ior, extinction);
+            f82_fss(f0, f82_tint_b_from_f82(f0, f82)).clamp(DVec3::ZERO, DVec3::ONE)
+        }
+    }
+}
+
+fn f82_tint_b_from_f82(f0: DVec3, f82: DVec3) -> DVec3 {
+    let f: f64 = 6.0 / 7.0;
+    let f5 = f.powi(5);
+    let schlick = f0.lerp(DVec3::ONE, f5);
+    (schlick - f82) * (7.0 / (f5 * f))
+}
+
+fn standalone_metallic_gain(
+    params: &BsdfParams,
+    metallic: MetallicParameters,
+    layers: &Layers,
+) -> DVec3 {
+    if metallic.distribution != MicrofacetDistribution::MultiGgx {
+        return DVec3::ONE;
+    }
+    let microfacet = standalone_metallic_setup_microfacet(params, layers, metallic.distribution);
+    let roughness = (microfacet.alpha_x * microfacet.alpha_y).sqrt().sqrt();
+    let energy = ggx_energy(roughness, microfacet.normal.dot(layers.view));
+    let missing = (1.0 - energy) / energy;
+    multiscatter_gain(
+        standalone_metallic_fss(params, metallic),
+        ggx_energy_average(roughness),
+        missing,
+    )
+}
+
+fn standalone_metallic_sample(
+    params: &BsdfParams,
+    layers: &Layers,
+    geometric: DVec3,
+    metallic: MetallicParameters,
+    random: [f64; 3],
+) -> StandaloneSample {
+    let microfacet = standalone_metallic_microfacet(params, layers, metallic.distribution);
+    let cosine_i = microfacet.normal.dot(layers.view);
+    if cosine_i <= 0.0 {
+        return StandaloneSample::Absorbed;
+    }
+    let singular = microfacet.alpha_x * microfacet.alpha_y <= GLASS_SINGULAR_ALPHA_SQUARED;
+    let half = if singular {
+        microfacet.normal
+    } else {
+        sample_standalone_half(microfacet, layers.view, random[0], random[1])
+    };
+    let cosine_hi = half.dot(layers.view);
+    let fresnel = standalone_metallic_fresnel(params, metallic, cosine_hi);
+    if fresnel.max_element() <= 0.0 {
+        return StandaloneSample::Absorbed;
+    }
+    let direction = 2.0 * cosine_hi * half - layers.view;
+    if geometric.dot(direction) < 0.0 || microfacet.normal.dot(direction) < 0.0 {
+        return StandaloneSample::Absorbed;
+    }
+    if singular {
+        StandaloneSample::Delta {
+            direction,
+            weight: fresnel * standalone_metallic_gain(params, metallic, layers),
+            ray: RayKind::Glossy,
+            branch_pdf: 1.0,
+        }
+    } else {
+        StandaloneSample::Continuous {
+            direction,
+            ray: RayKind::Glossy,
+        }
+    }
+}
+
+fn standalone_refraction_sample(
+    params: &BsdfParams,
+    layers: &Layers,
+    geometric: DVec3,
+    distribution: MicrofacetDistribution,
+    random: [f64; 3],
+) -> StandaloneSample {
+    let microfacet = standalone_refraction_microfacet(params, layers, distribution);
+    let cosine_i = microfacet.normal.dot(layers.view);
+    if cosine_i <= 0.0 {
+        return StandaloneSample::Absorbed;
+    }
+    let eta = standalone_eta(params);
+    let singular = microfacet.alpha_x * microfacet.alpha_y <= GLASS_SINGULAR_ALPHA_SQUARED;
+    let half = if singular {
+        microfacet.normal
+    } else {
+        sample_standalone_half(microfacet, layers.view, random[0], random[1])
+    };
+    let cosine_hi = half.dot(layers.view);
+    let (fresnel, cosine_ho) = dielectric_fresnel(cosine_hi, eta);
+    if fresnel >= 1.0 {
+        return StandaloneSample::Absorbed;
+    }
+    let direction = (layers.view.dot(half) / eta + cosine_ho) * half - layers.view / eta;
+    let cosine_o = microfacet.normal.dot(direction);
+    let geometric_cosine_o = geometric.dot(direction);
+    let geometric_cosine_is_negative = matches!(
+        geometric_cosine_o.partial_cmp(&0.0),
+        Some(std::cmp::Ordering::Less)
+    );
+    let cosine_is_negative = matches!(cosine_o.partial_cmp(&0.0), Some(std::cmp::Ordering::Less));
+    if !geometric_cosine_is_negative || !cosine_is_negative {
+        return StandaloneSample::Absorbed;
+    }
+    if singular || (eta - 1.0).abs() < 1.0e-4 {
+        StandaloneSample::Delta {
+            direction,
+            weight: standalone_color(params),
+            ray: RayKind::Transmission,
+            branch_pdf: 1.0,
+        }
+    } else {
+        StandaloneSample::Continuous {
+            direction,
+            ray: RayKind::Transmission,
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2210,6 +3660,62 @@ mod tests {
         let half = sample_specular_ggx_half(glossy, DVec3::Z, view, 0.2, 0.7);
         assert!(view.dot(half) > 0.0);
         assert!(DVec3::Z.dot(half) > 0.0);
+    }
+
+    #[test]
+    fn disabled_standalone_subsurface_keeps_the_diffuse_color() {
+        let params = BsdfParams {
+            model: BsdfModel::Subsurface,
+            base_color: [0.72, 0.31, 0.12, 1.0],
+            subsurface_radius: [0.85, 0.31, 0.12],
+            subsurface_scale: 0.24,
+            subsurface_method: SubsurfaceMethod::Burley,
+            subsurface_weight: 0.0,
+            ..BsdfParams::from_material(&Material::default(), DVec3::Z)
+        };
+        let (subsurface, diffuse, subsurface_probability, diffuse_probability, total) =
+            standalone_subsurface_weights(&params);
+        assert_eq!(subsurface, DVec3::ZERO);
+        assert_eq!(diffuse, DVec3::new(0.72, 0.31, 0.12));
+        assert_eq!(subsurface_probability, 0.0);
+        assert_eq!(diffuse_probability, 1.0);
+        assert!((total - 1.15 / 3.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn direct_eval_capability_tracks_bssrdf_only_and_diffuse_fallback() {
+        let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        params.base_color = [0.72, 0.31, 0.12, 1.0];
+        params.subsurface_radius = [0.85, 0.31, 0.12];
+        params.subsurface_scale = 0.24;
+        params.subsurface_weight = 1.0;
+        params.model = BsdfModel::Subsurface;
+        let layer_set = layers(&params, DVec3::Z, DVec3::Z);
+        assert!(!bsdf_has_direct_eval(&params, &layer_set));
+
+        params.subsurface_radius[2] = 1.0e-9;
+        let layer_set = layers(&params, DVec3::Z, DVec3::Z);
+        assert!(bsdf_has_direct_eval(&params, &layer_set));
+
+        params.subsurface_radius = [0.85, 0.31, 0.12];
+        params.thin_wall = true;
+        let layer_set = layers(&params, DVec3::Z, DVec3::Z);
+        assert!(bsdf_has_direct_eval(&params, &layer_set));
+
+        params.model = BsdfModel::Principled;
+        params.thin_wall = false;
+        params.reflectance = 0.0;
+        params.specular_ior_level = 0.0;
+        params.coat_weight = 0.0;
+        params.sheen_weight = 0.0;
+        params.transmission = 0.0;
+        params.roughness = 0.0;
+        let layer_set = layers(&params, DVec3::Z, DVec3::Z);
+        assert!(bsdf_has_direct_eval(&params, &layer_set));
+
+        params.subsurface_radius[0] = 1.0e-9;
+        let layer_set = layers(&params, DVec3::Z, DVec3::Z);
+        assert!(bsdf_has_direct_eval(&params, &layer_set));
     }
 
     #[test]
@@ -2395,6 +3901,44 @@ mod tests {
         params.coat_weight = 0.0;
         let shading = layers(&params, DVec3::Z, view);
         assert!((shading.sheen.normal - DVec3::Z).length() < 1.0e-12);
+    }
+
+    #[test]
+    fn glossy_blur_raises_standalone_refraction_alpha_and_keeps_a_larger_alpha() {
+        let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        params.model = BsdfModel::Refraction(MicrofacetDistribution::Ggx);
+        params.roughness = 0.13;
+        let sharp = layers(&params, DVec3::Z, DVec3::Z);
+        let alpha = |layers: &Layers| {
+            standalone_refraction_microfacet(&params, layers, MicrofacetDistribution::Ggx).alpha_x
+        };
+        assert!((alpha(&sharp) - 0.13_f64.powi(2)).abs() < 1.0e-12);
+        assert_eq!(alpha(&sharp.blurred(0.5)), 0.5);
+        assert!((alpha(&sharp.blurred(0.001)) - 0.13_f64.powi(2)).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn glossy_blur_raises_the_metallic_sampling_alpha_but_not_its_multiscatter_gain() {
+        let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        params.roughness = 0.3;
+        let metallic = MetallicParameters {
+            distribution: MicrofacetDistribution::MultiGgx,
+            fresnel: MetallicFresnel::PhysicalConductor,
+            edge_tint: [1.0; 3],
+            conductor_ior: [1.5; 3],
+            extinction: [1.0; 3],
+        };
+        params.model = BsdfModel::Metallic(metallic);
+        let view = DVec3::new(0.6, 0.0, 0.8);
+        let sharp = layers(&params, DVec3::Z, view);
+        let blurred = sharp.blurred(0.5);
+        let sampling = standalone_metallic_microfacet(&params, &blurred, metallic.distribution);
+        assert_eq!(sampling.alpha_x, 0.5);
+        assert_eq!(sampling.alpha_y, 0.5);
+        assert_eq!(
+            standalone_metallic_gain(&params, metallic, &sharp),
+            standalone_metallic_gain(&params, metallic, &blurred)
+        );
     }
 }
 
@@ -3366,5 +4910,33 @@ mod subsurface_tests {
             ),
             DVec3::ZERO
         );
+    }
+
+    #[test]
+    fn standalone_translucent_evaluates_and_samples_the_transmission_hemisphere() {
+        let material = Material {
+            base_color: [0.25, 0.5, 0.75, 1.0],
+            ..Material::default()
+        };
+        let mut params = BsdfParams::from_material(&material, DVec3::Z);
+        params.model = BsdfModel::Translucent;
+        let layers = layers(&params, DVec3::Z, DVec3::Z);
+        let light = -DVec3::Z;
+        let color = DVec3::new(0.25, 0.5, 0.75);
+        assert_eq!(standalone_eval(&params, &layers, light), color / PI);
+        assert!((standalone_density(&params, &layers, light) - 1.0 / PI).abs() < 1.0e-15);
+        let StandaloneSample::Continuous { direction, ray } =
+            standalone_sample(&params, &layers, DVec3::Z, [0.5, 0.5, 0.0])
+        else {
+            panic!("the transmitted hemisphere sample should be continuous");
+        };
+        assert_eq!(direction, -DVec3::Z);
+        assert_eq!(ray, RayKind::Transmission);
+    }
+
+    #[test]
+    fn standalone_f82_selection_uses_the_cycles_z_half_lut_slices() {
+        let scale = ggx_gen_schlick_s_f82(0.0, 0.0);
+        assert!((scale - 0.999_496).abs() < 1.0e-7);
     }
 }

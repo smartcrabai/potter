@@ -1,0 +1,245 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "blender_build_hash": "d13f752e3b9c",
+  "engine": "CYCLES",
+  "device": "CPU",
+  "resolution": [
+    4,
+    4
+  ],
+  "samples": 32,
+  "seeds": [
+    31,
+    43
+  ],
+  "denoising": false,
+  "max_bounces": 1,
+  "pixel_filter": "BLACKMAN_HARRIS",
+  "filter_width": 1.5,
+  "view_transform": "Standard",
+  "world_color": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "world_strength": 0.0,
+  "sun_energy": 1.0,
+  "sun_angle": 0.0,
+  "sun_rotation_euler": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "floor_dimensions": [
+    8.0,
+    8.0
+  ],
+  "camera_type": "ORTHO",
+  "camera_ortho_scale": 1.5,
+  "occluder": {
+    "name": "RayPortalOccluder",
+    "visible_camera": false,
+    "visible_shadow": true
+  },
+  "portal_color": [
+    0.8,
+    0.4,
+    0.2,
+    1.0
+  ],
+  "portal_direction": [
+    0.0,
+    0.0,
+    -1.0
+  ],
+  "mixed_factor": 0.5,
+  "transparent_color": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "transparent_shadow_gate": true,
+  "reference_semantics": "Means and standard errors are measured across all 16 linear EXR pixels; ratio uncertainty uses first-order independent-error propagation.",
+  "cases": {
+    "baseline": {
+      "blend": "baseline.blend",
+      "renders": [
+        {
+          "seed": 31,
+          "linear_exr": "baseline-seed31.exr",
+          "pixel_count": 16,
+          "mean_linear_associated_rgba": [
+            0.31830981373786926,
+            0.31830981373786926,
+            0.31830981373786926,
+            1.0
+          ],
+          "stderr_linear_associated_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "seed": 43,
+          "linear_exr": "baseline-seed43.exr",
+          "pixel_count": 16,
+          "mean_linear_associated_rgba": [
+            0.31830981373786926,
+            0.31830981373786926,
+            0.31830981373786926,
+            1.0
+          ],
+          "stderr_linear_associated_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    "pure_portal": {
+      "blend": "pure_portal.blend",
+      "renders": [
+        {
+          "seed": 31,
+          "linear_exr": "pure_portal-seed31.exr",
+          "pixel_count": 16,
+          "mean_linear_associated_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "stderr_linear_associated_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "seed": 43,
+          "linear_exr": "pure_portal-seed43.exr",
+          "pixel_count": 16,
+          "mean_linear_associated_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "stderr_linear_associated_rgba": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    "mixed": {
+      "blend": "mixed.blend",
+      "renders": [
+        {
+          "seed": 31,
+          "linear_exr": "mixed-seed31.exr",
+          "pixel_count": 16,
+          "mean_linear_associated_rgba": [
+            0.2862551510334015,
+            0.22229470312595367,
+            0.19038917496800423,
+            1.0
+          ],
+          "stderr_linear_associated_rgba": [
+            0.00010009330815686834,
+            0.0002335466096981097,
+            0.0002669116010838887,
+            0.0
+          ]
+        },
+        {
+          "seed": 43,
+          "linear_exr": "mixed-seed43.exr",
+          "pixel_count": 16,
+          "mean_linear_associated_rgba": [
+            0.2862551510334015,
+            0.22229470312595367,
+            0.19038917496800423,
+            1.0
+          ],
+          "stderr_linear_associated_rgba": [
+            0.00010009330815686834,
+            0.0002335466096981097,
+            0.0002669116010838887,
+            0.0
+          ]
+        }
+      ]
+    }
+  },
+  "ratios": [
+    {
+      "seed": 31,
+      "case": "pure_portal",
+      "rgb": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "stderr_rgb": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "alpha_ratio": 1.0
+    },
+    {
+      "seed": 31,
+      "case": "mixed",
+      "rgb": [
+        0.8992972842148529,
+        0.6983595652159665,
+        0.598125369533191
+      ],
+      "stderr_rgb": [
+        0.0003144524731471082,
+        0.0007337084802871873,
+        0.0008385277159682315
+      ],
+      "alpha_ratio": 1.0
+    },
+    {
+      "seed": 43,
+      "case": "pure_portal",
+      "rgb": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "stderr_rgb": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "alpha_ratio": 1.0
+    },
+    {
+      "seed": 43,
+      "case": "mixed",
+      "rgb": [
+        0.8992972842148529,
+        0.6983595652159665,
+        0.598125369533191
+      ],
+      "stderr_rgb": [
+        0.0003144524731471082,
+        0.0007337084802871873,
+        0.0008385277159682315
+      ],
+      "alpha_ratio": 1.0
+    }
+  ]
+}

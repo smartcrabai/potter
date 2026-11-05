@@ -12,7 +12,7 @@ use super::texture_procedural_kernels::{
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{GeneratedCorners, TextureSpace, volume::VolumeData},
-    graph::{GraphKind, GraphNode, NodeGroup},
+    graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
     image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
     model::{Id, Material, Registry, TextureRef, ThicknessMode},
 };
@@ -107,8 +107,126 @@ pub(crate) enum GlassDistribution {
     MultiGgx,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SheenDistribution {
+    Ashikhmin,
+    Microfiber,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MicrofacetDistribution {
+    Beckmann,
+    Ggx,
+    MultiGgx,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToonComponent {
+    Diffuse,
+    Glossy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ToonParameters {
+    pub(crate) component: ToonComponent,
+    pub(crate) size: f64,
+    pub(crate) smooth: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum MetallicFresnel {
+    F82,
+    PhysicalConductor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MetallicParameters {
+    pub(crate) distribution: MicrofacetDistribution,
+    pub(crate) fresnel: MetallicFresnel,
+    pub(crate) edge_tint: [f64; 3],
+    pub(crate) conductor_ior: [f64; 3],
+    pub(crate) extinction: [f64; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HairComponent {
+    Reflection,
+    Transmission,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct HairParameters {
+    pub(crate) component: HairComponent,
+    pub(crate) offset: f64,
+    pub(crate) roughness_u: f64,
+    pub(crate) roughness_v: f64,
+    pub(crate) tangent: DVec3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HairScatteringModel {
+    Chiang,
+    Huang,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HairParametrization {
+    Reflectance,
+    MelaninConcentration,
+    DirectAbsorption,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PrincipledHairParameters {
+    pub(crate) model: HairScatteringModel,
+    pub(crate) parametrization: HairParametrization,
+    pub(crate) melanin: f64,
+    pub(crate) melanin_redness: f64,
+    pub(crate) tint: [f64; 3],
+    pub(crate) absorption_coefficient: [f64; 3],
+    pub(crate) aspect_ratio: f64,
+    pub(crate) roughness: f64,
+    pub(crate) radial_roughness: f64,
+    pub(crate) coat: f64,
+    pub(crate) ior: f64,
+    pub(crate) offset: f64,
+    pub(crate) random_color: f64,
+    pub(crate) random_roughness: f64,
+    pub(crate) random: f64,
+    pub(crate) reflection: f64,
+    pub(crate) transmission: f64,
+    pub(crate) secondary_reflection: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RayPortalParameters {
+    pub(crate) position: DVec3,
+    pub(crate) direction: DVec3,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum BsdfModel {
+    #[default]
+    Principled,
+    Sheen(SheenDistribution),
+    Subsurface,
+    Translucent,
+    Refraction(MicrofacetDistribution),
+    Toon(ToonParameters),
+    Metallic(MetallicParameters),
+    Holdout,
+    Hair(HairParameters),
+    PrincipledHair(PrincipledHairParameters),
+    RayPortal(RayPortalParameters),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BsdfParams {
+    /// Raw local-space point-domain `ATTR_STD_VERTEX_NORMAL` used as Huang's elliptical major axis.
+    pub(crate) hair_normal: Option<DVec3>,
+    pub(crate) model: BsdfModel,
+    /// Effective surface shading normal for this closure.
+    pub normal: DVec3,
     pub base_color: [f64; 4],
     pub metallic: f64,
     pub roughness: f64,
@@ -137,6 +255,8 @@ pub struct BsdfParams {
     /// pass-through multiplies by this tint and a shadow ray's transmittance is `(1 - alpha) * tint`
     /// (`render/path.rs`). Non-transparent closures keep white.
     pub transparent_tint: [f64; 3],
+    /// Marks a standalone Transparent BSDF, whose SVM closure weight is its Color input.
+    pub(crate) transparent_bsdf: bool,
     /// Weight of the reflective share of this closure (diffuse, specular, transmission, environment). Emission
     /// contributes no reflection, so an Emission closure sets this to 0. Mix and Add scale the closure's weight
     /// instead of this value.
@@ -192,7 +312,10 @@ pub struct BsdfParams {
     /// Blender's `cycles.volume_interpolation` of the material this medium belongs to.
     pub volume_interpolation: crate::model::VolumeInterpolation,
     pub displacement_height: f64,
-    pub normal: DVec3,
+    /// The statically compiled EEVEE material flags for this closure, derived while evaluating its node.
+    pub(crate) eevee_gbuffer_features: EeveeGBufferFeatures,
+    /// Source-bound EEVEE diffuse radiance weight, independent of graph coverage/share.
+    pub(crate) eevee_diffuse_weight: Option<f64>,
 }
 
 /// One closure of a surface, weighted as Cycles weights closures (`closure_alloc`): `weight` is the share of
@@ -210,7 +333,8 @@ pub struct ShaderClosure {
 pub struct SurfaceShading {
     pub closures: Vec<ShaderClosure>,
     pub volume: Vec<ShaderClosure>,
-    /// The Displacement output's height along the hit normal.
+    /// Static EEVEE compile eligibility for the evaluated graph, independent of this hit's closure weights.
+    pub eevee_gbuffer_features: EeveeGBufferFeatures,
     pub displacement_height: f64,
 }
 
@@ -223,6 +347,538 @@ impl SurfaceShading {
     }
 }
 
+/// EEVEE's deferred material feature flags used to size its closure-bin array and choose the simple
+/// G-buffer layout. These are compile-time eligibility flags: a linked Principled socket can enable
+/// a lobe even when its evaluated value is zero.
+/// Colorless compile flags use `GPUNodeStack`'s linked-or-RGB-unequal tint analysis.
+///
+/// Derived from Blender 5.2.2 `node_shader_bsdf_principled.cc:367-428`,
+/// `eevee_material.hh:185-214`, and `eevee_shader.cc:1098-1139`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EeveeGBufferFeatures {
+    diffuse: bool,
+    reflection: bool,
+    refraction: bool,
+    subsurface: bool,
+    translucent: bool,
+    clearcoat: bool,
+    reflection_may_be_colored: bool,
+    refraction_may_be_colored: bool,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EeveePrincipledGBufferInputs {
+    metallic_not_zero: bool,
+    metallic_not_one: bool,
+    transmission_not_zero: bool,
+    transmission_not_one: bool,
+    subsurface_not_zero: bool,
+    thin_wall_not_zero: bool,
+    thin_wall_not_one: bool,
+    coat_not_zero: bool,
+    sheen_not_zero: bool,
+    base_color_may_be_tinted: bool,
+    specular_tint_may_be_tinted: bool,
+    coat_tint_may_be_tinted: bool,
+    multi_ggx: bool,
+}
+
+impl EeveeGBufferFeatures {
+    const fn empty() -> Self {
+        Self {
+            diffuse: false,
+            reflection: false,
+            refraction: false,
+            subsurface: false,
+            translucent: false,
+            clearcoat: false,
+            reflection_may_be_colored: false,
+            refraction_may_be_colored: false,
+        }
+    }
+    pub(crate) const fn diffuse_only() -> Self {
+        Self {
+            diffuse: true,
+            ..Self::empty()
+        }
+    }
+    fn from_material(
+        metallic: f64,
+        transmission: f64,
+        base_color: [f64; 3],
+        base_color_may_be_tinted: bool,
+    ) -> Self {
+        Self::principled(EeveePrincipledGBufferInputs {
+            metallic_not_zero: gpu_socket_not_zero(metallic),
+            metallic_not_one: gpu_socket_not_one(metallic),
+            transmission_not_zero: gpu_socket_not_zero(transmission),
+            transmission_not_one: gpu_socket_not_one(transmission),
+            base_color_may_be_tinted: base_color_may_be_tinted
+                || color_might_be_tinted(&base_color),
+            multi_ggx: true,
+            ..EeveePrincipledGBufferInputs::default()
+        })
+    }
+
+    fn principled(inputs: EeveePrincipledGBufferInputs) -> Self {
+        let diffuse =
+            inputs.sheen_not_zero || (inputs.metallic_not_one && inputs.transmission_not_one);
+        let subsurface = inputs.subsurface_not_zero && diffuse;
+        let refraction = inputs.metallic_not_one && inputs.transmission_not_zero;
+        let clearcoat = inputs.coat_not_zero;
+        let translucent = subsurface && inputs.thin_wall_not_zero;
+        let refraction_may_be_colored = (refraction && inputs.base_color_may_be_tinted)
+            || (clearcoat && inputs.coat_tint_may_be_tinted && refraction);
+        let reflection_may_be_colored = inputs.specular_tint_may_be_tinted
+            || (inputs.metallic_not_zero && inputs.base_color_may_be_tinted)
+            || (refraction_may_be_colored && inputs.multi_ggx)
+            || (clearcoat && inputs.coat_tint_may_be_tinted);
+        Self {
+            diffuse,
+            reflection: true,
+            refraction,
+            subsurface: subsurface && inputs.thin_wall_not_one,
+            translucent,
+            clearcoat,
+            reflection_may_be_colored,
+            refraction_may_be_colored,
+        }
+    }
+
+    fn simple_material(params: &BsdfParams, base_color_may_be_tinted: bool) -> Self {
+        Self::principled(EeveePrincipledGBufferInputs {
+            metallic_not_zero: gpu_socket_not_zero(params.metallic),
+            metallic_not_one: gpu_socket_not_one(params.metallic),
+            transmission_not_zero: gpu_socket_not_zero(params.transmission),
+            transmission_not_one: gpu_socket_not_one(params.transmission),
+            subsurface_not_zero: gpu_socket_not_zero(params.subsurface_weight),
+            thin_wall_not_zero: params.thin_wall,
+            thin_wall_not_one: params.thin_wall,
+            coat_not_zero: gpu_socket_not_zero(params.coat_weight),
+            sheen_not_zero: gpu_socket_not_zero(params.sheen_weight),
+            base_color_may_be_tinted: base_color_may_be_tinted
+                || color_might_be_tinted(&[
+                    params.base_color[0],
+                    params.base_color[1],
+                    params.base_color[2],
+                ]),
+            specular_tint_may_be_tinted: color_might_be_tinted(&params.specular_tint),
+            coat_tint_may_be_tinted: color_might_be_tinted(&params.coat_tint),
+            multi_ggx: params.glass_distribution == GlassDistribution::MultiGgx,
+        })
+    }
+
+    /// Union compile-time feature flags from graph closures that contribute to one material.
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            diffuse: self.diffuse || other.diffuse,
+            reflection: self.reflection || other.reflection,
+            refraction: self.refraction || other.refraction,
+            subsurface: self.subsurface || other.subsurface,
+            translucent: self.translucent || other.translucent,
+            clearcoat: self.clearcoat || other.clearcoat,
+            reflection_may_be_colored: self.reflection_may_be_colored
+                || other.reflection_may_be_colored,
+            refraction_may_be_colored: self.refraction_may_be_colored
+                || other.refraction_may_be_colored,
+        }
+    }
+
+    #[must_use]
+    pub const fn has_diffuse(self) -> bool {
+        self.diffuse
+    }
+
+    #[must_use]
+    pub const fn has_reflection(self) -> bool {
+        self.reflection
+    }
+
+    #[must_use]
+    pub const fn has_refraction(self) -> bool {
+        self.refraction
+    }
+
+    #[must_use]
+    pub const fn has_subsurface(self) -> bool {
+        self.subsurface
+    }
+
+    #[must_use]
+    pub const fn has_translucent(self) -> bool {
+        self.translucent
+    }
+
+    #[must_use]
+    pub const fn has_clearcoat(self) -> bool {
+        self.clearcoat
+    }
+
+    /// Blender's compile-time `to_gbuffer_bin_count`, before per-hit routing or weight cutoffs.
+    #[must_use]
+    pub const fn compile_bin_count(self) -> usize {
+        let mut slots = 0u8;
+        if self.diffuse {
+            if self.translucent && !self.clearcoat {
+                slots |= 1 << 2;
+            } else {
+                slots |= 1 << 0;
+            }
+        }
+        if self.subsurface || self.refraction || self.translucent {
+            slots |= 1 << 0;
+        }
+        if self.reflection {
+            slots |= 1 << 1;
+        }
+        if self.clearcoat {
+            slots |= 1 << 2;
+        }
+        slots.count_ones() as usize
+    }
+
+    /// Blender's `gbuffer_simple_layout`; only a two-bin compiled material can use it.
+    #[must_use]
+    pub const fn simple_layout(self) -> bool {
+        if self.compile_bin_count() != 2 {
+            return false;
+        }
+        let mut layer_count = 0u8;
+        if self.diffuse {
+            layer_count += 1;
+        }
+        if self.subsurface {
+            layer_count += 2;
+        }
+        if self.reflection {
+            layer_count += if self.reflection_may_be_colored { 2 } else { 1 };
+        }
+        if self.refraction {
+            layer_count += if self.refraction_may_be_colored { 2 } else { 1 };
+        }
+        if self.translucent {
+            layer_count += 1;
+        }
+        if self.clearcoat {
+            layer_count += if self.reflection_may_be_colored { 2 } else { 1 };
+        }
+        layer_count <= 2
+    }
+
+    fn supports(self, lobe: EeveeGBufferLobe) -> bool {
+        match lobe {
+            EeveeGBufferLobe::Diffuse => self.diffuse,
+            EeveeGBufferLobe::Reflection => self.reflection,
+            EeveeGBufferLobe::Refraction | EeveeGBufferLobe::ThinRefraction => self.refraction,
+            EeveeGBufferLobe::Subsurface => self.subsurface,
+            EeveeGBufferLobe::Translucent => self.translucent,
+            EeveeGBufferLobe::Clearcoat => self.clearcoat,
+        }
+    }
+}
+
+fn color_might_be_tinted<T: PartialOrd>(color: &[T; 3]) -> bool {
+    color[0].partial_cmp(&color[1]) != Some(std::cmp::Ordering::Equal)
+        || color[1].partial_cmp(&color[2]) != Some(std::cmp::Ordering::Equal)
+}
+// Blender GPU_material.hh:321-345 uses saturate_f and 1e-5 socket thresholds.
+fn gpu_socket_not_zero(value: f64) -> bool {
+    (value as f32).clamp(0.0, 1.0) > 1.0e-5
+}
+
+fn gpu_socket_not_one(value: f64) -> bool {
+    (value as f32).clamp(0.0, 1.0) < 1.0 - 1.0e-5
+}
+
+/// Supported EEVEE G-buffer closure types, before colorless mode selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EeveeGBufferLobe {
+    Diffuse,
+    Reflection,
+    Clearcoat,
+    Refraction,
+    ThinRefraction,
+    Translucent,
+    Subsurface,
+}
+
+/// One runtime lobe after source-ordered Principled expansion and EEVEE closure evaluation.
+/// `weight` and `color` are the evaluated `ClosureUndetermined` values (including graph Mix/Add
+/// scaling); the evaluator deliberately does not recreate the EEVEE BSDF formulas.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EeveeGBufferCandidate {
+    pub source_closure_index: usize,
+    pub lobe: EeveeGBufferLobe,
+    pub weight: f32,
+    pub color: [f32; 3],
+}
+
+/// The packed EEVEE G-buffer mode chosen from a retained source closure type and color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EeveeGBufferMode {
+    Diffuse,
+    Reflection,
+    ReflectionColorless,
+    Refraction,
+    RefractionColorless,
+    ThinRefraction,
+    ThinRefractionColorless,
+    Translucent,
+    Subsurface,
+}
+
+impl EeveeGBufferMode {
+    fn for_candidate(candidate: EeveeGBufferCandidate, color: [f32; 3]) -> Self {
+        let colorless = color[0].partial_cmp(&color[1]) == Some(std::cmp::Ordering::Equal)
+            && color[1].partial_cmp(&color[2]) == Some(std::cmp::Ordering::Equal);
+        match candidate.lobe {
+            EeveeGBufferLobe::Diffuse => Self::Diffuse,
+            EeveeGBufferLobe::Reflection | EeveeGBufferLobe::Clearcoat => {
+                if colorless {
+                    Self::ReflectionColorless
+                } else {
+                    Self::Reflection
+                }
+            }
+            EeveeGBufferLobe::Refraction => {
+                if colorless {
+                    Self::RefractionColorless
+                } else {
+                    Self::Refraction
+                }
+            }
+            EeveeGBufferLobe::ThinRefraction => {
+                if colorless {
+                    Self::ThinRefractionColorless
+                } else {
+                    Self::ThinRefraction
+                }
+            }
+            EeveeGBufferLobe::Translucent => Self::Translucent,
+            EeveeGBufferLobe::Subsurface => Self::Subsurface,
+        }
+    }
+
+    fn has_additional_layer(self) -> bool {
+        matches!(
+            self,
+            Self::Reflection | Self::Refraction | Self::ThinRefraction | Self::Subsurface
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EeveeGBufferBin {
+    /// Bin index before empty-bin compaction.
+    pub source_bin: usize,
+    /// Compact storage layer after dropping bins whose packed mode is `GBUF_NONE`.
+    pub storage_layer: usize,
+    pub source_closure_index: usize,
+    /// Position in the source-ordered candidate slice supplied to the resolver.
+    pub candidate_index: usize,
+    /// The reservoir-selected candidate color normalized by its average absolute channel.
+    pub color: [f32; 3],
+    pub lobe: EeveeGBufferLobe,
+    pub mode: EeveeGBufferMode,
+    /// The reservoir's accumulated weight, which is the weight tested by `pack_closure`.
+    pub weight: f32,
+    pub data0_layer: usize,
+    /// `None` for modes packing their extra parameters in data0, or when the 2-bin simple layout omits data1.
+    pub data1_layer: Option<usize>,
+}
+
+/// Error when a runtime lobe candidate does not match the material's compiled G-buffer features.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EeveeGBufferLayoutError {
+    /// The source closure lobe was not compiled into this material's G-buffer variant.
+    CandidateLobeNotCompiled(EeveeGBufferLobe),
+    /// A colored closure mode was not enabled by the material's compile-time tint flags.
+    ColoredModeNotCompiled(EeveeGBufferLobe),
+}
+
+/// Per-hit packed-bin result. `bin_count` is the number of nonempty, cutoff-surviving bins; it is
+/// never the number of graph closures or the compile-time bin capacity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EeveeGBufferLayout {
+    pub bin_count: usize,
+    pub compiled_bin_count: usize,
+    pub simple_layout: bool,
+    /// Occupied bins in source bin order, compacted to indices `0..bin_count`.
+    pub bins: [Option<EeveeGBufferBin>; 3],
+}
+
+#[derive(Clone, Copy)]
+struct EeveeGBufferReservoir {
+    selected_candidate: Option<usize>,
+    selected_color: [f32; 3],
+    total_weight: f32,
+    random: f32,
+}
+
+const EEVEE_GBUFFER_RESERVOIR_WEIGHT_CUTOFF: f32 = 1.0e-5;
+const EEVEE_GBUFFER_PACK_WEIGHT_CUTOFF: f32 = 1.0e-5;
+
+impl SurfaceShading {
+    /// Resolve Blender 5.2.2 EEVEE's per-hit routing, weighted reservoirs, pack cutoff, and
+    /// compact storage layers for the already-expanded source-order lobe candidates.
+    ///
+    /// Candidates must contain the exact EEVEE lobe weights/colors, not Cycles closure weights.
+    /// The same `closure_random` initializes each bin's source reservoir; it must be the per-hit
+    /// random value from `nodetree_surface`.
+    /// In the deferred pass this is `fract(blue_noise.r + rng_1D_get(SAMPLING_CLOSURE))` at the fragment coordinate
+    /// (`eevee_surf_deferred.bsl.hh:110-120`).
+    pub fn eevee_gbuffer_layout(
+        &self,
+        candidates: &[EeveeGBufferCandidate],
+        closure_random: f32,
+        alpha_reciprocal: f32,
+    ) -> std::result::Result<EeveeGBufferLayout, EeveeGBufferLayoutError> {
+        self.eevee_gbuffer_features.eevee_gbuffer_layout(
+            candidates,
+            closure_random,
+            alpha_reciprocal,
+        )
+    }
+}
+
+impl EeveeGBufferFeatures {
+    /// Resolve source-ordered lobe candidates through Blender's EEVEE reservoirs and packing.
+    ///
+    /// Candidates must include the actual EEVEE lobe weights/colors in emission order; this
+    /// resolver does not synthesize Principled lobes from Cycles `ShaderClosure` parameters.
+    /// Source closure types mapped to `GBUF_NONE` are omitted by the caller.
+    /// The deferred pass supplies `fract(blue_noise.r + rng_1D_get(SAMPLING_CLOSURE))` from the current fragment
+    /// (`eevee_surf_deferred.bsl.hh:110-120`).
+    pub fn eevee_gbuffer_layout(
+        self,
+        candidates: &[EeveeGBufferCandidate],
+        closure_random: f32,
+        alpha_reciprocal: f32,
+    ) -> std::result::Result<EeveeGBufferLayout, EeveeGBufferLayoutError> {
+        let compiled_bin_count = self.compile_bin_count();
+        let mut reservoirs = [EeveeGBufferReservoir {
+            selected_candidate: None,
+            selected_color: [0.0; 3],
+            total_weight: 0.0,
+            random: closure_random,
+        }; 3];
+        let mut reflection_bin = true;
+
+        for (candidate_index, candidate) in candidates.iter().copied().enumerate() {
+            if !self.supports(candidate.lobe) {
+                return Err(EeveeGBufferLayoutError::CandidateLobeNotCompiled(
+                    candidate.lobe,
+                ));
+            }
+            let bin = match candidate.lobe {
+                EeveeGBufferLobe::Diffuse => {
+                    usize::from(compiled_bin_count > 1 && self.translucent && !self.clearcoat)
+                }
+                EeveeGBufferLobe::Subsurface
+                | EeveeGBufferLobe::Translucent
+                | EeveeGBufferLobe::Refraction
+                | EeveeGBufferLobe::ThinRefraction => 0,
+                EeveeGBufferLobe::Reflection | EeveeGBufferLobe::Clearcoat => {
+                    if self.clearcoat {
+                        let (first, second) = if compiled_bin_count == 2 {
+                            (0, 1)
+                        } else {
+                            (1, 2)
+                        };
+                        let bin = if reflection_bin { second } else { first };
+                        reflection_bin = !reflection_bin;
+                        bin
+                    } else {
+                        match compiled_bin_count {
+                            1 => 0,
+                            2 => 1,
+                            _ => 2,
+                        }
+                    }
+                }
+            };
+            if bin >= compiled_bin_count {
+                return Err(EeveeGBufferLayoutError::CandidateLobeNotCompiled(
+                    candidate.lobe,
+                ));
+            }
+
+            let color_weight =
+                (candidate.color[0].abs() + candidate.color[1].abs() + candidate.color[2].abs())
+                    * (1.0 / 3.0);
+            let weight = candidate.weight * color_weight;
+            let reservoir = &mut reservoirs[bin];
+            if weight < EEVEE_GBUFFER_RESERVOIR_WEIGHT_CUTOFF {
+                continue;
+            }
+            reservoir.total_weight += weight;
+            let selection_probability = weight / reservoir.total_weight;
+            let selected = reservoir.random < selection_probability;
+            reservoir.random = if selected {
+                reservoir.random / selection_probability
+            } else {
+                (reservoir.random - selection_probability) / (1.0 - selection_probability)
+            };
+            if selected {
+                reservoir.selected_candidate = Some(candidate_index);
+                reservoir.selected_color = candidate.color.map(|channel| channel / color_weight);
+            }
+        }
+
+        let simple_layout = self.simple_layout();
+        let mut bins = [None; 3];
+        let mut bin_count = 0;
+        for (source_bin, reservoir) in reservoirs.into_iter().enumerate() {
+            let Some(candidate_index) = reservoir.selected_candidate else {
+                continue;
+            };
+            if reservoir.total_weight <= EEVEE_GBUFFER_PACK_WEIGHT_CUTOFF {
+                continue;
+            }
+            let candidate = candidates[candidate_index];
+            let resolved_color_scale = reservoir.total_weight * alpha_reciprocal;
+            let resolved_color = reservoir
+                .selected_color
+                .map(|channel| channel * resolved_color_scale);
+            let mode = EeveeGBufferMode::for_candidate(candidate, resolved_color);
+            if (mode == EeveeGBufferMode::Reflection && !self.reflection_may_be_colored)
+                || (matches!(
+                    mode,
+                    EeveeGBufferMode::Refraction | EeveeGBufferMode::ThinRefraction
+                ) && !self.refraction_may_be_colored)
+            {
+                return Err(EeveeGBufferLayoutError::ColoredModeNotCompiled(
+                    candidate.lobe,
+                ));
+            }
+            bins[bin_count] = Some(EeveeGBufferBin {
+                source_bin,
+                storage_layer: bin_count,
+                candidate_index,
+                color: reservoir.selected_color,
+                source_closure_index: candidate.source_closure_index,
+                lobe: candidate.lobe,
+                mode,
+                weight: reservoir.total_weight,
+                data0_layer: bin_count,
+                data1_layer: None,
+            });
+            bin_count += 1;
+        }
+
+        for bin in bins.iter_mut().take(bin_count).flatten() {
+            if bin.mode.has_additional_layer() && (bin_count == 1 || !simple_layout) {
+                bin.data1_layer = Some(bin_count + bin.storage_layer);
+            }
+        }
+        Ok(EeveeGBufferLayout {
+            bin_count,
+            compiled_bin_count,
+            simple_layout,
+            bins,
+        })
+    }
+}
 /// The heaviest item by its closure weight, the one Cycles' closure set takes its dominant normal from. `None` for no item.
 pub(crate) fn heaviest<T>(items: &[T], weight: impl Fn(&T) -> f64) -> Option<&T> {
     items
@@ -235,6 +891,7 @@ impl BsdfParams {
         let volume = principled_volume_weights(material.volume_color, [0.0; 3]);
         let density = material.volume_density.max(0.0);
         Self {
+            model: BsdfModel::Principled,
             base_color: material.base_color,
             metallic: material.metallic,
             roughness: material.roughness,
@@ -251,6 +908,7 @@ impl BsdfParams {
             back_facing: false,
             alpha: material.base_color[3],
             transparent_tint: [1.0; 3],
+            transparent_bsdf: false,
             reflectance: 1.0,
             subsurface_weight: 0.0,
             subsurface_radius: [1.0, 0.2, 0.1],
@@ -270,6 +928,7 @@ impl BsdfParams {
             anisotropy: 0.0,
             anisotropic_rotation: 0.0,
             anisotropic_tangent: None,
+            hair_normal: None,
             thin_film_thickness: 0.0,
             thin_film_ior: 1.33,
             diffuse_roughness: 0.0,
@@ -287,7 +946,23 @@ impl BsdfParams {
             normal: normalize_or(normal, DVec3::Z),
             coat_tint: [1.0; 3],
             coat_normal: None,
+            eevee_gbuffer_features: EeveeGBufferFeatures::from_material(
+                material.metallic,
+                material.transmission,
+                [
+                    material.base_color[0],
+                    material.base_color[1],
+                    material.base_color[2],
+                ],
+                material.base_color_texture.is_some(),
+            ),
+            eevee_diffuse_weight: None,
         }
+    }
+    /// The material's static EEVEE compile eligibility, independent of runtime closure values.
+    #[must_use]
+    pub const fn eevee_gbuffer_features(&self) -> EeveeGBufferFeatures {
+        self.eevee_gbuffer_features
     }
 
     /// The coat's normal: the linked Coat Normal, or the final shading normal when unlinked.
@@ -467,6 +1142,15 @@ pub struct HitContext<'a> {
     pub light_falloff_distance: Option<f64>,
     /// Whether this hit is evaluated by Cycles semantics rather than the realtime shader path.
     pub path_traced: bool,
+    /// Whether this path hit came from a curve primitive without mesh UV or generic-attribute interpolation.
+    pub(crate) hair_curve_hit: bool,
+    /// The strand tangent supplied by the curve/particle hit.
+    pub hair_tangent: Option<DVec3>,
+    /// Raw local-space point-domain `ATTR_STD_VERTEX_NORMAL`; Huang uses it as its elliptical
+    /// major axis.
+    pub hair_normal: Option<DVec3>,
+    /// Cycles' random value for the current hair curve.
+    pub hair_random: Option<f64>,
     /// The render color layer at this hit: the value a Vertex Color node with an empty layer name
     /// reads.
     pub color_render: Option<[f64; 4]>,
@@ -533,6 +1217,10 @@ impl<'a> HitContext<'a> {
             view_direction: DVec3::Z,
             light_falloff_distance: None,
             path_traced: false,
+            hair_curve_hit: false,
+            hair_tangent: None,
+            hair_random: None,
+            hair_normal: None,
             color_render: None,
             color_layers: None,
             geometry_attributes: None,
@@ -582,6 +1270,21 @@ impl<'a> HitContext<'a> {
     #[must_use]
     pub const fn with_path_traced(mut self, path_traced: bool) -> Self {
         self.path_traced = path_traced;
+        self
+    }
+
+    /// Attach the curve tangent and raw point-domain normal attribute, plus the optional Cycles
+    /// random value, for hair closures.
+    #[must_use]
+    pub const fn with_hair_context(
+        mut self,
+        tangent: DVec3,
+        curve_attribute_normal: Option<DVec3>,
+        curve_random: Option<f64>,
+    ) -> Self {
+        self.hair_tangent = Some(tangent);
+        self.hair_normal = curve_attribute_normal;
+        self.hair_random = curve_random;
         self
     }
 
@@ -866,6 +1569,7 @@ fn evaluate_surface_inner_into(
 ) -> Result<()> {
     shading.closures.clear();
     shading.volume.clear();
+    shading.eevee_gbuffer_features = EeveeGBufferFeatures::empty();
     shading.displacement_height = 0.0;
     let Some(graph_id) = &material.node_tree else {
         let mut params = BsdfParams::from_material(material, hit_ctx.normal);
@@ -883,6 +1587,7 @@ fn evaluate_surface_inner_into(
             weight: 1.0,
             params: surface_params,
         });
+        shading.eevee_gbuffer_features = surface_params.eevee_gbuffer_features;
         return Ok(());
     };
     let group = hit_ctx.node_groups.get(graph_id).ok_or_else(|| {
@@ -996,6 +1701,12 @@ fn evaluate_surface_inner_into(
         closure.params.thickness = thickness;
         closure.params.thickness_slab = material.thickness_mode == ThicknessMode::Slab;
     }
+    shading.eevee_gbuffer_features = shading
+        .closures
+        .iter()
+        .fold(EeveeGBufferFeatures::empty(), |features, closure| {
+            features.union(closure.params.eevee_gbuffer_features)
+        });
     shading.displacement_height = displacement_height;
     Ok(())
 }
@@ -1348,7 +2059,19 @@ enum ValueKind {
 #[derive(Clone, Copy)]
 enum NodeKind {
     OutputMaterial,
+    Reroute,
+    Muted,
     Principled,
+    Sheen,
+    Subsurface,
+    Translucent,
+    Refraction,
+    Toon,
+    Metallic,
+    Holdout,
+    Hair,
+    PrincipledHair,
+    RayPortal,
     VolumePrincipled,
     VolumeAbsorption,
     VolumeScatter,
@@ -1418,6 +2141,16 @@ impl NodeKind {
         Some(match node_type {
             "OutputMaterial" | "ShaderNodeOutputMaterial" => Self::OutputMaterial,
             "ShaderNodeBsdfPrincipled" => Self::Principled,
+            "ShaderNodeBsdfSheen" => Self::Sheen,
+            "ShaderNodeSubsurfaceScattering" => Self::Subsurface,
+            "ShaderNodeBsdfTranslucent" => Self::Translucent,
+            "ShaderNodeBsdfRefraction" => Self::Refraction,
+            "ShaderNodeBsdfToon" => Self::Toon,
+            "ShaderNodeBsdfMetallic" => Self::Metallic,
+            "ShaderNodeHoldout" => Self::Holdout,
+            "ShaderNodeBsdfHair" => Self::Hair,
+            "ShaderNodeBsdfHairPrincipled" => Self::PrincipledHair,
+            "ShaderNodeBsdfRayPortal" => Self::RayPortal,
             "ShaderNodeVolumePrincipled" => Self::VolumePrincipled,
             "ShaderNodeVolumeAbsorption" => Self::VolumeAbsorption,
             "ShaderNodeVolumeScatter" => Self::VolumeScatter,
@@ -1447,6 +2180,7 @@ impl NodeKind {
             "ShaderNodeVectorMath" => Self::VectorMath,
             "ShaderNodeGroup" => Self::Group,
             "NodeGroupInput" => Self::GroupInput,
+            "NodeReroute" => Self::Reroute,
             "ShaderNodeValue" => Self::Value,
             "ShaderNodeRGB" => Self::Rgb,
             "ShaderNodeCombineColor" => Self::CombineColor,
@@ -1663,6 +2397,38 @@ impl EvaluatorWorkspace {
 
 /// The per-material state a shader evaluation reads. A render builds it once for each material and passes it to every
 /// evaluation of that material, so no hit walks the graph again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceFoldFailure {
+    code: ErrorCode,
+    message: String,
+    details_json: String,
+}
+
+impl SourceFoldFailure {
+    fn new(error: PotError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            details_json: error.details.to_string(),
+        }
+    }
+
+    fn to_error(&self) -> Result<PotError> {
+        let details = serde_json::from_str(&self.details_json).map_err(PotError::internal_json)?;
+        Ok(PotError::with_details(
+            self.code,
+            self.message.clone(),
+            details,
+        ))
+    }
+}
+#[derive(Clone, Copy)]
+enum SourceFoldOutput {
+    Primitive(Value),
+    Dangling,
+    Linked,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PreparedMaterial {
     /// The Image Texture nodes whose Alpha output reaches the graph's output (see [`linked_alpha_image_nodes`]).
@@ -1671,9 +2437,16 @@ pub struct PreparedMaterial {
     bump_transparency_node: Option<Id>,
     /// Texture nodes with non-default mapping state, computed once per material rather than once per hit.
     texture_mapping_unsupported: BTreeSet<Id>,
-    /// Whether EEVEE would compile the material as transparent (`GPU_MATFLAG_TRANSPARENT`), which decides whether its
-    /// surfaces cast transparent shadows (see [`graph_is_transparent`]).
+    /// Whether any source closure reaches Surface as EEVEE-transparent.
     transparent: bool,
+    /// Whether a reachable Transparent BSDF can make the EEVEE forward target colored.
+    eevee_transparent_maybe_colored: bool,
+    /// Whether a reachable Holdout enables the EEVEE colored transparency targets.
+    eevee_has_holdout: bool,
+    /// Raw Source EEVEE closure bits from reachable GPU node compiler callbacks.
+    eevee_closure_flags: u32,
+    /// The first unsupported Source primitive fold needed by EEVEE's static closure classifier.
+    source_fold_failure: Option<SourceFoldFailure>,
     /// The graph's incoming links by target node, and the output's incoming sockets (see [`LinkIndex`]).
     links: LinkIndex,
 }
@@ -1759,14 +2532,27 @@ impl PreparedMaterial {
         else {
             return Self {
                 transparent: material.alpha_mode != "opaque" && material.base_color[3] < 1.0,
+                // The bridge exports node-less native materials as Principled inputs from Material fields.
+                eevee_closure_flags: source_simple_material_closure_flags(material),
                 ..Self::default()
             };
         };
         let output = Self::active_output(group);
         let links = LinkIndex::new(graph_id, group, output, node_groups);
+        let source_fold_failure = RefCell::new(None);
+        let eevee_closure_flags = graph_eevee_closure_flags(
+            graph_id,
+            group,
+            node_groups,
+            &links.folds,
+            material,
+            &source_fold_failure,
+        );
         let Some(output) = output else {
             return Self {
                 links,
+                eevee_closure_flags,
+                source_fold_failure: source_fold_failure.into_inner(),
                 ..Self::default()
             };
         };
@@ -1780,7 +2566,16 @@ impl PreparedMaterial {
             &mut visited_groups,
             &mut alpha_linked_images,
         );
-        let transparent = graph_is_transparent(graph_id, group, node_groups, output);
+        let eevee_flags = graph_eevee_surface_flags(
+            graph_id,
+            group,
+            node_groups,
+            &links.folds,
+            output,
+            material,
+            &source_fold_failure,
+        );
+        let transparent = eevee_flags.transparent;
         let texture_mapping_unsupported = group
             .nodes
             .iter()
@@ -1798,7 +2593,11 @@ impl PreparedMaterial {
                 .then(|| bump_affecting_transparency(graph_id, group, node_groups, output))
                 .flatten(),
             transparent,
+            eevee_transparent_maybe_colored: eevee_flags.transparent_maybe_colored,
+            eevee_has_holdout: eevee_flags.has_holdout,
             texture_mapping_unsupported,
+            eevee_closure_flags,
+            source_fold_failure: source_fold_failure.into_inner(),
             links,
         }
     }
@@ -1832,9 +2631,17 @@ impl PreparedMaterial {
         }
     }
 
-    /// Whether a surface of this material casts a transparent shadow, as EEVEE's static transparency decides it.
+    /// Whether the prepared surface graph has a reachable source transparent closure.
     pub(crate) fn is_transparent(&self) -> bool {
         self.transparent
+    }
+    /// Whether a reachable Transparent BSDF sets EEVEE's maybe-colored transparency material flag.
+    pub(crate) fn eevee_transparent_maybe_colored(&self) -> bool {
+        self.eevee_transparent_maybe_colored
+    }
+    /// Whether a reachable Holdout sets EEVEE's holdout material flag.
+    pub(crate) fn eevee_has_holdout(&self) -> bool {
+        self.eevee_has_holdout
     }
     /// A Bump that changes realtime transparent-shadow coverage must be refused, not evaluated with an unbumped normal.
     pub(crate) fn realtime_transparency_bump(&self) -> Option<&Id> {
@@ -1848,6 +2655,13 @@ impl PreparedMaterial {
     /// Whether the graph has a linked Volume output and no linked Surface output.
     pub(crate) fn is_volume_only(&self) -> bool {
         self.has_volume_output() && !self.links.has_surface
+    }
+    /// Source's compiled closure mask, cached once with the connected graph analysis.
+    pub(crate) fn eevee_closure_flags(&self) -> Result<u32> {
+        if let Some(error) = &self.source_fold_failure {
+            return Err(error.to_error()?);
+        }
+        Ok(self.eevee_closure_flags)
     }
 
     /// The output node a surface evaluates from: the active one, else the first `OutputMaterial`.
@@ -1916,6 +2730,15 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             .map(|candidate| &candidate.default)
             .filter(|default| !default.is_null())
     }
+    fn group_interface_output_default<'a>(&'a self, socket: &str) -> Option<&'a JsonValue> {
+        self.group
+            .interface
+            .outputs
+            .iter()
+            .find(|candidate| candidate.id == socket || candidate.name == socket)
+            .map(|candidate| &candidate.default)
+            .filter(|default| !default.is_null())
+    }
 
     fn input(&mut self, node_id: &Id, socket: &str, kind: ValueKind) -> Result<Value> {
         let node = self.node(node_id)?;
@@ -1945,7 +2768,15 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             }),
         };
         if let Some((socket_index, link)) = incoming {
-            return self.output(&link.from_node, &link.from_socket, socket_index);
+            let dangling = self.links.is_some_and(|index| {
+                index
+                    .dangling_outputs
+                    .get(&link.from_node)
+                    .is_some_and(|outputs| outputs.contains(&link.from_socket))
+            });
+            if !dangling {
+                return self.output(&link.from_node, &link.from_socket, socket_index);
+            }
         }
         let raw = node
             .inputs
@@ -1954,9 +2785,11 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             .map(|(_, value)| value)
             .filter(|value| !value.is_null());
         let default = raw.or_else(|| socket_default(node, socket)).or_else(|| {
-            (node.node_type == "ShaderNodeGroup")
-                .then(|| self.group_interface_input_default(node, socket))
-                .flatten()
+            match node.node_type.as_str() {
+                "ShaderNodeGroup" => self.group_interface_input_default(node, socket),
+                "NodeGroupOutput" => self.group_interface_output_default(socket),
+                _ => None,
+            }
         });
         match kind {
             ValueKind::Scalar => Ok(Value::Scalar(
@@ -2108,13 +2941,28 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             |links| links.primitive_nodes.contains(node_id),
         )
     }
+    /// The effective BSDF normal: unlinked EEVEE sockets use its face-forwarded `sd->N`; Cycles keeps the path hit normal.
+    fn bsdf_normal(&mut self, node_id: &Id) -> Result<DVec3> {
+        let normal = if self.is_linked(node_id, "Normal") {
+            self.vector_input(node_id, &["Normal"], self.hit_ctx.normal)?
+        } else if !self.hit_ctx.path_traced && self.hit_ctx.back_facing {
+            -self.hit_ctx.normal
+        } else {
+            self.hit_ctx.normal
+        };
+        Ok(normalize_or(normal, self.hit_ctx.normal))
+    }
     /// The effective lobe tangent: explicit Tangent link, or Cycles' implicit Geometry Tangent.
     fn anisotropic_tangent(&mut self, id: &Id, active: bool) -> Result<Option<DVec3>> {
         if !active {
             return Ok(None);
         }
         if !self.is_linked(id, "Tangent") {
-            return self.radial_tangent(id, "Z").map(Some);
+            return if self.hit_ctx.path_traced {
+                self.geometry_tangent(id).map(Some)
+            } else {
+                self.radial_tangent(id, "Z").map(Some)
+            };
         }
         let tangent = match self.input(id, "Tangent", ValueKind::Vector)? {
             Value::Vector(value) => value,
@@ -2152,19 +3000,25 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             socket: socket_index,
         });
         // Map the borrowed node type to a value before dispatch mutably through the evaluator.
-        let kind = match NodeKind::from_node_type(node.node_type.as_str()) {
-            Some(kind) => Ok(kind),
-            None => Err(PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                format!(
-                    "shader node `{}` is not supported by the native evaluator",
-                    node.node_type
-                ),
-                json!({
-                    "feature_id": format!("shader.node.{}", node.node_type),
-                    "node_id": node_id
-                }),
-            )),
+        let kind = if node.node_type == "NodeReroute" {
+            Ok(NodeKind::Reroute)
+        } else if node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true) {
+            Ok(NodeKind::Muted)
+        } else {
+            match NodeKind::from_node_type(node.node_type.as_str()) {
+                Some(kind) => Ok(kind),
+                None => Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    format!(
+                        "shader node `{}` is not supported by the native evaluator",
+                        node.node_type
+                    ),
+                    json!({
+                        "feature_id": format!("shader.node.{}", node.node_type),
+                        "node_id": node_id
+                    }),
+                )),
+            }
         };
         let result = kind.and_then(|kind| self.evaluate_node(node_id, kind, socket));
         self.workspace.active.pop();
@@ -2176,6 +3030,32 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             .nodes
             .get(node_id)
             .ok_or_else(|| invalid(format!("shader graph references absent node `{node_id}`")))
+    }
+
+    fn enum_property<'a>(&'a self, id: &Id, property: &str) -> Result<Option<&'a str>> {
+        let node = self.node(id)?;
+        match node.properties.get(property) {
+            None => Ok(None),
+            Some(JsonValue::String(value)) => Ok(Some(value)),
+            Some(_) => Err(unsupported_node(
+                id,
+                &format!("{}.{}", node.node_type, property),
+            )),
+        }
+    }
+
+    fn hair_tangent(&mut self, id: &Id, allow_socket: bool, node_type: &str) -> Result<DVec3> {
+        let tangent = if allow_socket && self.is_linked(id, "Tangent") {
+            self.vector_input(id, &["Tangent"], DVec3::ZERO)?
+        } else {
+            self.hit_ctx
+                .hair_tangent
+                .ok_or_else(|| unsupported_node(id, &format!("{node_type}.tangent_context")))?
+        };
+        if !tangent.is_finite() || tangent.length_squared() <= f64::EPSILON {
+            return Err(unsupported_node(id, &format!("{node_type}.tangent")));
+        }
+        Ok(tangent.normalize())
     }
     fn output_default(&self, node_id: &Id, socket: &str) -> Option<&JsonValue> {
         self.node(node_id)
@@ -2397,12 +3277,90 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         self.alpha_linked_images.contains(id)
     }
 
+    fn reroute(&mut self, id: &Id, output_socket: &str) -> Result<Value> {
+        self.passthrough_node(id, output_socket)
+    }
+
+    fn muted_node(&mut self, id: &Id, output_socket: &str) -> Result<Value> {
+        self.passthrough_node(id, output_socket)
+    }
+
+    fn passthrough_node(&mut self, id: &Id, output_socket: &str) -> Result<Value> {
+        let node = self.node(id)?;
+        let Some(input_socket) = super::inline_fold::source_passthrough_input_socket(
+            node,
+            output_socket,
+            self.group,
+            id,
+        ) else {
+            return Err(unsupported_node(
+                id,
+                &format!("{}.internal_links", node.node_type),
+            ));
+        };
+        let input_socket = input_socket.to_owned();
+        let kind = self
+            .node(id)?
+            .inputs
+            .get(&input_socket)
+            .map_or(ValueKind::Scalar, |value| {
+                match value.as_array().map(Vec::len) {
+                    Some(3) => ValueKind::Vector,
+                    Some(4) => ValueKind::Color,
+                    _ => ValueKind::Scalar,
+                }
+            });
+        self.input(id, &input_socket, kind)
+    }
+
     fn evaluate_node(&mut self, node_id: &Id, kind: NodeKind, socket: &str) -> Result<Value> {
         match kind {
+            NodeKind::Muted => self.muted_node(node_id, socket),
+            NodeKind::Reroute => self.reroute(node_id, socket),
             NodeKind::Group => self.group_node(node_id, socket),
             NodeKind::GroupInput => self.group_input(node_id, socket),
             NodeKind::Value => self.value(node_id, socket),
             NodeKind::Rgb => self.rgb(node_id, socket),
+            NodeKind::Sheen => {
+                let params = self.sheen(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Subsurface => {
+                let params = self.subsurface(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Translucent => {
+                let params = self.translucent(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Refraction => {
+                let params = self.refraction(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Toon => {
+                let params = self.toon(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Metallic => {
+                let params = self.metallic(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Holdout => {
+                let params = self.holdout();
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Hair => {
+                let params = self.hair(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::PrincipledHair => {
+                let params = self.principled_hair(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::RayPortal => {
+                let params = self.ray_portal(node_id)?;
+                Ok(self.closure_value(&params))
+            }
             NodeKind::CombineColor => self.combine_color(node_id, socket),
             NodeKind::SeparateColor => self.separate_color(node_id, socket),
             NodeKind::RgbToBw => self.rgb_to_bw(node_id, socket),
@@ -2516,12 +3474,81 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     /// alpha is not the surface's opacity (Cycles reads only Transparent BSDF, Principled Alpha and Mix through
     /// them), so only those closures set alpha. The non-graph path keeps `from_material`'s base colour alpha.
     fn closure_params(&self) -> BsdfParams {
+        let normal = if !self.hit_ctx.path_traced && self.hit_ctx.back_facing {
+            -self.hit_ctx.normal
+        } else {
+            self.hit_ctx.normal
+        };
         without_volume(BsdfParams {
             alpha: 1.0,
             // A closure is not glass: only Glass and Principled set transmission. The material's own value
             // belongs to the simple material's Principled (set there).
-            transmission: 0.0,
-            ..BsdfParams::from_material(self.material, self.hit_ctx.normal)
+            eevee_gbuffer_features: EeveeGBufferFeatures::empty(),
+            back_facing: self.hit_ctx.back_facing,
+            ..BsdfParams::from_material(self.material, normal)
+        })
+    }
+
+    // BsdfModel has no standalone Diffuse variant; route source Diffuse closures through the diffuse-only G-buffer flags.
+    fn eevee_diffuse_preview(&self, color: [f64; 4], normal: DVec3) -> BsdfParams {
+        let mut params = self.closure_params();
+        params.model = BsdfModel::Principled;
+        params.base_color = color;
+        params.alpha = 1.0;
+        params.metallic = 0.0;
+        params.roughness = 1.0;
+        params.diffuse_roughness = 0.0;
+        params.transmission = 0.0;
+        params.subsurface_weight = 0.0;
+        params.sheen_weight = 0.0;
+        params.coat_weight = 0.0;
+        params.thin_wall = false;
+        params.reflectance = 1.0;
+        params.specular_ior_level = 0.0;
+        params.emission_color = [0.0; 3];
+        params.emission_strength = 0.0;
+        params.thickness = None;
+        params.thickness_slab = false;
+        params.normal = normal;
+        params.eevee_gbuffer_features = EeveeGBufferFeatures::diffuse_only();
+        params
+    }
+
+    fn principled_gbuffer_features(
+        &self,
+        id: &Id,
+        params: &BsdfParams,
+        multi_ggx: bool,
+        base_color_may_be_tinted: bool,
+    ) -> EeveeGBufferFeatures {
+        let linked = |sockets: &[&str]| sockets.iter().any(|socket| self.is_linked(id, socket));
+        let not_zero = |sockets: &[&str], value: f64| linked(sockets) || gpu_socket_not_zero(value);
+        let not_one = |sockets: &[&str], value: f64| linked(sockets) || gpu_socket_not_one(value);
+        EeveeGBufferFeatures::principled(EeveePrincipledGBufferInputs {
+            metallic_not_zero: not_zero(&["Metallic"], params.metallic),
+            metallic_not_one: not_one(&["Metallic"], params.metallic),
+            transmission_not_zero: not_zero(
+                &["Transmission Weight", "Transmission"],
+                params.transmission,
+            ),
+            transmission_not_one: not_one(
+                &["Transmission Weight", "Transmission"],
+                params.transmission,
+            ),
+            subsurface_not_zero: not_zero(
+                &["Subsurface Weight", "Subsurface"],
+                params.subsurface_weight,
+            ),
+            thin_wall_not_zero: not_zero(&["Thin Wall"], if params.thin_wall { 1.0 } else { 0.0 }),
+            thin_wall_not_one: not_one(&["Thin Wall"], if params.thin_wall { 1.0 } else { 0.0 }),
+            coat_not_zero: not_zero(&["Coat Weight", "Clearcoat"], params.coat_weight),
+            sheen_not_zero: not_zero(&["Sheen Weight", "Sheen"], params.sheen_weight),
+            base_color_may_be_tinted,
+            specular_tint_may_be_tinted: linked(&["Specular Tint"])
+                || color_might_be_tinted(&params.specular_tint),
+            coat_tint_may_be_tinted: linked(&["Coat Tint"])
+                || color_might_be_tinted(&params.coat_tint),
+            multi_ggx,
         })
     }
 
@@ -2532,6 +3559,11 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
 
     fn principled(&mut self, id: &Id) -> Result<BsdfParams> {
         let node = self.node(id)?;
+        let multi_ggx = node
+            .properties
+            .get("distribution")
+            .and_then(JsonValue::as_str)
+            .is_none_or(|value| matches!(value, "MULTI_GGX" | "multi_ggx"));
         // Blender's default is random walk; a node without the property (an authored graph) is that default.
         let method_token = node
             .properties
@@ -2546,9 +3578,18 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             == Some(true)
         {
             let mut params = self.closure_params();
+            params.glass_distribution = if multi_ggx {
+                GlassDistribution::MultiGgx
+            } else {
+                GlassDistribution::Ggx
+            };
             params.transmission = self.material.transmission;
             params.base_color = textured_base(self.material, &self.hit_ctx, params.base_color)?;
             params.glass_transmission_tint = principled_glass_tint(params.base_color);
+            params.eevee_gbuffer_features = EeveeGBufferFeatures::simple_material(
+                &params,
+                self.material.base_color_texture.is_some(),
+            );
             // A simple-material graph holds no Alpha input unless the overlay wrote one (`write_principled_inputs`, for a
             // non-opaque material). Without it the material's own alpha applies, as before the closure change: its base
             // colour alpha, or 1 for an OPAQUE material, whose graph carries no transparency.
@@ -2561,7 +3602,14 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             return Ok(params);
         }
         let mut params = self.closure_params();
+        params.glass_distribution = if multi_ggx {
+            GlassDistribution::MultiGgx
+        } else {
+            GlassDistribution::Ggx
+        };
         let base = self.color_input(id, &["Base Color"], [0.8, 0.8, 0.8, 1.0])?;
+        let base_color_may_be_tinted =
+            self.is_linked(id, "Base Color") || color_might_be_tinted(&[base[0], base[1], base[2]]);
         params.base_color = textured_base(self.material, &self.hit_ctx, base)?;
         params.glass_transmission_tint = principled_glass_tint(params.base_color);
         params.metallic = self.scalar_input(id, &["Metallic"], 0.0)?;
@@ -2616,14 +3664,13 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                 .try_into()
                 .map_err(|_| invalid("invalid emission color"))?;
         params.emission_strength = self.scalar_input(id, &["Emission Strength"], 0.0)?;
-        params.normal = normalize_or(
-            self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
-            self.hit_ctx.normal,
-        );
+        params.normal = self.bsdf_normal(id)?;
         // An unlinked socket has no vector (zero or non-finite), so the coat follows the final normal.
         let coat_normal = self.vector_input(id, &["Coat Normal"], DVec3::ZERO)?;
         params.coat_normal =
             (coat_normal.length_squared() > f64::EPSILON).then(|| coat_normal.normalize());
+        params.eevee_gbuffer_features =
+            self.principled_gbuffer_features(id, &params, multi_ggx, base_color_may_be_tinted);
         Ok(params)
     }
 
@@ -2972,13 +4019,14 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
 
     fn diffuse(&mut self, id: &Id) -> Result<BsdfParams> {
         let mut params = self.closure_params();
+        params.normal = self.bsdf_normal(id)?;
         params.base_color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.0)?;
         params.diffuse_roughness = params.roughness;
-        params.normal = normalize_or(
-            self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
-            self.hit_ctx.normal,
-        );
+        params.eevee_gbuffer_features = EeveeGBufferFeatures {
+            diffuse: true,
+            ..EeveeGBufferFeatures::empty()
+        };
         Ok(params)
     }
 
@@ -3003,7 +4051,16 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             }
         }
         params.anisotropy = anisotropy;
-        params.anisotropy_model = AnisotropyModel::Glossy;
+        params.eevee_gbuffer_features = EeveeGBufferFeatures {
+            reflection: true,
+            reflection_may_be_colored: self.is_linked(id, "Color")
+                || color_might_be_tinted(&[
+                    params.base_color[0],
+                    params.base_color[1],
+                    params.base_color[2],
+                ]),
+            ..EeveeGBufferFeatures::empty()
+        };
         params.anisotropic_rotation = self.scalar_input(id, &["Rotation"], 0.0)?;
         params.anisotropic_tangent = self.anisotropic_tangent(id, anisotropy.abs() > 1.0e-4)?;
         Ok(params)
@@ -3037,6 +4094,488 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         params.glass_reflection_tint = color;
         params.glass_transmission_tint = color;
         params.standalone_glass = true;
+        params.eevee_gbuffer_features = EeveeGBufferFeatures {
+            reflection: true,
+            refraction: true,
+            reflection_may_be_colored: self.is_linked(id, "Color") || color_might_be_tinted(&color),
+            refraction_may_be_colored: self.is_linked(id, "Color") || color_might_be_tinted(&color),
+            ..EeveeGBufferFeatures::empty()
+        };
+        Ok(params)
+    }
+
+    fn sheen(&mut self, id: &Id) -> Result<BsdfParams> {
+        if !self.hit_ctx.path_traced {
+            let color = self
+                .color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?
+                .map(|channel| channel.max(0.0));
+            let normal = normalize_or(
+                self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
+                self.hit_ctx.normal,
+            );
+            let mut params = self.eevee_diffuse_preview(color, normal);
+            // EEVEE's GPU shader ignores the Cycles distribution and emits a diffuse closure.
+            params.model = BsdfModel::Sheen(SheenDistribution::Microfiber);
+            return Ok(params);
+        }
+        let distribution = match self.enum_property(id, "distribution")? {
+            None | Some("MICROFIBER") => SheenDistribution::Microfiber,
+            Some("ASHIKHMIN") => SheenDistribution::Ashikhmin,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfSheen.distribution:{value}"),
+                ));
+            }
+        };
+        let color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
+        let mut params = self.closure_params();
+        params.model = BsdfModel::Sheen(distribution);
+        params.base_color = color;
+        params.metallic = 0.0;
+        params.roughness = self.scalar_input(id, &["Roughness"], 0.5)?;
+        params.sheen_roughness = params.roughness;
+        params.sheen_tint = [color[0], color[1], color[2]];
+        params.sheen_weight = 1.0;
+        params.specular_ior_level = 0.0;
+        params.normal = self.bsdf_normal(id)?;
+        Ok(params)
+    }
+
+    fn subsurface(&mut self, id: &Id) -> Result<BsdfParams> {
+        let method = match self.enum_property(id, "falloff")? {
+            None | Some("RANDOM_WALK") => SubsurfaceMethod::RandomWalk,
+            Some("BURLEY") => SubsurfaceMethod::Burley,
+            Some("RANDOM_WALK_SKIN") => SubsurfaceMethod::RandomWalkSkin,
+            Some("RANDOM_WALK_LEGACY") => SubsurfaceMethod::RandomWalkLegacy,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeSubsurfaceScattering.falloff:{value}"),
+                ));
+            }
+        };
+        let color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
+        let radius = self
+            .vector_input(id, &["Radius"], DVec3::new(1.0, 0.2, 0.1))?
+            .to_array();
+        let scale = self.scalar_input(id, &["Scale"], 0.005)?;
+        let roughness = if matches!(
+            method,
+            SubsurfaceMethod::RandomWalk | SubsurfaceMethod::RandomWalkLegacy
+        ) {
+            self.scalar_input(id, &["Roughness"], 1.0)?
+        } else {
+            1.0
+        };
+        let (ior, anisotropy) = if method == SubsurfaceMethod::Burley {
+            (1.4, 0.0)
+        } else {
+            (
+                self.scalar_input(id, &["IOR"], 1.4)?,
+                self.scalar_input(id, &["Anisotropy"], 0.0)?,
+            )
+        };
+        let mut params = self.closure_params();
+        params.normal = self.bsdf_normal(id)?;
+        params.model = BsdfModel::Subsurface;
+        params.base_color = color;
+        params.metallic = 0.0;
+        params.roughness = roughness;
+        params.ior = ior;
+        params.subsurface_weight = 1.0;
+        params.subsurface_radius = radius;
+        params.subsurface_scale = scale;
+        params.subsurface_ior = ior;
+        params.subsurface_anisotropy = anisotropy;
+        params.subsurface_method = method;
+        params.eevee_gbuffer_features = EeveeGBufferFeatures {
+            subsurface: true,
+            ..EeveeGBufferFeatures::empty()
+        };
+        Ok(params)
+    }
+
+    fn translucent(&mut self, id: &Id) -> Result<BsdfParams> {
+        let mut params = self.closure_params();
+        params.normal = self.bsdf_normal(id)?;
+        params.model = BsdfModel::Translucent;
+        params.base_color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
+        params.metallic = 0.0;
+        params.transmission = 1.0;
+        params.eevee_gbuffer_features = EeveeGBufferFeatures {
+            translucent: true,
+            ..EeveeGBufferFeatures::empty()
+        };
+        Ok(params)
+    }
+
+    fn refraction(&mut self, id: &Id) -> Result<BsdfParams> {
+        let distribution = match self.enum_property(id, "distribution")? {
+            None | Some("BECKMANN") => MicrofacetDistribution::Beckmann,
+            Some("GGX") => MicrofacetDistribution::Ggx,
+            Some("MULTI_GGX") => {
+                return Err(unsupported_node(
+                    id,
+                    "ShaderNodeBsdfRefraction.distribution:MULTI_GGX",
+                ));
+            }
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfRefraction.distribution:{value}"),
+                ));
+            }
+        };
+        let color = self.color_input(id, &["Color"], [1.0, 1.0, 1.0, 1.0])?;
+        let mut params = self.closure_params();
+        params.normal = self.bsdf_normal(id)?;
+        params.model = BsdfModel::Refraction(distribution);
+        params.base_color = color;
+        params.metallic = 0.0;
+        params.roughness = self.scalar_input(id, &["Roughness"], 0.0)?;
+        params.ior = self.scalar_input(id, &["IOR"], 1.45)?;
+        params.transmission = 1.0;
+        params.glass_reflection_tint = [1.0; 3];
+        params.glass_transmission_tint = [color[0], color[1], color[2]];
+        params.eevee_gbuffer_features = EeveeGBufferFeatures {
+            refraction: true,
+            refraction_may_be_colored: self.is_linked(id, "Color")
+                || color_might_be_tinted(&[color[0], color[1], color[2]]),
+            ..EeveeGBufferFeatures::empty()
+        };
+        Ok(params)
+    }
+
+    fn toon(&mut self, id: &Id) -> Result<BsdfParams> {
+        if !self.hit_ctx.path_traced {
+            let color = self
+                .color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?
+                .map(|channel| channel.max(0.0));
+            let normal = normalize_or(
+                self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
+                self.hit_ctx.normal,
+            );
+            return Ok(self.eevee_diffuse_preview(color, normal));
+        }
+        let component = match self.enum_property(id, "component")? {
+            None | Some("DIFFUSE") => ToonComponent::Diffuse,
+            Some("GLOSSY") => ToonComponent::Glossy,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfToon.component:{value}"),
+                ));
+            }
+        };
+        let mut params = self.closure_params();
+        params.model = BsdfModel::Toon(ToonParameters {
+            component,
+            size: self.scalar_input(id, &["Size"], 0.5)?,
+            smooth: self.scalar_input(id, &["Smooth"], 0.0)?,
+        });
+        params.base_color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
+        params.metallic = 0.0;
+        params.normal = self.bsdf_normal(id)?;
+        Ok(params)
+    }
+
+    fn metallic(&mut self, id: &Id) -> Result<BsdfParams> {
+        let distribution = match self.enum_property(id, "distribution")? {
+            None | Some("MULTI_GGX") => MicrofacetDistribution::MultiGgx,
+            Some("BECKMANN") => MicrofacetDistribution::Beckmann,
+            Some("GGX") => MicrofacetDistribution::Ggx,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfMetallic.distribution:{value}"),
+                ));
+            }
+        };
+        let fresnel = match self.enum_property(id, "fresnel_type")? {
+            None | Some("F82") => MetallicFresnel::F82,
+            Some("PHYSICAL_CONDUCTOR") => MetallicFresnel::PhysicalConductor,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfMetallic.fresnel_type:{value}"),
+                ));
+            }
+        };
+        let (base_color, edge_tint, conductor_ior, extinction) = match fresnel {
+            MetallicFresnel::F82 => {
+                let color = self.color_input(id, &["Base Color"], [0.617, 0.577, 0.540, 1.0])?;
+                let edge = self.color_input(id, &["Edge Tint"], [0.695, 0.726, 0.770, 1.0])?;
+                (
+                    color,
+                    [edge[0], edge[1], edge[2]],
+                    [2.757, 2.513, 2.231],
+                    [3.867, 3.404, 3.009],
+                )
+            }
+            MetallicFresnel::PhysicalConductor => (
+                [1.0; 4],
+                [0.695, 0.726, 0.770],
+                self.vector_input(id, &["IOR"], DVec3::new(2.757, 2.513, 2.231))?
+                    .to_array(),
+                self.vector_input(id, &["Extinction"], DVec3::new(3.867, 3.404, 3.009))?
+                    .to_array(),
+            ),
+        };
+        let anisotropy = self.scalar_input(id, &["Anisotropy"], 0.0)?;
+        let rotation = self.scalar_input(id, &["Rotation"], 0.0)?;
+        let tangent = self.anisotropic_tangent(id, anisotropy > 0.0)?;
+        let thin_film_thickness = self.scalar_input(id, &["Thin Film Thickness"], 0.0)?;
+        let thin_film_ior = self.scalar_input(id, &["Thin Film IOR"], 1.33)?;
+        let mut params = self.closure_params();
+        params.normal = self.bsdf_normal(id)?;
+        params.model = BsdfModel::Metallic(MetallicParameters {
+            distribution,
+            fresnel,
+            edge_tint,
+            conductor_ior,
+            extinction,
+        });
+        params.base_color = base_color;
+        params.metallic = 1.0;
+        params.roughness = self.scalar_input(id, &["Roughness"], 0.5)?;
+        params.anisotropy = anisotropy;
+        params.anisotropy_model = AnisotropyModel::Glossy;
+        params.anisotropic_rotation = rotation;
+        params.anisotropic_tangent = tangent;
+        params.thin_film_thickness = thin_film_thickness;
+        params.thin_film_ior = thin_film_ior;
+        params.eevee_gbuffer_features = EeveeGBufferFeatures {
+            reflection: true,
+            reflection_may_be_colored: self.is_linked(id, "Base Color")
+                || self.is_linked(id, "Edge Tint")
+                || color_might_be_tinted(&[
+                    params.base_color[0],
+                    params.base_color[1],
+                    params.base_color[2],
+                ])
+                || color_might_be_tinted(&edge_tint),
+            ..EeveeGBufferFeatures::empty()
+        };
+        Ok(params)
+    }
+
+    fn holdout(&self) -> BsdfParams {
+        let mut params = self.closure_params();
+        params.model = BsdfModel::Holdout;
+        params.alpha = 0.0;
+        params.reflectance = 0.0;
+        params
+    }
+
+    fn hair(&mut self, id: &Id) -> Result<BsdfParams> {
+        if !self.hit_ctx.path_traced {
+            let color = self
+                .color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?
+                .map(|channel| channel.max(0.0));
+            return Ok(self.eevee_diffuse_preview(color, self.hit_ctx.normal));
+        }
+        let component = match self.enum_property(id, "component")? {
+            None | Some("Reflection") => HairComponent::Reflection,
+            Some("Transmission") => HairComponent::Transmission,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfHair.component:{value}"),
+                ));
+            }
+        };
+        let tangent = self.hair_tangent(id, true, "ShaderNodeBsdfHair")?;
+        let color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
+        let offset = self.scalar_input(id, &["Offset"], 0.0)?;
+        let roughness_u = self.scalar_input(id, &["RoughnessU"], 0.1)?;
+        let roughness_v = self.scalar_input(id, &["RoughnessV"], 1.0)?;
+        let mut params = self.closure_params();
+        params.model = BsdfModel::Hair(HairParameters {
+            component,
+            offset,
+            roughness_u,
+            roughness_v,
+            tangent,
+        });
+        params.base_color = color;
+        params.metallic = 0.0;
+        params.roughness = roughness_u;
+        params.anisotropic_tangent = Some(tangent);
+        Ok(params)
+    }
+
+    fn principled_hair(&mut self, id: &Id) -> Result<BsdfParams> {
+        let default_color = [0.017_513, 0.005_763, 0.002_059, 1.0];
+        if !self.hit_ctx.path_traced {
+            let color = self.color_input(id, &["Color"], default_color)?;
+            // The positional GPU ABI binds its final diffuse Weight to `TRT lobe`; this affects radiance, not graph coverage.
+            let mut params = self.eevee_diffuse_preview(color, self.hit_ctx.normal);
+            params.eevee_diffuse_weight = Some(self.scalar_input(id, &["TRT lobe"], 1.0)?);
+            return Ok(params);
+        }
+        let model = match self.enum_property(id, "model")? {
+            None | Some("CHIANG") => HairScatteringModel::Chiang,
+            Some("HUANG") => HairScatteringModel::Huang,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfHairPrincipled.model:{value}"),
+                ));
+            }
+        };
+        let parametrization = match self.enum_property(id, "parametrization")? {
+            None | Some("COLOR") => HairParametrization::Reflectance,
+            Some("MELANIN") => HairParametrization::MelaninConcentration,
+            Some("ABSORPTION") => HairParametrization::DirectAbsorption,
+            Some(value) => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("ShaderNodeBsdfHairPrincipled.parametrization:{value}"),
+                ));
+            }
+        };
+        let tangent = self.hair_tangent(id, false, "ShaderNodeBsdfHairPrincipled")?;
+        let color = if parametrization == HairParametrization::Reflectance {
+            self.color_input(id, &["Color"], default_color)?
+        } else {
+            default_color
+        };
+        let (melanin, melanin_redness, tint, random_color) =
+            if parametrization == HairParametrization::MelaninConcentration {
+                let tint = self.color_input(id, &["Tint"], [1.0; 4])?;
+                (
+                    self.scalar_input(id, &["Melanin"], 0.8)?,
+                    self.scalar_input(id, &["Melanin Redness"], 1.0)?,
+                    [tint[0], tint[1], tint[2]],
+                    self.scalar_input(id, &["Random Color"], 0.0)?,
+                )
+            } else {
+                (0.8, 1.0, [1.0; 3], 0.0)
+            };
+        let absorption_coefficient = if parametrization == HairParametrization::DirectAbsorption {
+            self.vector_input(
+                id,
+                &["Absorption Coefficient"],
+                DVec3::new(0.245_531, 0.52, 1.365),
+            )?
+            .to_array()
+        } else {
+            [0.245_531, 0.52, 1.365]
+        };
+        let aspect_ratio = if model == HairScatteringModel::Huang {
+            self.scalar_input(id, &["Aspect Ratio"], 0.85)?
+        } else {
+            0.85
+        };
+        let roughness = self.scalar_input(id, &["Roughness"], 0.3)?;
+        let (radial_roughness, coat) = if model == HairScatteringModel::Chiang {
+            (
+                self.scalar_input(id, &["Radial Roughness"], 0.3)?,
+                self.scalar_input(id, &["Coat"], 0.0)?,
+            )
+        } else {
+            (0.3, 0.0)
+        };
+        let ior = self.scalar_input(id, &["IOR"], 1.55)?;
+        let offset = self.scalar_input(
+            id,
+            &["Offset"],
+            f64::from(2.0_f32 * std::f32::consts::PI / 180.0_f32),
+        )?;
+        let random_roughness = self.scalar_input(id, &["Random Roughness"], 0.0)?;
+        let random = if self.is_linked(id, "Random") {
+            self.scalar_input(id, &["Random"], self.hit_ctx.hair_random.unwrap_or(0.0))?
+        } else {
+            self.hit_ctx
+                .hair_random
+                .unwrap_or(self.scalar_input(id, &["Random"], 0.0)?)
+        };
+        let (reflection, transmission, secondary_reflection) =
+            if model == HairScatteringModel::Huang {
+                (
+                    self.scalar_input(id, &["R lobe"], 1.0)?,
+                    self.scalar_input(id, &["TT lobe"], 1.0)?,
+                    self.scalar_input(id, &["TRT lobe"], 1.0)?,
+                )
+            } else {
+                (1.0, 1.0, 1.0)
+            };
+        let hair_normal = if model == HairScatteringModel::Huang {
+            let normal = self.hit_ctx.hair_normal.ok_or_else(|| {
+                unsupported_node(id, "ShaderNodeBsdfHairPrincipled.strand_normal_context")
+            })?;
+            if !normal.is_finite() || normal.length_squared() <= f64::EPSILON {
+                return Err(unsupported_node(
+                    id,
+                    "ShaderNodeBsdfHairPrincipled.strand_normal",
+                ));
+            }
+            Some(normal)
+        } else {
+            None
+        };
+        let mut params = self.closure_params();
+        params.model = BsdfModel::PrincipledHair(PrincipledHairParameters {
+            model,
+            parametrization,
+            melanin,
+            melanin_redness,
+            tint,
+            absorption_coefficient,
+            aspect_ratio,
+            roughness,
+            radial_roughness,
+            coat,
+            ior,
+            offset,
+            random_color,
+            random_roughness,
+            random,
+            reflection,
+            transmission,
+            secondary_reflection,
+        });
+        params.hair_normal = hair_normal;
+        params.base_color = color;
+        params.metallic = 0.0;
+        params.roughness = roughness;
+        params.ior = ior;
+        params.anisotropic_tangent = Some(tangent);
+        Ok(params)
+    }
+
+    fn ray_portal(&mut self, id: &Id) -> Result<BsdfParams> {
+        let color = self.color_input(id, &["Color"], [1.0, 1.0, 1.0, 1.0])?;
+        if !self.hit_ctx.path_traced {
+            let mut params = self.closure_params();
+            params.model = BsdfModel::Principled;
+            params.base_color = [color[0], color[1], color[2], 0.0];
+            params.alpha = 0.0;
+            params.metallic = 0.0;
+            params.transmission = 0.0;
+            params.subsurface_weight = 0.0;
+            params.sheen_weight = 0.0;
+            params.coat_weight = 0.0;
+            params.reflectance = 0.0;
+            params.emission_color = [0.0; 3];
+            params.emission_strength = 0.0;
+            params.transparent_tint = [color[0], color[1], color[2]];
+            params.eevee_gbuffer_features = EeveeGBufferFeatures::empty();
+            return Ok(params);
+        }
+        let position = if self.is_linked(id, "Position") {
+            self.vector_input(id, &["Position"], self.hit_ctx.position)?
+        } else {
+            self.hit_ctx.position
+        };
+        let direction = self.vector_input(id, &["Direction"], DVec3::ZERO)?;
+        let mut params = self.closure_params();
+        params.model = BsdfModel::RayPortal(RayPortalParameters {
+            position,
+            direction,
+        });
+        params.base_color = color;
         Ok(params)
     }
 
@@ -3048,6 +4587,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         params.base_color = [tint[0], tint[1], tint[2], 0.0];
         params.alpha = 0.0;
         params.transparent_tint = [tint[0], tint[1], tint[2]];
+        params.transparent_bsdf = true;
         Ok(params)
     }
     fn mix_shader(&mut self, id: &Id) -> Result<ClosureSpan> {
@@ -4651,28 +6191,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                         unsupported_node(id, "ShaderNodeNewGeometry.Tangent.orco_attribute")
                     })
             }
-            "Tangent" => {
-                let Some(layers) = self.hit_ctx.uv_layers else {
-                    return Err(unsupported_node(
-                        id,
-                        "ShaderNodeNewGeometry.Tangent.triangle_positions",
-                    ));
-                };
-                if self.hit_ctx.generated_corners.is_some() {
-                    return self.radial_tangent(id, "Z").map(Value::Vector);
-                }
-
-                let [first, second, third] = layers.positions;
-                let mut tangent = second - first;
-                if (second - first)
-                    .cross(third - first)
-                    .dot(self.hit_ctx.view_direction)
-                    < 0.0
-                {
-                    tangent = -tangent;
-                }
-                Ok(Value::Vector(tangent.normalize_or_zero()))
-            }
+            "Tangent" => self.geometry_tangent(id).map(Value::Vector),
             "Parametric" => self
                 .hit_ctx
                 .uv_layers
@@ -5468,6 +6987,13 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                 socket,
             ));
         }
+        if self.hit_ctx.hair_curve_hit && matches!(socket, "Generated" | "UV") {
+            let feature = match socket {
+                "Generated" => "ShaderNodeTexCoord.Generated.hair_curve_texture_space",
+                _ => "ShaderNodeTexCoord.UV.hair_curve_uv",
+            };
+            return Err(unsupported_node(id, feature));
+        }
         let value = match socket {
             "Generated" => self.hit_ctx.generated,
             "UV" => {
@@ -5522,6 +7048,9 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     fn uv_map(&self, id: &Id, socket: &str) -> Result<Value> {
         if socket != "UV" {
             return Err(invalid(format!("unknown UV Map output `{socket}`")));
+        }
+        if self.hit_ctx.hair_curve_hit {
+            return Err(unsupported_node(id, "ShaderNodeUVMap.hair_curve_uv"));
         }
         let node = self.node(id)?;
         if node
@@ -5597,8 +7126,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         };
         Ok(Value::Vector(tangent))
     }
-    /// The implicit `LINK_TANGENT` fallback: `GeometryNode::Tangent` uses RADIAL around Z
-    /// (`shader_graph.cpp:934-940`, `kernel/geom/primitive.h:162-185`).
+    /// Explicit `ShaderNodeTangent` RADIAL output; Geometry Tangent has a separate Cycles
+    /// `primitive_tangent` path because its object transform is an inverse-transpose.
     fn radial_tangent(&self, id: &Id, axis: &str) -> Result<DVec3> {
         let generated = self
             .hit_ctx
@@ -5618,6 +7147,52 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             .ok_or_else(|| unsupported_node(id, "Tangent:RADIAL:Generated"))?;
         surface_tangent(world_tangent, self.hit_ctx.normal)
             .ok_or_else(|| unsupported_node(id, "Tangent:RADIAL:direction"))
+    }
+    /// Cycles `primitive_tangent` transforms Generated radial data as a normal (inverse transpose)
+    /// before projecting it onto `sd->N`; without Generated it returns normalized `sd->dPdu`.
+    /// (`kernel/geom/primitive.h`, `kernel/geom/object.h`, `kernel/geom/shader_data.h`).
+    fn geometry_tangent(&self, id: &Id) -> Result<DVec3> {
+        if self.hit_ctx.generated_corners.is_some() {
+            let point = self.hit_ctx.generated;
+            if !point.is_finite() {
+                return Err(unsupported_node(
+                    id,
+                    "ShaderNodeNewGeometry.Tangent.orco_attribute",
+                ));
+            }
+            let local_tangent = DVec3::new(-(point.y - 0.5), point.x - 0.5, 0.0);
+            let transformed_tangent = self
+                .hit_ctx
+                .world_to_object
+                .transpose()
+                .transform_vector3(local_tangent);
+            if !transformed_tangent.is_finite() || !self.hit_ctx.normal.is_finite() {
+                return Err(unsupported_node(
+                    id,
+                    "ShaderNodeNewGeometry.Tangent.direction",
+                ));
+            }
+            let normal = self.hit_ctx.normal.normalize_or_zero();
+            let transformed_tangent = transformed_tangent.normalize_or_zero();
+            return Ok(normal.cross(transformed_tangent.cross(normal).normalize_or_zero()));
+        }
+
+        let Some(layers) = self.hit_ctx.uv_layers else {
+            return Err(unsupported_node(
+                id,
+                "ShaderNodeNewGeometry.Tangent.triangle_positions",
+            ));
+        };
+        let [first, second, third] = layers.positions;
+        let mut tangent = second - first;
+        if (second - first)
+            .cross(third - first)
+            .dot(self.hit_ctx.view_direction)
+            < 0.0
+        {
+            tangent = -tangent;
+        }
+        Ok(tangent.normalize_or_zero())
     }
     fn normal_map(&mut self, id: &Id, socket: &str) -> Result<Value> {
         if socket != "Normal" {
@@ -6025,6 +7600,12 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                 }),
             ));
         }
+        if self.hit_ctx.hair_curve_hit {
+            return Err(unsupported_node(
+                id,
+                "ShaderNodeAttribute.hair_curve_attribute_interpolation",
+            ));
+        }
         let name = node
             .properties
             .get("attribute_name")
@@ -6060,6 +7641,12 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
 
     /// `ShaderNodeVertexColor`: the named color layer, or the render layer when the name is empty.
     fn vertex_color(&self, id: &Id, socket: &str) -> Result<Value> {
+        if self.hit_ctx.hair_curve_hit {
+            return Err(unsupported_node(
+                id,
+                "ShaderNodeVertexColor.hair_curve_color_layers",
+            ));
+        }
         let node = self.node(id)?;
         let name = node
             .properties
@@ -6341,65 +7928,441 @@ fn collect_linked_alpha_images(
     }
 }
 
-/// Whether EEVEE compiles the graph as transparent, `GPU_MATFLAG_TRANSPARENT`, which is set statically per node:
-/// a Transparent BSDF whose Color is linked or not black (`node_shader_bsdf_transparent.cc:30`), and a Principled
-/// whose Alpha is linked or not one (`node_shader_bsdf_principled.cc:400`). Only the nodes that feed the output count.
-/// Specular and Ray Portal set the same flag in Blender, but Potter's evaluator rejects both node types, so a material
-/// with one never evaluates and needs no rule.
-fn graph_is_transparent(
+// Values from Blender 5.2.2 `eevee_material.hh:126-141`.
+pub(crate) const EEVEE_CLOSURE_DIFFUSE: u32 = 1 << 0;
+pub(crate) const EEVEE_CLOSURE_SUBSURFACE: u32 = 1 << 1;
+pub(crate) const EEVEE_CLOSURE_REFLECTION: u32 = 1 << 2;
+pub(crate) const EEVEE_CLOSURE_REFRACTION: u32 = 1 << 3;
+pub(crate) const EEVEE_CLOSURE_TRANSLUCENT: u32 = 1 << 4;
+pub(crate) const EEVEE_CLOSURE_TRANSPARENCY: u32 = 1 << 8;
+pub(crate) const EEVEE_CLOSURE_EMISSION: u32 = 1 << 9;
+const EEVEE_CLOSURE_HOLDOUT: u32 = 1 << 10;
+const EEVEE_CLOSURE_AMBIENT_OCCLUSION: u32 = 1 << 12;
+pub(crate) const EEVEE_CLOSURE_SHADER_TO_RGBA: u32 = 1 << 13;
+const EEVEE_CLOSURE_CLEARCOAT: u32 = 1 << 14;
+fn source_simple_material_closure_flags(material: &Material) -> u32 {
+    let features = EeveeGBufferFeatures::from_material(
+        material.metallic,
+        material.transmission,
+        [
+            material.base_color[0],
+            material.base_color[1],
+            material.base_color[2],
+        ],
+        false,
+    );
+    let mut flags = 0;
+    if features.has_diffuse() {
+        flags |= EEVEE_CLOSURE_DIFFUSE;
+    }
+    if features.has_reflection() {
+        flags |= EEVEE_CLOSURE_REFLECTION;
+    }
+    if features.has_refraction() {
+        flags |= EEVEE_CLOSURE_REFRACTION;
+    }
+    if features.has_subsurface() {
+        flags |= EEVEE_CLOSURE_SUBSURFACE;
+    }
+    if features.has_translucent() {
+        flags |= EEVEE_CLOSURE_TRANSLUCENT;
+    }
+    let alpha = match material.alpha_mode.as_str() {
+        "opaque" => 1.0,
+        "clip" if material.base_color[3] >= material.alpha_threshold => 1.0,
+        "clip" => 0.0,
+        _ => material.base_color[3],
+    };
+    if gpu_socket_not_one(alpha) {
+        flags |= EEVEE_CLOSURE_TRANSPARENCY;
+    }
+    flags
+}
+
+/// Blender 5.2.2 `shader_nodes_inline.cc` resolves inputs (398-445), dispatches group/reroute/muted
+/// outputs (508-582), evaluates primitive multi-functions (1125-1217), then replaces primitive
+/// sockets and applies typed conversions (1307-1340). `FoldIndex` is the per-invocation proof.
+struct SourceFoldResolver<'a> {
+    group: &'a NodeGroup,
+    node_groups: &'a Registry<NodeGroup>,
+    material: &'a Material,
+    fold_index: &'a super::inline_fold::FoldIndex,
+    input_binding: Option<&'a GroupInputBinding<'a>>,
+    failure: &'a RefCell<Option<SourceFoldFailure>>,
+}
+
+impl<'a> SourceFoldResolver<'a> {
+    fn output_value(&self, node_id: &Id, socket: &str, link_index: usize) -> SourceFoldOutput {
+        let key = (node_id.clone(), socket.to_owned());
+        if self.fold_index.primitive_outputs.contains(&key) {
+            // Only Source-proven primitive outputs enter this evaluator. Its field guard excludes
+            // unlinked procedural positions; images and geometry nodes are never static outputs.
+            let hit_ctx = HitContext::new(self.node_groups);
+            let mut workspace = EvaluatorWorkspace::default();
+            workspace.active.reserve(self.group.links.len());
+            let empty = BTreeSet::new();
+            let mut evaluator = Evaluator {
+                group: self.group,
+                material: self.material,
+                hit_ctx,
+                workspace: &mut workspace,
+                math_semantics: crate::node_kernels::MathSemantics::Eevee,
+                alpha_linked_images: &empty,
+                links: Some(self.fold_index),
+                group_input_binding: self.input_binding,
+                group_depth: self
+                    .input_binding
+                    .map_or(0, |binding| binding.depth.saturating_add(1)),
+                texture_mapping_unsupported: &empty,
+            };
+            return match evaluator.output(node_id, socket, link_index) {
+                Ok(value) => SourceFoldOutput::Primitive(value),
+                Err(error) => {
+                    self.record_failure(error);
+                    SourceFoldOutput::Linked
+                }
+            };
+        }
+        if self
+            .fold_index
+            .dangling_outputs
+            .get(node_id)
+            .is_some_and(|outputs| outputs.contains(socket))
+        {
+            return SourceFoldOutput::Dangling;
+        }
+        if self.fold_index.unknown_outputs.contains(&key)
+            && self.group.nodes.get(node_id).is_some_and(|node| {
+                node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true)
+                    || !matches!(
+                        node.node_type.as_str(),
+                        "NodeGroupInput" | "ShaderNodeGroup"
+                    )
+            })
+        {
+            self.record_unknown_output(node_id);
+        }
+        SourceFoldOutput::Linked
+    }
+
+    fn record_unknown_output(&self, node_id: &Id) {
+        let Some(node) = self.group.nodes.get(node_id) else {
+            return;
+        };
+        if node.properties.get("mute").and_then(JsonValue::as_bool) != Some(true)
+            && matches!(
+                node.node_type.as_str(),
+                "NodeGroupInput" | "ShaderNodeGroup"
+            )
+        {
+            return;
+        }
+        self.record_failure(unsupported_node(
+            node_id,
+            &format!("{}.internal_links", node.node_type),
+        ));
+    }
+
+    fn record_failure(&self, error: PotError) {
+        let mut failure = self.failure.borrow_mut();
+        if failure.is_none() {
+            *failure = Some(SourceFoldFailure::new(error));
+        }
+    }
+
+    fn output_is_unknown(&self, node_id: &Id, socket: &str) -> bool {
+        self.fold_index
+            .unknown_outputs
+            .contains(&(node_id.clone(), socket.to_owned()))
+    }
+
+    fn output_is_dangling(&self, node_id: &Id, socket: &str) -> bool {
+        self.fold_index
+            .dangling_outputs
+            .get(node_id)
+            .is_some_and(|outputs| outputs.contains(socket))
+    }
+
+    fn input_link<'b>(
+        &'b self,
+        node_id: &Id,
+        node: &GraphNode,
+        socket: &str,
+    ) -> Option<(usize, &'a GraphLink)> {
+        self.group.links.iter().enumerate().find(|(_, link)| {
+            link.to_node == *node_id
+                && input_socket_matches(self.node_groups, node, &link.to_socket, socket)
+        })
+    }
+
+    fn scalar_input(
+        &self,
+        node_id: &Id,
+        node: &GraphNode,
+        socket: &str,
+        default: f64,
+    ) -> (bool, f64) {
+        if let Some((link_index, link)) = self.input_link(node_id, node, socket) {
+            return match self.output_value(&link.from_node, &link.from_socket, link_index) {
+                SourceFoldOutput::Primitive(value) => {
+                    if super::inline_fold::source_input_socket_flag(
+                        node,
+                        &link.to_socket,
+                        "hide_value",
+                    ) == Some(true)
+                    {
+                        (true, default)
+                    } else {
+                        (false, source_value_scalar(value, default))
+                    }
+                }
+                SourceFoldOutput::Dangling => (
+                    false,
+                    source_socket_default(node, socket)
+                        .map_or(default, |value| number(value, default)),
+                ),
+                SourceFoldOutput::Linked => (true, default),
+            };
+        }
+        (
+            false,
+            source_socket_default(node, socket).map_or(default, |value| number(value, default)),
+        )
+    }
+
+    fn vector_input(
+        &self,
+        node_id: &Id,
+        node: &GraphNode,
+        socket: &str,
+        default: DVec3,
+    ) -> (bool, DVec3) {
+        if let Some((link_index, link)) = self.input_link(node_id, node, socket) {
+            return match self.output_value(&link.from_node, &link.from_socket, link_index) {
+                SourceFoldOutput::Primitive(value) => {
+                    if super::inline_fold::source_input_socket_flag(
+                        node,
+                        &link.to_socket,
+                        "hide_value",
+                    ) == Some(true)
+                    {
+                        (true, default)
+                    } else {
+                        (false, source_value_vector(value, default))
+                    }
+                }
+                SourceFoldOutput::Dangling => (
+                    false,
+                    source_socket_default(node, socket)
+                        .map_or(default, |value| vector(value, default)),
+                ),
+                SourceFoldOutput::Linked => (true, default),
+            };
+        }
+        (
+            false,
+            source_socket_default(node, socket).map_or(default, |value| vector(value, default)),
+        )
+    }
+
+    fn color_input(
+        &self,
+        node_id: &Id,
+        node: &GraphNode,
+        socket: &str,
+        default: [f32; 3],
+    ) -> (bool, [f32; 3]) {
+        if let Some((link_index, link)) = self.input_link(node_id, node, socket) {
+            return match self.output_value(&link.from_node, &link.from_socket, link_index) {
+                SourceFoldOutput::Primitive(value) => {
+                    if super::inline_fold::source_input_socket_flag(
+                        node,
+                        &link.to_socket,
+                        "hide_value",
+                    ) == Some(true)
+                    {
+                        (true, default)
+                    } else {
+                        (false, source_value_color(value, default))
+                    }
+                }
+                SourceFoldOutput::Dangling => (
+                    false,
+                    source_socket_default(node, socket)
+                        .map_or(default, |value| source_color_value(value, default)),
+                ),
+                SourceFoldOutput::Linked => (true, default),
+            };
+        }
+        (
+            false,
+            source_socket_default(node, socket)
+                .map_or(default, |value| source_color_value(value, default)),
+        )
+    }
+}
+
+/// Source callbacks produce these bits regardless of closure weight, except for their socket tests.
+fn graph_eevee_closure_flags(
     graph_id: &Id,
     group: &NodeGroup,
     node_groups: &Registry<NodeGroup>,
-    output: &Id,
-) -> bool {
-    let mut group_stack = BTreeSet::new();
-    group_stack.insert(graph_id.clone());
-    graph_is_transparent_output(group, node_groups, output, "Surface", &mut group_stack)
+    fold_index: &super::inline_fold::FoldIndex,
+    material: &Material,
+    fold_failure: &RefCell<Option<SourceFoldFailure>>,
+) -> u32 {
+    let mut flags = 0;
+    let mut group_stack = BTreeSet::from([graph_id.clone()]);
+
+    if let Some(output) = eevee_material_output(group) {
+        for link in group.links.iter().filter(|link| link.to_node == *output) {
+            flags |= graph_eevee_closure_flags_output(
+                group,
+                node_groups,
+                fold_index,
+                output,
+                &link.to_socket,
+                &mut group_stack,
+                None,
+                material,
+                fold_failure,
+            );
+        }
+    }
+    for (output, node) in &group.nodes {
+        if node.node_type == "ShaderNodeOutputAOV" {
+            for link in group.links.iter().filter(|link| link.to_node == *output) {
+                flags |= graph_eevee_closure_flags_output(
+                    group,
+                    node_groups,
+                    fold_index,
+                    output,
+                    &link.to_socket,
+                    &mut group_stack,
+                    None,
+                    material,
+                    fold_failure,
+                );
+            }
+        }
+    }
+    flags
 }
 
-fn graph_is_transparent_output(
+/// Blender prefers a target-specific EEVEE output over the active ALL output.
+fn eevee_material_output(group: &NodeGroup) -> Option<&Id> {
+    let mut active_eevee = None;
+    let mut fallback_eevee = None;
+    let mut active_all = None;
+    let mut fallback_all = None;
+    for (id, node) in &group.nodes {
+        if !matches!(
+            node.node_type.as_str(),
+            "OutputMaterial" | "ShaderNodeOutputMaterial"
+        ) {
+            continue;
+        }
+        let target = node
+            .properties
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("ALL");
+        let active = node
+            .properties
+            .get("is_active_output")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
+        match target {
+            "EEVEE" => {
+                if active {
+                    active_eevee = Some(id);
+                } else {
+                    fallback_eevee.get_or_insert(id);
+                }
+            }
+            "ALL" => {
+                if active {
+                    active_all = Some(id);
+                } else {
+                    fallback_all.get_or_insert(id);
+                }
+            }
+            _ => {}
+        }
+    }
+    active_eevee
+        .or(fallback_eevee)
+        .or(active_all)
+        .or(fallback_all)
+}
+
+fn graph_eevee_closure_flags_output(
     group: &NodeGroup,
     node_groups: &Registry<NodeGroup>,
+    fold_index: &super::inline_fold::FoldIndex,
     output: &Id,
     output_socket: &str,
     group_stack: &mut BTreeSet<Id>,
-) -> bool {
-    let reachable = nodes_reaching_socket(group, output, output_socket);
-    let linked = |node: &Id, socket: &str| {
-        group
-            .links
-            .iter()
-            .any(|link| link.to_node == *node && link.to_socket == socket)
+    input_binding: Option<&GroupInputBinding<'_>>,
+    material: &Material,
+    fold_failure: &RefCell<Option<SourceFoldFailure>>,
+) -> u32 {
+    let source = SourceFoldResolver {
+        group,
+        node_groups,
+        material,
+        fold_index,
+        input_binding,
+        failure: fold_failure,
     };
-    if group.nodes.iter().any(|(id, node)| {
-        if !reachable.contains(id) {
-            return false;
-        }
-        match node.node_type.as_str() {
-            "ShaderNodeBsdfTransparent" => {
-                linked(id, "Color")
-                    || node
-                        .inputs
-                        .get("Color")
-                        .is_none_or(|value| color(value, [1.0; 4])[..3].iter().any(|c| *c != 0.0))
-            }
-            "ShaderNodeBsdfPrincipled" => {
-                linked(id, "Alpha")
-                    || node
-                        .inputs
-                        .get("Alpha")
-                        .is_some_and(|value| number(value, 1.0).total_cmp(&1.0).is_ne())
-            }
-            _ => false,
-        }
-    }) {
-        return true;
-    }
+    let reachable = source_nodes_reaching_socket(&source, output, output_socket);
+    let mut flags = 0;
     for node_id in &reachable {
         let Some(node) = group.nodes.get(node_id) else {
             continue;
         };
-        if node.node_type != "ShaderNodeGroup" {
+        if node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true) {
+            continue;
+        }
+        flags |= match node.node_type.as_str() {
+            "ShaderNodeBsdfPrincipled" => {
+                source_principled_closure_flags(&source, node_id, node, material)
+            }
+            "ShaderNodeBsdfDiffuse"
+            | "ShaderNodeBsdfSheen"
+            | "ShaderNodeBsdfToon"
+            | "ShaderNodeBsdfHair"
+            | "ShaderNodeBsdfHairPrincipled" => EEVEE_CLOSURE_DIFFUSE,
+            "ShaderNodeBsdfGlossy" | "ShaderNodeBsdfAnisotropic" | "ShaderNodeBsdfMetallic" => {
+                EEVEE_CLOSURE_REFLECTION
+            }
+            "ShaderNodeBsdfGlass" => EEVEE_CLOSURE_REFLECTION | EEVEE_CLOSURE_REFRACTION,
+            "ShaderNodeBsdfRefraction" => EEVEE_CLOSURE_REFRACTION,
+            "ShaderNodeBsdfTranslucent" => EEVEE_CLOSURE_TRANSLUCENT,
+            "ShaderNodeSubsurfaceScattering" => EEVEE_CLOSURE_DIFFUSE | EEVEE_CLOSURE_SUBSURFACE,
+            "ShaderNodeEmission" => EEVEE_CLOSURE_EMISSION,
+            "ShaderNodeHoldout" => EEVEE_CLOSURE_HOLDOUT,
+            "ShaderNodeAmbientOcclusion" => EEVEE_CLOSURE_AMBIENT_OCCLUSION,
+            "ShaderNodeShaderToRGB" => EEVEE_CLOSURE_SHADER_TO_RGBA,
+            "ShaderNodeBsdfTransparent" | "ShaderNodeBsdfRayPortal" => {
+                let (color_linked, color) = source.color_input(node_id, node, "Color", [1.0; 3]);
+                if color_linked || color.iter().any(|channel| *channel != 0.0) {
+                    EEVEE_CLOSURE_TRANSPARENCY
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+    }
+
+    for node_id in &reachable {
+        let Some(node) = group.nodes.get(node_id) else {
+            continue;
+        };
+        if node.node_type != "ShaderNodeGroup"
+            || node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true)
+        {
             continue;
         }
         let Some(child_name) = node.properties.get("node_tree").and_then(JsonValue::as_str) else {
@@ -6415,10 +8378,14 @@ fn graph_is_transparent_output(
             group_stack.remove(child_id);
             continue;
         };
+        let Some(child_fold_index) = fold_index.children.get(node_id) else {
+            group_stack.remove(child_id);
+            continue;
+        };
         for link in group.links.iter().filter(|link| {
             link.from_node == *node_id
                 && (reachable.contains(&link.to_node)
-                    || (link.to_node == *output && link.to_socket == output_socket))
+                    || (link.to_node == *output && socket_matches(&link.to_socket, output_socket)))
         }) {
             let Some(interface_output) =
                 child.interface.outputs.iter().find(|socket| {
@@ -6427,20 +8394,476 @@ fn graph_is_transparent_output(
             else {
                 continue;
             };
-            if graph_is_transparent_output(
+            let binding = GroupInputBinding {
+                group,
+                node_id,
+                binding: input_binding,
+                links: Some(fold_index),
+                depth: input_binding.map_or(0, |binding| binding.depth.saturating_add(1)),
+            };
+            flags |= graph_eevee_closure_flags_output(
                 child,
                 node_groups,
+                child_fold_index,
                 child_output,
                 &interface_output.name,
                 group_stack,
-            ) {
-                group_stack.remove(child_id);
-                return true;
-            }
+                Some(&binding),
+                material,
+                fold_failure,
+            );
         }
         group_stack.remove(child_id);
     }
-    false
+    flags
+}
+
+/// Source `node_shader_bsdf_principled.cc:371-430` tests GPU stack links/values; thresholds and
+/// clamping match `GPU_material.hh:322-330`.
+fn source_principled_closure_flags(
+    source: &SourceFoldResolver<'_>,
+    id: &Id,
+    node: &GraphNode,
+    material: &Material,
+) -> u32 {
+    if node
+        .properties
+        .get("potter_simple_material")
+        .and_then(JsonValue::as_bool)
+        == Some(true)
+    {
+        return source_simple_material_closure_flags(material);
+    }
+    let socket_not_zero = |socket: &str, default| {
+        let (linked, value) = source.scalar_input(id, node, socket, default);
+        linked || gpu_socket_not_zero(value)
+    };
+    let socket_not_one = |socket: &str, default| {
+        let (linked, value) = source.scalar_input(id, node, socket, default);
+        linked || gpu_socket_not_one(value)
+    };
+    let use_diffuse = socket_not_zero("Sheen Weight", 0.0)
+        || (socket_not_one("Metallic", 0.0) && socket_not_one("Transmission Weight", 0.0));
+    let use_subsurface = socket_not_zero("Subsurface Weight", 0.0) && use_diffuse;
+    let use_refraction =
+        socket_not_one("Metallic", 0.0) && socket_not_zero("Transmission Weight", 0.0);
+    let use_transparency = socket_not_one("Alpha", 1.0);
+    let use_coat = socket_not_zero("Coat Weight", 0.0);
+    let use_translucent = use_subsurface && socket_not_zero("Thin Wall", 0.0);
+    let mut flags = EEVEE_CLOSURE_REFLECTION;
+    if use_diffuse {
+        flags |= EEVEE_CLOSURE_DIFFUSE;
+    }
+    if use_refraction {
+        flags |= EEVEE_CLOSURE_REFRACTION;
+    }
+    if use_subsurface && socket_not_one("Thin Wall", 0.0) {
+        flags |= EEVEE_CLOSURE_SUBSURFACE;
+    }
+    if use_transparency {
+        flags |= EEVEE_CLOSURE_TRANSPARENCY;
+    }
+    if use_coat {
+        // Source COAT maps to CLEARCOAT; Principled always sets GLOSSY too.
+        flags |= EEVEE_CLOSURE_CLEARCOAT;
+    }
+    if use_translucent {
+        flags |= EEVEE_CLOSURE_TRANSLUCENT;
+    }
+    flags
+}
+
+fn source_nodes_reaching_socket(
+    source: &SourceFoldResolver<'_>,
+    sink: &Id,
+    socket: &str,
+) -> BTreeSet<Id> {
+    let mut pending: Vec<(Id, String)> = source
+        .group
+        .links
+        .iter()
+        .filter(|link| {
+            link.to_node == *sink
+                && socket_matches(&link.to_socket, socket)
+                && source_link_is_compiled(source, link)
+        })
+        .map(|link| (link.from_node.clone(), link.from_socket.clone()))
+        .collect();
+    let mut visited_outputs = BTreeSet::new();
+    let mut ancestors = BTreeSet::new();
+    while let Some((node_id, output_socket)) = pending.pop() {
+        if !visited_outputs.insert((node_id.clone(), output_socket.clone())) {
+            continue;
+        }
+        ancestors.insert(node_id.clone());
+        let Some(node) = source.group.nodes.get(&node_id) else {
+            continue;
+        };
+        if source.output_is_unknown(&node_id, &output_socket) {
+            if node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true)
+                || !matches!(
+                    node.node_type.as_str(),
+                    "NodeGroupInput" | "ShaderNodeGroup"
+                )
+            {
+                source.record_unknown_output(&node_id);
+            }
+            continue;
+        }
+        if source.output_is_dangling(&node_id, &output_socket) {
+            continue;
+        }
+        let is_passthrough = node.node_type == "NodeReroute"
+            || node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true);
+        let input_socket = super::inline_fold::source_passthrough_input_socket(
+            node,
+            &output_socket,
+            source.group,
+            &node_id,
+        );
+        if is_passthrough && input_socket.is_none() {
+            continue;
+        }
+        for link in source.group.links.iter().filter(|link| {
+            link.to_node == node_id
+                && (!is_passthrough || input_socket == Some(link.to_socket.as_str()))
+                && source_link_is_compiled(source, link)
+        }) {
+            pending.push((link.from_node.clone(), link.from_socket.clone()));
+        }
+    }
+    ancestors
+}
+
+fn source_link_is_compiled(source: &SourceFoldResolver<'_>, link: &GraphLink) -> bool {
+    let Some(from) = source.group.nodes.get(&link.from_node) else {
+        return false;
+    };
+    let Some(to) = source.group.nodes.get(&link.to_node) else {
+        return false;
+    };
+    if matches!(from.node_type.as_str(), "ShaderNodeScript" | "Script")
+        || matches!(to.node_type.as_str(), "ShaderNodeScript" | "Script")
+    {
+        return false;
+    }
+    // A muted node forwards its declared internal link, bypassing Mix branch pruning.
+    to.node_type == "NodeReroute"
+        || to.properties.get("mute").and_then(JsonValue::as_bool) == Some(true)
+        || !source_mix_input_is_pruned(source, &link.to_node, &link.to_socket, to)
+}
+
+// Avoid float_cmp without changing Source's exact IEEE equality semantics.
+fn source_float_eq(left: f32, right: f32) -> bool {
+    left.partial_cmp(&right) == Some(std::cmp::Ordering::Equal)
+}
+
+// Source-folded GPU stack constants drive these clamped 0/1 branch checks.
+fn source_mix_input_is_pruned(
+    source: &SourceFoldResolver<'_>,
+    id: &Id,
+    socket: &str,
+    node: &GraphNode,
+) -> bool {
+    match node.node_type.as_str() {
+        "ShaderNodeMixShader" => {
+            source_mix_factor(source, id, node, "Fac", 0.5, true).is_some_and(|factor| {
+                (source_float_eq(factor, 0.0) && socket_matches(socket, "Shader_001"))
+                    || (source_float_eq(factor, 1.0) && socket_matches(socket, "Shader"))
+            })
+        }
+        "ShaderNodeMix" => {
+            let data_type = node
+                .properties
+                .get("data_type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("FLOAT");
+            let clamp = node
+                .properties
+                .get("clamp_factor")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true);
+            match data_type {
+                "FLOAT" => {
+                    if !matches!(socket, "Factor_Float" | "A_Float" | "B_Float") {
+                        return true;
+                    }
+                    source_mix_factor(source, id, node, "Factor_Float", 1.0, clamp).is_some_and(
+                        |factor| {
+                            (source_float_eq(factor, 0.0) && socket == "B_Float")
+                                || (source_float_eq(factor, 1.0) && socket == "A_Float")
+                        },
+                    )
+                }
+                "VECTOR" => {
+                    let non_uniform = node
+                        .properties
+                        .get("factor_mode")
+                        .and_then(JsonValue::as_str)
+                        == Some("NON_UNIFORM");
+                    let factor_socket = if non_uniform {
+                        "Factor_Vector"
+                    } else {
+                        "Factor_Float"
+                    };
+                    if socket != factor_socket && !matches!(socket, "A_Vector" | "B_Vector") {
+                        return true;
+                    }
+                    let factor = if non_uniform {
+                        let (linked, raw) =
+                            source.vector_input(id, node, factor_socket, DVec3::splat(0.5));
+                        if linked {
+                            return false;
+                        }
+                        let values = raw.to_array().map(|value| {
+                            let value = value as f32;
+                            if clamp { value.clamp(0.0, 1.0) } else { value }
+                        });
+                        (source_float_eq(values[0], values[1])
+                            && source_float_eq(values[0], values[2]))
+                        .then_some(values[0])
+                    } else {
+                        source_mix_factor(source, id, node, factor_socket, 1.0, clamp)
+                    };
+                    factor.is_some_and(|factor| {
+                        (source_float_eq(factor, 0.0) && socket == "B_Vector")
+                            || (source_float_eq(factor, 1.0) && socket == "A_Vector")
+                    })
+                }
+                "RGBA" => {
+                    if !matches!(socket, "Factor_Float" | "A_Color" | "B_Color") {
+                        return true;
+                    }
+                    source_mix_factor(source, id, node, "Factor_Float", 1.0, clamp)
+                        .is_some_and(|factor| source_float_eq(factor, 0.0) && socket == "B_Color")
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn source_mix_factor(
+    source: &SourceFoldResolver<'_>,
+    id: &Id,
+    node: &GraphNode,
+    socket: &str,
+    default: f64,
+    clamp: bool,
+) -> Option<f32> {
+    let (linked, value) = source.scalar_input(id, node, socket, default);
+    if linked {
+        return None;
+    }
+    let factor = value as f32;
+    Some(if clamp {
+        factor.clamp(0.0, 1.0)
+    } else {
+        factor
+    })
+}
+
+fn source_socket_default<'a>(node: &'a GraphNode, socket: &str) -> Option<&'a JsonValue> {
+    node.inputs
+        .get(socket)
+        .or_else(|| {
+            node.inputs
+                .iter()
+                .find_map(|(candidate, value)| socket_matches(candidate, socket).then_some(value))
+        })
+        .or_else(|| socket_default(node, socket))
+}
+
+fn source_value_scalar(value: Value, default: f64) -> f64 {
+    match value {
+        Value::Scalar(value) => value,
+        Value::Vector(value) => value.x,
+        Value::Color(value) => value[0],
+        Value::Shader(_) => default,
+    }
+}
+
+fn source_value_vector(value: Value, default: DVec3) -> DVec3 {
+    match value {
+        Value::Scalar(value) => DVec3::splat(value),
+        Value::Vector(value) => value,
+        Value::Color(value) => DVec3::new(value[0], value[1], value[2]),
+        Value::Shader(_) => default,
+    }
+}
+
+fn source_value_color(value: Value, default: [f32; 3]) -> [f32; 3] {
+    match value {
+        Value::Scalar(value) => [value as f32; 3],
+        Value::Vector(value) => value.to_array().map(|component| component as f32),
+        Value::Color(value) => [value[0] as f32, value[1] as f32, value[2] as f32],
+        Value::Shader(_) => default,
+    }
+}
+
+fn source_color_value(value: &JsonValue, default: [f32; 3]) -> [f32; 3] {
+    let color = color(
+        value,
+        [
+            f64::from(default[0]),
+            f64::from(default[1]),
+            f64::from(default[2]),
+            1.0,
+        ],
+    );
+    [color[0] as f32, color[1] as f32, color[2] as f32]
+}
+
+/// Static EEVEE surface flags produced by source node compilers.
+#[derive(Clone, Copy, Default)]
+struct EeveeSurfaceFlags {
+    transparent: bool,
+    transparent_maybe_colored: bool,
+    has_holdout: bool,
+}
+
+impl EeveeSurfaceFlags {
+    fn merge(&mut self, other: Self) {
+        self.transparent |= other.transparent;
+        self.transparent_maybe_colored |= other.transparent_maybe_colored;
+        self.has_holdout |= other.has_holdout;
+    }
+}
+
+/// Evaluates Source EEVEE transparency/holdout flags on the same inlined surface graph.
+fn graph_eevee_surface_flags(
+    graph_id: &Id,
+    group: &NodeGroup,
+    node_groups: &Registry<NodeGroup>,
+    fold_index: &super::inline_fold::FoldIndex,
+    output: &Id,
+    material: &Material,
+    fold_failure: &RefCell<Option<SourceFoldFailure>>,
+) -> EeveeSurfaceFlags {
+    let mut group_stack = BTreeSet::from([graph_id.clone()]);
+    graph_eevee_surface_flags_output(
+        group,
+        node_groups,
+        fold_index,
+        output,
+        "Surface",
+        &mut group_stack,
+        None,
+        material,
+        fold_failure,
+    )
+}
+
+fn graph_eevee_surface_flags_output(
+    group: &NodeGroup,
+    node_groups: &Registry<NodeGroup>,
+    fold_index: &super::inline_fold::FoldIndex,
+    output: &Id,
+    output_socket: &str,
+    group_stack: &mut BTreeSet<Id>,
+    input_binding: Option<&GroupInputBinding<'_>>,
+    material: &Material,
+    fold_failure: &RefCell<Option<SourceFoldFailure>>,
+) -> EeveeSurfaceFlags {
+    let source = SourceFoldResolver {
+        group,
+        node_groups,
+        material,
+        fold_index,
+        input_binding,
+        failure: fold_failure,
+    };
+    let reachable = source_nodes_reaching_socket(&source, output, output_socket);
+    let mut flags = EeveeSurfaceFlags::default();
+    for node_id in &reachable {
+        let Some(node) = group.nodes.get(node_id) else {
+            continue;
+        };
+        if node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true) {
+            continue;
+        }
+        match node.node_type.as_str() {
+            "ShaderNodeBsdfTransparent" => {
+                let (color_linked, color) = source.color_input(node_id, node, "Color", [1.0; 3]);
+                flags.transparent |= color_linked || color.iter().any(|channel| *channel != 0.0);
+                // GPUNodeStack::might_be_tinted() is exactly link || unequal RGB components.
+                flags.transparent_maybe_colored |=
+                    color_linked || color_might_be_tinted(&[color[0], color[1], color[2]]);
+            }
+            "ShaderNodeBsdfPrincipled" => {
+                let (linked, alpha) = source.scalar_input(node_id, node, "Alpha", 1.0);
+                flags.transparent |= linked || (alpha as f32).total_cmp(&1.0).is_ne();
+            }
+            "ShaderNodeBsdfRayPortal" => {
+                let (linked, color) = source.color_input(node_id, node, "Color", [1.0; 3]);
+                flags.transparent |= linked || color.iter().any(|channel| *channel != 0.0);
+            }
+            "ShaderNodeHoldout" => flags.has_holdout = true,
+            _ => {}
+        }
+    }
+
+    for node_id in &reachable {
+        let Some(node) = group.nodes.get(node_id) else {
+            continue;
+        };
+        if node.node_type != "ShaderNodeGroup"
+            || node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let Some(child_name) = node.properties.get("node_tree").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some((child_id, child)) = node_groups.get_key_value(child_name) else {
+            continue;
+        };
+        if child.kind != GraphKind::Shader || !group_stack.insert(child_id.clone()) {
+            continue;
+        }
+        let Some(child_output) = active_group_output(child) else {
+            group_stack.remove(child_id);
+            continue;
+        };
+        let Some(child_fold_index) = fold_index.children.get(node_id) else {
+            group_stack.remove(child_id);
+            continue;
+        };
+        for link in group.links.iter().filter(|link| {
+            link.from_node == *node_id
+                && (reachable.contains(&link.to_node)
+                    || (link.to_node == *output && socket_matches(&link.to_socket, output_socket)))
+        }) {
+            let Some(interface_output) =
+                child.interface.outputs.iter().find(|socket| {
+                    socket.id == link.from_socket || socket.name == link.from_socket
+                })
+            else {
+                continue;
+            };
+            let binding = GroupInputBinding {
+                group,
+                node_id,
+                binding: input_binding,
+                links: Some(fold_index),
+                depth: input_binding.map_or(0, |binding| binding.depth.saturating_add(1)),
+            };
+            flags.merge(graph_eevee_surface_flags_output(
+                child,
+                node_groups,
+                child_fold_index,
+                child_output,
+                &interface_output.name,
+                group_stack,
+                Some(&binding),
+                material,
+                fold_failure,
+            ));
+        }
+        group_stack.remove(child_id);
+    }
+    flags
 }
 
 fn nodes_reaching_socket(group: &NodeGroup, sink: &Id, socket: &str) -> BTreeSet<Id> {
@@ -7331,11 +9754,26 @@ mod tests {
     };
 
     use super::{
-        BsdfParams, Evaluator, EvaluatorWorkspace, GeometryAttribute, GeometryAttributeValues,
-        HitContext, HitDifferentials, HitUvLayers, PreparedMaterial, SurfaceShading,
-        Value as ShaderValue, color_lerp, evaluate_displacement, evaluate_surface, layer_index,
-        layer_uv,
+        BsdfModel, BsdfParams, EeveeGBufferCandidate, EeveeGBufferLobe, EeveeGBufferMode,
+        Evaluator, EvaluatorWorkspace, GeometryAttribute, GeometryAttributeValues, HairComponent,
+        HairParametrization, HairScatteringModel, HitContext, HitDifferentials, HitUvLayers,
+        MetallicFresnel, MicrofacetDistribution, PreparedMaterial, PrincipledHairParameters,
+        SheenDistribution, SubsurfaceMethod, SurfaceShading, ToonComponent, Value as ShaderValue,
+        color_lerp, evaluate_displacement, evaluate_surface, layer_index, layer_uv,
     };
+
+    #[test]
+    fn source_float_equality_preserves_exact_zero_and_nan_behavior() {
+        assert!(super::source_float_eq(0.0, -0.0));
+        assert!(super::source_float_eq(-0.0, 0.0));
+        assert!(super::source_float_eq(1.0, 1.0));
+        assert!(!super::source_float_eq(
+            1.0,
+            f32::from_bits(1.0_f32.to_bits() + 1),
+        ));
+        assert!(!super::source_float_eq(f32::NAN, f32::NAN));
+    }
+
     fn set_properties(group: &mut NodeGroup, id: &str, properties: Value) {
         let Value::Object(properties) = properties else {
             unreachable!("shader test properties must be an object")
@@ -7792,6 +10230,545 @@ mod tests {
         });
     }
 
+    fn evaluate_bsdf_node(
+        node_type: &str,
+        inputs: Value,
+        properties: Value,
+        path_traced: bool,
+        hair_context: Option<(DVec3, Option<DVec3>, Option<f64>)>,
+    ) -> crate::error::Result<BsdfParams> {
+        let mut graph = NodeGroup::new("Standalone BSDF", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(&mut graph, "bsdf", node_type, inputs);
+        set_properties(&mut graph, "bsdf", properties);
+        let output_socket = match node_type {
+            "ShaderNodeSubsurfaceScattering" => "BSSRDF",
+            "ShaderNodeHoldout" => "Holdout",
+            _ => "BSDF",
+        };
+        link(&mut graph, "bsdf", output_socket, "output", "Surface");
+        let graph_id = Id::new("standalone_bsdf_graph".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        let mut context = HitContext::new(&groups);
+        context.path_traced = path_traced;
+        context.position = DVec3::new(3.0, 4.0, 5.0);
+        if let Some((tangent, normal, random)) = hair_context {
+            context = context.with_hair_context(tangent, normal, random);
+        }
+        let shading = evaluate_surface(&material, &context)?;
+        Ok(shading.closures[0].params)
+    }
+
+    #[test]
+    fn standalone_sheen_subsurface_and_toon_read_exact_socket_values() {
+        let sheen = evaluate_bsdf_node(
+            "ShaderNodeBsdfSheen",
+            json!({"Color":[0.2,0.3,0.4,1.0],"Roughness":0.65,"Normal":[0.0,1.0,0.0]}),
+            json!({"distribution":"ASHIKHMIN"}),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(sheen.model, BsdfModel::Sheen(SheenDistribution::Ashikhmin));
+        assert_eq!(sheen.base_color, [0.2, 0.3, 0.4, 1.0]);
+        assert_eq!(sheen.sheen_tint, [0.2, 0.3, 0.4]);
+        assert_eq!(sheen.sheen_weight, 1.0);
+        assert_eq!(sheen.sheen_roughness, 0.65);
+        assert_eq!(sheen.specular_ior_level, 0.0);
+        assert_eq!(sheen.normal, DVec3::Z);
+
+        let toon = evaluate_bsdf_node(
+            "ShaderNodeBsdfToon",
+            json!({"Color":[0.4,0.3,0.2,1.0],"Size":0.7,"Smooth":0.15}),
+            json!({"component":"GLOSSY"}),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            toon.model,
+            BsdfModel::Toon(super::ToonParameters {
+                component: ToonComponent::Glossy,
+                size: 0.7,
+                smooth: 0.15,
+            })
+        );
+        assert_eq!(toon.base_color, [0.4, 0.3, 0.2, 1.0]);
+
+        for (falloff, method) in [
+            ("BURLEY", SubsurfaceMethod::Burley),
+            ("RANDOM_WALK", SubsurfaceMethod::RandomWalk),
+            ("RANDOM_WALK_SKIN", SubsurfaceMethod::RandomWalkSkin),
+            ("RANDOM_WALK_LEGACY", SubsurfaceMethod::RandomWalkLegacy),
+        ] {
+            let params = evaluate_bsdf_node(
+                "ShaderNodeSubsurfaceScattering",
+                json!({
+                    "Color":[0.6,0.5,0.4,1.0],
+                    "Scale":0.025,
+                    "Radius":[0.5,0.3,0.2],
+                    "IOR":1.7,
+                    "Roughness":0.45,
+                    "Anisotropy":0.6,
+                    "Normal":[0.0,0.0,1.0]
+                }),
+                json!({"falloff":falloff}),
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(params.model, BsdfModel::Subsurface);
+            assert_eq!(params.base_color, [0.6, 0.5, 0.4, 1.0]);
+            assert_eq!(params.subsurface_weight, 1.0);
+            assert_eq!(params.subsurface_radius, [0.5, 0.3, 0.2]);
+            assert_eq!(params.subsurface_scale, 0.025);
+            assert_eq!(params.subsurface_method, method);
+            assert_eq!(params.normal, DVec3::Z);
+            assert_eq!(
+                params.ior,
+                if method == SubsurfaceMethod::Burley {
+                    1.4
+                } else {
+                    1.7
+                }
+            );
+            assert_eq!(
+                params.roughness,
+                if matches!(
+                    method,
+                    SubsurfaceMethod::RandomWalk | SubsurfaceMethod::RandomWalkLegacy
+                ) {
+                    0.45
+                } else {
+                    1.0
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_metallic_uses_fresnel_specific_sockets_and_exact_defaults() {
+        let f82 = evaluate_bsdf_node(
+            "ShaderNodeBsdfMetallic",
+            json!({
+                "Base Color":[0.1,0.2,0.3,1.0],
+                "Edge Tint":[0.4,0.5,0.6,1.0],
+                "Roughness":0.3,
+                "Anisotropy":0.0,
+                "Rotation":0.5,
+                "Thin Film Thickness":0.0,
+                "Thin Film IOR":1.4
+            }),
+            json!({"distribution":"GGX","fresnel_type":"F82"}),
+            false,
+            None,
+        )
+        .unwrap();
+        let BsdfModel::Metallic(f82_parameters) = f82.model else {
+            panic!("metallic node must preserve the metallic model")
+        };
+        assert_eq!(f82_parameters.distribution, MicrofacetDistribution::Ggx);
+        assert_eq!(f82_parameters.fresnel, MetallicFresnel::F82);
+        assert_eq!(f82_parameters.edge_tint, [0.4, 0.5, 0.6]);
+        assert_eq!(f82_parameters.conductor_ior, [2.757, 2.513, 2.231]);
+        assert_eq!(f82_parameters.extinction, [3.867, 3.404, 3.009]);
+        assert_eq!(f82.base_color, [0.1, 0.2, 0.3, 1.0]);
+        assert_eq!(f82.metallic, 1.0);
+        assert_eq!(f82.roughness, 0.3);
+        assert_eq!(f82.anisotropy, 0.0);
+        assert_eq!(f82.anisotropic_rotation, 0.5);
+        assert_eq!(f82.thin_film_ior, 1.4);
+
+        let physical = evaluate_bsdf_node(
+            "ShaderNodeBsdfMetallic",
+            json!({
+                "Base Color":[0.0,0.0,0.0,1.0],
+                "Edge Tint":[0.0,0.0,0.0,1.0],
+                "IOR":[1.0,1.2,1.4],
+                "Extinction":[2.0,2.2,2.4]
+            }),
+            json!({"fresnel_type":"PHYSICAL_CONDUCTOR"}),
+            false,
+            None,
+        )
+        .unwrap();
+        let BsdfModel::Metallic(physical_parameters) = physical.model else {
+            panic!("physical conductor node must preserve the metallic model")
+        };
+        assert_eq!(
+            physical_parameters.fresnel,
+            MetallicFresnel::PhysicalConductor
+        );
+        assert_eq!(physical_parameters.conductor_ior, [1.0, 1.2, 1.4]);
+        assert_eq!(physical_parameters.extinction, [2.0, 2.2, 2.4]);
+        assert_eq!(physical_parameters.edge_tint, [0.695, 0.726, 0.770]);
+        assert_eq!(physical.base_color, [1.0; 4]);
+    }
+
+    #[test]
+    fn realtime_shader_previews_and_cycles_hair_context_are_source_specific() {
+        let input_color = [-0.2, 0.3, 0.4, 1.0];
+        let clamped_color = [0.0, 0.3, 0.4, 1.0];
+        let input_normal = [0.0, 1.0, 0.0];
+
+        let sheen = evaluate_bsdf_node(
+            "ShaderNodeBsdfSheen",
+            json!({"Color":input_color,"Normal":input_normal}),
+            json!({"distribution":"ASHIKHMIN"}),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            sheen.model,
+            BsdfModel::Sheen(SheenDistribution::Microfiber)
+        ));
+        assert_eq!(
+            sheen.base_color.map(f64::to_bits),
+            clamped_color.map(f64::to_bits)
+        );
+        assert_eq!(
+            sheen.normal.to_array().map(f64::to_bits),
+            DVec3::Y.to_array().map(f64::to_bits)
+        );
+        assert_eq!(sheen.eevee_gbuffer_features().compile_bin_count(), 1);
+
+        let toon = evaluate_bsdf_node(
+            "ShaderNodeBsdfToon",
+            json!({"Color":input_color,"Normal":input_normal}),
+            json!({"component":"GLOSSY"}),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(toon.model, BsdfModel::Principled);
+        assert_eq!(
+            toon.base_color.map(f64::to_bits),
+            clamped_color.map(f64::to_bits)
+        );
+        assert_eq!(
+            toon.normal.to_array().map(f64::to_bits),
+            DVec3::Y.to_array().map(f64::to_bits)
+        );
+        assert_eq!(toon.eevee_gbuffer_features().compile_bin_count(), 1);
+
+        let hair = evaluate_bsdf_node(
+            "ShaderNodeBsdfHair",
+            json!({"Color":input_color}),
+            json!({"component":"Transmission"}),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(hair.model, BsdfModel::Principled);
+        assert_eq!(
+            hair.base_color.map(f64::to_bits),
+            clamped_color.map(f64::to_bits)
+        );
+        assert_eq!(hair.eevee_gbuffer_features().compile_bin_count(), 1);
+
+        let principled_hair = evaluate_bsdf_node(
+            "ShaderNodeBsdfHairPrincipled",
+            json!({"Color":input_color}),
+            json!({"model":"HUANG","parametrization":"ABSORPTION"}),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(principled_hair.model, BsdfModel::Principled);
+        assert_eq!(
+            principled_hair.base_color.map(f64::to_bits),
+            input_color.map(f64::to_bits)
+        );
+        assert_eq!(
+            principled_hair.eevee_gbuffer_features().compile_bin_count(),
+            1
+        );
+
+        let portal_color = [0.3, 0.4, 0.5, 1.0];
+        let portal = evaluate_bsdf_node(
+            "ShaderNodeBsdfRayPortal",
+            json!({"Color":portal_color,"Position":[9.0,8.0,7.0],"Direction":[0.0,1.0,0.0]}),
+            json!({}),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(portal.model, BsdfModel::Principled);
+        assert_eq!(portal.alpha.to_bits(), 0.0_f64.to_bits());
+        let expected_portal_tint = [portal_color[0], portal_color[1], portal_color[2]];
+        assert_eq!(
+            portal.transparent_tint.map(f64::to_bits),
+            expected_portal_tint.map(f64::to_bits)
+        );
+        assert_eq!(portal.eevee_gbuffer_features().compile_bin_count(), 0);
+
+        let tangent_error =
+            evaluate_bsdf_node("ShaderNodeBsdfHair", json!({}), json!({}), true, None).unwrap_err();
+        assert_eq!(tangent_error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            tangent_error.details["feature_id"],
+            json!("shader.node.ShaderNodeBsdfHair.tangent_context")
+        );
+
+        let hair = evaluate_bsdf_node(
+            "ShaderNodeBsdfHair",
+            json!({
+                "Color":[0.2,0.3,0.4,1.0],
+                "Offset":0.1,
+                "RoughnessU":0.25,
+                "RoughnessV":0.75
+            }),
+            json!({"component":"Transmission"}),
+            true,
+            Some((DVec3::X, None, None)),
+        )
+        .unwrap();
+        let BsdfModel::Hair(hair_parameters) = hair.model else {
+            panic!("classic hair node must preserve the hair model")
+        };
+        assert_eq!(hair_parameters.component, HairComponent::Transmission);
+        assert_eq!(hair_parameters.tangent, DVec3::X);
+        assert_eq!(hair_parameters.offset, 0.1);
+        assert_eq!(hair_parameters.roughness_u, 0.25);
+        assert_eq!(hair_parameters.roughness_v, 0.75);
+
+        let principled = evaluate_bsdf_node(
+            "ShaderNodeBsdfHairPrincipled",
+            json!({
+                "Melanin":0.7,
+                "Melanin Redness":0.3,
+                "Tint":[0.1,0.2,0.3,1.0],
+                "Aspect Ratio":0.65,
+                "Roughness":0.2,
+                "Radial Roughness":0.4,
+                "Coat":0.1,
+                "IOR":1.6,
+                "Offset":0.05,
+                "Random Color":0.15,
+                "Random Roughness":0.25,
+                "R lobe":0.6,
+                "TT lobe":0.7,
+                "TRT lobe":0.8
+            }),
+            json!({
+                "model":"HUANG",
+                "parametrization":"MELANIN"
+            }),
+            true,
+            Some((DVec3::X, Some(DVec3::new(0.0, 0.0, 2.0)), Some(0.35))),
+        )
+        .unwrap();
+        assert_eq!(principled.eevee_diffuse_weight, None);
+        let BsdfModel::PrincipledHair(PrincipledHairParameters {
+            model,
+            parametrization,
+            melanin,
+            melanin_redness,
+            tint,
+            aspect_ratio,
+            random,
+            reflection,
+            transmission,
+            secondary_reflection,
+            ..
+        }) = principled.model
+        else {
+            panic!("principled hair node must preserve its model")
+        };
+        assert_eq!(model, HairScatteringModel::Huang);
+        assert_eq!(parametrization, HairParametrization::MelaninConcentration);
+        assert_eq!(melanin, 0.7);
+        assert_eq!(melanin_redness, 0.3);
+        assert_eq!(tint, [0.1, 0.2, 0.3]);
+        assert_eq!(aspect_ratio, 0.65);
+        assert_eq!(random, 0.35);
+        assert_eq!(reflection, 0.6);
+        assert_eq!(transmission, 0.7);
+        assert_eq!(secondary_reflection, 0.8);
+        assert_eq!(principled.hair_normal, Some(DVec3::new(0.0, 0.0, 2.0)));
+        assert_eq!(principled.anisotropic_tangent, Some(DVec3::X));
+        let random_fallback = evaluate_bsdf_node(
+            "ShaderNodeBsdfHairPrincipled",
+            json!({"Random":0.37}),
+            json!({"model":"CHIANG"}),
+            true,
+            Some((DVec3::X, Some(DVec3::Z), None)),
+        )
+        .unwrap();
+        let BsdfModel::PrincipledHair(random_fallback) = random_fallback.model else {
+            panic!("principled hair node must preserve the hair model")
+        };
+        assert_eq!(random_fallback.random, 0.37);
+
+        let missing_normal = evaluate_bsdf_node(
+            "ShaderNodeBsdfHairPrincipled",
+            json!({}),
+            json!({"model":"HUANG"}),
+            true,
+            Some((DVec3::X, None, None)),
+        )
+        .unwrap_err();
+        assert_eq!(missing_normal.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            missing_normal.details["feature_id"],
+            json!("shader.node.ShaderNodeBsdfHairPrincipled.strand_normal_context")
+        );
+    }
+
+    #[test]
+    fn unlinked_bsdf_normal_uses_the_hit_normal_not_saved_socket_default() {
+        let params = evaluate_bsdf_node(
+            "ShaderNodeBsdfSheen",
+            json!({
+                "Color":[0.72,0.31,0.12,1.0],
+                "Roughness":0.43,
+                "Normal":[0.06,0.02,0.998]
+            }),
+            json!({"distribution":"ASHIKHMIN"}),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params.normal, DVec3::Z);
+    }
+
+    #[test]
+    fn standalone_unknown_enums_and_unsupported_distribution_refuse() {
+        for (node_type, properties, feature) in [
+            (
+                "ShaderNodeBsdfSheen",
+                json!({"distribution":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfSheen.distribution:UNKNOWN",
+            ),
+            (
+                "ShaderNodeSubsurfaceScattering",
+                json!({"falloff":"UNKNOWN"}),
+                "shader.node.ShaderNodeSubsurfaceScattering.falloff:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfToon",
+                json!({"component":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfToon.component:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfMetallic",
+                json!({"distribution":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfMetallic.distribution:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfMetallic",
+                json!({"fresnel_type":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfMetallic.fresnel_type:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfHair",
+                json!({"component":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfHair.component:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfHairPrincipled",
+                json!({"model":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfHairPrincipled.model:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfHairPrincipled",
+                json!({"parametrization":"UNKNOWN"}),
+                "shader.node.ShaderNodeBsdfHairPrincipled.parametrization:UNKNOWN",
+            ),
+            (
+                "ShaderNodeBsdfRefraction",
+                json!({"distribution":"MULTI_GGX"}),
+                "shader.node.ShaderNodeBsdfRefraction.distribution:MULTI_GGX",
+            ),
+        ] {
+            let path_traced = matches!(
+                node_type,
+                "ShaderNodeBsdfSheen"
+                    | "ShaderNodeBsdfToon"
+                    | "ShaderNodeBsdfHair"
+                    | "ShaderNodeBsdfHairPrincipled"
+            );
+            let error = evaluate_bsdf_node(node_type, json!({}), properties, path_traced, None)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+            assert_eq!(error.details["feature_id"], json!(feature));
+        }
+
+        let portal = evaluate_bsdf_node(
+            "ShaderNodeBsdfRayPortal",
+            json!({"Color":[0.3,0.4,0.5,1.0],"Position":[9.0,8.0,7.0]}),
+            json!({}),
+            true,
+            None,
+        )
+        .unwrap();
+        let BsdfModel::RayPortal(portal_parameters) = portal.model else {
+            panic!("ray portal node must preserve the portal model")
+        };
+        assert_eq!(portal_parameters.position, DVec3::new(3.0, 4.0, 5.0));
+        assert_eq!(portal_parameters.direction, DVec3::ZERO);
+        assert_eq!(portal.base_color, [0.3, 0.4, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn standalone_refraction_translucent_and_holdout_keep_distinct_models() {
+        let refraction = evaluate_bsdf_node(
+            "ShaderNodeBsdfRefraction",
+            json!({"Color":[0.7,0.6,0.5,1.0],"IOR":1.6,"Roughness":0.2}),
+            json!({"distribution":"GGX"}),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            refraction.model,
+            BsdfModel::Refraction(MicrofacetDistribution::Ggx)
+        );
+        assert_eq!(refraction.base_color, [0.7, 0.6, 0.5, 1.0]);
+        assert_eq!(refraction.ior, 1.6);
+        assert_eq!(refraction.roughness, 0.2);
+        assert_eq!(refraction.transmission, 1.0);
+        assert_eq!(refraction.glass_transmission_tint, [0.7, 0.6, 0.5]);
+
+        let translucent = evaluate_bsdf_node(
+            "ShaderNodeBsdfTranslucent",
+            json!({"Color":[0.2,0.4,0.6,1.0],"Normal":[1.0,0.0,0.0]}),
+            json!({}),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(translucent.model, BsdfModel::Translucent);
+        assert_eq!(translucent.base_color, [0.2, 0.4, 0.6, 1.0]);
+        assert_eq!(translucent.transmission, 1.0);
+        assert_eq!(translucent.normal, DVec3::Z);
+
+        let holdout =
+            evaluate_bsdf_node("ShaderNodeHoldout", json!({}), json!({}), false, None).unwrap();
+        assert_eq!(holdout.model, BsdfModel::Holdout);
+        assert_eq!(holdout.alpha, 0.0);
+    }
+
+    #[test]
+    fn metallic_active_thin_film_is_preserved() {
+        let params = evaluate_bsdf_node(
+            "ShaderNodeBsdfMetallic",
+            json!({"Thin Film Thickness":0.2,"Thin Film IOR":1.4}),
+            json!({}),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params.thin_film_thickness, 0.2);
+        assert_eq!(params.thin_film_ior, 1.4);
+    }
+
     /// A graph whose Principled BSDF feeds the output with the given inputs.
     fn principled_output(principled_inputs: Value) -> NodeGroup {
         let mut graph = NodeGroup::new("Principled", GraphKind::Shader);
@@ -7804,6 +10781,460 @@ mod tests {
         );
         link(&mut graph, "principled", "BSDF", "output", "Surface");
         graph
+    }
+    fn evaluate_gbuffer_graph(graph: NodeGroup) -> SurfaceShading {
+        let graph_id = Id::new("gbuffer_layout_graph".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        evaluate_surface(&material, &HitContext::new(&groups)).unwrap()
+    }
+
+    fn principled_hair_preview_group(
+        output_type: &str,
+        output_socket: &str,
+        mix_with_black_diffuse: bool,
+    ) -> NodeGroup {
+        let mut graph = NodeGroup::new("Hair Preview", GraphKind::Shader);
+        if output_type == "NodeGroupOutput" {
+            graph.interface.outputs.push(GraphSocket {
+                id: "Shader".to_owned(),
+                name: "Shader".to_owned(),
+                socket_type: "shader".to_owned(),
+                default: Value::Null,
+            });
+        }
+        insert_node(&mut graph, "output", output_type, json!({}));
+        insert_node(
+            &mut graph,
+            "hair",
+            "ShaderNodeBsdfHairPrincipled",
+            json!({
+                "Color": [0.2, 0.3, 0.4, 1.0],
+                "TRT lobe": 0.62
+            }),
+        );
+        if mix_with_black_diffuse {
+            insert_node(
+                &mut graph,
+                "mix",
+                "ShaderNodeMixShader",
+                json!({"Fac": 0.5}),
+            );
+            insert_node(
+                &mut graph,
+                "black",
+                "ShaderNodeBsdfDiffuse",
+                json!({"Color": [0.0, 0.0, 0.0, 1.0]}),
+            );
+            link(&mut graph, "hair", "BSDF", "mix", "Shader");
+            link(&mut graph, "black", "BSDF", "mix", "Shader_001");
+            link(&mut graph, "mix", "Shader", "output", output_socket);
+        } else {
+            link(&mut graph, "hair", "BSDF", "output", output_socket);
+        }
+        graph
+    }
+
+    #[test]
+    fn eevee_principled_hair_gpu_weight_is_independent_of_graph_coverage() {
+        let direct = evaluate_gbuffer_graph(principled_hair_preview_group(
+            "ShaderNodeOutputMaterial",
+            "Surface",
+            false,
+        ));
+        assert_eq!(direct.closures.len(), 1);
+        assert_eq!(direct.closures[0].weight, 1.0);
+        assert_eq!(direct.closures[0].params.base_color, [0.2, 0.3, 0.4, 1.0]);
+        assert_eq!(direct.closures[0].params.eevee_diffuse_weight, Some(0.62));
+
+        let child_id = Id::new("hair_weight_child".to_owned()).unwrap();
+        let root_id = Id::new("hair_weight_root".to_owned()).unwrap();
+        let child = principled_hair_preview_group("NodeGroupOutput", "Shader", true);
+        let mut root = NodeGroup::new("Hair Weight Root", GraphKind::Shader);
+        insert_node(&mut root, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(&mut root, "child", "ShaderNodeGroup", json!({}));
+        set_properties(&mut root, "child", json!({"node_tree": child_id.as_str()}));
+        link(&mut root, "child", "Shader", "output", "Surface");
+        let mut groups = Registry::new();
+        groups.insert(child_id, child);
+        groups.insert(root_id.clone(), root);
+        let material = Material {
+            node_tree: Some(root_id),
+            ..Material::default()
+        };
+        let mixed = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
+        assert_eq!(mixed.closures.len(), 2);
+        let [hair, black] = mixed.closures.as_slice() else {
+            panic!("the grouped Mix Shader must retain both closures")
+        };
+        assert_eq!(hair.weight, 0.5);
+        assert_eq!(hair.params.alpha, 1.0);
+        assert_eq!(hair.params.eevee_diffuse_weight, Some(0.62));
+        assert_eq!(black.weight, 0.5);
+        assert_eq!(black.params.alpha, 1.0);
+        assert_eq!(black.params.eevee_diffuse_weight, None);
+
+        let ordinary = two_principled_surface("ShaderNodeMixShader", json!({"Fac": 0.25}));
+        assert_eq!(
+            ordinary
+                .closures
+                .iter()
+                .map(|closure| closure.weight)
+                .collect::<Vec<_>>(),
+            [0.75, 0.25]
+        );
+        assert!(
+            ordinary
+                .closures
+                .iter()
+                .all(|closure| closure.params.eevee_diffuse_weight.is_none())
+        );
+    }
+
+    #[test]
+    fn standalone_subsurface_resolves_one_compacted_gbuffer_bin() {
+        let mut graph = NodeGroup::new("Standalone SSS", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "sss",
+            "ShaderNodeSubsurfaceScattering",
+            json!({"Color":[0.7,0.4,0.2,1.0]}),
+        );
+        link(&mut graph, "sss", "BSSRDF", "output", "Surface");
+        let shading = evaluate_gbuffer_graph(graph);
+
+        assert_eq!(shading.eevee_gbuffer_features.compile_bin_count(), 1);
+        let layout = shading
+            .eevee_gbuffer_layout(
+                &[EeveeGBufferCandidate {
+                    source_closure_index: 0,
+                    lobe: EeveeGBufferLobe::Subsurface,
+                    weight: 1.0,
+                    color: [0.7, 0.4, 0.2],
+                }],
+                0.5,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(layout.bin_count, 1);
+        let bin = layout.bins[0].unwrap();
+        assert_eq!(bin.candidate_index, 0);
+        assert_eq!(bin.source_bin, 0);
+        assert_eq!(bin.storage_layer, 0);
+        assert_eq!(bin.mode, EeveeGBufferMode::Subsurface);
+        assert_eq!(bin.data0_layer, 0);
+        assert_eq!(bin.data1_layer, Some(1));
+    }
+
+    #[test]
+    fn mixed_principled_subsurface_and_diffuse_keep_compacted_modes() {
+        let mut graph = NodeGroup::new("Mixed SSS", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(&mut graph, "add", "ShaderNodeAddShader", json!({}));
+        insert_node(
+            &mut graph,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({"Subsurface Weight":1.0}),
+        );
+        insert_node(
+            &mut graph,
+            "diffuse",
+            "ShaderNodeBsdfDiffuse",
+            json!({"Color":[0.7,0.5,0.3,1.0]}),
+        );
+        link(&mut graph, "principled", "BSDF", "add", "Shader");
+        link(&mut graph, "diffuse", "BSDF", "add", "Shader_001");
+        link(&mut graph, "add", "Shader", "output", "Surface");
+        let shading = evaluate_gbuffer_graph(graph);
+
+        assert!(shading.eevee_gbuffer_features.has_subsurface());
+        assert!(shading.eevee_gbuffer_features.has_diffuse());
+        assert_eq!(shading.eevee_gbuffer_features.compile_bin_count(), 2);
+        let layout = shading
+            .eevee_gbuffer_layout(
+                &[
+                    EeveeGBufferCandidate {
+                        source_closure_index: 0,
+                        lobe: EeveeGBufferLobe::Reflection,
+                        weight: 1.0,
+                        color: [1.0; 3],
+                    },
+                    EeveeGBufferCandidate {
+                        source_closure_index: 0,
+                        lobe: EeveeGBufferLobe::Subsurface,
+                        weight: 1.0,
+                        color: [0.7, 0.5, 0.3],
+                    },
+                    EeveeGBufferCandidate {
+                        source_closure_index: 0,
+                        lobe: EeveeGBufferLobe::Diffuse,
+                        weight: 0.01,
+                        color: [0.8; 3],
+                    },
+                    EeveeGBufferCandidate {
+                        source_closure_index: 1,
+                        lobe: EeveeGBufferLobe::Diffuse,
+                        weight: 0.01,
+                        color: [0.7, 0.5, 0.3],
+                    },
+                ],
+                0.9,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(layout.bin_count, 2);
+        assert_eq!(layout.bins[0].unwrap().lobe, EeveeGBufferLobe::Subsurface);
+        assert_eq!(layout.bins[0].unwrap().mode, EeveeGBufferMode::Subsurface);
+        assert_eq!(layout.bins[0].unwrap().data1_layer, Some(2));
+        assert_eq!(
+            layout.bins[1].unwrap().mode,
+            EeveeGBufferMode::ReflectionColorless
+        );
+    }
+
+    #[test]
+    fn principled_refraction_reflection_and_coat_fill_three_bins() {
+        let graph = principled_output(json!({
+            "Base Color":[0.8,0.4,0.2,1.0],
+            "Metallic":0.2,
+            "Transmission Weight":0.5,
+            "Coat Weight":0.4
+        }));
+        let shading = evaluate_gbuffer_graph(graph);
+        assert_eq!(shading.eevee_gbuffer_features.compile_bin_count(), 3);
+        assert!(shading.eevee_gbuffer_features.has_refraction());
+        assert!(shading.eevee_gbuffer_features.has_clearcoat());
+
+        let layout = shading
+            .eevee_gbuffer_layout(
+                &[
+                    EeveeGBufferCandidate {
+                        source_closure_index: 0,
+                        lobe: EeveeGBufferLobe::Clearcoat,
+                        weight: 0.25,
+                        color: [1.0; 3],
+                    },
+                    EeveeGBufferCandidate {
+                        source_closure_index: 0,
+                        lobe: EeveeGBufferLobe::Refraction,
+                        weight: 1.0,
+                        color: [0.6, 0.3, 0.1],
+                    },
+                    EeveeGBufferCandidate {
+                        source_closure_index: 0,
+                        lobe: EeveeGBufferLobe::Reflection,
+                        weight: 1.0,
+                        color: [0.3, 0.2, 0.1],
+                    },
+                    EeveeGBufferCandidate {
+                        source_closure_index: 0,
+                        lobe: EeveeGBufferLobe::Diffuse,
+                        weight: 0.01,
+                        color: [0.8, 0.4, 0.2],
+                    },
+                ],
+                0.5,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(layout.bin_count, 3);
+        assert_eq!(layout.bins[0].unwrap().lobe, EeveeGBufferLobe::Refraction);
+        assert_eq!(layout.bins[0].unwrap().mode, EeveeGBufferMode::Refraction);
+        assert_eq!(layout.bins[0].unwrap().data1_layer, Some(3));
+        assert_eq!(layout.bins[1].unwrap().lobe, EeveeGBufferLobe::Reflection);
+        assert_eq!(layout.bins[1].unwrap().source_bin, 1);
+        assert_eq!(layout.bins[2].unwrap().lobe, EeveeGBufferLobe::Clearcoat);
+        assert_eq!(layout.bins[2].unwrap().source_bin, 2);
+    }
+
+    #[test]
+    fn empty_high_reflection_bin_compacts_without_capping_candidates() {
+        let mut graph = NodeGroup::new("Compaction", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(&mut graph, "root", "ShaderNodeAddShader", json!({}));
+        insert_node(&mut graph, "lower", "ShaderNodeAddShader", json!({}));
+        insert_node(&mut graph, "diffuse", "ShaderNodeBsdfDiffuse", json!({}));
+        insert_node(
+            &mut graph,
+            "translucent",
+            "ShaderNodeBsdfTranslucent",
+            json!({}),
+        );
+        insert_node(
+            &mut graph,
+            "glossy",
+            "ShaderNodeBsdfGlossy",
+            json!({"Color":[0.2,0.5,0.8,1.0]}),
+        );
+        link(&mut graph, "diffuse", "BSDF", "lower", "Shader");
+        link(&mut graph, "translucent", "BSDF", "lower", "Shader_001");
+        link(&mut graph, "lower", "Shader", "root", "Shader");
+        link(&mut graph, "glossy", "BSDF", "root", "Shader_001");
+        link(&mut graph, "root", "Shader", "output", "Surface");
+        let shading = evaluate_gbuffer_graph(graph);
+
+        assert_eq!(shading.eevee_gbuffer_features.compile_bin_count(), 3);
+        let layout = shading
+            .eevee_gbuffer_layout(
+                &[EeveeGBufferCandidate {
+                    source_closure_index: 2,
+                    lobe: EeveeGBufferLobe::Reflection,
+                    weight: 1.0,
+                    color: [0.2, 0.5, 0.8],
+                }],
+                0.5,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(layout.bin_count, 1);
+        assert_eq!(layout.bins[0].unwrap().source_bin, 2);
+        assert_eq!(layout.bins[0].unwrap().storage_layer, 0);
+        assert_eq!(layout.bins[0].unwrap().data1_layer, Some(1));
+    }
+
+    #[test]
+    fn colorless_reflection_uses_exact_two_bin_simple_layout() {
+        let shading = evaluate_gbuffer_graph(principled_output(json!({})));
+        let features = shading.eevee_gbuffer_features;
+        assert_eq!(features.compile_bin_count(), 2);
+        assert!(features.simple_layout());
+        let layout = features
+            .eevee_gbuffer_layout(
+                &[
+                    EeveeGBufferCandidate {
+                        source_closure_index: 0,
+                        lobe: EeveeGBufferLobe::Reflection,
+                        weight: 1.0,
+                        color: [0.4; 3],
+                    },
+                    EeveeGBufferCandidate {
+                        source_closure_index: 0,
+                        lobe: EeveeGBufferLobe::Diffuse,
+                        weight: 1.0,
+                        color: [0.8; 3],
+                    },
+                ],
+                0.5,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(layout.bin_count, 2);
+        assert!(layout.simple_layout);
+        assert_eq!(
+            layout.bins[1].unwrap().mode,
+            EeveeGBufferMode::ReflectionColorless
+        );
+        let reflection = layout.bins[1].unwrap();
+        assert_eq!(reflection.candidate_index, 0);
+        let color_weight = (0.4_f32.abs() + 0.4_f32.abs() + 0.4_f32.abs()) * (1.0 / 3.0);
+        assert_eq!(reflection.color, [0.4_f32 / color_weight; 3]);
+        assert_eq!(layout.bins[1].unwrap().data1_layer, None);
+    }
+    #[test]
+    fn dielectric_specular_tint_compiles_colored_reflection_storage() {
+        let shading = evaluate_gbuffer_graph(principled_output(json!({
+            "Metallic":0.0,
+            "Specular Tint":[0.8,0.3,0.1,1.0]
+        })));
+        assert!(shading.eevee_gbuffer_features.reflection_may_be_colored);
+    }
+
+    #[test]
+    fn linked_zero_subsurface_is_compile_eligible_but_cutoffs_stay_runtime() {
+        let unlinked_near_zero =
+            evaluate_gbuffer_graph(principled_output(json!({"Subsurface Weight":1.0e-6})));
+        assert!(!unlinked_near_zero.eevee_gbuffer_features.has_subsurface());
+        let mut graph = principled_output(json!({"Subsurface Weight":0.0}));
+        insert_node(&mut graph, "zero", "ShaderNodeValue", json!({}));
+        graph
+            .nodes
+            .get_mut(&Id::new("zero".to_owned()).unwrap())
+            .unwrap()
+            .properties
+            .insert(
+                "potter_output_defaults".to_owned(),
+                json!([{"identifier":"Value","default":0.0}]),
+            );
+        link(
+            &mut graph,
+            "zero",
+            "Value",
+            "principled",
+            "Subsurface Weight",
+        );
+        let shading = evaluate_gbuffer_graph(graph);
+        assert_eq!(shading.closures[0].params.subsurface_weight, 0.0);
+        assert!(shading.eevee_gbuffer_features.has_subsurface());
+
+        let runtime_layout = shading
+            .eevee_gbuffer_layout(
+                &[
+                    EeveeGBufferCandidate {
+                        source_closure_index: 0,
+                        lobe: EeveeGBufferLobe::Reflection,
+                        weight: 1.0,
+                        color: [1.0; 3],
+                    },
+                    EeveeGBufferCandidate {
+                        source_closure_index: 0,
+                        lobe: EeveeGBufferLobe::Diffuse,
+                        weight: 1.0,
+                        color: [0.8; 3],
+                    },
+                ],
+                0.5,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(runtime_layout.bin_count, 2);
+        assert!(
+            !runtime_layout
+                .bins
+                .iter()
+                .flatten()
+                .any(|bin| { bin.lobe == EeveeGBufferLobe::Subsurface })
+        );
+
+        for weight in [0.999e-5, 1.0e-5] {
+            let cutoff_layout = shading
+                .eevee_gbuffer_features
+                .eevee_gbuffer_layout(
+                    &[EeveeGBufferCandidate {
+                        source_closure_index: 0,
+                        lobe: EeveeGBufferLobe::Subsurface,
+                        weight,
+                        color: [1.0; 3],
+                    }],
+                    0.5,
+                    1.0,
+                )
+                .unwrap();
+            assert_eq!(cutoff_layout.bin_count, 0);
+        }
+        let above_cutoff = shading
+            .eevee_gbuffer_features
+            .eevee_gbuffer_layout(
+                &[EeveeGBufferCandidate {
+                    source_closure_index: 0,
+                    lobe: EeveeGBufferLobe::Subsurface,
+                    weight: 1.1e-5,
+                    color: [1.0; 3],
+                }],
+                0.5,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(above_cutoff.bin_count, 1);
+        assert_eq!(
+            above_cutoff.bins[0].unwrap().mode,
+            EeveeGBufferMode::Subsurface
+        );
     }
 
     #[test]
@@ -7902,15 +11333,563 @@ mod tests {
         );
     }
 
-    fn is_transparent(graph: NodeGroup) -> bool {
-        let id = Id::new("transparency_graph").unwrap();
+    fn prepared_material(graph: NodeGroup) -> PreparedMaterial {
+        let id = Id::new("transparency_graph".to_owned()).unwrap();
         let mut groups = Registry::new();
         groups.insert(id.clone(), graph);
         let material = Material {
             node_tree: Some(id),
             ..Material::default()
         };
-        PreparedMaterial::new(&material, &groups).is_transparent()
+        PreparedMaterial::new(&material, &groups)
+    }
+
+    fn is_transparent(graph: NodeGroup) -> bool {
+        prepared_material(graph).is_transparent()
+    }
+
+    #[test]
+    fn source_folded_math_vector_mix_chain_prunes_the_compiled_shader_arm() {
+        let mut graph = NodeGroup::new("Folded Mix Branch", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "transparent",
+            "ShaderNodeBsdfTransparent",
+            json!({}),
+        );
+        insert_node(&mut graph, "diffuse", "ShaderNodeBsdfDiffuse", json!({}));
+        insert_node(&mut graph, "mix_shader", "ShaderNodeMixShader", json!({}));
+        insert_node(
+            &mut graph,
+            "math",
+            "ShaderNodeMath",
+            json!({"Value":0.5,"Value_001":0.5}),
+        );
+        set_properties(&mut graph, "math", json!({"operation":"ADD"}));
+        insert_node(
+            &mut graph,
+            "mix",
+            "ShaderNodeMix",
+            json!({
+                "A_Vector":[0.0,0.0,0.0],
+                "B_Vector":[1.0,0.0,0.0],
+                "Factor_Float":0.5
+            }),
+        );
+        set_properties(
+            &mut graph,
+            "mix",
+            json!({"data_type":"VECTOR","factor_mode":"NON_UNIFORM"}),
+        );
+        insert_node(
+            &mut graph,
+            "length",
+            "ShaderNodeVectorMath",
+            json!({"Vector_001":[0.0,0.0,0.0]}),
+        );
+        set_properties(&mut graph, "length", json!({"operation":"LENGTH"}));
+        link(&mut graph, "math", "Value", "mix", "Factor_Vector");
+        link(&mut graph, "mix", "Result_Vector", "length", "Vector");
+        link(&mut graph, "transparent", "BSDF", "mix_shader", "Shader");
+        link(&mut graph, "diffuse", "BSDF", "mix_shader", "Shader_001");
+        link(&mut graph, "length", "Value", "mix_shader", "Fac");
+        link(&mut graph, "mix_shader", "Shader", "output", "Surface");
+
+        let flags = prepared_material(graph).eevee_closure_flags().unwrap();
+        assert_ne!(flags & super::EEVEE_CLOSURE_DIFFUSE, 0);
+        assert_eq!(flags & super::EEVEE_CLOSURE_TRANSPARENCY, 0);
+    }
+
+    #[test]
+    fn source_linked_runtime_mix_control_keeps_both_compiled_shader_arms() {
+        let mut graph = NodeGroup::new("Linked Mix Branch", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "transparent",
+            "ShaderNodeBsdfTransparent",
+            json!({}),
+        );
+        insert_node(&mut graph, "diffuse", "ShaderNodeBsdfDiffuse", json!({}));
+        insert_node(&mut graph, "mix", "ShaderNodeMixShader", json!({}));
+        insert_node(&mut graph, "object", "ShaderNodeObjectInfo", json!({}));
+        link(&mut graph, "transparent", "BSDF", "mix", "Shader");
+        link(&mut graph, "diffuse", "BSDF", "mix", "Shader_001");
+        link(&mut graph, "object", "Random", "mix", "Fac");
+        link(&mut graph, "mix", "Shader", "output", "Surface");
+
+        let flags = prepared_material(graph).eevee_closure_flags().unwrap();
+        assert_ne!(flags & super::EEVEE_CLOSURE_DIFFUSE, 0);
+        assert_ne!(flags & super::EEVEE_CLOSURE_TRANSPARENCY, 0);
+    }
+
+    #[test]
+    fn source_group_invocation_alias_and_factor_clamp_select_mix_branch() {
+        let prepared_for_factor = |factor: f64| {
+            let root_id = Id::new("group_mix_root".to_owned()).unwrap();
+            let child_id = Id::new("group_mix_child".to_owned()).unwrap();
+            let mut child = NodeGroup::new("Grouped Mix", GraphKind::Shader);
+            child.interface.inputs.push(GraphSocket {
+                id: "factor_input".to_owned(),
+                name: "Factor".to_owned(),
+                socket_type: "NodeSocketFloat".to_owned(),
+                default: json!(0.5),
+            });
+            child.interface.outputs.push(GraphSocket {
+                id: "surface_output".to_owned(),
+                name: "Surface".to_owned(),
+                socket_type: "NodeSocketShader".to_owned(),
+                default: Value::Null,
+            });
+            insert_node(&mut child, "group_input", "NodeGroupInput", json!({}));
+            insert_node(&mut child, "group_output", "NodeGroupOutput", json!({}));
+            set_properties(&mut child, "group_output", json!({"is_active_output":true}));
+            insert_node(
+                &mut child,
+                "transparent",
+                "ShaderNodeBsdfTransparent",
+                json!({}),
+            );
+            insert_node(&mut child, "diffuse", "ShaderNodeBsdfDiffuse", json!({}));
+            insert_node(&mut child, "mix", "ShaderNodeMixShader", json!({}));
+            link(&mut child, "group_input", "Factor", "mix", "Fac");
+            link(&mut child, "transparent", "BSDF", "mix", "Shader");
+            link(&mut child, "diffuse", "BSDF", "mix", "Shader_001");
+            link(&mut child, "mix", "Shader", "group_output", "Surface");
+
+            let mut root = NodeGroup::new("Group Mix Root", GraphKind::Shader);
+            insert_node(&mut root, "output", "ShaderNodeOutputMaterial", json!({}));
+            insert_node(
+                &mut root,
+                "group",
+                "ShaderNodeGroup",
+                json!({"Factor":factor}),
+            );
+            set_properties(&mut root, "group", json!({"node_tree":child_id.as_str()}));
+            link(&mut root, "group", "surface_output", "output", "Surface");
+
+            let mut groups = Registry::new();
+            groups.insert(child_id, child);
+            groups.insert(root_id.clone(), root);
+            let material = Material {
+                node_tree: Some(root_id),
+                ..Material::default()
+            };
+            let prepared = PreparedMaterial::new(&material, &groups);
+            (
+                prepared.eevee_closure_flags().unwrap(),
+                prepared.is_transparent(),
+            )
+        };
+
+        let (inside, inside_transparent) = prepared_for_factor(0.9999);
+        let (clamped, clamped_transparent) = prepared_for_factor(1.0001);
+        assert_ne!(inside & super::EEVEE_CLOSURE_TRANSPARENCY, 0);
+        assert!(inside_transparent);
+        assert_eq!(clamped & super::EEVEE_CLOSURE_TRANSPARENCY, 0);
+        assert!(!clamped_transparent);
+    }
+
+    #[test]
+    fn dangling_values_fall_back_at_group_input_and_group_output_boundaries() {
+        let group_input_result = {
+            let root_id = Id::new("dangling_input_root".to_owned()).unwrap();
+            let child_id = Id::new("dangling_input_child".to_owned()).unwrap();
+            let mut child = NodeGroup::new("Dangling Group Input", GraphKind::Shader);
+            child.interface.inputs.push(GraphSocket {
+                id: "alpha_input".to_owned(),
+                name: "Alpha".to_owned(),
+                socket_type: "NodeSocketFloat".to_owned(),
+                default: json!(1.0),
+            });
+            child.interface.outputs.push(GraphSocket {
+                id: "surface_output".to_owned(),
+                name: "Surface".to_owned(),
+                socket_type: "NodeSocketShader".to_owned(),
+                default: Value::Null,
+            });
+            insert_node(&mut child, "group_input", "NodeGroupInput", json!({}));
+            insert_node(&mut child, "group_output", "NodeGroupOutput", json!({}));
+            set_properties(&mut child, "group_output", json!({"is_active_output":true}));
+            insert_node(
+                &mut child,
+                "principled",
+                "ShaderNodeBsdfPrincipled",
+                json!({"Alpha":1.0}),
+            );
+            link(&mut child, "group_input", "Alpha", "principled", "Alpha");
+            link(&mut child, "principled", "BSDF", "group_output", "Surface");
+
+            let mut root = NodeGroup::new("Dangling Group Input Root", GraphKind::Shader);
+            insert_node(&mut root, "output", "ShaderNodeOutputMaterial", json!({}));
+            insert_node(&mut root, "group", "ShaderNodeGroup", json!({"Alpha":0.4}));
+            set_properties(&mut root, "group", json!({"node_tree":child_id.as_str()}));
+            insert_node(
+                &mut root,
+                "muted",
+                "ShaderNodeMix",
+                json!({
+                    "Factor_Float":0.25,
+                    "A_Float":1.0,
+                    "B_Float":0.95
+                }),
+            );
+            set_properties(
+                &mut root,
+                "muted",
+                json!({
+                    "mute":true,
+                    "data_type":"FLOAT",
+                    "internal_links":[{"from_socket":"A_Float","to_socket":"Result_Float"}]
+                }),
+            );
+            link(&mut root, "muted", "Result_Float", "group", "Alpha");
+            link(&mut root, "group", "surface_output", "output", "Surface");
+
+            let mut groups = Registry::new();
+            groups.insert(child_id, child);
+            groups.insert(root_id.clone(), root);
+            let material = Material {
+                node_tree: Some(root_id),
+                ..Material::default()
+            };
+            let prepared = PreparedMaterial::new(&material, &groups);
+            (
+                prepared.eevee_closure_flags().unwrap(),
+                prepared.is_transparent(),
+            )
+        };
+        assert_ne!(group_input_result.0 & super::EEVEE_CLOSURE_TRANSPARENCY, 0);
+        assert!(group_input_result.1);
+
+        let group_output_result = {
+            let root_id = Id::new("dangling_output_root".to_owned()).unwrap();
+            let child_id = Id::new("dangling_output_child".to_owned()).unwrap();
+            let mut child = NodeGroup::new("Dangling Group Output", GraphKind::Shader);
+            child.interface.outputs.push(GraphSocket {
+                id: "alpha_output".to_owned(),
+                name: "Alpha".to_owned(),
+                socket_type: "NodeSocketFloat".to_owned(),
+                default: json!(0.4),
+            });
+            insert_node(
+                &mut child,
+                "group_output",
+                "NodeGroupOutput",
+                json!({"Alpha":0.4}),
+            );
+            set_properties(&mut child, "group_output", json!({"is_active_output":true}));
+            insert_node(
+                &mut child,
+                "muted",
+                "ShaderNodeMix",
+                json!({
+                    "Factor_Float":0.25,
+                    "A_Float":1.0,
+                    "B_Float":0.95
+                }),
+            );
+            set_properties(
+                &mut child,
+                "muted",
+                json!({
+                    "mute":true,
+                    "data_type":"FLOAT",
+                    "internal_links":[{"from_socket":"A_Float","to_socket":"Result_Float"}]
+                }),
+            );
+            link(&mut child, "muted", "Result_Float", "group_output", "Alpha");
+
+            let mut root = NodeGroup::new("Dangling Group Output Root", GraphKind::Shader);
+            insert_node(&mut root, "output", "ShaderNodeOutputMaterial", json!({}));
+            insert_node(
+                &mut root,
+                "principled",
+                "ShaderNodeBsdfPrincipled",
+                json!({"Alpha":1.0}),
+            );
+            insert_node(&mut root, "group", "ShaderNodeGroup", json!({}));
+            set_properties(&mut root, "group", json!({"node_tree":child_id.as_str()}));
+            link(&mut root, "group", "alpha_output", "principled", "Alpha");
+            link(&mut root, "principled", "BSDF", "output", "Surface");
+
+            let mut groups = Registry::new();
+            groups.insert(child_id, child);
+            groups.insert(root_id.clone(), root);
+            let material = Material {
+                node_tree: Some(root_id),
+                ..Material::default()
+            };
+            let prepared = PreparedMaterial::new(&material, &groups);
+            (
+                prepared.eevee_closure_flags().unwrap(),
+                prepared.is_transparent(),
+            )
+        };
+        assert_ne!(group_output_result.0 & super::EEVEE_CLOSURE_TRANSPARENCY, 0);
+        assert!(group_output_result.1);
+    }
+
+    #[test]
+    fn source_folded_values_drive_principled_and_transparent_color_flags() {
+        let mut principled = NodeGroup::new("Folded Principled Input", GraphKind::Shader);
+        insert_node(
+            &mut principled,
+            "output",
+            "ShaderNodeOutputMaterial",
+            json!({}),
+        );
+        insert_node(
+            &mut principled,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({"Coat Weight":0.0}),
+        );
+        insert_node(
+            &mut principled,
+            "weight",
+            "ShaderNodeMath",
+            json!({"Value":0.25,"Value_001":0.5}),
+        );
+        set_properties(&mut principled, "weight", json!({"operation":"ADD"}));
+        link(
+            &mut principled,
+            "weight",
+            "Value",
+            "principled",
+            "Coat Weight",
+        );
+        link(&mut principled, "principled", "BSDF", "output", "Surface");
+        assert_ne!(
+            prepared_material(principled).eevee_closure_flags().unwrap()
+                & super::EEVEE_CLOSURE_CLEARCOAT,
+            0
+        );
+
+        for node_type in ["ShaderNodeBsdfTransparent", "ShaderNodeBsdfRayPortal"] {
+            let mut graph = NodeGroup::new("Folded BSDF Color", GraphKind::Shader);
+            insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+            insert_node(
+                &mut graph,
+                "bsdf",
+                node_type,
+                json!({"Color":[1.0,1.0,1.0,1.0]}),
+            );
+            insert_node(
+                &mut graph,
+                "black",
+                "ShaderNodeMix",
+                json!({
+                    "Factor_Float":0.5,
+                    "A_Color":[0.0,0.0,0.0,1.0],
+                    "B_Color":[0.0,0.0,0.0,1.0]
+                }),
+            );
+            set_properties(&mut graph, "black", json!({"data_type":"RGBA"}));
+            link(&mut graph, "black", "Result_Color", "bsdf", "Color");
+            link(&mut graph, "bsdf", "BSDF", "output", "Surface");
+            let prepared = prepared_material(graph);
+            assert_eq!(
+                prepared.eevee_closure_flags().unwrap() & super::EEVEE_CLOSURE_TRANSPARENCY,
+                0
+            );
+            assert!(!prepared.is_transparent());
+        }
+    }
+
+    #[test]
+    fn source_reroutes_and_muted_internal_links_preserve_primitive_outputs() {
+        let mut graph = NodeGroup::new("Primitive Pass Through", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "transparent",
+            "ShaderNodeBsdfTransparent",
+            json!({}),
+        );
+        insert_node(&mut graph, "diffuse", "ShaderNodeBsdfDiffuse", json!({}));
+        insert_node(&mut graph, "mix_shader", "ShaderNodeMixShader", json!({}));
+        insert_node(
+            &mut graph,
+            "math",
+            "ShaderNodeMath",
+            json!({"Value":0.5,"Value_001":0.5}),
+        );
+        set_properties(&mut graph, "math", json!({"operation":"ADD"}));
+        insert_node(&mut graph, "reroute", "NodeReroute", json!({"Input":0.0}));
+        insert_node(
+            &mut graph,
+            "muted",
+            "ShaderNodeMix",
+            json!({
+                "Factor_Float":0.25,
+                "A_Float":0.0,
+                "B_Float":0.95
+            }),
+        );
+        set_properties(
+            &mut graph,
+            "muted",
+            json!({
+                "mute":true,
+                "data_type":"FLOAT",
+                "internal_links":[{"from_socket":"A_Float","to_socket":"Result_Float"}]
+            }),
+        );
+        link(&mut graph, "math", "Value", "reroute", "Input");
+        link(&mut graph, "reroute", "Output", "muted", "A_Float");
+        link(&mut graph, "transparent", "BSDF", "mix_shader", "Shader");
+        link(&mut graph, "diffuse", "BSDF", "mix_shader", "Shader_001");
+        link(&mut graph, "muted", "Result_Float", "mix_shader", "Fac");
+        link(&mut graph, "mix_shader", "Shader", "output", "Surface");
+
+        let prepared = prepared_material(graph);
+        assert_ne!(
+            prepared.eevee_closure_flags().unwrap() & super::EEVEE_CLOSURE_DIFFUSE,
+            0
+        );
+        assert_eq!(
+            prepared.eevee_closure_flags().unwrap() & super::EEVEE_CLOSURE_TRANSPARENCY,
+            0
+        );
+        assert!(!prepared.is_transparent());
+    }
+
+    #[test]
+    fn dangling_muted_output_uses_the_nonmuted_sink_default() {
+        let mut graph = NodeGroup::new("Dangling Muted Input", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({"Alpha":0.4}),
+        );
+        insert_node(
+            &mut graph,
+            "muted",
+            "ShaderNodeMix",
+            json!({
+                "Factor_Float":0.25,
+                "A_Float":1.0,
+                "B_Float":0.95
+            }),
+        );
+        set_properties(
+            &mut graph,
+            "muted",
+            json!({
+                "mute":true,
+                "data_type":"FLOAT",
+                "internal_links":[{"from_socket":"A_Float","to_socket":"Result_Float"}]
+            }),
+        );
+        link(&mut graph, "muted", "Result_Float", "principled", "Alpha");
+        link(&mut graph, "principled", "BSDF", "output", "Surface");
+
+        let prepared = prepared_material(graph);
+        assert_ne!(
+            prepared.eevee_closure_flags().unwrap() & super::EEVEE_CLOSURE_TRANSPARENCY,
+            0
+        );
+        assert!(prepared.is_transparent());
+    }
+
+    #[test]
+    fn unsupported_source_primitive_fold_is_not_reported_as_a_linked_value() {
+        let mut graph = NodeGroup::new("Unsupported Native Primitive", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "transparent",
+            "ShaderNodeBsdfTransparent",
+            json!({}),
+        );
+        insert_node(&mut graph, "diffuse", "ShaderNodeBsdfDiffuse", json!({}));
+        insert_node(&mut graph, "mix", "ShaderNodeMixShader", json!({}));
+        insert_node(
+            &mut graph,
+            "radial",
+            "ShaderNodeRadialTiling",
+            json!({"Vector":[1.0,0.0,0.0],"Sides":5.0,"Roundness":0.0}),
+        );
+        link(&mut graph, "transparent", "BSDF", "mix", "Shader");
+        link(&mut graph, "diffuse", "BSDF", "mix", "Shader_001");
+        link(&mut graph, "radial", "Segment ID", "mix", "Fac");
+        link(&mut graph, "mix", "Shader", "output", "Surface");
+
+        let error = prepared_material(graph).eevee_closure_flags().unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            error.details["feature_id"].as_str(),
+            Some("shader.node.ShaderNodeRadialTiling")
+        );
+    }
+
+    #[test]
+    fn eevee_forward_color_target_flags_follow_gpu_material_flags() {
+        let transparent = |color: Value| {
+            let mut graph = NodeGroup::new("Transparent", GraphKind::Shader);
+            insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+            insert_node(
+                &mut graph,
+                "transparent",
+                "ShaderNodeBsdfTransparent",
+                color,
+            );
+            link(&mut graph, "transparent", "BSDF", "output", "Surface");
+            graph
+        };
+        let monochrome = prepared_material(transparent(json!({"Color":[0.7,0.7,0.7,1.0]})));
+        assert!(monochrome.is_transparent());
+        assert!(!monochrome.eevee_transparent_maybe_colored());
+
+        let tinted = prepared_material(transparent(json!({"Color":[0.92,0.87,0.73,1.0]})));
+        assert!(tinted.eevee_transparent_maybe_colored());
+
+        let mut linked = transparent(json!({"Color":[1.0,1.0,1.0,1.0]}));
+        insert_node(&mut linked, "color", "ShaderNodeRGB", json!({}));
+        link(&mut linked, "color", "Color", "transparent", "Color");
+        assert!(prepared_material(linked).eevee_transparent_maybe_colored());
+
+        let mut portal = NodeGroup::new("Portal", GraphKind::Shader);
+        insert_node(&mut portal, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut portal,
+            "portal",
+            "ShaderNodeBsdfRayPortal",
+            json!({"Color":[0.92,0.87,0.73,1.0]}),
+        );
+        link(&mut portal, "portal", "BSDF", "output", "Surface");
+        let portal = prepared_material(portal);
+        assert!(portal.is_transparent());
+        assert!(!portal.eevee_transparent_maybe_colored());
+
+        let mut holdout = NodeGroup::new("Holdout", GraphKind::Shader);
+        insert_node(
+            &mut holdout,
+            "output",
+            "ShaderNodeOutputMaterial",
+            json!({}),
+        );
+        insert_node(&mut holdout, "holdout", "ShaderNodeHoldout", json!({}));
+        link(&mut holdout, "holdout", "Holdout", "output", "Surface");
+        assert!(prepared_material(holdout).eevee_has_holdout());
+    }
+
+    #[test]
+    fn unconnected_colored_transparency_nodes_do_not_enable_the_forward_target() {
+        let mut graph = principled_output(json!({}));
+        insert_node(
+            &mut graph,
+            "orphan",
+            "ShaderNodeBsdfTransparent",
+            json!({"Color":[0.92,0.87,0.73,1.0]}),
+        );
+        let prepared = prepared_material(graph);
+        assert!(!prepared.eevee_transparent_maybe_colored());
+        assert!(!prepared.eevee_has_holdout());
     }
 
     #[test]
@@ -8256,9 +12235,23 @@ mod tests {
                 "Normal":[0.0,0.0,1.0],"Coat Weight":0.2
             }),
         );
+        insert_node(
+            &mut graph,
+            "first_normal",
+            "ShaderNodeCombineXYZ",
+            json!({"X":1.0,"Y":0.0,"Z":0.0}),
+        );
+        insert_node(
+            &mut graph,
+            "second_normal",
+            "ShaderNodeCombineXYZ",
+            json!({"X":0.0,"Y":0.0,"Z":1.0}),
+        );
         insert_node(&mut graph, "combine", combiner, inputs);
         link(&mut graph, "first", "BSDF", "combine", "Shader");
         link(&mut graph, "second", "BSDF", "combine", "Shader_001");
+        link(&mut graph, "first_normal", "Vector", "first", "Normal");
+        link(&mut graph, "second_normal", "Vector", "second", "Normal");
         link(&mut graph, "combine", "Shader", "output", "Surface");
         let graph_id = Id::new("surface_shader".to_owned()).unwrap();
         let mut groups = Registry::new();
@@ -9281,6 +13274,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hair_curve_hit_refuses_unavailable_mesh_shader_inputs() {
+        let mut graph = NodeGroup::new("Hair hit context", GraphKind::Shader);
+        insert_node(&mut graph, "coordinates", "ShaderNodeTexCoord", json!({}));
+        insert_node(&mut graph, "uv_map", "ShaderNodeUVMap", json!({}));
+        insert_node(&mut graph, "attribute", "ShaderNodeAttribute", json!({}));
+        insert_node(
+            &mut graph,
+            "vertex_color",
+            "ShaderNodeVertexColor",
+            json!({}),
+        );
+        let graph_id = Id::new("hair_hit_context".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let mut context = HitContext::new(&groups);
+        context.hair_curve_hit = true;
+        for (node_id, socket, feature) in [
+            (
+                "coordinates",
+                "Generated",
+                "shader.node.ShaderNodeTexCoord.Generated.hair_curve_texture_space",
+            ),
+            (
+                "coordinates",
+                "UV",
+                "shader.node.ShaderNodeTexCoord.UV.hair_curve_uv",
+            ),
+            ("uv_map", "UV", "shader.node.ShaderNodeUVMap.hair_curve_uv"),
+            (
+                "attribute",
+                "Color",
+                "shader.node.ShaderNodeAttribute.hair_curve_attribute_interpolation",
+            ),
+            (
+                "vertex_color",
+                "Color",
+                "shader.node.ShaderNodeVertexColor.hair_curve_color_layers",
+            ),
+        ] {
+            let error = evaluate_input_node_output(
+                &groups,
+                &graph_id,
+                &Id::new(node_id.to_owned()).unwrap(),
+                socket,
+                &context,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+            assert_eq!(error.details["feature_id"], json!(feature));
+        }
+    }
+
     fn evaluate_input_node_output(
         groups: &Registry<NodeGroup>,
         graph_id: &Id,
@@ -9379,6 +13425,43 @@ mod tests {
             panic!("Geometry Tangent must be a vector")
         };
         assert!(tangent.abs_diff_eq(-DVec3::Y, 1.0e-12));
+        let transform_barycentric = [0.4, 0.3, 0.3];
+        let transformed_layers = HitUvLayers {
+            positions: [DVec3::ZERO, 2.0 * DVec3::X, 3.0 * DVec3::Y],
+            barycentric: transform_barycentric,
+            ..layers
+        };
+        let mut transformed_context = HitContext::new(&groups)
+            .with_uv_layers(transformed_layers)
+            .with_generated_corners(generated, transform_barycentric);
+        transformed_context.path_traced = true;
+        transformed_context.normal = DVec3::Z;
+        transformed_context.object_to_world = DMat4::from_scale(DVec3::new(2.0, 3.0, 4.0));
+        transformed_context.world_to_object = transformed_context.object_to_world.inverse();
+        let super::Value::Vector(transformed_tangent) = evaluate_input_node_output(
+            &groups,
+            &graph_id,
+            &geometry_id,
+            "Tangent",
+            &transformed_context,
+        )
+        .unwrap() else {
+            panic!("Geometry Tangent must be a vector after object transformation")
+        };
+        let generated_point = DVec3::new(0.3, 0.3, 0.0);
+        let generated_tangent =
+            DVec3::new(-(generated_point.y - 0.5), generated_point.x - 0.5, 0.0);
+        let transformed_normal_tangent = transformed_context
+            .world_to_object
+            .transpose()
+            .transform_vector3(generated_tangent)
+            .normalize();
+        let expected_tangent = transformed_context.normal.cross(
+            transformed_normal_tangent
+                .cross(transformed_context.normal)
+                .normalize(),
+        );
+        assert!(transformed_tangent.abs_diff_eq(expected_tangent, 1.0e-12));
         let mut derivative_context = HitContext::new(&groups).with_uv_layers(layers);
         derivative_context.path_traced = true;
         derivative_context.normal = DVec3::Z;

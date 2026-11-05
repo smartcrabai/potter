@@ -1,0 +1,369 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "blender_build_hash": "d13f752e3b9c",
+  "scene_inputs": {
+    "engine": "BLENDER_EEVEE",
+    "scene_objects": [
+      "Fixed White Point Sun",
+      "Holdout Diffuse Probe Patch",
+      "Holdout Surface Method Camera",
+      "Opaque Diffuse Backplate Control"
+    ],
+    "resolution": [
+      128,
+      128
+    ],
+    "resolution_percentage": 100,
+    "render_samples": 1,
+    "threads": 1,
+    "film_transparent": true,
+    "view_transform": "Standard",
+    "view_look": "None",
+    "exposure": 0.0,
+    "gamma": 1.0,
+    "camera": {
+      "type": "ORTHO",
+      "location": [
+        0.0,
+        0.0,
+        10.0
+      ],
+      "rotation_euler": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "ortho_scale": 8.0
+    },
+    "sun": {
+      "type": "SUN",
+      "location": [
+        0.0,
+        0.0,
+        10.0
+      ],
+      "rotation_euler": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "energy": 1.0,
+      "angle": 0.0,
+      "use_shadow": true
+    },
+    "world_background_color": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "world_background_strength": 0.0,
+    "backplate": {
+      "size_world_units": 2.0,
+      "location": [
+        -3.0,
+        0.0,
+        -0.05000000074505806
+      ],
+      "surface_render_method": "DITHERED",
+      "shader": "Diffuse BSDF -> Material Output",
+      "color_rgba": [
+        0.8,
+        0.8,
+        0.8,
+        1.0
+      ],
+      "roughness": 0.0
+    },
+    "probe": {
+      "size_world_units": 4.0,
+      "location": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "holdout_mix_factor": 0.5,
+      "graph": "Holdout -> Mix Shader input 1; opaque Diffuse BSDF -> input 2; Mix Shader -> Material Output",
+      "diffuse_color_rgba": [
+        0.8,
+        0.32,
+        0.12,
+        1.0
+      ],
+      "diffuse_roughness": 0.0,
+      "target_pixel_xy": [
+        64,
+        64
+      ],
+      "backplate_control_pixel_xy": [
+        16,
+        64
+      ],
+      "transparent_world_neighbor_pixel_xy": [
+        112,
+        64
+      ],
+      "pixel_note": "Probe target is 32 pixels from its edges; the adjacent backplate control is 16 pixels from its edges."
+    },
+    "exr": {
+      "file_format": "OPEN_EXR",
+      "color_mode": "RGBA",
+      "color_depth": "32",
+      "codec": "NONE",
+      "captured_rgba": "raw source EXR RGBA; no unassociation or color conversion"
+    }
+  },
+  "captures_by_surface_render_method": {
+    "DITHERED": {
+      "surface_render_method": "DITHERED",
+      "raycast_provenance": {
+        "probe_target": {
+          "expected_object_id": "Holdout Diffuse Probe Patch",
+          "expected_evaluated_material_id": "Holdout 0.5 Plus Opaque Diffuse 0.5",
+          "center": {
+            "pixel_xy": [
+              64,
+              64
+            ],
+            "hit": true,
+            "object_id": "Holdout Diffuse Probe Patch",
+            "face_index": 0,
+            "material_index": 0,
+            "evaluated_material_id": "Holdout 0.5 Plus Opaque Diffuse 0.5"
+          },
+          "interior_corner": {
+            "pixel_xy": [
+              40,
+              40
+            ],
+            "hit": true,
+            "object_id": "Holdout Diffuse Probe Patch",
+            "face_index": 0,
+            "material_index": 0,
+            "evaluated_material_id": "Holdout 0.5 Plus Opaque Diffuse 0.5"
+          }
+        },
+        "opaque_backplate_control": {
+          "expected_object_id": "Opaque Diffuse Backplate Control",
+          "expected_evaluated_material_id": "Opaque Diffuse Backplate",
+          "center": {
+            "pixel_xy": [
+              16,
+              64
+            ],
+            "hit": true,
+            "object_id": "Opaque Diffuse Backplate Control",
+            "face_index": 0,
+            "material_index": 0,
+            "evaluated_material_id": "Opaque Diffuse Backplate"
+          },
+          "interior_corner": {
+            "pixel_xy": [
+              8,
+              56
+            ],
+            "hit": true,
+            "object_id": "Opaque Diffuse Backplate Control",
+            "face_index": 0,
+            "material_index": 0,
+            "evaluated_material_id": "Opaque Diffuse Backplate"
+          }
+        },
+        "transparent_world": {
+          "expected_hit": false,
+          "center": {
+            "pixel_xy": [
+              112,
+              64
+            ],
+            "hit": false,
+            "object_id": null,
+            "face_index": null,
+            "material_index": null,
+            "evaluated_material_id": null
+          },
+          "interior_corner": {
+            "pixel_xy": [
+              104,
+              56
+            ],
+            "hit": false,
+            "object_id": null,
+            "face_index": null,
+            "material_index": null,
+            "evaluated_material_id": null
+          }
+        }
+      },
+      "source_alpha_mode": "PREMUL",
+      "target": {
+        "pixel_xy": [
+          64,
+          64
+        ],
+        "raw_associated_rgba": [
+          0.127197265625,
+          0.05072021484375,
+          0.01898193359375,
+          0.5
+        ]
+      },
+      "transparent_world_neighbor": {
+        "pixel_xy": [
+          112,
+          64
+        ],
+        "raw_associated_rgba": [
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "opaque_backplate_control": {
+        "pixel_xy": [
+          16,
+          64
+        ],
+        "raw_associated_rgba": [
+          0.254638671875,
+          0.25439453125,
+          0.25439453125,
+          1.0
+        ]
+      },
+      "artifacts": {
+        "blend": "holdout_dithered.blend",
+        "exr": "holdout_dithered.exr"
+      }
+    },
+    "BLENDED": {
+      "surface_render_method": "BLENDED",
+      "raycast_provenance": {
+        "probe_target": {
+          "expected_object_id": "Holdout Diffuse Probe Patch",
+          "expected_evaluated_material_id": "Holdout 0.5 Plus Opaque Diffuse 0.5",
+          "center": {
+            "pixel_xy": [
+              64,
+              64
+            ],
+            "hit": true,
+            "object_id": "Holdout Diffuse Probe Patch",
+            "face_index": 0,
+            "material_index": 0,
+            "evaluated_material_id": "Holdout 0.5 Plus Opaque Diffuse 0.5"
+          },
+          "interior_corner": {
+            "pixel_xy": [
+              40,
+              40
+            ],
+            "hit": true,
+            "object_id": "Holdout Diffuse Probe Patch",
+            "face_index": 0,
+            "material_index": 0,
+            "evaluated_material_id": "Holdout 0.5 Plus Opaque Diffuse 0.5"
+          }
+        },
+        "opaque_backplate_control": {
+          "expected_object_id": "Opaque Diffuse Backplate Control",
+          "expected_evaluated_material_id": "Opaque Diffuse Backplate",
+          "center": {
+            "pixel_xy": [
+              16,
+              64
+            ],
+            "hit": true,
+            "object_id": "Opaque Diffuse Backplate Control",
+            "face_index": 0,
+            "material_index": 0,
+            "evaluated_material_id": "Opaque Diffuse Backplate"
+          },
+          "interior_corner": {
+            "pixel_xy": [
+              8,
+              56
+            ],
+            "hit": true,
+            "object_id": "Opaque Diffuse Backplate Control",
+            "face_index": 0,
+            "material_index": 0,
+            "evaluated_material_id": "Opaque Diffuse Backplate"
+          }
+        },
+        "transparent_world": {
+          "expected_hit": false,
+          "center": {
+            "pixel_xy": [
+              112,
+              64
+            ],
+            "hit": false,
+            "object_id": null,
+            "face_index": null,
+            "material_index": null,
+            "evaluated_material_id": null
+          },
+          "interior_corner": {
+            "pixel_xy": [
+              104,
+              56
+            ],
+            "hit": false,
+            "object_id": null,
+            "face_index": null,
+            "material_index": null,
+            "evaluated_material_id": null
+          }
+        }
+      },
+      "source_alpha_mode": "PREMUL",
+      "target": {
+        "pixel_xy": [
+          64,
+          64
+        ],
+        "raw_associated_rgba": [
+          0.06365966796875,
+          0.02545166015625,
+          0.00954437255859375,
+          0.498046875
+        ]
+      },
+      "transparent_world_neighbor": {
+        "pixel_xy": [
+          112,
+          64
+        ],
+        "raw_associated_rgba": [
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "opaque_backplate_control": {
+        "pixel_xy": [
+          16,
+          64
+        ],
+        "raw_associated_rgba": [
+          0.254638671875,
+          0.25439453125,
+          0.25439453125,
+          1.0
+        ]
+      },
+      "artifacts": {
+        "blend": "holdout_blended.blend",
+        "exr": "holdout_blended.exr"
+      }
+    }
+  }
+}

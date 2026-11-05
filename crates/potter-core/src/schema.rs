@@ -156,7 +156,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":17},
+        "schema_version":{"const":18},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -208,7 +208,7 @@ fn scene_schema() -> Value {
         "mesh":{"type":"object","required":["vertices","edges","faces","attributes","next_id"],"properties":{"vertices":{"type":"array","items":{"$ref":"#/$defs/vertex"}},"edges":{"type":"array","items":{"$ref":"#/$defs/edge"}},"faces":{"type":"array","items":{"$ref":"#/$defs/face"}},"attributes":{"type":"object"},"next_id":{"type":"object","properties":{"vertex":{"type":"integer","minimum":0},"edge":{"type":"integer","minimum":0},"face":{"type":"integer","minimum":0}},"required":["vertex","edge","face"],"additionalProperties":false}},"additionalProperties":false},
         "data_block":{"type":"object","required":["type"],"properties":{"type":{"type":"string"},"descriptor":{"type":["object","null"]},"mesh":{"oneOf":[{"$ref":"#/$defs/mesh"},{"type":"null"}]},"camera":{"oneOf":[{"$ref":"#/$defs/camera"},{"type":"null"}]},"light":{"oneOf":[{"$ref":"#/$defs/light"},{"type":"null"}]},"grease_pencil":{"type":["object","null"]},"armature":{"type":["object","null"]},"shape_keys":{"type":["object","null"]},"vertex_groups":{"type":"array","items":{"type":"object"}},"vertex_weights":{"type":"object"}},"additionalProperties":false},
         "camera": camera_data_schema(),
-        "light":{"type":"object","required":["light_type","color","energy","radius","spot_size","spot_blend"],"properties":{"light_type":{"enum":["point","sun","spot","area"]},"color":{"$ref":"#/$defs/vec3"},"energy":{"type":"number"},"radius":{"type":"number"},"soft_falloff":{"type":"boolean"},"use_multiple_importance_sampling":{"type":"boolean"},"spread":{"type":"number","minimum":0,"maximum":std::f64::consts::PI},"spot_size":{"type":"number"},"spot_blend":{"type":"number"}},"additionalProperties":false},
+        "light":{"type":"object","required":["light_type","color","energy","radius","spot_size","spot_blend","use_shadow"],"properties":{"light_type":{"enum":["point","sun","spot","area"]},"color":{"$ref":"#/$defs/vec3"},"energy":{"type":"number"},"radius":{"type":"number"},"soft_falloff":{"type":"boolean"},"use_multiple_importance_sampling":{"type":"boolean"},"spread":{"type":"number","minimum":0,"maximum":std::f64::consts::PI},"spot_size":{"type":"number"},"spot_blend":{"type":"number"},"use_shadow":{"type":["boolean","null"],"description":"Whether this light casts shadows; null indicates that the source value is unavailable.","examples":[true,false,null]}},"additionalProperties":false},
         "material":{"type":"object","required":["name","base_color","metallic","roughness","emission_color","emission_strength","transmission","ior","double_sided","node_tree","base_color_texture","roughness_texture","metallic_texture","normal_texture"],"properties":{"name":{"type":"string"},"base_color":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":4,"maxItems":4},"metallic":{"type":"number","minimum":0,"maximum":1},"roughness":{"type":"number","minimum":0,"maximum":1},"emission_color":{"$ref":"#/$defs/vec3"},"emission_strength":{"type":"number","minimum":0},"transmission":{"type":"number","minimum":0,"maximum":1},"ior":{"type":"number","exclusiveMinimum":0},"thickness_mode":{"type":"string","enum":["sphere","slab"]},"double_sided":{"type":"boolean"},"node_tree":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"base_color_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"roughness_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"metallic_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"normal_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]}},"additionalProperties":false},
         "texture_ref":texture_ref,
         "world":{"type":"object","required":["color","strength"],"properties":{"color":{"$ref":"#/$defs/vec3"},"strength":{"type":"number","minimum":0}},"additionalProperties":false},
@@ -418,9 +418,12 @@ fn complete_scene_schema(root: &mut Value) {
         "color_management",
         "markers",
         "rigid_body_world",
-        "sequencer"
+        "sequencer",
+        "eevee_has_local_volume_probe_grids"
     ]);
     scene["properties"]["active_clip"] = json!({"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]});
+    scene["properties"]["eevee_has_local_volume_probe_grids"] =
+        json!({"type":["boolean","null"],"default":false});
     scene["properties"]["use_gravity"] = json!({"type":"boolean"});
     scene["properties"]["use_compositing"] = json!({"type":"boolean"});
     scene["properties"]["compositor"] = json!({"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]});
@@ -441,8 +444,79 @@ fn complete_scene_schema(root: &mut Value) {
     ] {
         defs["light"]["properties"][factor] = json!({"type":"number","minimum":0});
     }
+    defs["world"]["properties"]["eevee_sun_threshold"] =
+        json!({"type":["number","null"],"minimum":0,"maximum":f32::MAX});
+    defs["world"]["properties"]["eevee_sun_angle"] = json!({
+        "type":["number","null"],
+        "minimum":0,
+        "maximum":f64::from(std::f32::consts::PI),
+        "default":f64::from(0.526_f32.to_radians())
+    });
+    defs["world"]["properties"]["eevee_use_sun_shadow"] =
+        json!({"type":["boolean","null"],"default":true});
+    defs["world"]["properties"]["eevee_sun_shadow_maximum_resolution"] = json!({"type":["number","null"],"minimum":0,"maximum":f32::MAX,"default":f64::from(0.001_f32)});
+    defs["world"]["properties"]["eevee_sun_shadow_jitter_overblur"] =
+        json!({"type":["number","null"],"minimum":0,"maximum":100,"default":10});
+    defs["world"]["properties"]["eevee_sun_shadow_filter_radius"] =
+        json!({"type":["number","null"],"minimum":0,"maximum":f32::MAX,"default":1});
+    defs["world"]["properties"]["eevee_use_sun_shadow_jitter"] =
+        json!({"type":["boolean","null"],"default":false});
+    defs["world"]["required"] = json!([
+        "color",
+        "strength",
+        "eevee_sun_threshold",
+        "eevee_sun_angle",
+        "eevee_use_sun_shadow",
+        "eevee_sun_shadow_maximum_resolution",
+        "eevee_sun_shadow_jitter_overblur",
+        "eevee_sun_shadow_filter_radius",
+        "eevee_use_sun_shadow_jitter"
+    ]);
     let render = &mut defs["render_settings"];
+    render["properties"]["use_high_quality_normals"] = json!({"type":["boolean","null"]});
     render["properties"]["eevee_light_threshold"] = json!({"type":"number","minimum":0.0});
+    render["properties"]["eevee_gi_cubemap_resolution"] = json!({
+        "oneOf":[{"type":"integer","enum":[128,256,512,1024,2048,4096]},{"type":"null"}],
+        "default":512
+    });
+    render["properties"]["eevee_use_raytracing"] = json!({"type":["boolean","null"]});
+    render["properties"]["eevee_use_fast_gi"] = json!({"type":["boolean","null"]});
+    render["properties"]["eevee_raytracing_method"] =
+        json!({"oneOf":[{"enum":["probe","screen"]},{"type":"null"}]});
+    render["properties"]["eevee_raytracing_resolution_scale"] =
+        json!({"oneOf":[{"type":"integer","enum":[1,2,4,8,16]},{"type":"null"}]});
+    render["properties"]["eevee_raytracing_screen_trace_quality"] =
+        json!({"type":["number","null"],"minimum":0,"maximum":1});
+    render["properties"]["eevee_raytracing_screen_trace_thickness"] =
+        json!({"type":["number","null"],"minimum":0.000_001,"maximum":f32::MAX});
+    render["properties"]["eevee_raytracing_trace_max_roughness"] =
+        json!({"type":["number","null"],"minimum":0,"maximum":1});
+    render["properties"]["eevee_raytracing_use_backface_hit"] = json!({"type":["boolean","null"]});
+    render["properties"]["eevee_raytracing_backface_radiance_scale"] =
+        json!({"type":["number","null"],"minimum":0,"maximum":1});
+    render["properties"]["eevee_raytracing_use_denoise"] = json!({"type":["boolean","null"]});
+    render["properties"]["eevee_raytracing_denoise_spatial"] = json!({"type":["boolean","null"]});
+    render["properties"]["eevee_raytracing_denoise_temporal"] = json!({"type":["boolean","null"]});
+    render["properties"]["eevee_raytracing_denoise_bilateral"] = json!({"type":["boolean","null"]});
+    render["properties"]["eevee_fast_gi_bias"] =
+        json!({"type":["number","null"],"minimum":0,"maximum":1});
+    render["properties"]["eevee_fast_gi_resolution"] =
+        json!({"oneOf":[{"type":"integer","enum":[1,2,4,8,16]},{"type":"null"}]});
+    render["properties"]["eevee_fast_gi_step_count"] =
+        json!({"type":["integer","null"],"minimum":1,"maximum":64});
+    render["properties"]["eevee_fast_gi_ray_count"] =
+        json!({"type":["integer","null"],"minimum":1,"maximum":16});
+    render["properties"]["eevee_fast_gi_quality"] =
+        json!({"type":["number","null"],"minimum":0,"maximum":1});
+    render["properties"]["eevee_fast_gi_distance"] =
+        json!({"type":["number","null"],"minimum":0,"maximum":100_000});
+    render["properties"]["eevee_fast_gi_thickness_near"] =
+        json!({"type":["number","null"],"minimum":0,"maximum":100_000});
+    render["properties"]["eevee_fast_gi_method"] = json!({
+        "oneOf":[{"enum":["ambient_occlusion_only","global_illumination"]},{"type":"null"}]
+    });
+    render["properties"]["eevee_clamp_surface_indirect"] =
+        json!({"type":["number","null"],"minimum":0,"maximum":f32::MAX,"default":10.0});
     render["properties"]["eevee_use_volumetric_shadows"] =
         json!({"type":"boolean","default":false});
     render["properties"]["eevee_volumetric_tile_size"] =
@@ -465,6 +539,7 @@ fn complete_scene_schema(root: &mut Value) {
         "seed",
         "max_bounces",
         "film_transparent",
+        "use_high_quality_normals",
         "engine",
         "use_sequencer",
         "audio_codec",
@@ -474,6 +549,31 @@ fn complete_scene_schema(root: &mut Value) {
         "motion_blur_samples",
         "dicing_rate",
         "preview_dicing_rate",
+        "cycles_curves_shape",
+        "cycles_curves_subdivisions",
+        "eevee_gi_cubemap_resolution",
+        "eevee_use_raytracing",
+        "eevee_use_fast_gi",
+        "eevee_raytracing_method",
+        "eevee_raytracing_resolution_scale",
+        "eevee_raytracing_screen_trace_quality",
+        "eevee_raytracing_screen_trace_thickness",
+        "eevee_raytracing_trace_max_roughness",
+        "eevee_raytracing_use_backface_hit",
+        "eevee_raytracing_backface_radiance_scale",
+        "eevee_raytracing_use_denoise",
+        "eevee_raytracing_denoise_spatial",
+        "eevee_raytracing_denoise_temporal",
+        "eevee_raytracing_denoise_bilateral",
+        "eevee_fast_gi_bias",
+        "eevee_fast_gi_resolution",
+        "eevee_fast_gi_step_count",
+        "eevee_fast_gi_ray_count",
+        "eevee_fast_gi_quality",
+        "eevee_fast_gi_distance",
+        "eevee_fast_gi_thickness_near",
+        "eevee_fast_gi_method",
+        "eevee_clamp_surface_indirect",
         "max_subdivisions",
         "offscreen_dicing_scale"
     ]);
@@ -494,6 +594,11 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["filter_size"] = json!({"type":"number","minimum":0,"maximum":500});
     render["properties"]["filter_glossy"] = json!({"type":"number","minimum":0,"maximum":10});
     render["properties"]["volume_bounces"] = json!({"type":"integer","minimum":0,"maximum":1024});
+    render["properties"]["cycles_curves_shape"] = json!({
+        "oneOf":[{"enum":["ribbons","thick","thick_linear"]},{"type":"null"}]
+    });
+    render["properties"]["cycles_curves_subdivisions"] =
+        json!({"type":["integer","null"],"minimum":0,"maximum":24});
 
     defs["light"]["properties"]["sun_angle"] =
         json!({"type":"number","minimum":0,"maximum":std::f64::consts::PI});
@@ -508,6 +613,7 @@ fn complete_scene_schema(root: &mut Value) {
     let material = &mut defs["material"];
     material["properties"]["use_transparent_shadow"] = json!({"type":"boolean"});
     material["properties"]["use_bump_map_correction"] = json!({"type":"boolean"});
+    material["properties"]["use_raytrace_refraction"] = json!({"type":["boolean","null"]});
     material["properties"]["pass_index"] = json!({
         "oneOf":[
             {"type":"integer","minimum":0,"maximum":i16::MAX},
@@ -526,6 +632,7 @@ fn complete_scene_schema(root: &mut Value) {
         "emission_color",
         "emission_strength",
         "transmission",
+        "use_raytrace_refraction",
         "ior",
         "thickness_mode",
         "double_sided",
@@ -1254,6 +1361,7 @@ fn operation_contract(name: &str) -> OperationContract {
                 "emission_color",
                 "emission_strength",
                 "transmission",
+                "use_raytrace_refraction",
                 "ior",
                 "thickness_mode",
                 "base_color_texture",
@@ -1272,7 +1380,7 @@ fn operation_contract(name: &str) -> OperationContract {
             vec!["op", "id"],
             "material",
             "none",
-            json!({"name":"id","pass_index":0,"base_color":[0.6,0.6,0.6,1.0],"metallic":0.0,"roughness":0.8,"double_sided":false,"emission_color":[0.0,0.0,0.0],"emission_strength":0.0,"transmission":0.0,"ior":1.45}),
+            json!({"name":"id","pass_index":0,"base_color":[0.6,0.6,0.6,1.0],"metallic":0.0,"roughness":0.8,"double_sided":false,"emission_color":[0.0,0.0,0.0],"emission_strength":0.0,"transmission":0.0,"use_raytrace_refraction":false,"ior":1.45}),
         ),
         "material.update" => (
             vec!["target", "set"],
@@ -2022,11 +2130,12 @@ fn operation_contract(name: &str) -> OperationContract {
                 "spread",
                 "spot_size",
                 "spot_blend",
+                "use_shadow",
             ],
             vec!["op", "id"],
             "light object",
             "none",
-            json!({"tags":[],"visible":true,"render_visible":true,"selectable":true,"light_type":"point","color":[1,1,1],"energy":1000,"radius":0.1}),
+            json!({"tags":[],"visible":true,"render_visible":true,"selectable":true,"light_type":"point","color":[1,1,1],"energy":1000,"radius":0.1,"use_shadow":true}),
         ),
         "light.update" => (
             vec!["target", "set"],
@@ -2759,6 +2868,7 @@ fn field_schema(operation: &str, field: &str) -> Value {
             "volume_anisotropy" => json!({"type":"number","minimum":-0.999,"maximum":0.999}),
             "displacement_scale" => json!({"type":"number"}),
             "pass_index" => json!({"type":"integer","minimum":0,"maximum":i16::MAX}),
+            "use_raytrace_refraction" => json!({"type":["boolean","null"]}),
             _ => common_field_schema(field),
         };
     }
@@ -2842,6 +2952,7 @@ fn field_schema(operation: &str, field: &str) -> Value {
         "interpolation" => json!({"enum":["constant","linear","bezier"],"default":"linear"}),
         "method" => json!({"enum":["box","smart","cube"],"default":"box"}),
         "shape" => json!({"enum":["box","sphere","convex_hull","mesh"]}),
+        "use_shadow" => light_shadow_schema(),
         "active" | "visible" | "render_visible" | "selectable" | "enabled" | "double_sided"
         | "show_viewport" | "show_render" | "recursive" | "cascade_data" | "unlink"
         | "keep_world" | "merge" | "individual" => {
@@ -3115,6 +3226,32 @@ fn set_schema(operation: &str) -> Value {
             "samples":{"type":"integer","minimum":1,"maximum":1_000_000},
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
             "max_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "cycles_curves_shape":{"oneOf":[{"enum":["ribbons","thick","thick_linear"]},{"type":"null"}]},
+            "cycles_curves_subdivisions":{"type":["integer","null"],"minimum":0,"maximum":24},
+            "eevee_gi_cubemap_resolution":{"oneOf":[{"type":"integer","enum":[128,256,512,1024,2048,4096]},{"type":"null"}]},
+            "eevee_use_raytracing":{"type":["boolean","null"]},
+            "eevee_use_fast_gi":{"type":["boolean","null"]},
+            "use_high_quality_normals":{"type":["boolean","null"]},
+            "eevee_raytracing_method":{"oneOf":[{"enum":["probe","screen"]},{"type":"null"}]},
+            "eevee_raytracing_resolution_scale":{"oneOf":[{"type":"integer","enum":[1,2,4,8,16]},{"type":"null"}]},
+            "eevee_raytracing_screen_trace_quality":{"type":["number","null"],"minimum":0,"maximum":1},
+            "eevee_raytracing_screen_trace_thickness":{"type":["number","null"],"minimum":0.000_001,"maximum":f32::MAX},
+            "eevee_raytracing_trace_max_roughness":{"type":["number","null"],"minimum":0,"maximum":1},
+            "eevee_raytracing_use_backface_hit":{"type":["boolean","null"]},
+            "eevee_raytracing_backface_radiance_scale":{"type":["number","null"],"minimum":0,"maximum":1},
+            "eevee_raytracing_use_denoise":{"type":["boolean","null"]},
+            "eevee_raytracing_denoise_spatial":{"type":["boolean","null"]},
+            "eevee_raytracing_denoise_temporal":{"type":["boolean","null"]},
+            "eevee_raytracing_denoise_bilateral":{"type":["boolean","null"]},
+            "eevee_fast_gi_bias":{"type":["number","null"],"minimum":0,"maximum":1},
+            "eevee_fast_gi_resolution":{"oneOf":[{"type":"integer","enum":[1,2,4,8,16]},{"type":"null"}]},
+            "eevee_fast_gi_step_count":{"type":["integer","null"],"minimum":1,"maximum":64},
+            "eevee_fast_gi_ray_count":{"type":["integer","null"],"minimum":1,"maximum":16},
+            "eevee_fast_gi_quality":{"type":["number","null"],"minimum":0,"maximum":1},
+            "eevee_fast_gi_distance":{"type":["number","null"],"minimum":0,"maximum":100_000},
+            "eevee_fast_gi_thickness_near":{"type":["number","null"],"minimum":0,"maximum":100_000},
+            "eevee_fast_gi_method":{"oneOf":[{"enum":["ambient_occlusion_only","global_illumination"]},{"type":"null"}]},
+            "eevee_clamp_surface_indirect":{"type":["number","null"],"minimum":0,"maximum":f32::MAX},
             "volume_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "pixel_filter_type":{"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"]},
@@ -3356,6 +3493,7 @@ fn material_set_properties() -> Value {
         "emission_color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},
         "emission_strength":{"type":"number","minimum":0},
         "transmission":{"type":"number","minimum":0,"maximum":1},
+        "use_raytrace_refraction":{"type":["boolean","null"]},
         "ior":{"type":"number","exclusiveMinimum":0},
         "thickness_mode":{"type":"string","enum":["sphere","slab"]},
         "base_color_texture":nullable_texture_ref_schema(),
@@ -3408,9 +3546,12 @@ fn camera_data_schema() -> Value {
 }
 
 fn light_set_properties() -> Value {
-    json!({"light_type":{"enum":["point","sun","spot","area"]},"color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},"energy":{"type":"number","minimum":0},"radius":{"type":"number","minimum":0},"soft_falloff":{"type":"boolean"},"use_multiple_importance_sampling":{"type":"boolean"},"spread":{"type":"number","minimum":0,"maximum":std::f64::consts::PI},"spot_size":{"type":"number","exclusiveMinimum":0,"maximum":std::f64::consts::TAU},"spot_blend":{"type":"number","minimum":0,"maximum":1}})
+    json!({"light_type":{"enum":["point","sun","spot","area"]},"color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},"energy":{"type":"number","minimum":0},"radius":{"type":"number","minimum":0},"soft_falloff":{"type":"boolean"},"use_multiple_importance_sampling":{"type":"boolean"},"spread":{"type":"number","minimum":0,"maximum":std::f64::consts::PI},"spot_size":{"type":"number","exclusiveMinimum":0,"maximum":std::f64::consts::TAU},"spot_blend":{"type":"number","minimum":0,"maximum":1},"use_shadow":light_shadow_schema()})
 }
 
+fn light_shadow_schema() -> Value {
+    json!({"type":"boolean","default":true,"description":"Whether this light casts shadows.","examples":[false,true]})
+}
 fn world_set_properties() -> Value {
     json!({
         "color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},
@@ -3667,5 +3808,150 @@ mod tests {
         assert_eq!(update["properties"]["image"]["oneOf"][1]["type"], "null");
         Ok(())
     }
+    #[test]
+    fn cycles_curve_settings_are_visible_in_scene_and_render_schemas() -> crate::error::Result<()> {
+        let scene = schema("scene", None)?;
+        assert_eq!(scene["properties"]["schema_version"]["const"], 18);
+        let render = &scene["$defs"]["render_settings"];
+        for field in ["cycles_curves_shape", "cycles_curves_subdivisions"] {
+            assert!(
+                render["required"]
+                    .as_array()
+                    .is_some_and(|required| required.iter().any(|value| value == field))
+            );
+        }
+        assert_eq!(
+            render["properties"]["cycles_curves_shape"]["oneOf"][0]["enum"],
+            serde_json::json!(["ribbons", "thick", "thick_linear"])
+        );
+        assert_eq!(
+            render["properties"]["cycles_curves_subdivisions"]["maximum"],
+            24
+        );
+
+        let update = schema("operations", Some("render.update"))?;
+        let set = &update["properties"]["set"]["properties"];
+        assert_eq!(
+            set["cycles_curves_shape"]["oneOf"][0]["enum"],
+            serde_json::json!(["ribbons", "thick", "thick_linear"])
+        );
+        assert_eq!(set["cycles_curves_subdivisions"]["minimum"], 0);
+        assert_eq!(set["cycles_curves_subdivisions"]["maximum"], 24);
+        Ok(())
+    }
+
+    #[test]
+    fn eevee_probe_resolution_is_visible_in_scene_and_render_update_schemas()
+    -> crate::error::Result<()> {
+        let scene = schema("scene", None)?;
+        let render = &scene["$defs"]["render_settings"];
+        assert!(render["required"].as_array().is_some_and(|required| {
+            required
+                .iter()
+                .any(|field| field == "eevee_gi_cubemap_resolution")
+        }));
+        let expected = serde_json::json!([128, 256, 512, 1024, 2048, 4096]);
+        assert_eq!(
+            render["properties"]["eevee_gi_cubemap_resolution"]["oneOf"][0]["enum"],
+            expected
+        );
+
+        let update = schema("operations", Some("render.update"))?;
+        assert_eq!(
+            update["properties"]["set"]["properties"]["eevee_gi_cubemap_resolution"]["oneOf"][0]["enum"],
+            expected
+        );
+        Ok(())
+    }
+    #[test]
+    fn scene_local_volume_probe_marker_is_nullable_with_native_false_default()
+    -> crate::error::Result<()> {
+        let scene = schema("scene", None)?;
+        let marker = &scene["$defs"]["scene"]["properties"]["eevee_has_local_volume_probe_grids"];
+        assert_eq!(marker["type"], serde_json::json!(["boolean", "null"]));
+        assert_eq!(marker["default"], false);
+        assert!(
+            scene["$defs"]["scene"]["required"]
+                .as_array()
+                .is_some_and(|required| {
+                    required
+                        .iter()
+                        .any(|field| field == "eevee_has_local_volume_probe_grids")
+                })
+        );
+        Ok(())
+    }
+    #[test]
+    fn eevee_sun_threshold_is_nullable_world_source_range() -> crate::error::Result<()> {
+        let scene = schema("scene", None)?;
+        let threshold = &scene["$defs"]["world"]["properties"]["eevee_sun_threshold"];
+        assert!(
+            scene["$defs"]["world"]["required"]
+                .as_array()
+                .is_some_and(|required| required
+                    .iter()
+                    .any(|field| field == "eevee_sun_threshold"))
+        );
+        assert_eq!(threshold["type"], serde_json::json!(["number", "null"]));
+        assert_eq!(threshold["minimum"], 0);
+        assert_eq!(threshold["maximum"], f32::MAX);
+        Ok(())
+    }
+    #[test]
+    fn eevee_world_sun_settings_expose_blender_source_ranges_and_defaults()
+    -> crate::error::Result<()> {
+        let scene = schema("scene", None)?;
+        let world = &scene["$defs"]["world"];
+        let properties = &world["properties"];
+        for field in [
+            "eevee_sun_threshold",
+            "eevee_sun_angle",
+            "eevee_use_sun_shadow",
+            "eevee_sun_shadow_maximum_resolution",
+            "eevee_sun_shadow_jitter_overblur",
+            "eevee_sun_shadow_filter_radius",
+            "eevee_use_sun_shadow_jitter",
+        ] {
+            assert!(
+                world["required"]
+                    .as_array()
+                    .is_some_and(|required| required.iter().any(|item| item == field)),
+                "{field} must be present even when its imported value is unknown"
+            );
+        }
+        assert_eq!(
+            properties["eevee_sun_angle"]["maximum"],
+            f64::from(std::f32::consts::PI)
+        );
+        assert_eq!(
+            properties["eevee_sun_shadow_maximum_resolution"]["maximum"],
+            f32::MAX
+        );
+        assert_eq!(
+            properties["eevee_sun_shadow_jitter_overblur"]["maximum"],
+            100
+        );
+        assert_eq!(
+            properties["eevee_sun_shadow_filter_radius"]["maximum"],
+            f32::MAX
+        );
+        assert_eq!(
+            properties["eevee_sun_angle"]["default"],
+            f64::from(0.526_f32.to_radians())
+        );
+        assert_eq!(
+            properties["eevee_sun_shadow_maximum_resolution"]["default"],
+            f64::from(0.001_f32)
+        );
+        assert_eq!(
+            properties["eevee_sun_shadow_jitter_overblur"]["default"],
+            10.0
+        );
+        assert_eq!(properties["eevee_sun_shadow_filter_radius"]["default"], 1.0);
+        assert_eq!(properties["eevee_use_sun_shadow"]["default"], true);
+        assert_eq!(properties["eevee_use_sun_shadow_jitter"]["default"], false);
+        Ok(())
+    }
+
     use serde_json::Value;
 }

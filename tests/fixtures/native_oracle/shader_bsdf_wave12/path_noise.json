@@ -1,0 +1,113 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "cases": [
+    {
+      "name": "sheen_ashikhmin",
+      "mean_absolute_error": 1.9908663716705632e-05
+    },
+    {
+      "name": "sheen_microfiber",
+      "mean_absolute_error": 2.5379930674615785e-05
+    },
+    {
+      "name": "subsurface_burley",
+      "mean_absolute_error": 0.057842644552389716
+    },
+    {
+      "name": "subsurface_random_walk",
+      "mean_absolute_error": 0.10251960489484993
+    },
+    {
+      "name": "subsurface_random_walk_skin",
+      "mean_absolute_error": 0.019216706355412838
+    },
+    {
+      "name": "subsurface_random_walk_legacy",
+      "mean_absolute_error": 0.015129644837644368
+    },
+    {
+      "name": "translucent",
+      "mean_absolute_error": 0.017169726805554508
+    },
+    {
+      "name": "refraction_beckmann",
+      "mean_absolute_error": 1.0348028510465124e-10
+    },
+    {
+      "name": "refraction_ggx",
+      "mean_absolute_error": 0.00012270909630589417
+    },
+    {
+      "name": "toon_diffuse",
+      "mean_absolute_error": 0.014867429104116286
+    },
+    {
+      "name": "toon_glossy",
+      "mean_absolute_error": 0.005894256962670208
+    },
+    {
+      "name": "metallic_beckmann_f82",
+      "mean_absolute_error": 0.09285257651289516
+    },
+    {
+      "name": "metallic_ggx_f82",
+      "mean_absolute_error": 0.0828596976482206
+    },
+    {
+      "name": "metallic_multi_ggx_f82",
+      "mean_absolute_error": 0.11949955798789047
+    },
+    {
+      "name": "metallic_beckmann_conductor",
+      "mean_absolute_error": 0.08224934974633574
+    },
+    {
+      "name": "metallic_ggx_conductor",
+      "mean_absolute_error": 0.005504245973295636
+    },
+    {
+      "name": "metallic_multi_ggx_conductor",
+      "mean_absolute_error": 0.006671899619201817
+    },
+    {
+      "name": "holdout",
+      "mean_absolute_error": 0.0
+    },
+    {
+      "name": "hair_reflection",
+      "mean_absolute_error": 0.0023257223268349937
+    },
+    {
+      "name": "hair_transmission",
+      "mean_absolute_error": 0.0030036257166001497
+    },
+    {
+      "name": "principled_hair_chiang_reflectance",
+      "mean_absolute_error": 0.0034653409901592575
+    },
+    {
+      "name": "principled_hair_chiang_melanin",
+      "mean_absolute_error": 0.0005021741639615789
+    },
+    {
+      "name": "principled_hair_chiang_absorption",
+      "mean_absolute_error": 0.0011524383185638285
+    },
+    {
+      "name": "principled_hair_huang_reflectance",
+      "mean_absolute_error": 0.002027810654706419
+    },
+    {
+      "name": "principled_hair_huang_melanin",
+      "mean_absolute_error": 0.0015829935049017259
+    },
+    {
+      "name": "principled_hair_huang_absorption",
+      "mean_absolute_error": 0.0008923478890210442
+    },
+    {
+      "name": "ray_portal",
+      "mean_absolute_error": 0.0004843926920633174
+    }
+  ]
+}

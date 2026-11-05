@@ -93,7 +93,7 @@ fn schema_kinds_are_meta_schemas_and_operation_batches_validate() -> Result<(), 
         assert!(result["op"].is_null());
         let schema = result["schema"].clone();
         if kind == "scene" {
-            assert_eq!(schema["properties"]["schema_version"]["const"], 17);
+            assert_eq!(schema["properties"]["schema_version"]["const"], 18);
         }
         let validator = jsonschema::validator_for(&schema)?;
         if matches!(kind, "capabilities" | "formats") {
@@ -1507,8 +1507,8 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
     let eevee_cubemap_resolution = features
         .iter()
         .find(|feature| feature["feature_id"] == "blender.scene.eevee.gi_cubemap_resolution")
-        .expect("non-default EEVEE cubemap resolution loss is catalogued");
-    assert_eq!(eevee_cubemap_resolution["status"], "not_supported");
+        .expect("EEVEE probe resolution is catalogued");
+    assert_eq!(eevee_cubemap_resolution["status"], "supported");
     assert_eq!(
         eevee_cubemap_resolution["pot_ops"],
         json!(["render.update"])
@@ -1579,9 +1579,12 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "shader.node.ShaderNodeTexImage.linear_mip_filtering",
         "shader.node.ShaderNodeTexEnvironment.linear_mip_filtering",
         "shader.material_texture.linear_mip_filtering",
-        "blender.scene.eevee.gi_cubemap_resolution",
         "shader.volume.spectral_extinction.realtime_scattering",
         "shader.volume.world_probe_l1.realtime_scattering",
+        "render.world.volume_absorption",
+        "render.eevee.world_probe.local_volume_grids",
+        "render.eevee.world_sun.shadow_map_settings",
+        "render.eevee.world_sun.volume_shadow_radius",
         "shader.node.Bump.realtime_transparent_shadow_height",
         "text.font.external.format",
         "text.font.external.resource",

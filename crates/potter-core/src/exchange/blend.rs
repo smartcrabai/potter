@@ -25,13 +25,15 @@ use crate::{
         Action, ActionSlot, ArmatureData, Bone, CameraData, CameraProjection, Collection,
         Constraint, ConstraintType, CurveData, CurveDimensions, CurveFillMode, CurveFillRule,
         CurveFillSolver, CurveHandleType, CurvePoint, CurveSpline, CurveSplineType,
-        CurveTaperRadiusMode, DEFAULT_FILTER_WIDTH, DataBlock, Driver, DriverType, DriverVariable,
-        DriverVariableType, Extrapolation, FCurve, FCurveAutoSmoothing, FCurveHandleType,
-        FCurveModifier, ForceField, ForceFieldType, GreasePencilData, GreasePencilFrame,
-        GreasePencilLayer, GreasePencilPoint, GreasePencilStroke, Id, Image, ImageAlphaMode,
-        ImageColorspace, ImageSource, ImageTile, Interpolation, Keyframe, Library, LibraryKind,
-        LibraryOverride, LibraryOverrideProperty, LibraryStatus, LightData, LightType, Material,
-        MaterialLink, Modifier, ModifierParameterBinding, MovieClip, MovieTracking, NlaBlendType,
+        CurveTaperRadiusMode, CyclesCurveShape, CyclesHairShadowGeometryKey, CyclesHairShadowGroup,
+        CyclesHairShadowInstanceKey, CyclesHairShadowMember, DEFAULT_FILTER_WIDTH, DataBlock,
+        Driver, DriverType, DriverVariable, DriverVariableType, Extrapolation, FCurve,
+        FCurveAutoSmoothing, FCurveHandleType, FCurveModifier, ForceField, ForceFieldType,
+        GreasePencilData, GreasePencilFrame, GreasePencilLayer, GreasePencilPoint,
+        GreasePencilStroke, HairCurvesData, Id, Image, ImageAlphaMode, ImageColorspace,
+        ImageSource, ImageTile, Interpolation, Keyframe, Library, LibraryKind, LibraryOverride,
+        LibraryOverrideProperty, LibraryStatus, LightData, LightType, Material, MaterialLink,
+        Modifier, ModifierParameterBinding, MovieClip, MovieTracking, NlaBlendType,
         NlaExtrapolation, NlaStrip, NlaTrack, Node, ParentType, PixelFilterType, Profile, RayKind,
         RayVisibility, Registry, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType,
         RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint,
@@ -109,6 +111,459 @@ fn find_in_path(executable: &str) -> Option<PathBuf> {
     })
 }
 
+fn shader_node_metadata_error(properties: &Map<String, Value>) -> Option<String> {
+    if let Some(routes) = properties.get("internal_links") {
+        let Some(routes) = routes.as_array() else {
+            return Some("`internal_links` must be an array".to_owned());
+        };
+        for route in routes {
+            let Some(route) = route.as_object() else {
+                return Some("each `internal_links` entry must be an object".to_owned());
+            };
+            if route.len() != 2 {
+                return Some(
+                    "each `internal_links` entry must contain only its socket keys".to_owned(),
+                );
+            }
+            for key in ["from_socket", "to_socket"] {
+                if route
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Some(format!(
+                        "each `internal_links` entry needs a non-empty `{key}`"
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(flags) = properties.get("input_socket_flags") {
+        let Some(flags) = flags.as_object() else {
+            return Some("`input_socket_flags` must be an object".to_owned());
+        };
+        for (socket, value) in flags {
+            if socket.is_empty() {
+                return Some(
+                    "`input_socket_flags` keys must be non-empty socket identifiers".to_owned(),
+                );
+            }
+            let Some(value) = value.as_object() else {
+                return Some(format!("input socket `{socket}` flags must be an object"));
+            };
+            if value.len() != 2
+                || !["enabled", "hide_value"]
+                    .into_iter()
+                    .all(|key| value.get(key).and_then(Value::as_bool).is_some())
+            {
+                return Some(format!(
+                    "input socket `{socket}` flags need exactly boolean `enabled` and `hide_value`"
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn validate_shader_node_metadata(doc: &SceneDoc) -> Result<()> {
+    for (graph_id, group) in &doc.node_groups {
+        for (node_id, node) in &group.nodes {
+            if let Some(reason) = shader_node_metadata_error(&node.properties) {
+                return Err(PotError::invalid_argument(format!(
+                    "node `{node_id}` in graph `{graph_id}` has invalid Blender socket metadata: {reason}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_bridge_id(value: &Value) -> Option<&str> {
+    value
+        .get("potter_id")
+        .and_then(Value::as_str)
+        .filter(|id| crate::model::is_valid_id(id))
+}
+
+fn compatibility_name_for_id<'a>(
+    source: &'a Value,
+    entity_prefix: &str,
+    identifier: &str,
+) -> Option<&'a str> {
+    source
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .and_then(|adapter| adapter.get("id_mappings"))
+        .and_then(Value::as_object)?
+        .iter()
+        .find_map(|(reference, id)| {
+            (id.as_str() == Some(identifier))
+                .then(|| reference.strip_prefix(entity_prefix))
+                .flatten()
+        })
+}
+
+fn source_world_name<'a>(source: &'a Value, world_id: &str) -> Option<&'a str> {
+    compatibility_name_for_id(source, "World:", world_id)
+}
+
+fn reopened_graph_node<'a>(
+    tree: &'a Value,
+    node_id: &str,
+    source_node: &Value,
+) -> Option<&'a Value> {
+    let nodes = tree.get("nodes").and_then(Value::as_array)?;
+    nodes
+        .iter()
+        .find(|node| valid_bridge_id(node) == Some(node_id))
+        .or_else(|| {
+            let name = source_node.get("name").and_then(Value::as_str)?;
+            nodes.iter().find(|node| {
+                valid_bridge_id(node).is_none()
+                    && node.get("name").and_then(Value::as_str) == Some(name)
+            })
+        })
+}
+
+fn menu_switch_socket_identifiers<'source, 'actual>(
+    source_node: &'source Value,
+    actual_node: &'actual Value,
+) -> Option<(&'source [Value], &'actual [Value])> {
+    if source_node.get("type").and_then(Value::as_str) != Some("GeometryNodeMenuSwitch")
+        || actual_node.get("type").and_then(Value::as_str) != Some("GeometryNodeMenuSwitch")
+    {
+        return None;
+    }
+    let source_properties = source_node.get("properties")?.as_object()?;
+    let actual_properties = actual_node.get("properties")?.as_object()?;
+    let source_items = source_properties.get("potter_menu_items")?;
+    if actual_properties.get("potter_menu_items") != Some(source_items) {
+        return None;
+    }
+    let item_count = source_items.as_array()?.len();
+    let source_identifiers = source_properties
+        .get("potter_menu_item_identifiers")?
+        .as_array()?;
+    let actual_identifiers = actual_properties
+        .get("potter_menu_item_identifiers")?
+        .as_array()?;
+    if source_identifiers.len() != item_count || actual_identifiers.len() != item_count {
+        return None;
+    }
+    for identifiers in [source_identifiers, actual_identifiers] {
+        let mut seen = BTreeSet::new();
+        for identifier in identifiers {
+            let identifier = identifier
+                .as_str()
+                .filter(|identifier| !identifier.is_empty())?;
+            if !seen.insert(identifier) {
+                return None;
+            }
+        }
+    }
+    Some((source_identifiers, actual_identifiers))
+}
+
+fn remap_menu_switch_socket_key<'a>(
+    socket: &'a str,
+    source_identifiers: &'a [Value],
+    actual_identifiers: &'a [Value],
+) -> &'a str {
+    for (source, actual) in source_identifiers.iter().zip(actual_identifiers) {
+        if source.as_str() == Some(socket) {
+            return actual.as_str().unwrap_or(socket);
+        }
+    }
+    socket
+}
+
+fn remapped_input_socket_flags_match(
+    expected: &Value,
+    actual: &Value,
+    source_identifiers: &[Value],
+    actual_identifiers: &[Value],
+) -> bool {
+    let (Some(expected), Some(actual)) = (expected.as_object(), actual.as_object()) else {
+        return false;
+    };
+    expected.len() == actual.len()
+        && expected.iter().all(|(socket, flags)| {
+            actual.get(remap_menu_switch_socket_key(
+                socket,
+                source_identifiers,
+                actual_identifiers,
+            )) == Some(flags)
+        })
+}
+
+fn remapped_internal_links_match(
+    expected: &Value,
+    actual: &Value,
+    source_identifiers: &[Value],
+    actual_identifiers: &[Value],
+) -> bool {
+    let (Some(expected), Some(actual)) = (expected.as_array(), actual.as_array()) else {
+        return false;
+    };
+    expected.len() == actual.len()
+        && expected.iter().zip(actual).all(|(expected, actual)| {
+            let (Some(expected), Some(actual)) = (expected.as_object(), actual.as_object()) else {
+                return false;
+            };
+            expected.len() == actual.len()
+                && expected.iter().all(|(key, value)| {
+                    let Some(actual_value) = actual.get(key) else {
+                        return false;
+                    };
+                    if key == "from_socket" || key == "to_socket" {
+                        value.as_str().is_some_and(|socket| {
+                            actual_value.as_str()
+                                == Some(remap_menu_switch_socket_key(
+                                    socket,
+                                    source_identifiers,
+                                    actual_identifiers,
+                                ))
+                        })
+                    } else {
+                        actual_value == value
+                    }
+                })
+        })
+}
+
+fn reopened_node_metadata_matches(
+    source_node: &Value,
+    actual_node: Option<&Value>,
+    property: &str,
+    expected: &Value,
+) -> bool {
+    let Some(actual_properties) = actual_node
+        .and_then(|node| node.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(actual) = actual_properties.get(property) else {
+        return false;
+    };
+    let Some((source_identifiers, actual_identifiers)) =
+        actual_node.and_then(|node| menu_switch_socket_identifiers(source_node, node))
+    else {
+        return actual == expected;
+    };
+    match property {
+        "input_socket_flags" => remapped_input_socket_flags_match(
+            expected,
+            actual,
+            source_identifiers,
+            actual_identifiers,
+        ),
+        "internal_links" => {
+            remapped_internal_links_match(expected, actual, source_identifiers, actual_identifiers)
+        }
+        _ => actual == expected,
+    }
+}
+
+fn reopened_shader_node_metadata_matches(
+    source: &Value,
+    reopened: &Value,
+    graph_id: &str,
+    node_id: &str,
+    source_node: &Value,
+    property: &str,
+    expected: &Value,
+) -> bool {
+    let mut found_tree = false;
+    let mut preserved = true;
+    let source_materials = source.get("materials").and_then(Value::as_object);
+    let source_worlds = source.get("worlds").and_then(Value::as_object);
+    let root_owned = source_materials.is_some_and(|materials| {
+        materials
+            .values()
+            .any(|material| material.get("node_tree").and_then(Value::as_str) == Some(graph_id))
+    }) || source_worlds.is_some_and(|worlds| {
+        worlds
+            .values()
+            .any(|world| world.get("node_tree").and_then(Value::as_str) == Some(graph_id))
+    });
+
+    if root_owned {
+        if let Some(source_materials) = source_materials {
+            let actual_materials = reopened.get("materials").and_then(Value::as_array);
+            for (material_id, material) in source_materials.iter().filter(|(_, material)| {
+                material.get("node_tree").and_then(Value::as_str) == Some(graph_id)
+            }) {
+                let source_name = material.get("name").and_then(Value::as_str);
+                let actual = actual_materials.and_then(|actual_materials| {
+                    actual_materials.iter().find(|actual| {
+                        if let Some(actual_id) = valid_bridge_id(actual) {
+                            actual_id == material_id.as_str()
+                        } else {
+                            actual.get("name").and_then(Value::as_str) == source_name
+                                || actual
+                                    .get("nodes")
+                                    .and_then(|tree| tree.get("potter_id"))
+                                    .and_then(Value::as_str)
+                                    == Some(graph_id)
+                        }
+                    })
+                });
+                if let Some(tree) = actual.and_then(|material| material.get("nodes")) {
+                    found_tree = true;
+                    let actual_node = reopened_graph_node(tree, node_id, source_node);
+                    if !reopened_node_metadata_matches(source_node, actual_node, property, expected)
+                    {
+                        preserved = false;
+                    }
+                } else {
+                    preserved = false;
+                }
+            }
+        }
+        if let Some(source_worlds) = source_worlds {
+            let scenes = reopened.get("scenes").and_then(Value::as_array);
+            for (world_id, _) in source_worlds.iter().filter(|(_, world)| {
+                world.get("node_tree").and_then(Value::as_str) == Some(graph_id)
+            }) {
+                let world_name = source_world_name(source, world_id);
+                let mut found_world = false;
+                if let Some(scenes) = scenes {
+                    for world in scenes.iter().filter_map(|scene| scene.get("world")) {
+                        if world.is_null() {
+                            continue;
+                        }
+                        let same_world = if let Some(actual_id) = valid_bridge_id(world) {
+                            actual_id == world_id.as_str()
+                        } else {
+                            world.get("name").and_then(Value::as_str) == world_name
+                                || world
+                                    .get("nodes")
+                                    .and_then(|tree| tree.get("potter_id"))
+                                    .and_then(Value::as_str)
+                                    == Some(graph_id)
+                        };
+                        if !same_world {
+                            continue;
+                        }
+                        found_world = true;
+                        let tree = world.get("nodes");
+                        if tree.is_some() {
+                            found_tree = true;
+                        } else {
+                            preserved = false;
+                        }
+                        let actual_node =
+                            tree.and_then(|tree| reopened_graph_node(tree, node_id, source_node));
+                        if !reopened_node_metadata_matches(
+                            source_node,
+                            actual_node,
+                            property,
+                            expected,
+                        ) {
+                            preserved = false;
+                        }
+                    }
+                }
+                if !found_world {
+                    preserved = false;
+                }
+            }
+        }
+    } else if let Some(groups) = reopened.get("node_groups").and_then(Value::as_array) {
+        let mapped_group_name = compatibility_name_for_id(source, "NodeGroup:", graph_id);
+        let imported_tree_name = compatibility_name_for_id(source, "NodeTree:", graph_id);
+        let model_group_name = source
+            .get("node_groups")
+            .and_then(Value::as_object)
+            .and_then(|groups| groups.get(graph_id))
+            .and_then(|group| group.get("name"))
+            .and_then(Value::as_str);
+        let mut found_group = false;
+        for group in groups {
+            let Some(tree) = group.get("tree") else {
+                continue;
+            };
+            let group_id = valid_bridge_id(group);
+            let tree_id = valid_bridge_id(tree);
+            let matches_id = group_id == Some(graph_id) || tree_id == Some(graph_id);
+            let matches_name = group_id.is_none()
+                && tree_id.is_none()
+                && [mapped_group_name, imported_tree_name, model_group_name]
+                    .into_iter()
+                    .flatten()
+                    .any(|name| {
+                        group.get("name").and_then(Value::as_str) == Some(name)
+                            || tree.get("name").and_then(Value::as_str) == Some(name)
+                    });
+            if !matches_id && !matches_name {
+                continue;
+            }
+            found_group = true;
+            found_tree = true;
+            let actual_node = reopened_graph_node(tree, node_id, source_node);
+            if !reopened_node_metadata_matches(source_node, actual_node, property, expected) {
+                preserved = false;
+            }
+        }
+        if !found_group {
+            preserved = false;
+        }
+    }
+    found_tree && preserved
+}
+
+fn reopened_shader_node_metadata_losses(source: &Value, reopened: &Value) -> Vec<Loss> {
+    let Some(source_groups) = source.get("node_groups").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut losses = Vec::new();
+    for (graph_id, source_group) in source_groups {
+        let Some(source_nodes) = source_group.get("nodes").and_then(Value::as_object) else {
+            continue;
+        };
+        for (node_id, source_node) in source_nodes {
+            let Some(properties) = source_node.get("properties").and_then(Value::as_object) else {
+                continue;
+            };
+            for (property, feature, description) in [
+                (
+                    "internal_links",
+                    "blender.node.internal_links",
+                    "internal routing",
+                ),
+                (
+                    "input_socket_flags",
+                    "blender.node.input_socket_flags",
+                    "input socket flags",
+                ),
+            ] {
+                let Some(expected) = properties.get(property) else {
+                    continue;
+                };
+                if !reopened_shader_node_metadata_matches(
+                    source,
+                    reopened,
+                    graph_id,
+                    node_id,
+                    source_node,
+                    property,
+                    expected,
+                ) {
+                    losses.push(loss(
+                        feature,
+                        Some(node_id),
+                        &format!(
+                            "Blender did not preserve {description} on node `{node_id}`; its reopened canonical metadata is used."
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    losses
+}
+
 /// Export the supported portion of a scene graph through a clean Blender process.
 /// Unsupported source structures are reported, and fail closed unless lossy export was
 /// explicitly requested. Their JSON compatibility payload is included as an inert Text.
@@ -123,6 +578,7 @@ pub fn export_blend(
     opts: &ExportOptions<'_>,
 ) -> Result<ExportReport> {
     doc.validate()?;
+    validate_shader_node_metadata(doc)?;
     for (node_id, node) in &doc.nodes {
         let Some(settings) = node
             .properties
@@ -243,6 +699,17 @@ pub fn export_blend(
                 "Blender export did not pass reopen validation",
                 json!({"cause": error}),
             ));
+        }
+        let metadata_losses = reopened_shader_node_metadata_losses(&document, &intermediate);
+        if !metadata_losses.is_empty() {
+            if !opts.allow_lossy {
+                return Err(PotError::with_details(
+                    ErrorCode::UnrepresentableFeature,
+                    "Blender could not preserve canonical shader socket metadata; rerun with --allow-lossy",
+                    json!({"losses": metadata_losses}),
+                ));
+            }
+            losses.extend(metadata_losses);
         }
         if let Err(error) = fs::rename(&blend_temp, out) {
             forward_child_output(&exported);
@@ -3020,6 +3487,122 @@ fn validate_intermediate(raw: &Value) -> Result<()> {
                         "`{collection}` contains a non-object item"
                     )));
                 }
+                if collection == "scenes" {
+                    parse_optional_eevee_bool(
+                        item.get("eevee_has_local_volume_probe_grids"),
+                        "eevee_has_local_volume_probe_grids",
+                    )?;
+                }
+                if collection == "scenes"
+                    && let Some(world) = item.get("world").filter(|world| world.is_object())
+                {
+                    parse_eevee_world_sun_threshold(world.get("sun_threshold"))?;
+                    parse_eevee_world_sun_number(
+                        world.get("sun_angle"),
+                        "sun_angle",
+                        f64::from(std::f32::consts::PI),
+                    )?;
+                    parse_eevee_world_sun_bool(world.get("use_sun_shadow"), "use_sun_shadow")?;
+                    parse_eevee_world_sun_number(
+                        world.get("sun_shadow_maximum_resolution"),
+                        "sun_shadow_maximum_resolution",
+                        f64::from(f32::MAX),
+                    )?;
+                    parse_eevee_world_sun_number(
+                        world.get("sun_shadow_jitter_overblur"),
+                        "sun_shadow_jitter_overblur",
+                        100.0,
+                    )?;
+                    parse_eevee_world_sun_number(
+                        world.get("sun_shadow_filter_radius"),
+                        "sun_shadow_filter_radius",
+                        f64::from(f32::MAX),
+                    )?;
+                    parse_eevee_world_sun_bool(
+                        world.get("use_sun_shadow_jitter"),
+                        "use_sun_shadow_jitter",
+                    )?;
+                }
+                if collection == "scenes"
+                    && let Some(render) = item.get("render").and_then(Value::as_object)
+                {
+                    if render.get("cycles_curves_shape").is_some_and(|shape| {
+                        !shape.is_null()
+                            && !shape.as_str().is_some_and(|shape| {
+                                matches!(shape, "ribbons" | "thick" | "thick_linear")
+                            })
+                    }) {
+                        return Err(invalid_intermediate("scene cycles_curves_shape is invalid"));
+                    }
+                    if render
+                        .get("cycles_curves_subdivisions")
+                        .is_some_and(|subdivisions| {
+                            !subdivisions.is_null()
+                                && subdivisions
+                                    .as_u64()
+                                    .is_none_or(|subdivisions| subdivisions > 24)
+                        })
+                    {
+                        return Err(invalid_intermediate(
+                            "scene cycles_curves_subdivisions must be an integer in 0..=24",
+                        ));
+                    }
+                    if let Some(resolution) = render.get("eevee_gi_cubemap_resolution") {
+                        parse_eevee_gi_cubemap_resolution(Some(resolution))?;
+                    }
+                    if render
+                        .get("eevee_use_raytracing")
+                        .is_some_and(|value| !value.is_null() && !value.is_boolean())
+                    {
+                        return Err(invalid_intermediate(
+                            "scene eevee_use_raytracing must be a boolean or null",
+                        ));
+                    }
+                    for field in [
+                        "eevee_use_fast_gi",
+                        "eevee_raytracing_use_backface_hit",
+                        "eevee_raytracing_use_denoise",
+                        "eevee_raytracing_denoise_spatial",
+                        "eevee_raytracing_denoise_temporal",
+                        "eevee_raytracing_denoise_bilateral",
+                        "use_high_quality_normals",
+                    ] {
+                        parse_optional_eevee_bool(render.get(field), field)?;
+                    }
+                    for field in [
+                        "eevee_raytracing_screen_trace_quality",
+                        "eevee_raytracing_screen_trace_thickness",
+                        "eevee_raytracing_trace_max_roughness",
+                        "eevee_raytracing_backface_radiance_scale",
+                        "eevee_fast_gi_bias",
+                        "eevee_fast_gi_quality",
+                        "eevee_fast_gi_distance",
+                        "eevee_fast_gi_thickness_near",
+                        "eevee_clamp_surface_indirect",
+                    ] {
+                        parse_optional_eevee_float(render.get(field), field)?;
+                    }
+                    if parse_optional_eevee_float(
+                        render.get("eevee_clamp_surface_indirect"),
+                        "eevee_clamp_surface_indirect",
+                    )?
+                    .is_some_and(|value| !(0.0..=f64::from(f32::MAX)).contains(&value))
+                    {
+                        return Err(invalid_intermediate(
+                            "render eevee_clamp_surface_indirect must be in Blender's 0..=FLT_MAX range or null",
+                        ));
+                    }
+                    for field in [
+                        "eevee_raytracing_resolution_scale",
+                        "eevee_fast_gi_resolution",
+                        "eevee_fast_gi_step_count",
+                        "eevee_fast_gi_ray_count",
+                    ] {
+                        parse_optional_eevee_u32(render.get(field), field)?;
+                    }
+                    parse_eevee_raytracing_method(render.get("eevee_raytracing_method"))?;
+                    parse_eevee_fast_gi_method(render.get("eevee_fast_gi_method"))?;
+                }
             }
         }
     }
@@ -3031,6 +3614,495 @@ fn invalid_intermediate(message: &str) -> PotError {
         ErrorCode::ImportFailed,
         format!("invalid Blender intermediate JSON: {message}"),
     )
+}
+
+fn parse_cycles_hair_shadow_instance_key(
+    raw: &Value,
+    object_ids: &BTreeMap<String, Id>,
+) -> Result<CyclesHairShadowInstanceKey> {
+    let real_object_name = string_field(raw, "real_object")?;
+    let real_object_node_id = object_ids
+        .get(real_object_name)
+        .cloned()
+        .ok_or_else(|| invalid_intermediate("Cycles Hair instance references an unknown Object"))?;
+    let parent_node_id = match raw.get("parent") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(parent_name)) => {
+            Some(object_ids.get(parent_name).cloned().ok_or_else(|| {
+                invalid_intermediate("Cycles Hair instance parent references an unknown Object")
+            })?)
+        }
+        Some(_) => {
+            return Err(invalid_intermediate(
+                "Cycles Hair instance parent must be an Object name or null",
+            ));
+        }
+    };
+    let persistent_values = raw
+        .get("persistent_id")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 8)
+        .ok_or_else(|| {
+            invalid_intermediate("Cycles Hair instance persistent_id must contain eight integers")
+        })?;
+    let mut persistent_id = [0_i32; 8];
+    for (index, value) in persistent_values.iter().enumerate() {
+        persistent_id[index] = value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| {
+                invalid_intermediate(
+                    "Cycles Hair instance persistent_id entries must be 32-bit integers",
+                )
+            })?;
+    }
+    let is_instance = raw
+        .get("is_instance")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            invalid_intermediate("Cycles Hair instance is_instance must be a boolean")
+        })?;
+    let use_particle_hair = raw
+        .get("use_particle_hair")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            invalid_intermediate("Cycles Hair instance use_particle_hair must be a boolean")
+        })?;
+    if !is_instance
+        && (parent_node_id.as_ref() != Some(&real_object_node_id) || persistent_id != [0; 8])
+    {
+        return Err(invalid_intermediate(
+            "non-instance Cycles Hair key has an invalid parent or persistent_id",
+        ));
+    }
+    Ok(CyclesHairShadowInstanceKey {
+        real_object_node_id,
+        parent_node_id,
+        persistent_id,
+        is_instance,
+        use_particle_hair,
+    })
+}
+
+fn parse_cycles_hair_shadow_member(
+    raw: &Value,
+    object_ids: &BTreeMap<String, Id>,
+    material_ids: &BTreeMap<String, Id>,
+) -> Result<CyclesHairShadowMember> {
+    let instance = parse_cycles_hair_shadow_instance_key(
+        raw.get("instance")
+            .ok_or_else(|| invalid_intermediate("Cycles Hair member has no instance key"))?,
+        object_ids,
+    )?;
+    let matrix_rows = raw
+        .get("object_to_world")
+        .and_then(Value::as_array)
+        .filter(|rows| rows.len() == 4)
+        .ok_or_else(|| invalid_intermediate("Cycles Hair object_to_world must have four rows"))?;
+    let mut object_to_world = [[0.0; 4]; 4];
+    for (row_index, row) in matrix_rows.iter().enumerate() {
+        let row_values = row
+            .as_array()
+            .filter(|values| values.len() == 4)
+            .ok_or_else(|| {
+                invalid_intermediate("Cycles Hair object_to_world rows must have four values")
+            })?;
+        for (column_index, value) in row_values.iter().enumerate() {
+            object_to_world[row_index][column_index] = value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    invalid_intermediate("Cycles Hair object_to_world values must be finite")
+                })?;
+        }
+    }
+    let color_values = raw
+        .get("object_color")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 4)
+        .ok_or_else(|| invalid_intermediate("Cycles Hair object_color must have four values"))?;
+    let mut object_color = [0.0; 4];
+    for (index, value) in color_values.iter().enumerate() {
+        object_color[index] = value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| {
+                invalid_intermediate("Cycles Hair object_color values must be finite")
+            })?;
+    }
+    let object_pass_index = raw
+        .get("object_pass_index")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| invalid_intermediate("Cycles Hair object_pass_index must be an integer"))?;
+    let object_random_id = raw
+        .get("object_random_id")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| invalid_intermediate("Cycles Hair object_random_id must be an i32"))?;
+    let slot_0_material_id = match raw.get("slot_0_material") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(material_ids.get(name).cloned().ok_or_else(|| {
+            invalid_intermediate("Cycles Hair slot-0 Material references an unknown Material")
+        })?),
+        Some(_) => {
+            return Err(invalid_intermediate(
+                "Cycles Hair slot-0 Material must be a name or null",
+            ));
+        }
+    };
+    let ray_visibility = serde_json::from_value(
+        raw.get("ray_visibility")
+            .cloned()
+            .ok_or_else(|| invalid_intermediate("Cycles Hair member has no ray visibility"))?,
+    )
+    .map_err(|_| invalid_intermediate("Cycles Hair member ray visibility is invalid"))?;
+    Ok(CyclesHairShadowMember {
+        instance,
+        object_to_world,
+        object_color,
+        object_pass_index,
+        object_random_id,
+        slot_0_material_id,
+        ray_visibility,
+    })
+}
+
+fn parse_cycles_hair_shadow_groups(
+    raw: Option<&Value>,
+    doc: &SceneDoc,
+    scene_id: &Id,
+    materials: &BTreeMap<String, Id>,
+    object_ids: &BTreeMap<String, Id>,
+) -> Result<Option<Vec<CyclesHairShadowGroup>>> {
+    let Some(raw) = raw.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let raw_groups = raw.as_array().ok_or_else(|| {
+        invalid_intermediate("cycles_hair_shadow_groups must be an array or null")
+    })?;
+    let scene = doc
+        .scenes
+        .get(scene_id)
+        .ok_or_else(|| invalid_intermediate("Cycles Hair group Scene mapping is missing"))?;
+    let mut groups = Vec::with_capacity(raw_groups.len());
+    for raw_group in raw_groups {
+        let view_layer_name = string_field(raw_group, "view_layer")?;
+        let view_layer_id = scene
+            .view_layers
+            .iter()
+            .find_map(|(id, layer)| (layer.name == view_layer_name).then(|| id.clone()))
+            .ok_or_else(|| {
+                invalid_intermediate("Cycles Hair group references an unknown view layer")
+            })?;
+        let representative_name = string_field(raw_group, "representative")?;
+        let representative_node_id =
+            object_ids
+                .get(representative_name)
+                .cloned()
+                .ok_or_else(|| {
+                    invalid_intermediate(
+                        "Cycles Hair group representative references an unknown Object",
+                    )
+                })?;
+        let raw_members = raw_group
+            .get("members")
+            .and_then(Value::as_array)
+            .filter(|members| !members.is_empty())
+            .ok_or_else(|| invalid_intermediate("Cycles Hair group members must be non-empty"))?;
+        let members = raw_members
+            .iter()
+            .map(|member| parse_cycles_hair_shadow_member(member, object_ids, materials))
+            .collect::<Result<Vec<_>>>()?;
+        if members[0].instance.real_object_node_id != representative_node_id {
+            return Err(invalid_intermediate(
+                "Cycles Hair representative is not the first ordered member",
+            ));
+        }
+        let member_node_ids = raw_group
+            .get("member_nodes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_intermediate("Cycles Hair member_nodes must be an array"))?
+            .iter()
+            .map(|member| {
+                let member_name = member.as_str().ok_or_else(|| {
+                    invalid_intermediate("Cycles Hair member_nodes must contain Object names")
+                })?;
+                object_ids.get(member_name).cloned().ok_or_else(|| {
+                    invalid_intermediate("Cycles Hair member_nodes references an unknown Object")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut unique_member_node_ids = Vec::new();
+        for member in &members {
+            let node_id = &member.instance.real_object_node_id;
+            if !unique_member_node_ids.contains(node_id) {
+                unique_member_node_ids.push(node_id.clone());
+            }
+        }
+        if member_node_ids != unique_member_node_ids {
+            return Err(invalid_intermediate(
+                "Cycles Hair member_nodes do not match ordered physical members",
+            ));
+        }
+        let geometry_key_raw = raw_group
+            .get("geometry_key")
+            .ok_or_else(|| invalid_intermediate("Cycles Hair group has no GeometryKey"))?;
+        let geometry_key = match string_field(geometry_key_raw, "kind")? {
+            "object" => {
+                let node_name = string_field(geometry_key_raw, "node")?;
+                let node_id = object_ids.get(node_name).cloned().ok_or_else(|| {
+                    invalid_intermediate(
+                        "Cycles Hair object GeometryKey references an unknown Object",
+                    )
+                })?;
+                if node_id != representative_node_id {
+                    return Err(invalid_intermediate(
+                        "Cycles Hair object GeometryKey differs from the representative Object",
+                    ));
+                }
+                CyclesHairShadowGeometryKey::Object { node_id }
+            }
+            "data" => {
+                let uses_source_data = geometry_key_raw
+                    .get("uses_source_data")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        invalid_intermediate(
+                            "Cycles Hair data GeometryKey uses_source_data must be a boolean",
+                        )
+                    })?;
+                let data_id = if uses_source_data {
+                    Some(
+                        doc.nodes
+                            .get(&representative_node_id)
+                            .and_then(|node| node.data.clone())
+                            .ok_or_else(|| {
+                                invalid_intermediate(
+                                    "Cycles Hair source Data GeometryKey has no mapped source DataBlock",
+                                )
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                CyclesHairShadowGeometryKey::Data { data_id }
+            }
+            _ => {
+                return Err(invalid_intermediate(
+                    "Cycles Hair GeometryKey kind is unknown",
+                ));
+            }
+        };
+        let source_curve_indices = match raw_group.get("source_curve_indices") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(indices)) => Some(
+                indices
+                    .iter()
+                    .map(|index| {
+                        index
+                            .as_u64()
+                            .and_then(|index| u32::try_from(index).ok())
+                            .ok_or_else(|| {
+                                invalid_intermediate(
+                                    "Cycles Hair source curve indices must be u32 values",
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            Some(_) => {
+                return Err(invalid_intermediate(
+                    "Cycles Hair source_curve_indices must be an array or null",
+                ));
+            }
+        };
+        let evaluated_hair_curves = match raw_group.get("evaluated_hair_curves") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(parse_hair_curves_data_payload(value, Some(object_ids))?),
+        };
+        let mut group = CyclesHairShadowGroup {
+            view_layer_id,
+            geometry_key,
+            representative_node_id,
+            member_node_ids,
+            members,
+            source_curve_indices,
+            evaluated_hair_curves,
+            source_input_fingerprint: None,
+        };
+        group.source_input_fingerprint =
+            doc.cycles_hair_shadow_source_fingerprint(scene_id, &group)?;
+        groups.push(group);
+    }
+    Ok(Some(groups))
+}
+
+fn parse_eevee_gi_cubemap_resolution(value: Option<&Value>) -> Result<Option<u32>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let resolution = value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| crate::model::EEVEE_GI_CUBEMAP_RESOLUTIONS.contains(value))
+        .ok_or_else(|| {
+            invalid_intermediate(
+                "render eevee_gi_cubemap_resolution must be one of 128, 256, 512, 1024, 2048, or 4096",
+            )
+        })?;
+    Ok(Some(resolution))
+}
+fn parse_eevee_world_sun_threshold(value: Option<&Value>) -> Result<Option<f64>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|threshold| {
+                threshold.is_finite()
+                    && (0.0..=f64::from(f32::MAX)).contains(threshold)
+            })
+            .map(Some)
+            .ok_or_else(|| {
+                invalid_intermediate(
+                    "World.sun_threshold must be a finite number in Blender's 0..=FLT_MAX range or null",
+                )
+            }),
+    }
+}
+fn parse_eevee_world_sun_number(
+    value: Option<&Value>,
+    field: &str,
+    maximum: f64,
+) -> Result<Option<f64>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|number| number.is_finite() && (0.0..=maximum).contains(number))
+            .map(Some)
+            .ok_or_else(|| {
+                invalid_intermediate(&format!(
+                    "World.{field} must be a finite number in its Blender RNA range or null"
+                ))
+            }),
+    }
+}
+fn parse_eevee_world_sun_bool(value: Option<&Value>, field: &str) -> Result<Option<bool>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_bool().map(Some).ok_or_else(|| {
+            invalid_intermediate(&format!("World.{field} must be a boolean or null"))
+        }),
+    }
+}
+
+fn parse_optional_eevee_bool(value: Option<&Value>, field: &str) -> Result<Option<bool>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_bool().map(Some).ok_or_else(|| {
+            invalid_intermediate(&format!("render {field} must be a boolean or null"))
+        }),
+    }
+}
+
+fn parse_optional_eevee_float(value: Option<&Value>, field: &str) -> Result<Option<f64>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(Some)
+            .ok_or_else(|| {
+                invalid_intermediate(&format!("render {field} must be a finite number or null"))
+            }),
+    }
+}
+
+fn parse_optional_eevee_u32(value: Option<&Value>, field: &str) -> Result<Option<u32>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| invalid_intermediate(&format!("render {field} must be a u32 or null"))),
+    }
+}
+
+fn parse_eevee_use_raytracing(value: Option<&Value>) -> Result<Option<bool>> {
+    parse_optional_eevee_bool(value, "eevee_use_raytracing")
+}
+
+fn parse_eevee_raytracing_method(
+    value: Option<&Value>,
+) -> Result<Option<crate::model::EeveeRayTracingMethod>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => match value.as_str() {
+            "PROBE" | "probe" => Ok(Some(crate::model::EeveeRayTracingMethod::Probe)),
+            "SCREEN" | "screen" => Ok(Some(crate::model::EeveeRayTracingMethod::Screen)),
+            _ => Err(invalid_intermediate(
+                "render eevee_raytracing_method is unknown",
+            )),
+        },
+        Some(_) => Err(invalid_intermediate(
+            "render eevee_raytracing_method must be a string or null",
+        )),
+    }
+}
+
+fn parse_eevee_fast_gi_method(
+    value: Option<&Value>,
+) -> Result<Option<crate::model::EeveeFastGiMethod>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => match value.as_str() {
+            "AMBIENT_OCCLUSION_ONLY" | "ambient_occlusion_only" => {
+                Ok(Some(crate::model::EeveeFastGiMethod::AmbientOcclusionOnly))
+            }
+            "GLOBAL_ILLUMINATION" | "global_illumination" => {
+                Ok(Some(crate::model::EeveeFastGiMethod::GlobalIllumination))
+            }
+            _ => Err(invalid_intermediate(
+                "render eevee_fast_gi_method is unknown",
+            )),
+        },
+        Some(_) => Err(invalid_intermediate(
+            "render eevee_fast_gi_method must be a string or null",
+        )),
+    }
+}
+
+fn parse_cycles_curve_shape(value: Option<&Value>) -> Result<Option<CyclesCurveShape>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(shape)) => match shape.as_str() {
+            "ribbons" => Ok(Some(CyclesCurveShape::Ribbons)),
+            "thick" => Ok(Some(CyclesCurveShape::Thick)),
+            "thick_linear" => Ok(Some(CyclesCurveShape::ThickLinear)),
+            _ => Err(invalid_intermediate(
+                "render cycles_curves_shape is unknown",
+            )),
+        },
+        Some(_) => Err(invalid_intermediate(
+            "render cycles_curves_shape must be a string or null",
+        )),
+    }
+}
+
+fn parse_cycles_curve_subdivisions(value: Option<&Value>) -> Result<Option<u32>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let subdivisions = value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value <= 24)
+        .ok_or_else(|| {
+            invalid_intermediate("render cycles_curves_subdivisions must be an integer in 0..=24")
+        })?;
+    Ok(Some(subdivisions))
 }
 
 fn discover_nested_blend_libraries(
@@ -3291,6 +4363,28 @@ fn build_imported_graph(
         let fps = u32::try_from(integer_field(item, "fps", 24))
             .map_err(|_| invalid_intermediate("scene fps is out of range"))?;
         let render = item.get("render").cloned().unwrap_or(Value::Null);
+        let cycles_curves_shape = parse_cycles_curve_shape(render.get("cycles_curves_shape"))?;
+        let cycles_curves_subdivisions =
+            parse_cycles_curve_subdivisions(render.get("cycles_curves_subdivisions"))?;
+        let eevee_gi_cubemap_resolution =
+            parse_eevee_gi_cubemap_resolution(render.get("eevee_gi_cubemap_resolution"))?;
+        let eevee_use_raytracing = parse_eevee_use_raytracing(render.get("eevee_use_raytracing"))?;
+        let eevee_use_fast_gi =
+            parse_optional_eevee_bool(render.get("eevee_use_fast_gi"), "eevee_use_fast_gi")?;
+        let use_high_quality_normals = parse_optional_eevee_bool(
+            render.get("use_high_quality_normals"),
+            "use_high_quality_normals",
+        )?;
+        let eevee_clamp_surface_indirect = parse_optional_eevee_float(
+            render.get("eevee_clamp_surface_indirect"),
+            "eevee_clamp_surface_indirect",
+        )?;
+        let eevee_raytracing_method =
+            parse_eevee_raytracing_method(render.get("eevee_raytracing_method"))?;
+        let eevee_raytracing_resolution_scale = parse_optional_eevee_u32(
+            render.get("eevee_raytracing_resolution_scale"),
+            "eevee_raytracing_resolution_scale",
+        )?;
         let render_settings = RenderSettings {
             resolution_x: u32::try_from(integer_field(&render, "resolution_x", 1920))
                 .map_err(|_| invalid_intermediate("render resolution_x is out of range"))?,
@@ -3334,6 +4428,8 @@ fn build_imported_graph(
                 .map_err(|_| invalid_intermediate("render max_subdivisions is out of range"))?,
             offscreen_dicing_scale: number_field(&render, "offscreen_dicing_scale", 4.0),
             dicing_camera: None,
+            cycles_curves_shape,
+            cycles_curves_subdivisions,
             film_transparent: render
                 .get("film_transparent")
                 .and_then(Value::as_bool)
@@ -3344,6 +4440,7 @@ fn build_imported_graph(
                 .and_then(Value::as_str)
                 .unwrap_or("path")
                 .to_owned(),
+            use_high_quality_normals,
             use_sequencer: render
                 .get("use_sequencer")
                 .and_then(Value::as_bool)
@@ -3368,6 +4465,77 @@ fn build_imported_graph(
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             eevee_light_threshold: number_field(&render, "eevee_light_threshold", 0.01),
+            eevee_gi_cubemap_resolution,
+            eevee_use_raytracing,
+            eevee_use_fast_gi,
+            eevee_raytracing_method,
+            eevee_raytracing_resolution_scale,
+            eevee_raytracing_screen_trace_quality: parse_optional_eevee_float(
+                render.get("eevee_raytracing_screen_trace_quality"),
+                "eevee_raytracing_screen_trace_quality",
+            )?,
+            eevee_raytracing_screen_trace_thickness: parse_optional_eevee_float(
+                render.get("eevee_raytracing_screen_trace_thickness"),
+                "eevee_raytracing_screen_trace_thickness",
+            )?,
+            eevee_raytracing_trace_max_roughness: parse_optional_eevee_float(
+                render.get("eevee_raytracing_trace_max_roughness"),
+                "eevee_raytracing_trace_max_roughness",
+            )?,
+            eevee_raytracing_use_backface_hit: parse_optional_eevee_bool(
+                render.get("eevee_raytracing_use_backface_hit"),
+                "eevee_raytracing_use_backface_hit",
+            )?,
+            eevee_raytracing_backface_radiance_scale: parse_optional_eevee_float(
+                render.get("eevee_raytracing_backface_radiance_scale"),
+                "eevee_raytracing_backface_radiance_scale",
+            )?,
+            eevee_raytracing_use_denoise: parse_optional_eevee_bool(
+                render.get("eevee_raytracing_use_denoise"),
+                "eevee_raytracing_use_denoise",
+            )?,
+            eevee_raytracing_denoise_spatial: parse_optional_eevee_bool(
+                render.get("eevee_raytracing_denoise_spatial"),
+                "eevee_raytracing_denoise_spatial",
+            )?,
+            eevee_raytracing_denoise_temporal: parse_optional_eevee_bool(
+                render.get("eevee_raytracing_denoise_temporal"),
+                "eevee_raytracing_denoise_temporal",
+            )?,
+            eevee_raytracing_denoise_bilateral: parse_optional_eevee_bool(
+                render.get("eevee_raytracing_denoise_bilateral"),
+                "eevee_raytracing_denoise_bilateral",
+            )?,
+            eevee_fast_gi_bias: parse_optional_eevee_float(
+                render.get("eevee_fast_gi_bias"),
+                "eevee_fast_gi_bias",
+            )?,
+            eevee_fast_gi_resolution: parse_optional_eevee_u32(
+                render.get("eevee_fast_gi_resolution"),
+                "eevee_fast_gi_resolution",
+            )?,
+            eevee_fast_gi_step_count: parse_optional_eevee_u32(
+                render.get("eevee_fast_gi_step_count"),
+                "eevee_fast_gi_step_count",
+            )?,
+            eevee_fast_gi_ray_count: parse_optional_eevee_u32(
+                render.get("eevee_fast_gi_ray_count"),
+                "eevee_fast_gi_ray_count",
+            )?,
+            eevee_fast_gi_quality: parse_optional_eevee_float(
+                render.get("eevee_fast_gi_quality"),
+                "eevee_fast_gi_quality",
+            )?,
+            eevee_fast_gi_distance: parse_optional_eevee_float(
+                render.get("eevee_fast_gi_distance"),
+                "eevee_fast_gi_distance",
+            )?,
+            eevee_fast_gi_thickness_near: parse_optional_eevee_float(
+                render.get("eevee_fast_gi_thickness_near"),
+                "eevee_fast_gi_thickness_near",
+            )?,
+            eevee_fast_gi_method: parse_eevee_fast_gi_method(render.get("eevee_fast_gi_method"))?,
+            eevee_clamp_surface_indirect,
             eevee_use_volumetric_shadows: render
                 .get("eevee_use_volumetric_shadows")
                 .and_then(Value::as_bool)
@@ -3437,6 +4605,11 @@ fn build_imported_graph(
             name: name.to_owned(),
             root_collection: root,
             view_layers,
+            eevee_has_local_volume_probe_grids: parse_optional_eevee_bool(
+                item.get("eevee_has_local_volume_probe_grids"),
+                "eevee_has_local_volume_probe_grids",
+            )?,
+            cycles_hair_shadow_groups: None,
             frame_current: number_field(item, "frame_current", 1.0),
             frame_start,
             frame_end,
@@ -3509,6 +4682,37 @@ fn build_imported_graph(
                     color: vec3_field(world, "color", [1.0; 3]),
                     background_color: world.get("background_color").and_then(parse_vec3_value),
                     strength: number_field(world, "strength", 1.0),
+                    eevee_sun_threshold: parse_eevee_world_sun_threshold(
+                        world.get("sun_threshold"),
+                    )?,
+                    eevee_sun_angle: parse_eevee_world_sun_number(
+                        world.get("sun_angle"),
+                        "sun_angle",
+                        f64::from(std::f32::consts::PI),
+                    )?,
+                    eevee_use_sun_shadow: parse_eevee_world_sun_bool(
+                        world.get("use_sun_shadow"),
+                        "use_sun_shadow",
+                    )?,
+                    eevee_sun_shadow_maximum_resolution: parse_eevee_world_sun_number(
+                        world.get("sun_shadow_maximum_resolution"),
+                        "sun_shadow_maximum_resolution",
+                        f64::from(f32::MAX),
+                    )?,
+                    eevee_sun_shadow_jitter_overblur: parse_eevee_world_sun_number(
+                        world.get("sun_shadow_jitter_overblur"),
+                        "sun_shadow_jitter_overblur",
+                        100.0,
+                    )?,
+                    eevee_sun_shadow_filter_radius: parse_eevee_world_sun_number(
+                        world.get("sun_shadow_filter_radius"),
+                        "sun_shadow_filter_radius",
+                        f64::from(f32::MAX),
+                    )?,
+                    eevee_use_sun_shadow_jitter: parse_eevee_world_sun_bool(
+                        world.get("use_sun_shadow_jitter"),
+                        "use_sun_shadow_jitter",
+                    )?,
                     ..World::default()
                 },
             );
@@ -3684,6 +4888,7 @@ fn build_imported_graph(
                 camera: None,
                 light: Some(LightData {
                     light_type,
+                    use_shadow: item.get("use_shadow").and_then(Value::as_bool),
                     color: vec3_field(item, "color", [1.0; 3]),
                     energy: number_field(item, "energy", 1000.0),
                     radius: number_field(item, "shadow_soft_size", 0.1),
@@ -3790,6 +4995,9 @@ fn build_imported_graph(
                 emission_color: vec3_field(item, "emission_color", [0.0; 3]),
                 emission_strength: number_field(item, "emission_strength", 0.0),
                 transmission: number_field(item, "transmission", 0.0),
+                use_raytrace_refraction: item
+                    .get("use_raytrace_refraction")
+                    .and_then(Value::as_bool),
                 ior: number_field(item, "ior", 1.5),
                 thickness_mode: match item.get("thickness_mode").and_then(Value::as_str) {
                     Some("slab") => crate::model::ThicknessMode::Slab,
@@ -5096,33 +6304,51 @@ fn build_imported_graph(
             .filter_map(|object| object_ids.get(object).cloned())
             .collect();
     }
+    let preliminary_id_mappings =
+        serde_json::to_value(&mappings).map_err(PotError::internal_json)?;
+    doc.compatibility.insert(
+        "blender_adapter".to_owned(),
+        json!({"id_mappings": preliminary_id_mappings}),
+    );
+
     for item in scenes {
         let name = string_field(item, "name")?;
-        if let Some(scene_id) = scene_ids.get(name).cloned()
-            && let Some(scene) = doc.scenes.get_mut(&scene_id)
+        let Some(scene_id) = scene_ids.get(name).cloned() else {
+            continue;
+        };
+        let cycles_hair_shadow_groups = parse_cycles_hair_shadow_groups(
+            item.get("cycles_hair_shadow_groups"),
+            &doc,
+            &scene_id,
+            &material_ids,
+            &object_ids,
+        )?;
+        let scene = doc
+            .scenes
+            .get_mut(&scene_id)
+            .ok_or_else(|| invalid_intermediate("Scene ID mapping is missing"))?;
+        scene.camera = item
+            .get("camera")
+            .and_then(Value::as_str)
+            .and_then(|camera_name| object_ids.get(camera_name))
+            .cloned();
+        scene.render.dicing_camera = match item
+            .get("render")
+            .and_then(|render| render.get("dicing_camera"))
         {
-            scene.camera = item
-                .get("camera")
-                .and_then(Value::as_str)
-                .and_then(|camera_name| object_ids.get(camera_name))
-                .cloned();
-            scene.render.dicing_camera = match item
-                .get("render")
-                .and_then(|render| render.get("dicing_camera"))
-            {
-                None | Some(Value::Null) => None,
-                Some(Value::String(camera_name)) => {
-                    Some(object_ids.get(camera_name).cloned().ok_or_else(|| {
-                        invalid_intermediate("render dicing_camera references a missing object")
-                    })?)
-                }
-                Some(_) => {
-                    return Err(invalid_intermediate(
-                        "render dicing_camera must be an object name or null",
-                    ));
-                }
-            };
-        }
+            None | Some(Value::Null) => None,
+            Some(Value::String(camera_name)) => {
+                Some(object_ids.get(camera_name).cloned().ok_or_else(|| {
+                    invalid_intermediate("render dicing_camera references a missing object")
+                })?)
+            }
+            Some(_) => {
+                return Err(invalid_intermediate(
+                    "render dicing_camera must be an object name or null",
+                ));
+            }
+        };
+        scene.cycles_hair_shadow_groups = cycles_hair_shadow_groups;
     }
     let mut generic_ids = BTreeMap::<String, BTreeMap<String, Id>>::new();
     for (collection, kind, prefix) in [("texts", "Text", "text")] {
@@ -5840,6 +7066,11 @@ fn import_node_groups(
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
+            if let Some(reason) = shader_node_metadata_error(&properties) {
+                return Err(invalid_intermediate(&format!(
+                    "node `{node_name}` has invalid Blender socket metadata: {reason}"
+                )));
+            }
             let node_type = string_field(raw_node, "type")?.to_owned();
             if matches!(
                 node_type.as_str(),
@@ -7003,115 +8234,137 @@ fn import_hair_curves(
             mappings,
             "Curves",
         )?;
-        let raw_curves = optional_array(item, "curves")?;
-        let mut curves = Vec::with_capacity(raw_curves.len());
-        let mut point_count = 0_usize;
-        for raw_curve in raw_curves {
-            let points = array(raw_curve, "points")?
-                .iter()
-                .map(|point| {
-                    parse_vec3_value(point)
-                        .ok_or_else(|| invalid_intermediate("hair Curves point is invalid"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            point_count = point_count
-                .checked_add(points.len())
-                .ok_or_else(|| invalid_intermediate("hair Curves point count overflowed"))?;
-            curves.push(crate::model::HairCurve {
-                points,
-                radius: number_field(raw_curve, "radius", 0.0),
-            });
-        }
-        let curve_count = curves.len();
-        let mut attributes = BTreeMap::new();
-        for raw_attribute in optional_array(item, "attributes")? {
-            let attribute_name = string_field(raw_attribute, "name")?;
-            let domain = string_field(raw_attribute, "domain")?;
-            if !matches!(domain, "POINT" | "CURVE") {
-                return Err(invalid_intermediate(
-                    "hair Curves attribute has an unsupported domain",
-                ));
-            }
-            let data_type = string_field(raw_attribute, "data_type")?;
-            if data_type.is_empty() {
-                return Err(invalid_intermediate(
-                    "hair Curves attribute has an empty data type",
-                ));
-            }
-            let values = array(raw_attribute, "values")?;
-            let expected_count = if domain == "POINT" {
-                point_count
-            } else {
-                curve_count
-            };
-            if values.len() != expected_count {
-                return Err(invalid_intermediate(
-                    "hair Curves attribute value count does not match its domain",
-                ));
-            }
-            if attribute_name == "position" && domain == "POINT" {
-                continue;
-            }
-            if attributes
-                .insert(
-                    attribute_name.to_owned(),
-                    crate::model::HairCurveAttribute {
-                        domain: domain.to_owned(),
-                        data_type: data_type.to_owned(),
-                        values: values.to_vec(),
-                    },
-                )
-                .is_some()
-            {
-                return Err(invalid_intermediate(
-                    "hair Curves contains a duplicate attribute name",
-                ));
-            }
-        }
-        let selection_domain = match item
-            .get("selection_domain")
-            .and_then(Value::as_str)
-            .unwrap_or("POINT")
-        {
-            domain @ ("POINT" | "CURVE") => domain.to_owned(),
-            _ => {
-                return Err(invalid_intermediate(
-                    "hair Curves selection domain is invalid",
-                ));
-            }
-        };
+        let hair_curves = parse_hair_curves_data_payload(item, None)?;
         doc.data_blocks.insert(
             id,
             DataBlock {
                 data_type: "hair_curves".to_owned(),
-                hair_curves: Some(crate::model::HairCurvesData {
-                    curves,
-                    attributes,
-                    surface: None,
-                    surface_uv_map: item
-                        .get("surface_uv_map")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    use_mirror_x: item
-                        .get("use_mirror_x")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    use_mirror_y: item
-                        .get("use_mirror_y")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    use_mirror_z: item
-                        .get("use_mirror_z")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    selection_domain,
-                }),
+                hair_curves: Some(hair_curves),
                 ..DataBlock::default()
             },
         );
     }
     Ok(data_ids)
+}
+
+fn parse_hair_curves_data_payload(
+    raw: &Value,
+    object_ids: Option<&BTreeMap<String, Id>>,
+) -> Result<HairCurvesData> {
+    let raw_curves = optional_array(raw, "curves")?;
+    let mut curves = Vec::with_capacity(raw_curves.len());
+    let mut point_count = 0_usize;
+    for raw_curve in raw_curves {
+        let points = array(raw_curve, "points")?
+            .iter()
+            .map(|point| {
+                parse_vec3_value(point)
+                    .ok_or_else(|| invalid_intermediate("hair Curves point is invalid"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        point_count = point_count
+            .checked_add(points.len())
+            .ok_or_else(|| invalid_intermediate("hair Curves point count overflowed"))?;
+        curves.push(crate::model::HairCurve {
+            points,
+            radius: number_field(raw_curve, "radius", 0.0),
+        });
+    }
+    let curve_count = curves.len();
+    let mut attributes = BTreeMap::new();
+    for raw_attribute in optional_array(raw, "attributes")? {
+        let attribute_name = string_field(raw_attribute, "name")?;
+        let domain = string_field(raw_attribute, "domain")?;
+        if !matches!(domain, "POINT" | "CURVE") {
+            return Err(invalid_intermediate(
+                "hair Curves attribute has an unsupported domain",
+            ));
+        }
+        let data_type = string_field(raw_attribute, "data_type")?;
+        if data_type.is_empty() {
+            return Err(invalid_intermediate(
+                "hair Curves attribute has an empty data type",
+            ));
+        }
+        let values = array(raw_attribute, "values")?;
+        let expected_count = if domain == "POINT" {
+            point_count
+        } else {
+            curve_count
+        };
+        if values.len() != expected_count {
+            return Err(invalid_intermediate(
+                "hair Curves attribute value count does not match its domain",
+            ));
+        }
+        if attribute_name == "position" && domain == "POINT" {
+            continue;
+        }
+        if attributes
+            .insert(
+                attribute_name.to_owned(),
+                crate::model::HairCurveAttribute {
+                    domain: domain.to_owned(),
+                    data_type: data_type.to_owned(),
+                    values: values.to_vec(),
+                },
+            )
+            .is_some()
+        {
+            return Err(invalid_intermediate(
+                "hair Curves contains a duplicate attribute name",
+            ));
+        }
+    }
+    let selection_domain = match raw
+        .get("selection_domain")
+        .and_then(Value::as_str)
+        .unwrap_or("POINT")
+    {
+        domain @ ("POINT" | "CURVE") => domain.to_owned(),
+        _ => {
+            return Err(invalid_intermediate(
+                "hair Curves selection domain is invalid",
+            ));
+        }
+    };
+    let surface = match raw.get("surface") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => match object_ids {
+            Some(object_ids) => Some(object_ids.get(name).cloned().ok_or_else(|| {
+                invalid_intermediate("hair Curves surface references an unknown Object")
+            })?),
+            None => None,
+        },
+        Some(_) => {
+            return Err(invalid_intermediate(
+                "hair Curves surface must be an Object name or null",
+            ));
+        }
+    };
+    Ok(HairCurvesData {
+        curves,
+        attributes,
+        surface,
+        surface_uv_map: raw
+            .get("surface_uv_map")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        use_mirror_x: raw
+            .get("use_mirror_x")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        use_mirror_y: raw
+            .get("use_mirror_y")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        use_mirror_z: raw
+            .get("use_mirror_z")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        selection_domain,
+    })
 }
 
 fn register_blend_libraries(
@@ -12154,22 +13407,6 @@ fn material_shader_graph_import_losses(raw: &Value, material: &Value, losses: &m
                 ));
             }
         }
-        if node_type == "ShaderNodeBsdfGlass"
-            && !properties.get("distribution").is_none_or(|value| {
-                value.as_str().is_some_and(|distribution| {
-                    distribution.eq_ignore_ascii_case("GGX")
-                        || distribution.eq_ignore_ascii_case("MULTI_GGX")
-                })
-            })
-        {
-            losses.push(loss(
-                "blender.material.shader_node.glass_distribution",
-                material_name,
-                &format!(
-                    "Glass BSDF `{name}` uses a distribution Potter refuses; the setting is preserved"
-                ),
-            ));
-        }
         if node_type == "ShaderNodeAttribute" {
             let attribute_type = properties
                 .get("attribute_type")
@@ -12245,6 +13482,42 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
         .into_iter()
         .flatten()
     {
+        let scene_name = scene.get("name").and_then(Value::as_str);
+        let engine = scene
+            .get("render")
+            .and_then(|render| render.get("engine"))
+            .and_then(Value::as_str);
+        if engine == Some("realtime") {
+            let volume_reachable = scene
+                .get("world")
+                .and_then(|world| world.get("nodes"))
+                .map(|tree| {
+                    shader_graph_nodes_reaching_output_socket(
+                        tree,
+                        "ShaderNodeOutputWorld",
+                        Some("Volume"),
+                    )
+                })
+                .unwrap_or_default();
+            if !volume_reachable.is_empty() {
+                losses.push(loss(
+                    "render.world.volume_absorption",
+                    scene_name,
+                    "World Output.Volume is reachable but Potter does not evaluate that World Volume closure; EEVEE uses its absorption state to decide whether WorldSun extraction is enabled, and that state is not represented.",
+                ));
+            }
+        }
+        if scene
+            .get("eevee_has_local_volume_probe_grids")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            losses.push(loss(
+                "render.eevee.world_probe.local_volume_grids",
+                scene_name,
+                "Visible view-layer VOLUME LightProbe objects may supply local SH, but Blender's cache is not exposed through RNA and Potter does not retain the probe cache or SH payload.",
+            ));
+        }
         for strip in scene
             .get("sequencer")
             .and_then(|sequencer| sequencer.get("strips"))
@@ -12671,24 +13944,6 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             if is_unsupported {
                 losses.push(loss(feature, name, reason));
             }
-        }
-        let render = scene.get("render");
-        if render
-            .and_then(|render| render.get("engine"))
-            .and_then(Value::as_str)
-            == Some("realtime")
-            && let Some(resolution) = render
-                .and_then(|render| render.get("eevee_gi_cubemap_resolution"))
-                .and_then(Value::as_u64)
-                .filter(|resolution| *resolution != 512)
-        {
-            losses.push(loss(
-                "blender.scene.eevee.gi_cubemap_resolution",
-                name,
-                &format!(
-                    "Blender SceneEEVEE.gi_cubemap_resolution is {resolution}; Potter preserves only the default 512, which EEVEE captures at 256 texels (512 / 2), so this non-default setting is not restored"
-                ),
-            ));
         }
     }
     for material in raw
@@ -14272,6 +15527,13 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                 "Material.pass_index is unknown, so Blender export would change the material metadata to its default 0",
             ));
         }
+        if material.use_raytrace_refraction.is_none() {
+            losses.push(loss(
+                "blender.material.use_raytrace_refraction",
+                Some(material_id.as_str()),
+                "the Blender material setting is unknown and cannot be restored without choosing a value",
+            ));
+        }
     }
     losses.extend(legacy_shader_mapping_export_losses(doc));
     // A USD cache resource has no Blender CacheFile to become: the exporter does not create an Alembic CacheFile
@@ -14393,6 +15655,85 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             ),
         ));
     }
+    let has_blender_adapter = doc
+        .compatibility
+        .get("blender_adapter")
+        .is_some_and(Value::is_object);
+    for (world_id, world) in &doc.worlds {
+        let is_linked = doc.libraries.values().any(|library| {
+            library
+                .linked_ids
+                .get("worlds")
+                .is_some_and(|worlds| worlds.contains(world_id))
+        });
+        if world.eevee_sun_threshold.is_none() && !is_linked {
+            let recovery = if has_blender_adapter {
+                "Reimport the source .blend to recover it or set World.eevee_sun_threshold."
+            } else {
+                "Set World.eevee_sun_threshold before export."
+            };
+            losses.push(loss(
+                "blender.world.eevee_sun_threshold_unknown",
+                Some(world_id.as_str()),
+                &format!(
+                    "This World has no known sun threshold; exporting a recreated World would substitute Blender's 10.0 default. {recovery}"
+                ),
+            ));
+        }
+        for (field, source, default, unknown) in [
+            (
+                "eevee_sun_angle",
+                "sun_angle",
+                "0.526 degree (0.00918043 radians)",
+                world.eevee_sun_angle.is_none(),
+            ),
+            (
+                "eevee_use_sun_shadow",
+                "use_sun_shadow",
+                "True",
+                world.eevee_use_sun_shadow.is_none(),
+            ),
+            (
+                "eevee_sun_shadow_maximum_resolution",
+                "sun_shadow_maximum_resolution",
+                "0.001",
+                world.eevee_sun_shadow_maximum_resolution.is_none(),
+            ),
+            (
+                "eevee_sun_shadow_jitter_overblur",
+                "sun_shadow_jitter_overblur",
+                "10.0",
+                world.eevee_sun_shadow_jitter_overblur.is_none(),
+            ),
+            (
+                "eevee_sun_shadow_filter_radius",
+                "sun_shadow_filter_radius",
+                "1.0",
+                world.eevee_sun_shadow_filter_radius.is_none(),
+            ),
+            (
+                "eevee_use_sun_shadow_jitter",
+                "use_sun_shadow_jitter",
+                "False",
+                world.eevee_use_sun_shadow_jitter.is_none(),
+            ),
+        ] {
+            if unknown && !is_linked {
+                let recovery = if has_blender_adapter {
+                    format!(" Reimport the source .blend or set World.{field} before export.")
+                } else {
+                    format!(" Set World.{field} before export.")
+                };
+                losses.push(loss(
+                    format!("blender.world.{field}_unknown"),
+                    Some(world_id.as_str()),
+                    &format!(
+                        "This World has no known World.{source}; recreating it would substitute Blender's {default} default.{recovery}"
+                    ),
+                ));
+            }
+        }
+    }
     for (scene_id, scene) in &doc.scenes {
         if scene
             .world
@@ -14424,8 +15765,152 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                 "only path and realtime render engines are mapped by the adapter",
             ));
         }
+        let scene_is_linked = doc.libraries.values().any(|library| {
+            library
+                .linked_ids
+                .get("scenes")
+                .is_some_and(|scenes| scenes.contains(scene_id))
+        });
+        if !scene_is_linked {
+            match scene.eevee_has_local_volume_probe_grids {
+                Some(true) => losses.push(loss(
+                    "blender.scene.eevee.world_probe.local_volume_grids_unexported",
+                    Some(scene_id.as_str()),
+                    "This Scene has visible view-layer VOLUME LightProbe objects that may supply local SH, but Blender's cache is not exposed through RNA and no cache payload is retained; export cannot recreate their source data.",
+                )),
+                None => losses.push(loss(
+                    "blender.scene.eevee.world_probe.local_volume_grids_unknown",
+                    Some(scene_id.as_str()),
+                    "This Scene's visible view-layer VOLUME LightProbe presence is unknown; recreating it would assume no local SH probes. Reimport the source .blend to recover the marker.",
+                )),
+                Some(false) => {}
+            }
+        }
+        if !scene_is_linked && scene.render.use_high_quality_normals.is_none() {
+            losses.push(loss(
+                "blender.scene.render.use_high_quality_normals",
+                Some(scene_id.as_str()),
+                "Scene.render.use_high_quality_normals is unknown; exporting a recreated Scene would substitute Blender's default. Reimport the source .blend or set use_high_quality_normals before export.",
+            ));
+        }
+        if scene.render.engine == "realtime" && scene.render.eevee_gi_cubemap_resolution.is_none() {
+            losses.push(loss(
+                "blender.scene.eevee.gi_cubemap_resolution_unknown",
+                Some(scene_id.as_str()),
+                "The EEVEE sphere-probe capture resolution is unknown; Blender export would substitute its 512 default. Reimport the source .blend to recover the exact value or set eevee_gi_cubemap_resolution.",
+            ));
+        }
+        if has_blender_adapter
+            && scene.render.engine == "realtime"
+            && scene.render.eevee_use_raytracing.is_none()
+        {
+            losses.push(loss(
+                "blender.scene.eevee.use_raytracing_unknown",
+                Some(scene_id.as_str()),
+                "The Blender-imported EEVEE realtime scene's SceneEEVEE.use_raytracing value is unknown; export would substitute Blender's default. Reimport the source .blend to recover the exact value or set eevee_use_raytracing.",
+            ));
+        }
+        if scene.render.engine == "realtime"
+            && scene.render.eevee_use_raytracing == Some(true)
+            && [
+                scene.render.eevee_use_fast_gi.is_some(),
+                scene.render.eevee_raytracing_method.is_some(),
+                scene.render.eevee_raytracing_resolution_scale.is_some(),
+                scene.render.eevee_raytracing_screen_trace_quality.is_some(),
+                scene
+                    .render
+                    .eevee_raytracing_screen_trace_thickness
+                    .is_some(),
+                scene.render.eevee_raytracing_trace_max_roughness.is_some(),
+                scene.render.eevee_raytracing_use_backface_hit.is_some(),
+                scene
+                    .render
+                    .eevee_raytracing_backface_radiance_scale
+                    .is_some(),
+                scene.render.eevee_raytracing_use_denoise.is_some(),
+                scene.render.eevee_raytracing_denoise_spatial.is_some(),
+                scene.render.eevee_raytracing_denoise_temporal.is_some(),
+                scene.render.eevee_raytracing_denoise_bilateral.is_some(),
+                scene.render.eevee_fast_gi_bias.is_some(),
+                scene.render.eevee_fast_gi_resolution.is_some(),
+                scene.render.eevee_fast_gi_step_count.is_some(),
+                scene.render.eevee_fast_gi_ray_count.is_some(),
+                scene.render.eevee_fast_gi_quality.is_some(),
+                scene.render.eevee_fast_gi_distance.is_some(),
+                scene.render.eevee_fast_gi_thickness_near.is_some(),
+                scene.render.eevee_fast_gi_method.is_some(),
+            ]
+            .iter()
+            .any(|known| !known)
+        {
+            losses.push(loss(
+                "blender.scene.eevee.raytracing_settings_unknown",
+                Some(scene_id.as_str()),
+                "The active EEVEE realtime scene has incomplete SceneEEVEE/RaytraceEEVEE ray-tracing and Fast GI settings; Blender export would substitute defaults. Reimport the source .blend if these values came from Blender, or set eevee_use_fast_gi and all eevee_raytracing_* and eevee_fast_gi_* settings.",
+            ));
+        }
+        if !scene_is_linked && scene.render.eevee_clamp_surface_indirect.is_none() {
+            losses.push(loss(
+                "blender.scene.eevee.clamp_surface_indirect_unknown",
+                Some(scene_id.as_str()),
+                "SceneEEVEE.clamp_surface_indirect is unknown; recreating this Scene would substitute Blender's 10.0 default. Reimport the source .blend or set eevee_clamp_surface_indirect.",
+            ));
+        }
+
+        let hair_curves_in_scene = doc.nodes.iter().any(|(node_id, node)| {
+            node.kind == "hair_curves"
+                && node
+                    .data
+                    .as_ref()
+                    .and_then(|data_id| doc.data_blocks.get(data_id))
+                    .is_some_and(|data| data.hair_curves.is_some())
+                && collection_contains_object(doc, &scene.root_collection, node_id)
+        });
+        let shape_unknown = scene.render.cycles_curves_shape.is_none();
+        let subdivisions_unknown =
+            has_blender_adapter && scene.render.cycles_curves_subdivisions.is_none();
+        if hair_curves_in_scene && (shape_unknown || subdivisions_unknown) {
+            let missing_settings = match (shape_unknown, subdivisions_unknown) {
+                (true, true) => "shape and subdivisions",
+                (true, false) => "shape",
+                (false, true) => "subdivisions",
+                (false, false) => unreachable!(),
+            };
+            let recovery = if has_blender_adapter {
+                "Reimport the source .blend to recover the exact pair."
+            } else {
+                "Set cycles_curves_shape before export."
+            };
+            losses.push(loss(
+                "blender.cycles_curves.settings_unknown",
+                Some(scene_id.as_str()),
+                &format!(
+                    "Cycles curve settings ({missing_settings}) are unknown for hair in this scene; Blender export would use its defaults. {recovery}"
+                ),
+            ));
+        }
     }
     for (data_id, data) in &doc.data_blocks {
+        if data.data_type == "light"
+            && data
+                .light
+                .as_ref()
+                .is_some_and(|light| light.use_shadow.is_none())
+        {
+            let light_is_linked = doc.libraries.values().any(|library| {
+                library
+                    .linked_ids
+                    .get("data_blocks")
+                    .is_some_and(|data_blocks| data_blocks.contains(data_id))
+            });
+            if !light_is_linked {
+                losses.push(loss(
+                    "blender.light.use_shadow",
+                    Some(data_id.as_str()),
+                    "Light.use_shadow is unknown and cannot be restored without choosing a value; a recreated light would use Blender's default. Reimport the source .blend or set Light.use_shadow before export.",
+                ));
+            }
+        }
         if !matches!(
             data.data_type.as_str(),
             "mesh"
@@ -15358,6 +16843,158 @@ fn shader_node_import_losses(doc: &SceneDoc) -> Vec<Loss> {
     losses
 }
 
+fn report_shader_bsdf_enum_import_losses(
+    group: &NodeGroup,
+    node_id: &Id,
+    node: &GraphNode,
+    path_traced: bool,
+    recorded: &mut BTreeSet<(String, String)>,
+    losses: &mut Vec<Loss>,
+) {
+    let mut record = |property: &str, value: String| {
+        let feature_id = format!("shader.node.{}.{}", node.node_type, property);
+        let reason = format!(
+            "Shader BSDF node `{}` uses unsupported `{property}` value `{value}`; Potter's shader evaluator refuses this setting.",
+            node.name
+        );
+        record_shader_loss(recorded, losses, &feature_id, node_id, &reason);
+    };
+    let property_value = |property: &str,
+                          supported: &[&str],
+                          case_insensitive: bool,
+                          non_string_is_unsupported: bool| {
+        node.properties.get(property).and_then(|raw| {
+            let Some(value) = raw.as_str() else {
+                return non_string_is_unsupported.then(|| raw.to_string());
+            };
+            let is_supported = supported.iter().any(|candidate| {
+                if case_insensitive {
+                    candidate.eq_ignore_ascii_case(value)
+                } else {
+                    *candidate == value
+                }
+            });
+            (!is_supported).then(|| value.to_owned())
+        })
+    };
+
+    match node.node_type.as_str() {
+        "ShaderNodeBsdfGlossy" | "ShaderNodeBsdfAnisotropic" => {
+            let anisotropy_linked = group
+                .links
+                .iter()
+                .any(|link| link.to_node == *node_id && link.to_socket == "Anisotropy");
+            let anisotropy_active = anisotropy_linked
+                || node
+                    .inputs
+                    .get("Anisotropy")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|value| value.abs() > 1.0e-4);
+            if anisotropy_active
+                && let Some(value) =
+                    property_value("distribution", &["GGX", "MULTI_GGX"], false, false)
+            {
+                record("distribution", value);
+            }
+        }
+        "ShaderNodeBsdfGlass" => {
+            if let Some(value) = property_value("distribution", &["GGX", "MULTI_GGX"], true, true) {
+                record("distribution", value);
+            }
+        }
+        "ShaderNodeBsdfSheen" if path_traced => {
+            if let Some(value) =
+                property_value("distribution", &["MICROFIBER", "ASHIKHMIN"], false, true)
+            {
+                record("distribution", value);
+            }
+        }
+        "ShaderNodeSubsurfaceScattering" => {
+            if let Some(value) = property_value(
+                "falloff",
+                &[
+                    "RANDOM_WALK",
+                    "BURLEY",
+                    "RANDOM_WALK_SKIN",
+                    "RANDOM_WALK_LEGACY",
+                ],
+                false,
+                true,
+            ) {
+                record("falloff", value);
+            }
+        }
+        "ShaderNodeBsdfRefraction" => {
+            if let Some(value) = property_value("distribution", &["BECKMANN", "GGX"], false, true) {
+                record("distribution", value);
+            }
+        }
+        "ShaderNodeBsdfToon" if path_traced => {
+            if let Some(value) = property_value("component", &["DIFFUSE", "GLOSSY"], false, true) {
+                record("component", value);
+            }
+        }
+        "ShaderNodeBsdfMetallic" => {
+            if let Some(value) = property_value(
+                "distribution",
+                &["MULTI_GGX", "BECKMANN", "GGX"],
+                false,
+                true,
+            ) {
+                record("distribution", value);
+            }
+            if let Some(value) =
+                property_value("fresnel_type", &["F82", "PHYSICAL_CONDUCTOR"], false, true)
+            {
+                record("fresnel_type", value);
+            }
+        }
+        "ShaderNodeBsdfHair" if path_traced => {
+            if let Some(value) =
+                property_value("component", &["Reflection", "Transmission"], false, true)
+            {
+                record("component", value);
+            }
+        }
+        "ShaderNodeBsdfHairPrincipled" if path_traced => {
+            if let Some(value) = property_value("model", &["CHIANG", "HUANG"], false, true) {
+                record("model", value);
+            }
+            if let Some(value) = property_value(
+                "parametrization",
+                &["COLOR", "MELANIN", "ABSORPTION"],
+                false,
+                true,
+            ) {
+                record("parametrization", value);
+            }
+        }
+        "ShaderNodeBsdfPrincipled"
+            if node
+                .properties
+                .get("potter_simple_material")
+                .and_then(Value::as_bool)
+                != Some(true) =>
+        {
+            if let Some(value) = node
+                .properties
+                .get("subsurface_method")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    !matches!(
+                        *value,
+                        "BURLEY" | "RANDOM_WALK" | "RANDOM_WALK_SKIN" | "RANDOM_WALK_LEGACY"
+                    )
+                })
+                .map(str::to_owned)
+            {
+                record("subsurface_method", value);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_shader_node_import_losses(
     doc: &SceneDoc,
     material_id: &Id,
@@ -15396,6 +17033,7 @@ fn collect_shader_node_import_losses(
         if outputs.is_empty() {
             continue;
         }
+        report_shader_bsdf_enum_import_losses(group, node_id, node, path_traced, recorded, losses);
         if has_realtime_world_graph
             && volume_reachable.contains(node_id)
             && node.node_type == "ShaderNodeVolumePrincipled"
@@ -16014,6 +17652,127 @@ mod tests {
     use super::*;
     use crate::model::{HairCurveAttribute, HairCurvesData};
     #[test]
+    fn cycles_hair_bridge_group_import_preserves_instance_context_and_evaluated_curves() {
+        let scene_id = Id::from_static("scene_main");
+        let object_id = Id::new("hair_object").unwrap();
+        let data_id = Id::new("hair_data").unwrap();
+        let material_id = Id::new("hair_material").unwrap();
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000012".to_owned());
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "hair_curves".to_owned(),
+                mesh: None,
+                hair_curves: Some(HairCurvesData {
+                    curves: vec![crate::model::HairCurve {
+                        points: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                        radius: 0.05,
+                    }],
+                    ..HairCurvesData::default()
+                }),
+                ..DataBlock::default()
+            },
+        );
+        doc.materials
+            .insert(material_id.clone(), Material::default());
+        doc.nodes.insert(
+            object_id.clone(),
+            Node {
+                name: "Hair".to_owned(),
+                kind: "hair_curves".to_owned(),
+                data: Some(data_id.clone()),
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .unwrap()
+            .objects
+            .push(object_id.clone());
+
+        let identity = json!([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ]);
+        let raw_groups = json!([{
+            "view_layer": "View Layer",
+            "geometry_key": {"kind": "data", "uses_source_data": true},
+            "representative": "Hair",
+            "member_nodes": ["Hair"],
+            "members": [{
+                "instance": {
+                    "real_object": "Hair",
+                    "parent": "Hair",
+                    "persistent_id": [0, 0, 0, 0, 0, 0, 0, 0],
+                    "is_instance": false,
+                    "use_particle_hair": false
+                },
+                "object_to_world": identity,
+                "object_color": [0.2, 0.3, 0.4, 1.0],
+                "object_pass_index": 22,
+                "object_random_id": -947_307_473,
+                "slot_0_material": "HairMaterial",
+                "ray_visibility": {
+                    "camera": true, "diffuse": true, "glossy": true,
+                    "transmission": true, "shadow": true, "volume_scatter": true
+                }
+            }],
+            "source_curve_indices": [0],
+            "evaluated_hair_curves": {
+                "curves": [{"points": [[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]], "radius": 0.1}],
+                "attributes": [{
+                    "name": "test_attr", "domain": "CURVE", "data_type": "FLOAT", "values": [0.75]
+                }],
+                "surface": null,
+                "surface_uv_map": "",
+                "use_mirror_x": false,
+                "use_mirror_y": false,
+                "use_mirror_z": false,
+                "selection_domain": "POINT"
+            }
+        }]);
+        let object_ids = BTreeMap::from([("Hair".to_owned(), object_id)]);
+        let material_ids = BTreeMap::from([("HairMaterial".to_owned(), material_id.clone())]);
+        let groups = parse_cycles_hair_shadow_groups(
+            Some(&raw_groups),
+            &doc,
+            &scene_id,
+            &material_ids,
+            &object_ids,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].geometry_key,
+            CyclesHairShadowGeometryKey::Data {
+                data_id: Some(data_id)
+            }
+        );
+        assert_eq!(groups[0].members[0].object_pass_index, 22);
+        assert_eq!(groups[0].members[0].object_random_id, -947_307_473);
+        assert_eq!(groups[0].members[0].slot_0_material_id, Some(material_id));
+        assert_eq!(
+            groups[0].evaluated_hair_curves.as_ref().unwrap().curves[0].points[1],
+            [0.0, 0.0, 2.0]
+        );
+        assert_eq!(groups[0].source_curve_indices, Some(vec![0]));
+        assert!(
+            groups[0]
+                .source_input_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| fingerprint.starts_with("sha256:"))
+        );
+        doc.scenes
+            .get_mut(&scene_id)
+            .unwrap()
+            .cycles_hair_shadow_groups = Some(groups);
+        doc.validate().unwrap();
+    }
+
+    #[test]
     fn nla_import_preserves_influence_flag_and_curves() {
         let mappings = BTreeMap::new();
         let static_disabled = json!({"properties": {
@@ -16273,6 +18032,56 @@ mod tests {
             loss.feature_id == "blender.material.pass_index"
                 && loss.data_id.as_deref() == Some(material_id.as_str())
         }));
+        Ok(())
+    }
+    #[test]
+    fn unknown_light_shadow_is_an_export_loss_unless_its_linked_source_is_reused() -> Result<()> {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let light_id = Id::new("unknown_light_shadow")?;
+        doc.data_blocks.insert(
+            light_id.clone(),
+            DataBlock {
+                data_type: "light".to_owned(),
+                light: Some(LightData {
+                    use_shadow: None,
+                    ..LightData::default()
+                }),
+                ..DataBlock::default()
+            },
+        );
+        let unknown = export_losses(&doc)
+            .into_iter()
+            .find(|loss| loss.feature_id == "blender.light.use_shadow")
+            .ok_or_else(|| invalid_intermediate("unknown Light.use_shadow was not reported"))?;
+        assert_eq!(unknown.data_id.as_deref(), Some(light_id.as_str()));
+
+        doc.libraries.insert(
+            Id::new("light_library")?,
+            Library {
+                linked_ids: std::collections::BTreeMap::from([(
+                    "data_blocks".to_owned(),
+                    vec![light_id.clone()],
+                )]),
+                ..Library::default()
+            },
+        );
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .all(|loss| loss.feature_id != "blender.light.use_shadow")
+        );
+
+        doc.libraries.clear();
+        doc.data_blocks
+            .get_mut(&light_id)
+            .and_then(|data| data.light.as_mut())
+            .ok_or_else(|| invalid_intermediate("test light data is missing"))?
+            .use_shadow = Some(false);
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .all(|loss| loss.feature_id != "blender.light.use_shadow")
+        );
         Ok(())
     }
 
@@ -17138,6 +18947,232 @@ mod tests {
         ));
     }
     #[test]
+    fn intermediate_validates_cycles_curve_shape_and_subdivisions() {
+        let mut intermediate = json!({
+            "bridge_version": 2,
+            "blender_version": "5.2.2",
+            "file_version": [5, 2, 2],
+            "scenes": [{
+                "render": {
+                    "cycles_curves_shape": "ribbons",
+                    "cycles_curves_subdivisions": 0
+                }
+            }],
+            "collections": [],
+            "objects": [],
+            "meshes": [],
+            "materials": [],
+            "cameras": [],
+            "lights": [],
+            "actions": [],
+            "texts": [],
+            "node_groups": [],
+            "other_datablocks": [],
+            "unused_datablocks": []
+        });
+        intermediate["scenes"][0]["render"] = json!({});
+
+        assert!(validate_intermediate(&intermediate).is_ok());
+        intermediate["scenes"][0]["render"] = json!({
+            "cycles_curves_shape": null,
+            "cycles_curves_subdivisions": null
+        });
+        assert!(validate_intermediate(&intermediate).is_ok());
+        for (shape, subdivisions) in [("ribbons", 0), ("thick", 2), ("thick_linear", 24)] {
+            intermediate["scenes"][0]["render"]["cycles_curves_shape"] = json!(shape);
+            intermediate["scenes"][0]["render"]["cycles_curves_subdivisions"] = json!(subdivisions);
+            assert!(validate_intermediate(&intermediate).is_ok());
+        }
+        intermediate["scenes"][0]["render"]["cycles_curves_shape"] = json!("bad");
+        assert!(validate_intermediate(&intermediate).is_err());
+        intermediate["scenes"][0]["render"]["cycles_curves_shape"] = json!("thick");
+        intermediate["scenes"][0]["render"]["cycles_curves_subdivisions"] = json!(25);
+        assert!(validate_intermediate(&intermediate).is_err());
+    }
+    #[test]
+    fn intermediate_validates_eevee_cubemap_resolution_enum() {
+        let mut intermediate = json!({
+            "bridge_version": 2,
+            "blender_version": "5.2.2",
+            "file_version": [5, 2, 2],
+            "scenes": [{"render": {}}],
+            "collections": [],
+            "objects": [],
+            "meshes": [],
+            "materials": [],
+            "cameras": [],
+            "lights": [],
+            "actions": [],
+            "texts": [],
+            "node_groups": [],
+            "other_datablocks": [],
+            "unused_datablocks": []
+        });
+        intermediate["scenes"][0]["render"]["eevee_gi_cubemap_resolution"] = Value::Null;
+        assert!(validate_intermediate(&intermediate).is_ok());
+        for resolution in crate::model::EEVEE_GI_CUBEMAP_RESOLUTIONS {
+            intermediate["scenes"][0]["render"]["eevee_gi_cubemap_resolution"] = json!(resolution);
+            assert!(validate_intermediate(&intermediate).is_ok(), "{resolution}");
+        }
+        intermediate["scenes"][0]["render"]["eevee_gi_cubemap_resolution"] = json!(2049);
+        assert!(validate_intermediate(&intermediate).is_err());
+    }
+    #[test]
+    fn intermediate_validates_world_sun_threshold_source_range() {
+        let mut intermediate = json!({
+            "bridge_version": 2,
+            "blender_version": "5.2.2",
+            "file_version": [5, 2, 2],
+            "scenes": [{"world": {"sun_threshold": null}, "render": {}}],
+            "collections": [],
+            "objects": [],
+            "meshes": [],
+            "materials": [],
+            "cameras": [],
+            "lights": [],
+            "actions": [],
+            "texts": [],
+            "node_groups": [],
+            "other_datablocks": [],
+            "unused_datablocks": []
+        });
+        assert!(validate_intermediate(&intermediate).is_ok());
+        for threshold in [0.0, 10.0, f64::from(f32::MAX)] {
+            intermediate["scenes"][0]["world"]["sun_threshold"] = json!(threshold);
+            assert!(validate_intermediate(&intermediate).is_ok(), "{threshold}");
+        }
+        for threshold in [
+            -f64::EPSILON,
+            f64::from_bits(f64::from(f32::MAX).to_bits() + 1),
+        ] {
+            intermediate["scenes"][0]["world"]["sun_threshold"] = json!(threshold);
+            assert!(validate_intermediate(&intermediate).is_err(), "{threshold}");
+        }
+        intermediate["scenes"][0]["world"]["sun_threshold"] = json!("10");
+        assert!(validate_intermediate(&intermediate).is_err());
+    }
+    #[test]
+    fn intermediate_validates_world_sun_shadow_source_ranges() {
+        let mut intermediate = json!({
+            "bridge_version": 2,
+            "blender_version": "5.2.2",
+            "file_version": [5, 2, 2],
+            "scenes": [{"world": {
+                "sun_angle": null,
+                "use_sun_shadow": null,
+                "sun_shadow_maximum_resolution": null,
+                "sun_shadow_jitter_overblur": null,
+                "sun_shadow_filter_radius": null,
+                "use_sun_shadow_jitter": null
+            }, "render": {}}],
+            "collections": [],
+            "objects": [],
+            "meshes": [],
+            "materials": [],
+            "cameras": [],
+            "lights": [],
+            "actions": [],
+            "texts": [],
+            "node_groups": [],
+            "other_datablocks": [],
+            "unused_datablocks": []
+        });
+        assert!(validate_intermediate(&intermediate).is_ok());
+        for (field, maximum) in [
+            ("sun_angle", f64::from(std::f32::consts::PI)),
+            ("sun_shadow_maximum_resolution", f64::from(f32::MAX)),
+            ("sun_shadow_jitter_overblur", 100.0),
+            ("sun_shadow_filter_radius", f64::from(f32::MAX)),
+        ] {
+            intermediate["scenes"][0]["world"][field] = json!(0.0);
+            assert!(validate_intermediate(&intermediate).is_ok(), "{field}");
+            intermediate["scenes"][0]["world"][field] = json!(maximum);
+            assert!(validate_intermediate(&intermediate).is_ok(), "{field}");
+            intermediate["scenes"][0]["world"][field] =
+                json!(f64::from_bits(maximum.to_bits() + 1));
+            assert!(validate_intermediate(&intermediate).is_err(), "{field}");
+            intermediate["scenes"][0]["world"][field] = json!(-f64::EPSILON);
+            assert!(validate_intermediate(&intermediate).is_err(), "{field}");
+            intermediate["scenes"][0]["world"][field] = Value::Null;
+        }
+        for field in ["use_sun_shadow", "use_sun_shadow_jitter"] {
+            intermediate["scenes"][0]["world"][field] = json!(true);
+            assert!(validate_intermediate(&intermediate).is_ok(), "{field}");
+            intermediate["scenes"][0]["world"][field] = json!(false);
+            assert!(validate_intermediate(&intermediate).is_ok(), "{field}");
+            intermediate["scenes"][0]["world"][field] = json!("true");
+            assert!(validate_intermediate(&intermediate).is_err(), "{field}");
+            intermediate["scenes"][0]["world"][field] = Value::Null;
+        }
+    }
+
+    #[test]
+    fn intermediate_validates_eevee_raytracing_settings_types() {
+        let mut intermediate = json!({
+            "bridge_version": 2,
+            "blender_version": "5.2.2",
+            "file_version": [5, 2, 2],
+            "scenes": [{
+                "eevee_has_local_volume_probe_grids": true,
+                "render": {
+                "eevee_use_raytracing": true,
+                "eevee_use_fast_gi": false,
+                "eevee_raytracing_method": "SCREEN",
+                "eevee_raytracing_resolution_scale": 4,
+                "eevee_raytracing_screen_trace_quality": 0.4,
+                "eevee_raytracing_screen_trace_thickness": 0.25,
+                "eevee_raytracing_trace_max_roughness": 0.75,
+                "eevee_raytracing_use_backface_hit": false,
+                "eevee_raytracing_backface_radiance_scale": 0.4,
+                "eevee_raytracing_use_denoise": true,
+                "eevee_raytracing_denoise_spatial": false,
+                "eevee_raytracing_denoise_temporal": true,
+                "eevee_raytracing_denoise_bilateral": false,
+                "eevee_fast_gi_bias": 0.2,
+                "eevee_fast_gi_resolution": 8,
+                "eevee_fast_gi_step_count": 32,
+                "eevee_fast_gi_ray_count": 5,
+                "eevee_fast_gi_quality": 0.7,
+                "eevee_fast_gi_distance": 200.0,
+                "eevee_fast_gi_thickness_near": 0.3,
+                "eevee_fast_gi_method": "AMBIENT_OCCLUSION_ONLY",
+                "eevee_clamp_surface_indirect": 0.0
+            }}],
+            "collections": [],
+            "objects": [],
+            "meshes": [],
+            "materials": [],
+            "cameras": [],
+            "lights": [],
+            "actions": [],
+            "texts": [],
+            "node_groups": [],
+            "other_datablocks": [],
+            "unused_datablocks": []
+        });
+        assert!(validate_intermediate(&intermediate).is_ok());
+        intermediate["scenes"][0]["eevee_has_local_volume_probe_grids"] = json!("true");
+        assert!(validate_intermediate(&intermediate).is_err());
+        intermediate["scenes"][0]["eevee_has_local_volume_probe_grids"] = json!(false);
+        assert!(validate_intermediate(&intermediate).is_ok());
+
+        intermediate["scenes"][0]["render"]["eevee_use_raytracing"] = json!("true");
+        assert!(validate_intermediate(&intermediate).is_err());
+        intermediate["scenes"][0]["render"]["eevee_use_raytracing"] = json!(true);
+        intermediate["scenes"][0]["render"]["eevee_raytracing_method"] = json!("HARDWARE");
+        assert!(validate_intermediate(&intermediate).is_err());
+        intermediate["scenes"][0]["render"]["eevee_raytracing_method"] = json!("SCREEN");
+        intermediate["scenes"][0]["render"]["eevee_clamp_surface_indirect"] =
+            json!(f64::from(f32::MAX));
+        assert!(validate_intermediate(&intermediate).is_ok());
+        intermediate["scenes"][0]["render"]["eevee_clamp_surface_indirect"] =
+            json!(f64::from_bits(f64::from(f32::MAX).to_bits() + 1));
+        assert!(validate_intermediate(&intermediate).is_err());
+        intermediate["scenes"][0]["render"]["eevee_clamp_surface_indirect"] = json!(-f64::EPSILON);
+        assert!(validate_intermediate(&intermediate).is_err());
+    }
+
+    #[test]
     fn intermediate_uv_layers_become_storage_values_with_active_and_render_layers() -> Result<()> {
         let item = json!({
             "vertices": [{"co": [0.0, 0.0, 0.0]}, {"co": [1.0, 0.0, 0.0]}, {"co": [1.0, 1.0, 0.0]}, {"co": [0.0, 1.0, 0.0]}],
@@ -17449,7 +19484,8 @@ mod tests {
                 "display_shading": {"type": "SOLID", "light": "STUDIO", "studio_light": "Default", "color_type": "MATERIAL", "use_world_space_lighting": false, "show_specular_highlight": true, "show_cavity": false, "show_shadows": false, "show_object_outline": false, "show_backface_culling": false, "show_xray": false, "xray_alpha": 0.5, "use_dof": false, "camera_dof": false, "background_type": "THEME"},
                 "render": {"resolution_x": 640, "resolution_y": 360, "resolution_percentage": 100,
                            "samples": 12, "seed": 5, "film_transparent": false, "engine": "path",
-                           "engine_native": "CYCLES"},
+                           "engine_native": "CYCLES", "cycles_curves_shape": "thick",
+                           "cycles_curves_subdivisions": 2},
                 "view_layers": [{"name": "View Layer", "excluded_collections": []}]
             }],
             "collections": [{
@@ -17506,7 +19542,7 @@ mod tests {
                 "nodes": {"nodes": [{"name":"Principled BSDF","type":"ShaderNodeBsdfPrincipled"}]},
                 "custom_properties": {}, "fake_user": false, "users": 1
             }],
-            "cameras": [], "lights": [],
+            "cameras": [], "lights": [{"name":"Legacy Light", "potter_id":"light_legacy", "type":"POINT"}],
             "actions": [{
                 "name": "Move", "potter_id": "action_move",
                 "fcurves": [{"path": "location", "index": 0,
@@ -17541,6 +19577,13 @@ mod tests {
             b"ORIGINAL".to_vec(),
             &BTreeMap::new(),
         )?;
+        assert_eq!(
+            test_data_ref(&imported.doc, "light_legacy")?
+                .light
+                .as_ref()
+                .and_then(|light| light.use_shadow),
+            None
+        );
         assert_eq!(imported.doc.active_scene.as_str(), "scene_test");
         let scene = imported
             .doc
@@ -17718,7 +19761,7 @@ mod tests {
                 "frame_current":1.0,"frame_start":1,"frame_end":250,"fps":24,"fps_base":1.0,
                 "camera":null,"world":null,"unit":{"system":"METRIC","scale_length":1.0},
                 "display_shading":{"type":"SOLID","light":"STUDIO","studio_light":"Default","color_type":"MATERIAL","use_world_space_lighting":false,"show_specular_highlight":true,"show_cavity":false,"show_shadows":false,"show_object_outline":false,"show_backface_culling":false,"show_xray":false,"xray_alpha":0.5,"use_dof":false,"camera_dof":false,"background_type":"THEME"},
-                "render":{},"view_layers":[{"name":"View Layer","excluded_collections":[]}],
+                "render":{"cycles_curves_shape":"thick","cycles_curves_subdivisions":2},
                 "markers":[{"name":"Marker","frame":12.0}],
                 "rigid_body_world":{"enabled":true,"gravity":[0.0,0.0,-9.81],
                     "substeps":4,"solver_iterations":10,"frame_start":1,"frame_end":250,"seed":3}
@@ -18257,6 +20300,150 @@ mod tests {
             assert_eq!(
                 reopened, present,
                 "sharp_face presence after a .blend round trip"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blender_roundtrip_preserves_cycles_curve_shape_and_subdivisions() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let scene_id = Id::from_static("scene_main");
+        for (index, (shape, expected)) in [
+            (CyclesCurveShape::Ribbons, "ribbons"),
+            (CyclesCurveShape::Thick, "thick"),
+            (CyclesCurveShape::ThickLinear, "thick_linear"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut doc = roundtrip_scene()?;
+            let scene = doc
+                .scenes
+                .get_mut(&scene_id)
+                .ok_or_else(|| invalid_intermediate("roundtrip scene is missing"))?;
+            scene.render.cycles_curves_shape = Some(shape);
+            scene.render.cycles_curves_subdivisions = Some(2);
+            let output = directory
+                .path()
+                .join(format!("cycles-curves-{index}.blend"));
+            let context = crate::eval::EvaluationContext::default();
+            let options = ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            };
+            export_blend(&doc, &project, &output, &options)?;
+            let imported = import_blend(&output, Some(&blender))?;
+            let render = &imported.doc.scenes[&scene_id].render;
+            assert_eq!(render.cycles_curves_shape, Some(shape), "{expected}");
+            assert_eq!(render.cycles_curves_subdivisions, Some(2), "{expected}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blender_roundtrip_preserves_nondefault_eevee_probe_resolution() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let scene_id = Id::from_static("scene_main");
+        let mut doc = roundtrip_scene()?;
+        let scene = doc
+            .scenes
+            .get_mut(&scene_id)
+            .ok_or_else(|| invalid_intermediate("roundtrip scene is missing"))?;
+        scene.render.engine = "realtime".to_owned();
+        scene.render.eevee_gi_cubemap_resolution = Some(1024);
+        let output = directory.path().join("eevee-probe-1024.blend");
+        let context = crate::eval::EvaluationContext::default();
+        let options = ExportOptions {
+            allow_lossy: false,
+            pack: false,
+            blender: Some(&blender),
+            context: &context,
+        };
+        export_blend(&doc, &project, &output, &options)?;
+        let imported = import_blend(&output, Some(&blender))?;
+        assert_eq!(
+            imported.doc.scenes[&scene_id]
+                .render
+                .eevee_gi_cubemap_resolution,
+            Some(1024)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blender_roundtrip_preserves_eevee_raytracing_and_mesh_normal_precision() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let scene_id = Id::from_static("scene_main");
+        for (index, (value, high_quality_normals)) in
+            [(true, false), (false, true)].into_iter().enumerate()
+        {
+            let mut doc = roundtrip_scene()?;
+            let scene = doc
+                .scenes
+                .get_mut(&scene_id)
+                .ok_or_else(|| invalid_intermediate("roundtrip scene is missing"))?;
+            scene.render.engine = "realtime".to_owned();
+            scene.render.eevee_gi_cubemap_resolution = Some(1024);
+            scene.render.eevee_use_raytracing = Some(value);
+            scene.render.eevee_use_fast_gi = Some(false);
+            scene.render.eevee_raytracing_method =
+                Some(crate::model::EeveeRayTracingMethod::Screen);
+            scene.render.eevee_raytracing_resolution_scale = Some(2);
+            scene.render.eevee_raytracing_screen_trace_quality = Some(0.25);
+            scene.render.eevee_raytracing_screen_trace_thickness = Some(0.1);
+            scene.render.eevee_raytracing_trace_max_roughness = Some(0.5);
+            scene.render.eevee_raytracing_use_backface_hit = Some(true);
+            scene.render.eevee_raytracing_backface_radiance_scale = Some(0.25);
+            scene.render.eevee_raytracing_use_denoise = Some(true);
+            scene.render.eevee_raytracing_denoise_spatial = Some(true);
+            scene.render.eevee_raytracing_denoise_temporal = Some(true);
+            scene.render.eevee_raytracing_denoise_bilateral = Some(true);
+            scene.render.eevee_fast_gi_bias = Some(0.05);
+            scene.render.eevee_fast_gi_resolution = Some(2);
+            scene.render.eevee_fast_gi_step_count = Some(8);
+            scene.render.eevee_fast_gi_ray_count = Some(2);
+            scene.render.eevee_fast_gi_quality = Some(0.25);
+            scene.render.eevee_fast_gi_distance = Some(0.0);
+            scene.render.eevee_fast_gi_thickness_near = Some(0.1);
+            scene.render.eevee_fast_gi_method =
+                Some(crate::model::EeveeFastGiMethod::GlobalIllumination);
+            scene.render.use_high_quality_normals = Some(high_quality_normals);
+            let output = directory
+                .path()
+                .join(format!("eevee-raytracing-{index}.blend"));
+            let context = crate::eval::EvaluationContext::default();
+            let options = ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            };
+            export_blend(&doc, &project, &output, &options)?;
+            let imported = import_blend(&output, Some(&blender))?;
+            assert_eq!(
+                imported.doc.scenes[&scene_id].render.eevee_use_raytracing,
+                Some(value)
+            );
+            assert_eq!(
+                imported.doc.scenes[&scene_id]
+                    .render
+                    .use_high_quality_normals,
+                Some(high_quality_normals)
             );
         }
         Ok(())
@@ -18864,6 +21051,360 @@ mod tests {
                     .any(|node| node.node_type == "OutputMaterial")
             );
         }
+        Ok(())
+    }
+
+    fn muted_mix_shader_graph() -> Result<(NodeGroup, Id, Id)> {
+        let graph_id = Id::new("muted_mix_graph")?;
+        let material_id = Id::new("muted_mix_material")?;
+        let mut group = NodeGroup::new("Muted Mix Shader", GraphKind::Shader);
+
+        let mut constant = GraphNode::new("ShaderNodeValue");
+        constant.properties.insert(
+            "potter_output_defaults".to_owned(),
+            json!([{"identifier": "Value", "default": 1.0}]),
+        );
+        let mut mix = GraphNode::new("ShaderNodeMix");
+        mix.properties.insert("mute".to_owned(), json!(true));
+        mix.properties
+            .insert("data_type".to_owned(), json!("FLOAT"));
+        mix.inputs.insert("Factor".to_owned(), json!(0.25));
+        mix.inputs.insert("B".to_owned(), json!(0.95));
+        let mut principled = GraphNode::new("ShaderNodeBsdfPrincipled");
+        principled.inputs.insert("Alpha".to_owned(), json!(0.4));
+        let mut output = GraphNode::new("OutputMaterial");
+        output
+            .properties
+            .insert("is_active_output".to_owned(), json!(true));
+        for (id, node) in [
+            ("constant", constant),
+            ("muted_mix", mix),
+            ("principled", principled),
+            ("output", output),
+        ] {
+            group.nodes.insert(Id::new(id)?, node);
+        }
+        for (from_node, from_socket, to_node, to_socket) in [
+            ("constant", "Value", "muted_mix", "A"),
+            ("muted_mix", "Result", "principled", "Alpha"),
+            ("principled", "BSDF", "output", "Surface"),
+        ] {
+            group.links.push(GraphLink {
+                from_node: Id::new(from_node)?,
+                from_socket: from_socket.to_owned(),
+                to_node: Id::new(to_node)?,
+                to_socket: to_socket.to_owned(),
+            });
+        }
+        Ok((group, graph_id, material_id))
+    }
+
+    fn muted_mix_world_graph() -> Result<(NodeGroup, Id)> {
+        let world_graph_id = Id::new("muted_mix_world_graph")?;
+        let mut world_group = NodeGroup::new("Muted Mix World", GraphKind::Shader);
+        let mut background = GraphNode::new("ShaderNodeBackground");
+        background
+            .inputs
+            .insert("Color".to_owned(), json!([0.2, 0.3, 0.4, 1.0]));
+        background.inputs.insert("Strength".to_owned(), json!(0.75));
+        let mut world_output = GraphNode::new("ShaderNodeOutputWorld");
+        world_output
+            .properties
+            .insert("is_active_output".to_owned(), json!(true));
+        world_group
+            .nodes
+            .insert(Id::new("world_background")?, background);
+        world_group
+            .nodes
+            .insert(Id::new("world_output")?, world_output);
+        world_group.links.push(GraphLink {
+            from_node: Id::new("world_background")?,
+            from_socket: "Background".to_owned(),
+            to_node: Id::new("world_output")?,
+            to_socket: "Surface".to_owned(),
+        });
+        Ok((world_group, world_graph_id))
+    }
+
+    fn muted_mix_scene_doc() -> Result<(SceneDoc, Id, Id)> {
+        let (group, graph_id, material_id) = muted_mix_shader_graph()?;
+        let (world_group, world_graph_id) = muted_mix_world_graph()?;
+        let world_id = Id::new("muted_mix_world")?;
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.node_groups.insert(graph_id.clone(), group);
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                name: "Muted Mix".to_owned(),
+                node_tree: Some(graph_id.clone()),
+                ..Material::default()
+            },
+        );
+        doc.node_groups.insert(world_graph_id.clone(), world_group);
+        doc.worlds.insert(
+            world_id.clone(),
+            World {
+                node_tree: Some(world_graph_id),
+                ..World::default()
+            },
+        );
+        doc.scenes
+            .get_mut(&Id::from_static("scene_main"))
+            .ok_or_else(|| invalid_intermediate("test scene is missing"))?
+            .world = Some(world_id);
+        let mesh_id = Id::new("muted_mix_mesh")?;
+        doc.data_blocks.insert(
+            mesh_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(box_with_attributes(Vec::new())?),
+                ..DataBlock::default()
+            },
+        );
+        let object_id = Id::new("muted_mix_object")?;
+        let mut object = test_node("Muted Mix", mesh_id.as_str(), None, None)?;
+        object.materials = vec![Some(material_id.clone())];
+        doc.nodes.insert(object_id.clone(), object);
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .ok_or_else(|| invalid_intermediate("root collection is missing"))?
+            .objects
+            .push(object_id);
+        Ok((doc, graph_id, material_id))
+    }
+
+    fn muted_mix_closure_flags(doc: &SceneDoc, material_id: &Id) -> Result<u32> {
+        let material = doc
+            .materials
+            .get(material_id)
+            .ok_or_else(|| invalid_intermediate("muted Mix material is missing"))?;
+        PreparedMaterial::new(material, &doc.node_groups).eevee_closure_flags()
+    }
+
+    fn assert_muted_mix_route_policy(
+        source: &SceneDoc,
+        project: &Project,
+        directory: &Path,
+        blender: &Path,
+        context: &crate::eval::EvaluationContext,
+        graph_id: &Id,
+        material_id: &Id,
+        flags_before: u32,
+    ) -> Result<()> {
+        let mut wrong_route = source.clone();
+        wrong_route
+            .node_groups
+            .get_mut(graph_id)
+            .and_then(|group| group.nodes.get_mut(&Id::new("muted_mix").ok()?))
+            .ok_or_else(|| invalid_intermediate("muted Mix node is missing"))?
+            .properties
+            .insert("internal_links".to_owned(), json!([]));
+        let transparency = crate::shader::EEVEE_CLOSURE_TRANSPARENCY;
+        assert_ne!(
+            muted_mix_closure_flags(&wrong_route, material_id)? & transparency,
+            0,
+            "an empty known route map must not guess the linked A input"
+        );
+        let Err(route_strict_error) = export_blend(
+            &wrong_route,
+            project,
+            &directory.join("muted-mix-strict-route.blend"),
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(blender),
+                context,
+            },
+        ) else {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "strict Blender export accepted changed muted internal routing",
+            ));
+        };
+        assert_eq!(route_strict_error.code, ErrorCode::UnrepresentableFeature);
+        assert!(
+            route_strict_error.details["losses"]
+                .as_array()
+                .is_some_and(|losses| {
+                    losses.iter().any(|loss| {
+                        loss["feature_id"] == json!("blender.node.internal_links")
+                            && loss["data_id"] == json!("muted_mix")
+                    })
+                })
+        );
+        let lossy_route_path = directory.join("muted-mix-lossy-route.blend");
+        let route_report = export_blend(
+            &wrong_route,
+            project,
+            &lossy_route_path,
+            &ExportOptions {
+                allow_lossy: true,
+                pack: false,
+                blender: Some(blender),
+                context,
+            },
+        )?;
+        assert!(route_report.losses.iter().any(|loss| {
+            loss.feature_id == "blender.node.internal_links"
+                && loss.data_id.as_deref() == Some("muted_mix")
+        }));
+        let route_roundtrip = import_blend(&lossy_route_path, Some(blender))?;
+        assert_eq!(
+            muted_mix_closure_flags(&route_roundtrip.doc, material_id)?,
+            flags_before
+        );
+        Ok(())
+    }
+
+    fn assert_muted_mix_socket_flag_policy(
+        source: &SceneDoc,
+        project: &Project,
+        directory: &Path,
+        blender: &Path,
+        context: &crate::eval::EvaluationContext,
+        graph_id: &Id,
+        material_id: &Id,
+        flags_before: u32,
+    ) -> Result<()> {
+        let mut wrong_flags = source.clone();
+        let mix = wrong_flags
+            .node_groups
+            .get_mut(graph_id)
+            .and_then(|group| group.nodes.get_mut(&Id::new("muted_mix").ok()?))
+            .ok_or_else(|| invalid_intermediate("muted Mix node is missing"))?;
+        let socket_flags = mix
+            .properties
+            .get_mut("input_socket_flags")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| invalid_intermediate("muted Mix socket flags are missing"))?;
+        let flags = socket_flags
+            .values_mut()
+            .next()
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| invalid_intermediate("muted Mix socket flags are empty"))?;
+        let enabled = flags
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| invalid_intermediate("muted Mix enabled flag is missing"))?;
+        flags.insert("enabled".to_owned(), json!(!enabled));
+        let Err(flag_strict_error) = export_blend(
+            &wrong_flags,
+            project,
+            &directory.join("muted-mix-strict-flags.blend"),
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(blender),
+                context,
+            },
+        ) else {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "strict Blender export accepted changed read-only socket flags",
+            ));
+        };
+        assert_eq!(flag_strict_error.code, ErrorCode::UnrepresentableFeature);
+        assert!(
+            flag_strict_error.details["losses"]
+                .as_array()
+                .is_some_and(|losses| {
+                    losses.iter().any(|loss| {
+                        loss["feature_id"] == json!("blender.node.input_socket_flags")
+                            && loss["data_id"] == json!("muted_mix")
+                    })
+                })
+        );
+        let lossy_flags_path = directory.join("muted-mix-lossy-flags.blend");
+        let flag_report = export_blend(
+            &wrong_flags,
+            project,
+            &lossy_flags_path,
+            &ExportOptions {
+                allow_lossy: true,
+                pack: false,
+                blender: Some(blender),
+                context,
+            },
+        )?;
+        assert!(flag_report.losses.iter().any(|loss| {
+            loss.feature_id == "blender.node.input_socket_flags"
+                && loss.data_id.as_deref() == Some("muted_mix")
+        }));
+        let flags_roundtrip = import_blend(&lossy_flags_path, Some(blender))?;
+        assert_eq!(
+            muted_mix_closure_flags(&flags_roundtrip.doc, material_id)?,
+            flags_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blender_muted_mix_internal_links_preserve_native_closure_flags() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let (doc, graph_id, material_id) = muted_mix_scene_doc()?;
+        let context = export_context();
+        let source_path = directory.path().join("muted-mix-source.blend");
+        export_blend(
+            &doc,
+            &project,
+            &source_path,
+            &ExportOptions {
+                allow_lossy: true,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        let source = import_blend(&source_path, Some(&blender))?;
+        let flags_before = muted_mix_closure_flags(&source.doc, &material_id)?;
+        let transparency = crate::shader::EEVEE_CLOSURE_TRANSPARENCY;
+        assert_eq!(
+            flags_before & transparency,
+            0,
+            "the linked constant routed through muted Mix must keep Alpha opaque"
+        );
+
+        let normal_path = directory.path().join("muted-mix-roundtrip.blend");
+        export_blend(
+            &source.doc,
+            &project,
+            &normal_path,
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        let normal_roundtrip = import_blend(&normal_path, Some(&blender))?;
+        assert_eq!(
+            muted_mix_closure_flags(&normal_roundtrip.doc, &material_id)?,
+            flags_before
+        );
+        assert_muted_mix_route_policy(
+            &source.doc,
+            &project,
+            directory.path(),
+            &blender,
+            &context,
+            &graph_id,
+            &material_id,
+            flags_before,
+        )?;
+        assert_muted_mix_socket_flag_policy(
+            &source.doc,
+            &project,
+            directory.path(),
+            &blender,
+            &context,
+            &graph_id,
+            &material_id,
+            flags_before,
+        )?;
         Ok(())
     }
     fn blend_corner_values_by_vertex(
@@ -21455,6 +23996,73 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 .and_then(Value::as_bool),
             Some(true)
         );
+        Ok(())
+    }
+    #[test]
+    fn blender_refraction_fixture_roundtrips_light_use_shadow_false_and_true() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../tests/fixtures/native_oracle/shader_bsdf_wave12/eevee_refraction_layers.blend",
+        );
+        let imported = import_blend(&source, Some(&blender))?;
+        let light_id = imported
+            .doc
+            .data_blocks
+            .iter()
+            .find(|(_, data)| data.light.is_some())
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| invalid_intermediate("refraction fixture has no light"))?;
+        assert_eq!(
+            test_data_ref(&imported.doc, light_id.as_str())?
+                .light
+                .as_ref()
+                .and_then(|light| light.use_shadow),
+            Some(false)
+        );
+
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let context = export_context();
+        for expected in [false, true] {
+            let mut doc = imported.doc.clone();
+            doc.data_blocks
+                .get_mut(&light_id)
+                .and_then(|data| data.light.as_mut())
+                .ok_or_else(|| invalid_intermediate("refraction fixture light data is missing"))?
+                .use_shadow = Some(expected);
+            let output = directory
+                .path()
+                .join(format!("light-shadow-{expected}.blend"));
+            let report = export_blend(
+                &doc,
+                &project,
+                &output,
+                &ExportOptions {
+                    allow_lossy: true,
+                    pack: false,
+                    blender: Some(&blender),
+                    context: &context,
+                },
+            )?;
+            assert!(
+                report.losses.iter().all(|loss| {
+                    loss.feature_id != "blender.light.use_shadow"
+                        || loss.data_id.as_deref() != Some(light_id.as_str())
+                }),
+                "explicit Light.use_shadow reported an export loss: {:?}",
+                report.losses
+            );
+            let reopened = import_blend(&output, Some(&blender))?;
+            assert_eq!(
+                test_data_ref(&reopened.doc, light_id.as_str())?
+                    .light
+                    .as_ref()
+                    .and_then(|light| light.use_shadow),
+                Some(expected)
+            );
+        }
         Ok(())
     }
     #[test]
@@ -24784,6 +27392,49 @@ print("UNSUPPORTED_POSE " + json.dumps({
         );
     }
     #[test]
+    fn import_losses_report_unmodeled_world_volume_and_local_grid_cache_inputs() {
+        let mut raw = json!({
+            "scenes": [{
+                "name": "Realtime",
+                "render": {"engine": "realtime"},
+                "world": {"nodes": {
+                    "nodes": [
+                        {
+                            "name": "World Output",
+                            "type": "ShaderNodeOutputWorld",
+                            "properties": {"is_active_output": true}
+                        },
+                        {"name": "Absorption", "type": "ShaderNodeVolumeAbsorption"}
+                    ],
+                    "links": [{
+                        "from_node": "Absorption",
+                        "from_socket": "Volume",
+                        "to_node": "World Output",
+                        "to_socket": "Volume"
+                    }]
+                }},
+                "eevee_has_local_volume_probe_grids": true
+            }]
+        });
+        let losses = import_losses(&raw);
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "render.world.volume_absorption"
+                && loss.data_id.as_deref() == Some("Realtime")
+        }));
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "render.eevee.world_probe.local_volume_grids"
+                && loss.data_id.as_deref() == Some("Realtime")
+                && loss.reason.contains("cache is not exposed through RNA")
+        }));
+
+        raw["scenes"][0]["render"]["engine"] = json!("path");
+        raw["scenes"][0]["eevee_has_local_volume_probe_grids"] = json!(false);
+        assert!(import_losses(&raw).iter().all(|loss| {
+            loss.feature_id != "render.world.volume_absorption"
+                && loss.feature_id != "render.eevee.world_probe.local_volume_grids"
+        }));
+    }
+    #[test]
     fn import_losses_report_hair_curves_custom_knots() {
         let raw = json!({"hair_curves": [{
             "name": "Custom Curves",
@@ -24878,6 +27529,416 @@ print("UNSUPPORTED_POSE " + json.dumps({
                 && loss.data_id.as_deref() == Some(data_id.as_str())
         }));
         Ok(())
+    }
+
+    #[test]
+    fn blender_export_reports_unknown_realtime_probe_resolution_without_fabricating_it() {
+        let scene_id = Id::from_static("scene_main");
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let scene = doc.scenes.get_mut(&scene_id).expect("default scene");
+        scene.render.engine = "realtime".to_owned();
+        scene.render.eevee_gi_cubemap_resolution = None;
+        let unknown = export_losses(&doc)
+            .into_iter()
+            .find(|loss| loss.feature_id == "blender.scene.eevee.gi_cubemap_resolution_unknown")
+            .expect("unknown realtime probe resolution is an export loss");
+        assert_eq!(unknown.data_id.as_deref(), Some("scene_main"));
+        assert!(unknown.reason.contains("512 default"));
+
+        {
+            let scene = doc.scenes.get_mut(&scene_id).expect("default scene");
+            scene.render.engine = "path".to_owned();
+        }
+        assert!(export_losses(&doc).iter().all(|loss| {
+            loss.feature_id != "blender.scene.eevee.gi_cubemap_resolution_unknown"
+        }));
+        {
+            let scene = doc.scenes.get_mut(&scene_id).expect("default scene");
+            scene.render.engine = "realtime".to_owned();
+            scene.render.eevee_gi_cubemap_resolution = Some(1024);
+        }
+        assert!(export_losses(&doc).iter().all(|loss| {
+            loss.feature_id != "blender.scene.eevee.gi_cubemap_resolution_unknown"
+        }));
+    }
+    #[test]
+    fn blender_export_reports_unknown_world_sun_threshold_for_recreated_worlds() -> Result<()> {
+        let scene_id = Id::from_static("scene_main");
+        let world_id = Id::new("unknown_sun_world")?;
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.worlds.insert(
+            world_id.clone(),
+            crate::model::World {
+                eevee_sun_threshold: None,
+                ..crate::model::World::default()
+            },
+        );
+        let scene = doc.scenes.get_mut(&scene_id).expect("default scene");
+        scene.render.engine = "realtime".to_owned();
+        scene.render.eevee_use_raytracing = Some(false);
+        scene.world = Some(world_id.clone());
+        let unknown = export_losses(&doc)
+            .into_iter()
+            .find(|loss| loss.feature_id == "blender.world.eevee_sun_threshold_unknown")
+            .expect("unknown recreated World threshold is an export loss");
+        assert_eq!(unknown.data_id.as_deref(), Some(world_id.as_str()));
+        assert!(unknown.reason.contains("10.0 default"));
+
+        doc.scenes
+            .get_mut(&scene_id)
+            .expect("default scene")
+            .render
+            .engine = "path".to_owned();
+        doc.scenes.get_mut(&scene_id).expect("default scene").world = None;
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .any(|loss| { loss.feature_id == "blender.world.eevee_sun_threshold_unknown" })
+        );
+
+        doc.libraries.insert(
+            Id::new("world_library")?,
+            crate::model::Library {
+                linked_ids: std::collections::BTreeMap::from([(
+                    "worlds".to_owned(),
+                    vec![world_id.clone()],
+                )]),
+                ..crate::model::Library::default()
+            },
+        );
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .all(|loss| { loss.feature_id != "blender.world.eevee_sun_threshold_unknown" })
+        );
+
+        doc.libraries.clear();
+        doc.worlds
+            .get_mut(&world_id)
+            .expect("world")
+            .eevee_sun_threshold = Some(0.0);
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .all(|loss| { loss.feature_id != "blender.world.eevee_sun_threshold_unknown" })
+        );
+        Ok(())
+    }
+    #[test]
+    fn blender_export_reports_unknown_recreated_world_sun_shadow_settings() -> Result<()> {
+        let world_id = Id::new("unknown_world_sun_shadow")?;
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.worlds.insert(
+            world_id.clone(),
+            crate::model::World {
+                eevee_sun_angle: None,
+                eevee_use_sun_shadow: None,
+                eevee_sun_shadow_maximum_resolution: None,
+                eevee_sun_shadow_jitter_overblur: None,
+                eevee_sun_shadow_filter_radius: None,
+                eevee_use_sun_shadow_jitter: None,
+                ..crate::model::World::default()
+            },
+        );
+        let expected = [
+            ("eevee_sun_angle", "0.526 degree"),
+            ("eevee_use_sun_shadow", "True"),
+            ("eevee_sun_shadow_maximum_resolution", "0.001"),
+            ("eevee_sun_shadow_jitter_overblur", "10.0"),
+            ("eevee_sun_shadow_filter_radius", "1.0"),
+            ("eevee_use_sun_shadow_jitter", "False"),
+        ];
+        for (field, default) in expected {
+            let feature_id = format!("blender.world.{field}_unknown");
+            let loss = export_losses(&doc)
+                .into_iter()
+                .find(|loss| loss.feature_id == feature_id)
+                .unwrap_or_else(|| panic!("missing export loss {feature_id}"));
+            assert_eq!(loss.data_id.as_deref(), Some(world_id.as_str()));
+            assert!(loss.reason.contains(default), "{}", loss.reason);
+        }
+
+        doc.libraries.insert(
+            Id::new("world_library")?,
+            crate::model::Library {
+                linked_ids: std::collections::BTreeMap::from([(
+                    "worlds".to_owned(),
+                    vec![world_id.clone()],
+                )]),
+                ..crate::model::Library::default()
+            },
+        );
+        assert!(export_losses(&doc).iter().all(|loss| {
+            expected
+                .iter()
+                .all(|(field, _)| loss.feature_id != format!("blender.world.{field}_unknown"))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn blender_export_reports_unknown_raytracing_only_when_realtime_settings_are_needed() {
+        let scene_id = Id::from_static("scene_main");
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let scene = doc.scenes.get_mut(&scene_id).expect("default scene");
+        scene.render.engine = "realtime".to_owned();
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .all(|loss| { loss.feature_id != "blender.scene.eevee.use_raytracing_unknown" })
+        );
+        doc.scenes
+            .get_mut(&scene_id)
+            .expect("default scene")
+            .render
+            .eevee_use_raytracing = Some(true);
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .any(|loss| loss.feature_id == "blender.scene.eevee.raytracing_settings_unknown")
+        );
+        doc.scenes
+            .get_mut(&scene_id)
+            .expect("default scene")
+            .render
+            .eevee_use_raytracing = None;
+
+        doc.compatibility
+            .insert("blender_adapter".to_owned(), json!({}));
+        let unknown = export_losses(&doc)
+            .into_iter()
+            .find(|loss| loss.feature_id == "blender.scene.eevee.use_raytracing_unknown")
+            .expect("unknown imported raytracing is an export loss");
+        assert_eq!(unknown.data_id.as_deref(), Some("scene_main"));
+        assert!(unknown.reason.contains("Reimport"));
+
+        doc.scenes
+            .get_mut(&scene_id)
+            .expect("default scene")
+            .render
+            .eevee_use_raytracing = Some(false);
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .all(|loss| { loss.feature_id != "blender.scene.eevee.use_raytracing_unknown" })
+        );
+        assert!(
+            export_losses(&doc).iter().all(|loss| {
+                loss.feature_id != "blender.scene.eevee.raytracing_settings_unknown"
+            })
+        );
+        doc.scenes
+            .get_mut(&scene_id)
+            .expect("default scene")
+            .render
+            .eevee_use_raytracing = Some(true);
+        let incomplete = export_losses(&doc)
+            .into_iter()
+            .find(|loss| loss.feature_id == "blender.scene.eevee.raytracing_settings_unknown")
+            .expect("incomplete active raytracing settings are an export loss");
+        assert!(incomplete.reason.contains("Reimport"));
+
+        let render = &mut doc.scenes.get_mut(&scene_id).expect("default scene").render;
+        render.eevee_use_fast_gi = Some(false);
+        render.eevee_raytracing_method = Some(crate::model::EeveeRayTracingMethod::Screen);
+        render.eevee_raytracing_resolution_scale = Some(2);
+        render.eevee_raytracing_screen_trace_quality = Some(0.25);
+        render.eevee_raytracing_screen_trace_thickness = Some(0.1);
+        render.eevee_raytracing_trace_max_roughness = Some(0.5);
+        render.eevee_raytracing_use_backface_hit = Some(true);
+        render.eevee_raytracing_backface_radiance_scale = Some(0.25);
+        render.eevee_raytracing_use_denoise = Some(true);
+        render.eevee_raytracing_denoise_spatial = Some(true);
+        render.eevee_raytracing_denoise_temporal = Some(true);
+        render.eevee_raytracing_denoise_bilateral = Some(true);
+        render.eevee_fast_gi_bias = Some(0.05);
+        render.eevee_fast_gi_resolution = Some(2);
+        render.eevee_fast_gi_step_count = Some(8);
+        render.eevee_fast_gi_ray_count = Some(2);
+        render.eevee_fast_gi_quality = Some(0.25);
+        render.eevee_fast_gi_distance = Some(0.0);
+        render.eevee_fast_gi_thickness_near = Some(0.1);
+        render.eevee_fast_gi_method = Some(crate::model::EeveeFastGiMethod::GlobalIllumination);
+        assert!(
+            export_losses(&doc).iter().all(|loss| {
+                loss.feature_id != "blender.scene.eevee.raytracing_settings_unknown"
+            })
+        );
+    }
+    #[test]
+    fn blender_export_reports_unknown_mesh_normal_precision() {
+        let scene_id = Id::from_static("scene_main");
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let render = &mut doc.scenes.get_mut(&scene_id).expect("default scene").render;
+        render.use_high_quality_normals = None;
+        let unknown = export_losses(&doc)
+            .into_iter()
+            .find(|loss| loss.feature_id == "blender.scene.render.use_high_quality_normals")
+            .expect("unknown source normal precision is an authoring loss");
+        assert_eq!(unknown.data_id.as_deref(), Some("scene_main"));
+        assert!(unknown.reason.contains("Blender's default"));
+
+        doc.scenes
+            .get_mut(&scene_id)
+            .expect("default scene")
+            .render
+            .use_high_quality_normals = Some(true);
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .all(|loss| { loss.feature_id != "blender.scene.render.use_high_quality_normals" })
+        );
+    }
+    #[test]
+    fn blender_export_reports_unknown_indirect_clamp_for_recreated_scenes() {
+        let scene_id = Id::from_static("scene_main");
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let render = &mut doc.scenes.get_mut(&scene_id).expect("default scene").render;
+        render.engine = "path".to_owned();
+        render.eevee_use_fast_gi = Some(false);
+        render.eevee_clamp_surface_indirect = None;
+        let unknown = export_losses(&doc)
+            .into_iter()
+            .find(|loss| loss.feature_id == "blender.scene.eevee.clamp_surface_indirect_unknown")
+            .expect("clamp remains source authoring data on a recreated Path Scene");
+        assert_eq!(unknown.data_id.as_deref(), Some("scene_main"));
+        assert!(unknown.reason.contains("10.0 default"));
+
+        {
+            let render = &mut doc.scenes.get_mut(&scene_id).expect("default scene").render;
+            render.eevee_clamp_surface_indirect = Some(0.0);
+        }
+        assert!(export_losses(&doc).iter().all(|loss| {
+            loss.feature_id != "blender.scene.eevee.clamp_surface_indirect_unknown"
+        }));
+        {
+            let render = &mut doc.scenes.get_mut(&scene_id).expect("default scene").render;
+            render.eevee_clamp_surface_indirect = None;
+            render.engine = "realtime".to_owned();
+        }
+        assert!(export_losses(&doc).iter().any(|loss| {
+            loss.feature_id == "blender.scene.eevee.clamp_surface_indirect_unknown"
+        }));
+    }
+    #[test]
+    fn blender_export_reports_local_volume_probe_cache_loss_for_recreated_scenes() -> Result<()> {
+        let scene_id = Id::from_static("scene_main");
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.scenes
+            .get_mut(&scene_id)
+            .expect("default scene")
+            .eevee_has_local_volume_probe_grids = Some(true);
+        assert!(export_losses(&doc).iter().any(|loss| {
+            loss.feature_id == "blender.scene.eevee.world_probe.local_volume_grids_unexported"
+                && loss.reason.contains("cache is not exposed through RNA")
+        }));
+
+        doc.scenes
+            .get_mut(&scene_id)
+            .expect("default scene")
+            .eevee_has_local_volume_probe_grids = None;
+        assert!(export_losses(&doc).iter().any(|loss| {
+            loss.feature_id == "blender.scene.eevee.world_probe.local_volume_grids_unknown"
+        }));
+        doc.scenes
+            .get_mut(&scene_id)
+            .expect("default scene")
+            .eevee_has_local_volume_probe_grids = Some(false);
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .all(|loss| { !loss.feature_id.contains("world_probe.local_volume_grids") })
+        );
+
+        doc.scenes
+            .get_mut(&scene_id)
+            .expect("default scene")
+            .eevee_has_local_volume_probe_grids = Some(true);
+        doc.libraries.insert(
+            Id::new("scene_library")?,
+            crate::model::Library {
+                linked_ids: std::collections::BTreeMap::from([(
+                    "scenes".to_owned(),
+                    vec![scene_id.clone()],
+                )]),
+                ..crate::model::Library::default()
+            },
+        );
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .all(|loss| { !loss.feature_id.contains("world_probe.local_volume_grids") })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blender_export_reports_unknown_curve_settings_only_for_hair_scenes() {
+        let scene_id = Id::from_static("scene_main");
+        let hair_id = Id::from_static("hair_data");
+        let hair_node_id = Id::from_static("hair_object");
+        let mut imported = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        imported
+            .compatibility
+            .insert("blender_adapter".to_owned(), json!({}));
+        imported.data_blocks.insert(
+            hair_id.clone(),
+            DataBlock {
+                data_type: "hair_curves".to_owned(),
+                mesh: None,
+                hair_curves: Some(HairCurvesData::default()),
+                ..DataBlock::default()
+            },
+        );
+        imported.nodes.insert(
+            hair_node_id.clone(),
+            Node {
+                kind: "hair_curves".to_owned(),
+                data: Some(hair_id),
+                ..Node::default()
+            },
+        );
+        imported
+            .collections
+            .get_mut(&Id::from_static("collection_root"))
+            .expect("root collection")
+            .objects
+            .push(hair_node_id);
+        let scene = imported.scenes.get_mut(&scene_id).expect("default scene");
+        scene.render.cycles_curves_shape = None;
+        scene.render.cycles_curves_subdivisions = None;
+
+        let unknown = export_losses(&imported)
+            .into_iter()
+            .find(|loss| loss.feature_id == "blender.cycles_curves.settings_unknown")
+            .expect("unknown imported hair settings are an export loss");
+        assert_eq!(unknown.data_id.as_deref(), Some("scene_main"));
+        assert!(unknown.reason.contains("shape and subdivisions"));
+        assert!(unknown.reason.contains("Reimport"));
+
+        let mut no_hair = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        no_hair
+            .compatibility
+            .insert("blender_adapter".to_owned(), json!({}));
+        let scene = no_hair.scenes.get_mut(&scene_id).expect("default scene");
+        scene.render.cycles_curves_shape = None;
+        scene.render.cycles_curves_subdivisions = None;
+        assert!(
+            export_losses(&no_hair)
+                .iter()
+                .all(|loss| loss.feature_id != "blender.cycles_curves.settings_unknown")
+        );
+
+        let mut native = imported;
+        native.compatibility.remove("blender_adapter");
+        let scene = native.scenes.get_mut(&scene_id).expect("default scene");
+        scene.render.cycles_curves_shape = Some(CyclesCurveShape::Thick);
+        scene.render.cycles_curves_subdivisions = None;
+        assert!(
+            export_losses(&native)
+                .iter()
+                .all(|loss| loss.feature_id != "blender.cycles_curves.settings_unknown")
+        );
     }
 
     #[test]
@@ -25843,7 +28904,7 @@ mod workbench_display_loss_tests {
         );
     }
     #[test]
-    fn eevee_cubemap_resolution_reports_only_nondefault_values() {
+    fn eevee_cubemap_resolution_is_no_longer_an_import_loss() {
         let raw = |resolution| {
             json!({
                 "scenes": [{
@@ -25856,23 +28917,15 @@ mod workbench_display_loss_tests {
                 }]
             })
         };
-        let feature_id = "blender.scene.eevee.gi_cubemap_resolution";
-        assert!(
-            !import_losses(&raw(512))
-                .iter()
-                .any(|loss| loss.feature_id == feature_id)
-        );
-        let losses = import_losses(&raw(1024));
-        assert!(losses.iter().any(|loss| {
-            loss.feature_id == feature_id && loss.data_id.as_deref() == Some("Scene")
-        }));
+        for resolution in [128, 256, 512, 1024, 2048, 4096] {
+            assert!(
+                import_losses(&raw(resolution)).is_empty(),
+                "exact enum value {resolution} is supported"
+            );
+        }
         let mut path_scene = raw(1024);
         path_scene["scenes"][0]["render"]["engine"] = json!("path");
-        assert!(
-            !import_losses(&path_scene)
-                .iter()
-                .any(|loss| loss.feature_id == feature_id)
-        );
+        assert!(import_losses(&path_scene).is_empty());
     }
 }
 

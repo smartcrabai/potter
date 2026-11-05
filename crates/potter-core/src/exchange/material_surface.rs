@@ -1828,6 +1828,7 @@ impl GraphReducer<'_> {
         let node = self.node(source)?;
         match node.node_type.as_str() {
             "ShaderNodeBsdfPrincipled" => self.principled(source, depth),
+            "ShaderNodeBsdfMetallic" => self.metallic_bsdf(source, node, depth),
             "ShaderNodeEmission" => self.emission_shade(source, node, depth),
             "ShaderNodeBackground" => self.background_shade(source, node, depth),
             "ShaderNodeBsdfTransparent" => {
@@ -2167,6 +2168,62 @@ impl GraphReducer<'_> {
         };
         Ok(Shade {
             core: Some(plain_core(color, ScalarIn::constant(0.0), roughness)),
+            ..Shade::default()
+        })
+    }
+
+    /// A metallic conductor approximated by glTF metallic-roughness PBR.
+    fn metallic_bsdf(
+        &mut self,
+        source: &Id,
+        node: &GraphNode,
+        depth: usize,
+    ) -> crate::error::Result<Shade> {
+        let fresnel = prop_str(node, "fresnel_type").unwrap_or("F82");
+        let (base, reason) = match fresnel {
+            "F82" => (
+                self.color_input(source, "Base Color", [0.617, 0.577, 0.540], depth)?,
+                format!(
+                    "surface `{source}` (ShaderNodeBsdfMetallic) uses F82 conductor Fresnel and other Metallic inputs that glTF metallic-roughness PBR cannot represent exactly; Base Color and Roughness are exported as an approximation"
+                ),
+            ),
+            "PHYSICAL_CONDUCTOR" => (
+                ColorIn::constant([1.0; 3]),
+                format!(
+                    "surface `{source}` (ShaderNodeBsdfMetallic) uses PHYSICAL_CONDUCTOR Fresnel and Metallic inputs that glTF metallic-roughness PBR cannot represent; a white metallic surface is exported as an approximation"
+                ),
+            ),
+            other => {
+                self.loss(
+                    feature_id::UNSUPPORTED_NODE,
+                    format!("ShaderNodeBsdfMetallic `{source}` has unsupported Fresnel type `{other}`; F82 is used"),
+                    None,
+                );
+                (
+                    self.color_input(source, "Base Color", [0.617, 0.577, 0.540], depth)?,
+                    format!(
+                        "surface `{source}` (ShaderNodeBsdfMetallic) uses an unsupported conductor Fresnel model and other Metallic inputs that glTF metallic-roughness PBR cannot represent exactly; Base Color and Roughness are exported as an approximation"
+                    ),
+                )
+            }
+        };
+        self.loss(feature_id::UNREPRESENTABLE_SURFACE, reason, None);
+        let roughness = self.scalar_input(source, "Roughness", 0.5, depth)?;
+        let normal = self.normal_input(source, "Normal", depth)?;
+        Ok(Shade {
+            core: Some(Core {
+                base,
+                alpha: Alpha::Const(1.0),
+                metallic: ScalarIn::constant(1.0),
+                roughness,
+                normal,
+                ior: 1.5,
+                transmission: None,
+                clearcoat: None,
+                sheen: None,
+                specular: None,
+                anisotropy: None,
+            }),
             ..Shade::default()
         })
     }

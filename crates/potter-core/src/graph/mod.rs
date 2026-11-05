@@ -20,6 +20,35 @@ pub use evaluator::{
 pub use model::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup};
 pub use sockets::{validate_link, validate_link_with_groups};
 
+fn is_intrinsic_shader_socket_metadata(
+    properties: &serde_json::Map<String, serde_json::Value>,
+    allow_simple_material_marker: bool,
+) -> bool {
+    properties.iter().all(|(key, value)| match key.as_str() {
+        "potter_simple_material" => {
+            allow_simple_material_marker && value == &serde_json::Value::Bool(true)
+        }
+        "internal_links" => value.as_array().is_some_and(Vec::is_empty),
+        "input_socket_flags" => value.as_object().is_some_and(|flags| {
+            flags.iter().all(|(socket, value)| {
+                !socket.is_empty()
+                    && value.as_object().is_some_and(|flags| {
+                        flags.len() == 2
+                            && flags
+                                .get("enabled")
+                                .and_then(serde_json::Value::as_bool)
+                                .is_some()
+                            && flags
+                                .get("hide_value")
+                                .and_then(serde_json::Value::as_bool)
+                                .is_some()
+                    })
+            })
+        }),
+        _ => false,
+    })
+}
+
 pub(crate) fn is_generated_simple_material_graph(group: &NodeGroup) -> bool {
     if group.kind != GraphKind::Shader
         || !group.interface.inputs.is_empty()
@@ -45,14 +74,14 @@ pub(crate) fn is_generated_simple_material_graph(group: &NodeGroup) -> bool {
         && principled.name == "ShaderNodeBsdfPrincipled"
         && principled.location.map(f64::to_bits) == [0; 2]
         && principled.inputs.is_empty()
-        && principled.properties.len() == 1
         && principled.properties.get("potter_simple_material")
             == Some(&serde_json::Value::Bool(true))
+        && is_intrinsic_shader_socket_metadata(&principled.properties, true)
         && output.node_type == "OutputMaterial"
         && output.name == "OutputMaterial"
         && output.location.map(f64::to_bits) == [0; 2]
         && output.inputs.is_empty()
-        && output.properties.is_empty()
+        && is_intrinsic_shader_socket_metadata(&output.properties, false)
         && link.from_node.as_str() == "principled"
         && link.from_socket == "BSDF"
         && link.to_node.as_str() == "output"

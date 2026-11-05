@@ -1,0 +1,45 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "engine": "BLENDER_EEVEE",
+  "resolution": [
+    192,
+    192
+  ],
+  "samples": 64,
+  "seed": 17,
+  "linear_exr": "eevee_sheen_ashikhmin.exr",
+  "cases": [
+    {
+      "name": "sheen_eevee",
+      "mode": {
+        "distribution": "ASHIKHMIN"
+      },
+      "inputs": {
+        "Color": [
+          0.72,
+          0.31,
+          0.12,
+          1.0
+        ],
+        "Roughness": 0.43,
+        "Normal": [
+          0.06,
+          0.02,
+          0.998
+        ]
+      },
+      "probe": [
+        20,
+        96,
+        1
+      ],
+      "linear_rgba": [
+        3.2825520833333335,
+        0.6060655381944444,
+        0.1832004123263889,
+        1.0
+      ],
+      "normal_linked": true
+    }
+  ]
+}

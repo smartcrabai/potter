@@ -1,0 +1,91 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "blender_build_hash": "d13f752e3b9c",
+  "engine": "BLENDER_EEVEE",
+  "resolution": [
+    64,
+    64
+  ],
+  "samples": 64,
+  "seed": 17,
+  "linear_exr": "eevee_sss_transmission.exr",
+  "source": "Blender 5.2.2 d13 eevee_deferred_eval.bsl.hh:183-201",
+  "world": {
+    "background_color": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "strength": 0.0
+  },
+  "light": {
+    "type": "SUN",
+    "energy": 4.0,
+    "rotation_euler": [
+      3.141592653589793,
+      0.0,
+      0.0
+    ]
+  },
+  "surface": {
+    "normal": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "thickness": 0.0,
+    "thickness_node": {
+      "type": "ShaderNodeValue",
+      "value": 0.0
+    }
+  },
+  "cases": [
+    {
+      "name": "burley_sss_backface_direct",
+      "mode": {
+        "node_type": "ShaderNodeSubsurfaceScattering",
+        "falloff": "BURLEY"
+      },
+      "inputs": {
+        "Color": [
+          0.8,
+          0.8,
+          0.8,
+          1.0
+        ],
+        "Weight": 1.0,
+        "Scale": 0.24,
+        "Radius": [
+          1.0,
+          0.7,
+          0.4
+        ],
+        "IOR": 1.4,
+        "Roughness": 0.36,
+        "Anisotropy": 0.0
+      },
+      "probe": [
+        32,
+        32,
+        1
+      ],
+      "linear_rgba": [
+        1.0122612847222223,
+        1.0121527777777777,
+        0.99951171875,
+        1.0
+      ],
+      "corner_probe": [
+        2,
+        2
+      ],
+      "corner_rgba": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    }
+  ]
+}

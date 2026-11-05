@@ -8,18 +8,27 @@ mod world;
 
 mod evaluator;
 
+#[cfg(test)]
+pub(crate) use evaluator::RayPortalParameters;
 pub(crate) use evaluator::{
-    AnisotropyModel, GeometryAttribute, GeometryAttributeValues, GlassDistribution, dielectric_f0,
-    evaluate_surface_with_workspace_into_semantics, evaluate_surface_with_workspace_semantics,
-    heaviest, make_orthonormals, shader_node_type_supported,
+    AnisotropyModel, BsdfModel, EEVEE_CLOSURE_DIFFUSE, EEVEE_CLOSURE_EMISSION,
+    EEVEE_CLOSURE_REFLECTION, EEVEE_CLOSURE_REFRACTION, EEVEE_CLOSURE_SHADER_TO_RGBA,
+    EEVEE_CLOSURE_SUBSURFACE, EEVEE_CLOSURE_TRANSLUCENT, EEVEE_CLOSURE_TRANSPARENCY,
+    GeometryAttribute, GeometryAttributeValues, GlassDistribution, HairComponent, HairParameters,
+    HairParametrization, HairScatteringModel, MetallicFresnel, MetallicParameters,
+    MicrofacetDistribution, PrincipledHairParameters, SheenDistribution, ToonComponent,
+    ToonParameters, dielectric_f0, evaluate_surface_with_workspace_into_semantics,
+    evaluate_surface_with_workspace_semantics, heaviest, make_orthonormals,
+    shader_node_type_supported,
 };
 
 pub(crate) use evaluator::evaluate_displacement_with_workspace_semantics;
 pub use evaluator::{
-    BsdfParams, EvaluatorWorkspace, HitContext, HitDifferentials, HitFootprint, HitUvLayers,
-    PreparedMaterial, ShaderClosure, SubsurfaceMethod, SurfaceShading, evaluate_displacement,
-    evaluate_displacement_with_workspace, evaluate_surface, evaluate_surface_with_workspace,
-    fill_color_layers, height_gradient,
+    BsdfParams, EeveeGBufferBin, EeveeGBufferCandidate, EeveeGBufferFeatures, EeveeGBufferLayout,
+    EeveeGBufferLayoutError, EeveeGBufferLobe, EeveeGBufferMode, EvaluatorWorkspace, HitContext,
+    HitDifferentials, HitFootprint, HitUvLayers, PreparedMaterial, ShaderClosure, SubsurfaceMethod,
+    SurfaceShading, evaluate_displacement, evaluate_displacement_with_workspace, evaluate_surface,
+    evaluate_surface_with_workspace, fill_color_layers, height_gradient,
 };
 pub use world::evaluate_world;
 pub(crate) use world::{environment_texture_uv, equirectangular_uv, sky_property_is_default};
