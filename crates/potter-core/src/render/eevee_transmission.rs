@@ -120,7 +120,7 @@ fn transmission_factor(roughness: f64, n_dot_v: f64, amplitude: f64) -> f64 {
 /// EEVEE's `GGXBsdfData` for an IOR below one: the scale, bias and transmission factor. Its coordinates are the
 /// `GGXBsdfData::lut_coords_get` of `eevee_bxdf_lut_lib.bsl.hh`: `x = ior²`, and `y` remaps `cos θ` about the critical
 /// angle `sqrt(1 - ior²)`.
-fn bsdf_channels(ior: f64, roughness: f64, n_dot_v: f64) -> [f64; 3] {
+fn bsdf_channels(ior: f64, roughness: f64, n_dot_v: f64, include_transmission: bool) -> [f64; 3] {
     let critical_cos = (1.0 - ior * ior).max(0.0).sqrt();
     let offset = n_dot_v - critical_cos;
     let remapped = offset
@@ -134,16 +134,24 @@ fn bsdf_channels(ior: f64, roughness: f64, n_dot_v: f64) -> [f64; 3] {
     let (l0, l1, fl) = layer_weights(roughness);
     let channel =
         |layer: usize, channel: usize| utility_sample_2d(x, y, |x, y| bsdf(layer, x, y, channel));
-    [0, 1, 2].map(|index| blend(channel(l0, index), channel(l1, index), fl))
+    let scale = blend(channel(l0, 0), channel(l1, 0), fl);
+    let bias = blend(channel(l0, 1), channel(l1, 1), fl);
+    let transmission = if include_transmission {
+        blend(channel(l0, 2), channel(l1, 2), fl)
+    } else {
+        0.0
+    };
+    [scale, bias, transmission]
 }
 
-/// EEVEE's reflectance component of `bsdf_lut` with `do_multiscatter == false`.
-pub(crate) fn eevee_bsdf_lut_single_scatter(
+/// EEVEE's `bsdf_lut` reflectance for a zero transmission tint, including its optional multiscatter energy compensation.
+pub(crate) fn eevee_bsdf_lut(
     f0: DVec3,
     f90: DVec3,
     cos_theta: f64,
     roughness: f64,
     ior: f64,
+    do_multiscatter: bool,
 ) -> DVec3 {
     if ior.partial_cmp(&1.0) == Some(std::cmp::Ordering::Equal) {
         return DVec3::ZERO;
@@ -153,16 +161,31 @@ pub(crate) fn eevee_bsdf_lut_single_scatter(
     } else {
         f90
     };
-    let channels = if ior > 1.0 {
-        [
-            brdf_channel(0, roughness, cos_theta),
-            brdf_channel(1, roughness, cos_theta),
-        ]
+    let (scale, bias, transmission) = if ior > 1.0 {
+        let scale = brdf_channel(0, roughness, cos_theta);
+        let bias = brdf_channel(1, roughness, cos_theta);
+        let transmission = if do_multiscatter {
+            transmission_factor(roughness, cos_theta, (ior - 1.0) / (ior + 1.0))
+        } else {
+            0.0
+        };
+        (scale, bias, transmission)
     } else {
-        let channels = bsdf_channels(ior, roughness, cos_theta);
-        [channels[0], channels[1]]
+        let [scale, bias, transmission] = bsdf_channels(ior, roughness, cos_theta, do_multiscatter);
+        (scale, bias, transmission)
     };
-    f0 * channels[0] + f90 * channels[1]
+
+    let mut reflectance = f0 * scale + f90 * bias;
+    if do_multiscatter {
+        let amplitude = (ior - 1.0) / (ior + 1.0);
+        let real_f0 = amplitude * amplitude;
+        let ess = real_f0 * scale + bias + (1.0 - real_f0) * transmission;
+        let ems = 1.0 - ess;
+        let f_avg = f0 + (f90 - f0) / 21.0;
+        let scale = DVec3::ONE / (DVec3::ONE - ems * f_avg);
+        reflectance *= scale;
+    }
+    reflectance
 }
 
 /// The reflectance and transmittance of a GGX glass closure, per channel, as EEVEE's `bsdf_lut` gives them with
@@ -211,7 +234,7 @@ fn glass_split_with_multiscatter(
             (2.33 / 0.33 * amplitude).clamp(0.0, 1.0),
         )
     } else {
-        let [scale, bias, transmission] = bsdf_channels(ior, roughness, n_dot_v);
+        let [scale, bias, transmission] = bsdf_channels(ior, roughness, n_dot_v, true);
         (scale, bias, transmission, 1.0)
     };
 
@@ -256,19 +279,7 @@ fn thin_glass_split(
     f0: DVec3,
     base_color: DVec3,
 ) -> GlassSplit {
-    thin_glass_split_with_multiscatter(ior, roughness, n_dot_v, f0, base_color, true)
-}
-
-fn thin_glass_split_with_multiscatter(
-    ior: f64,
-    roughness: f64,
-    n_dot_v: f64,
-    f0: DVec3,
-    base_color: DVec3,
-    do_multiscatter: bool,
-) -> GlassSplit {
-    let split =
-        glass_split_with_multiscatter(ior, roughness, n_dot_v, f0, DVec3::ONE, do_multiscatter);
+    let split = glass_split_with_multiscatter(ior, roughness, n_dot_v, f0, DVec3::ONE, true);
     let c = slab_transmittance_at_angle(base_color, n_dot_v, ior);
     let round_trip = split.reflectance * c;
     let denominator = DVec3::ONE - round_trip * round_trip;
@@ -448,16 +459,62 @@ pub(crate) fn irradiance_probe_radiance(radiance: DVec3) -> DVec3 {
     probe_radiance(radiance * (1.0 - 1.0 / 131_072.0))
 }
 
-/// One channel of a `UFLOAT` with `mantissa_bits` mantissa bits, a 5-bit exponent (bias 15) and truncation.
+/// One channel of a `UFLOAT` with a 5-bit exponent (bias 15) and truncation, as a decoded value.
 pub(crate) fn truncate_ufloat(value: f64, mantissa_bits: i32) -> f64 {
+    ufloat_bits_to_f64(truncate_ufloat_bits(value, mantissa_bits), mantissa_bits)
+}
+
+/// The truncated `UFLOAT` channel as its packed exponent and mantissa bits.
+pub(crate) fn truncate_ufloat_bits(value: f64, mantissa_bits: i32) -> u32 {
     if value.is_nan() || value <= 0.0 {
-        return 0.0;
+        return 0;
     }
-    let largest = (2.0 - 2.0_f64.powi(-mantissa_bits)) * 32_768.0;
-    let value = value.min(largest);
-    let exponent = value.log2().floor().clamp(-14.0, 15.0);
-    let step = (exponent - f64::from(mantissa_bits)).exp2();
-    (value / step).floor() * step
+
+    let mantissa_bits = mantissa_bits as u32;
+    let mantissa_mask = (1_u32 << mantissa_bits) - 1;
+    let largest_bits = (1_038_u64 << 52) | (u64::from(mantissa_mask) << (52 - mantissa_bits));
+    let value_bits = value.to_bits();
+    if value_bits >= largest_bits {
+        return (30 << mantissa_bits) | mantissa_mask;
+    }
+
+    let exponent_field = ((value_bits >> 52) & 0x7ff) as i32;
+    if exponent_field == 0 {
+        return 0;
+    }
+    let exponent = exponent_field - 1023;
+    if exponent < -14 {
+        let significand = (value_bits & ((1_u64 << 52) - 1)) | (1_u64 << 52);
+        let shift = (38 - exponent - mantissa_bits as i32) as u32;
+        if shift >= 64 {
+            0
+        } else {
+            (significand >> shift) as u32
+        }
+    } else {
+        let fraction = value_bits & ((1_u64 << 52) - 1);
+        (((exponent + 15) as u32) << mantissa_bits) | ((fraction >> (52 - mantissa_bits)) as u32)
+    }
+}
+
+/// Decodes a finite `UFLOAT` field to its exactly representable `f64` value.
+pub(crate) fn ufloat_bits_to_f64(bits: u32, mantissa_bits: i32) -> f64 {
+    let mantissa_bits = mantissa_bits as u32;
+    let mantissa = bits & ((1_u32 << mantissa_bits) - 1);
+    let exponent = (bits >> mantissa_bits) & 0x1f;
+    if exponent == 0 {
+        if mantissa == 0 {
+            return 0.0;
+        }
+        let highest_bit = mantissa.ilog2();
+        let exponent = highest_bit as i32 - 14 - mantissa_bits as i32;
+        let fraction = u64::from(mantissa - (1 << highest_bit)) << (52 - highest_bit);
+        return f64::from_bits((((exponent + 1023) as u64) << 52) | fraction);
+    }
+
+    let exponent = exponent as i32 - 15;
+    let fraction = u64::from(mantissa) << (52 - mantissa_bits);
+    f64::from_bits((((exponent + 1023) as u64) << 52) | fraction)
 }
 
 /// The glass closures of one shading point, as EEVEE weights them, with the directions to sample the environment at.
@@ -557,18 +614,7 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -> 
         roughness,
         thin_wall: params.thin_wall,
         split: if params.thin_wall {
-            if params.glass_distribution == GlassDistribution::MultiGgx {
-                thin_glass_split(ior, roughness, normal.dot(view), f0, lut_base_color)
-            } else {
-                thin_glass_split_with_multiscatter(
-                    ior,
-                    roughness,
-                    normal.dot(view),
-                    f0,
-                    lut_base_color,
-                    false,
-                )
-            }
+            thin_glass_split(ior, roughness, normal.dot(view), f0, lut_base_color)
         } else {
             glass_split_with_multiscatter(
                 ior,
@@ -913,6 +959,16 @@ mod tests {
         let mut params = glass(0.0);
         params.thin_wall = true;
         let view = DVec3::new(0.6, 0.0, 0.8);
+        params.glass_distribution = GlassDistribution::Ggx;
+        let ggx_split = glass_lobe(&params, DVec3::Z, view, DVec3::ONE)
+            .ok_or_else(|| "GGX thin-wall lobe is missing".to_owned())?
+            .split;
+        params.glass_distribution = GlassDistribution::MultiGgx;
+        let multi_split = glass_lobe(&params, DVec3::Z, view, DVec3::ONE)
+            .ok_or_else(|| "MULTI_GGX thin-wall lobe is missing".to_owned())?
+            .split;
+        assert_eq!(ggx_split, multi_split);
+        params.glass_distribution = GlassDistribution::Ggx;
         let thin = glass_closures(&params, DVec3::Z, view, DVec3::ONE, Thickness::None)
             .ok_or_else(|| "thin glass has a transmission lobe".to_owned())?;
         let with_object_thickness =
@@ -1006,9 +1062,9 @@ mod tests {
     }
 
     #[test]
-    fn single_scatter_lut_matches_source_brdf_scale_bias() {
+    fn dielectric_lut_preserves_single_scatter_and_increases_multiscatter() {
         assert_eq!(
-            eevee_bsdf_lut_single_scatter(DVec3::splat(0.04), DVec3::ONE, 0.7, 0.3, 1.0,),
+            eevee_bsdf_lut(DVec3::splat(0.04), DVec3::ONE, 0.7, 0.3, 1.0, false),
             DVec3::ZERO
         );
 
@@ -1024,9 +1080,12 @@ mod tests {
         let scale = sample_channel(0);
         let bias = sample_channel(1);
         let f90 = DVec3::splat((2.33 / 0.33 * ((ior - 1.0) / (ior + 1.0))).clamp(0.0, 1.0));
-        let expected = f0 * scale + f90 * bias;
-        let actual = eevee_bsdf_lut_single_scatter(f0, DVec3::ONE, cosine, roughness, ior);
-        assert!((actual - expected).max_element().abs() < 1.0e-12);
+        let single_scatter = f0 * scale + f90 * bias;
+        let single_actual = eevee_bsdf_lut(f0, DVec3::ONE, cosine, roughness, ior, false);
+        assert!((single_actual - single_scatter).max_element().abs() < 1.0e-12);
+
+        let multi_actual = eevee_bsdf_lut(f0, DVec3::ONE, cosine, roughness, ior, true);
+        assert!(multi_actual.max_element() > single_actual.max_element());
     }
 
     #[test]

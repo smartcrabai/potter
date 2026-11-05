@@ -9,9 +9,11 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     model::{EeveeFastGiMethod, EeveeRayTracingMethod, RenderSettings},
 };
+
 use exr::prelude::f16;
 use glam::{Mat4, UVec2, Vec2, Vec3, Vec4};
 use serde_json::json;
+
 /// Fully recovered settings for an EEVEE ray-tracing pass. `None` is reserved for explicit-off or
 /// native legacy scenes; Blender-imported unknown state is an error.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -376,14 +378,13 @@ impl<'a> ScreenRadianceBuffer<'a> {
     }
 }
 
-/// Result of `raytrace_screen`; `hit_uv.z` is the ray's normalized screen depth.
+/// Result of `raytrace_screen`, including the LOD-0 scene depth at its reported hit UV.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ScreenTraceHit {
     pub(crate) valid: bool,
     pub(crate) time: f32,
     pub(crate) hit_backface: bool,
     pub(crate) hit_uv: Vec2,
-    pub(crate) hit_screen_position: Vec3,
     pub(crate) hit_view_position: Vec3,
 }
 
@@ -392,6 +393,26 @@ pub(crate) struct ScreenTraceHit {
 /// This is `raytrace_screen` in EEVEE 5.2.2. `stride_rand` is the shader's `[0, 1]` jitter;
 /// `HiZ` values must be canonical depth (not the hardware reverse-Z encoding).
 pub(crate) fn raytrace_screen(
+    camera: ScreenTraceCamera,
+    parameters: ScreenTraceParameters,
+    hiz: HiZBuffer<'_>,
+    ray: ScreenTraceRay,
+    stride_rand: f32,
+    roughness: f32,
+    allow_self_intersection: bool,
+) -> Result<ScreenTraceHit, ScreenTraceError> {
+    raytrace_screen_impl(
+        camera,
+        parameters,
+        hiz,
+        ray,
+        stride_rand,
+        roughness,
+        allow_self_intersection,
+    )
+}
+
+fn raytrace_screen_impl(
     camera: ScreenTraceCamera,
     parameters: ScreenTraceParameters,
     hiz: HiZBuffer<'_>,
@@ -438,7 +459,6 @@ pub(crate) fn raytrace_screen(
             time: 0.0,
             hit_backface: false,
             hit_uv: screen_position.truncate(),
-            hit_screen_position: screen_position,
             hit_view_position: view_position,
         });
     }
@@ -473,12 +493,13 @@ pub(crate) fn raytrace_screen(
             .ray_thickness
             .pixel_depth_thickness_at(sample_view_z);
         delta = depth_sample - screen_position.z;
+        let ray_z_before_intersection = previous_ray_z;
         hit = thickness_estimator.intersect(
             depth_sample,
             time,
             sample_min_thickness,
             screen_position.z,
-            previous_ray_z,
+            ray_z_before_intersection,
         );
         previous_ray_z = screen_position.z;
     }
@@ -493,16 +514,15 @@ pub(crate) fn raytrace_screen(
     let hit_screen_position = screen_ray.position_at(time);
     let hit_view_position = camera.point_screen_to_view(hit_screen_position);
     let trace_time = (hit_view_position - ray.origin).length() / ray.direction.length();
-    let valid = hit
-        && sample_hiz(hiz, hit_screen_position.truncate(), 0.0).partial_cmp(&1.0)
-            != Some(std::cmp::Ordering::Equal);
+    let scene_depth = hit.then(|| sample_hiz(hiz, hit_screen_position.truncate(), 0.0));
+    let valid =
+        scene_depth.is_some_and(|depth| depth.partial_cmp(&1.0) != Some(std::cmp::Ordering::Equal));
 
     Ok(ScreenTraceHit {
         valid,
         time: trace_time,
         hit_backface,
         hit_uv: hit_screen_position.truncate(),
-        hit_screen_position,
         hit_view_position,
     })
 }

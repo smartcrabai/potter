@@ -12,7 +12,7 @@ use super::texture_procedural_kernels::{
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{GeneratedCorners, TextureSpace, volume::VolumeData},
-    graph::{GraphKind, GraphNode, NodeGroup},
+    graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
     image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
     model::{Id, Material, Registry, TextureRef, ThicknessMode},
 };
@@ -2059,6 +2059,8 @@ enum ValueKind {
 #[derive(Clone, Copy)]
 enum NodeKind {
     OutputMaterial,
+    Reroute,
+    Muted,
     Principled,
     Sheen,
     Subsurface,
@@ -2178,6 +2180,7 @@ impl NodeKind {
             "ShaderNodeVectorMath" => Self::VectorMath,
             "ShaderNodeGroup" => Self::Group,
             "NodeGroupInput" => Self::GroupInput,
+            "NodeReroute" => Self::Reroute,
             "ShaderNodeValue" => Self::Value,
             "ShaderNodeRGB" => Self::Rgb,
             "ShaderNodeCombineColor" => Self::CombineColor,
@@ -2394,6 +2397,38 @@ impl EvaluatorWorkspace {
 
 /// The per-material state a shader evaluation reads. A render builds it once for each material and passes it to every
 /// evaluation of that material, so no hit walks the graph again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceFoldFailure {
+    code: ErrorCode,
+    message: String,
+    details_json: String,
+}
+
+impl SourceFoldFailure {
+    fn new(error: PotError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            details_json: error.details.to_string(),
+        }
+    }
+
+    fn to_error(&self) -> Result<PotError> {
+        let details = serde_json::from_str(&self.details_json).map_err(PotError::internal_json)?;
+        Ok(PotError::with_details(
+            self.code,
+            self.message.clone(),
+            details,
+        ))
+    }
+}
+#[derive(Clone, Copy)]
+enum SourceFoldOutput {
+    Primitive(Value),
+    Dangling,
+    Linked,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PreparedMaterial {
     /// The Image Texture nodes whose Alpha output reaches the graph's output (see [`linked_alpha_image_nodes`]).
@@ -2406,8 +2441,12 @@ pub struct PreparedMaterial {
     transparent: bool,
     /// Whether a reachable Transparent BSDF can make the EEVEE forward target colored.
     eevee_transparent_maybe_colored: bool,
-    /// Whether a reachable Holdout enables EEVEE's colored transparency targets.
+    /// Whether a reachable Holdout enables the EEVEE colored transparency targets.
     eevee_has_holdout: bool,
+    /// Raw Source EEVEE closure bits from reachable GPU node compiler callbacks.
+    eevee_closure_flags: u32,
+    /// The first unsupported Source primitive fold needed by EEVEE's static closure classifier.
+    source_fold_failure: Option<SourceFoldFailure>,
     /// The graph's incoming links by target node, and the output's incoming sockets (see [`LinkIndex`]).
     links: LinkIndex,
 }
@@ -2493,14 +2532,27 @@ impl PreparedMaterial {
         else {
             return Self {
                 transparent: material.alpha_mode != "opaque" && material.base_color[3] < 1.0,
+                // The bridge exports node-less native materials as Principled inputs from Material fields.
+                eevee_closure_flags: source_simple_material_closure_flags(material),
                 ..Self::default()
             };
         };
         let output = Self::active_output(group);
         let links = LinkIndex::new(graph_id, group, output, node_groups);
+        let source_fold_failure = RefCell::new(None);
+        let eevee_closure_flags = graph_eevee_closure_flags(
+            graph_id,
+            group,
+            node_groups,
+            &links.folds,
+            material,
+            &source_fold_failure,
+        );
         let Some(output) = output else {
             return Self {
                 links,
+                eevee_closure_flags,
+                source_fold_failure: source_fold_failure.into_inner(),
                 ..Self::default()
             };
         };
@@ -2514,7 +2566,15 @@ impl PreparedMaterial {
             &mut visited_groups,
             &mut alpha_linked_images,
         );
-        let eevee_flags = graph_eevee_surface_flags(graph_id, group, node_groups, output);
+        let eevee_flags = graph_eevee_surface_flags(
+            graph_id,
+            group,
+            node_groups,
+            &links.folds,
+            output,
+            material,
+            &source_fold_failure,
+        );
         let transparent = eevee_flags.transparent;
         let texture_mapping_unsupported = group
             .nodes
@@ -2536,6 +2596,8 @@ impl PreparedMaterial {
             eevee_transparent_maybe_colored: eevee_flags.transparent_maybe_colored,
             eevee_has_holdout: eevee_flags.has_holdout,
             texture_mapping_unsupported,
+            eevee_closure_flags,
+            source_fold_failure: source_fold_failure.into_inner(),
             links,
         }
     }
@@ -2593,6 +2655,13 @@ impl PreparedMaterial {
     /// Whether the graph has a linked Volume output and no linked Surface output.
     pub(crate) fn is_volume_only(&self) -> bool {
         self.has_volume_output() && !self.links.has_surface
+    }
+    /// Source's compiled closure mask, cached once with the connected graph analysis.
+    pub(crate) fn eevee_closure_flags(&self) -> Result<u32> {
+        if let Some(error) = &self.source_fold_failure {
+            return Err(error.to_error()?);
+        }
+        Ok(self.eevee_closure_flags)
     }
 
     /// The output node a surface evaluates from: the active one, else the first `OutputMaterial`.
@@ -2661,6 +2730,15 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             .map(|candidate| &candidate.default)
             .filter(|default| !default.is_null())
     }
+    fn group_interface_output_default<'a>(&'a self, socket: &str) -> Option<&'a JsonValue> {
+        self.group
+            .interface
+            .outputs
+            .iter()
+            .find(|candidate| candidate.id == socket || candidate.name == socket)
+            .map(|candidate| &candidate.default)
+            .filter(|default| !default.is_null())
+    }
 
     fn input(&mut self, node_id: &Id, socket: &str, kind: ValueKind) -> Result<Value> {
         let node = self.node(node_id)?;
@@ -2690,7 +2768,15 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             }),
         };
         if let Some((socket_index, link)) = incoming {
-            return self.output(&link.from_node, &link.from_socket, socket_index);
+            let dangling = self.links.is_some_and(|index| {
+                index
+                    .dangling_outputs
+                    .get(&link.from_node)
+                    .is_some_and(|outputs| outputs.contains(&link.from_socket))
+            });
+            if !dangling {
+                return self.output(&link.from_node, &link.from_socket, socket_index);
+            }
         }
         let raw = node
             .inputs
@@ -2699,9 +2785,11 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             .map(|(_, value)| value)
             .filter(|value| !value.is_null());
         let default = raw.or_else(|| socket_default(node, socket)).or_else(|| {
-            (node.node_type == "ShaderNodeGroup")
-                .then(|| self.group_interface_input_default(node, socket))
-                .flatten()
+            match node.node_type.as_str() {
+                "ShaderNodeGroup" => self.group_interface_input_default(node, socket),
+                "NodeGroupOutput" => self.group_interface_output_default(socket),
+                _ => None,
+            }
         });
         match kind {
             ValueKind::Scalar => Ok(Value::Scalar(
@@ -2912,19 +3000,25 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             socket: socket_index,
         });
         // Map the borrowed node type to a value before dispatch mutably through the evaluator.
-        let kind = match NodeKind::from_node_type(node.node_type.as_str()) {
-            Some(kind) => Ok(kind),
-            None => Err(PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                format!(
-                    "shader node `{}` is not supported by the native evaluator",
-                    node.node_type
-                ),
-                json!({
-                    "feature_id": format!("shader.node.{}", node.node_type),
-                    "node_id": node_id
-                }),
-            )),
+        let kind = if node.node_type == "NodeReroute" {
+            Ok(NodeKind::Reroute)
+        } else if node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true) {
+            Ok(NodeKind::Muted)
+        } else {
+            match NodeKind::from_node_type(node.node_type.as_str()) {
+                Some(kind) => Ok(kind),
+                None => Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    format!(
+                        "shader node `{}` is not supported by the native evaluator",
+                        node.node_type
+                    ),
+                    json!({
+                        "feature_id": format!("shader.node.{}", node.node_type),
+                        "node_id": node_id
+                    }),
+                )),
+            }
         };
         let result = kind.and_then(|kind| self.evaluate_node(node_id, kind, socket));
         self.workspace.active.pop();
@@ -3183,8 +3277,46 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         self.alpha_linked_images.contains(id)
     }
 
+    fn reroute(&mut self, id: &Id, output_socket: &str) -> Result<Value> {
+        self.passthrough_node(id, output_socket)
+    }
+
+    fn muted_node(&mut self, id: &Id, output_socket: &str) -> Result<Value> {
+        self.passthrough_node(id, output_socket)
+    }
+
+    fn passthrough_node(&mut self, id: &Id, output_socket: &str) -> Result<Value> {
+        let node = self.node(id)?;
+        let Some(input_socket) = super::inline_fold::source_passthrough_input_socket(
+            node,
+            output_socket,
+            self.group,
+            id,
+        ) else {
+            return Err(unsupported_node(
+                id,
+                &format!("{}.internal_links", node.node_type),
+            ));
+        };
+        let input_socket = input_socket.to_owned();
+        let kind = self
+            .node(id)?
+            .inputs
+            .get(&input_socket)
+            .map_or(ValueKind::Scalar, |value| {
+                match value.as_array().map(Vec::len) {
+                    Some(3) => ValueKind::Vector,
+                    Some(4) => ValueKind::Color,
+                    _ => ValueKind::Scalar,
+                }
+            });
+        self.input(id, &input_socket, kind)
+    }
+
     fn evaluate_node(&mut self, node_id: &Id, kind: NodeKind, socket: &str) -> Result<Value> {
         match kind {
+            NodeKind::Muted => self.muted_node(node_id, socket),
+            NodeKind::Reroute => self.reroute(node_id, socket),
             NodeKind::Group => self.group_node(node_id, socket),
             NodeKind::GroupInput => self.group_input(node_id, socket),
             NodeKind::Value => self.value(node_id, socket),
@@ -3446,6 +3578,11 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             == Some(true)
         {
             let mut params = self.closure_params();
+            params.glass_distribution = if multi_ggx {
+                GlassDistribution::MultiGgx
+            } else {
+                GlassDistribution::Ggx
+            };
             params.transmission = self.material.transmission;
             params.base_color = textured_base(self.material, &self.hit_ctx, params.base_color)?;
             params.glass_transmission_tint = principled_glass_tint(params.base_color);
@@ -3465,6 +3602,11 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             return Ok(params);
         }
         let mut params = self.closure_params();
+        params.glass_distribution = if multi_ggx {
+            GlassDistribution::MultiGgx
+        } else {
+            GlassDistribution::Ggx
+        };
         let base = self.color_input(id, &["Base Color"], [0.8, 0.8, 0.8, 1.0])?;
         let base_color_may_be_tinted =
             self.is_linked(id, "Base Color") || color_might_be_tinted(&[base[0], base[1], base[2]]);
@@ -7786,6 +7928,793 @@ fn collect_linked_alpha_images(
     }
 }
 
+// Values from Blender 5.2.2 `eevee_material.hh:126-141`.
+pub(crate) const EEVEE_CLOSURE_DIFFUSE: u32 = 1 << 0;
+pub(crate) const EEVEE_CLOSURE_SUBSURFACE: u32 = 1 << 1;
+pub(crate) const EEVEE_CLOSURE_REFLECTION: u32 = 1 << 2;
+pub(crate) const EEVEE_CLOSURE_REFRACTION: u32 = 1 << 3;
+pub(crate) const EEVEE_CLOSURE_TRANSLUCENT: u32 = 1 << 4;
+pub(crate) const EEVEE_CLOSURE_TRANSPARENCY: u32 = 1 << 8;
+pub(crate) const EEVEE_CLOSURE_EMISSION: u32 = 1 << 9;
+const EEVEE_CLOSURE_HOLDOUT: u32 = 1 << 10;
+const EEVEE_CLOSURE_AMBIENT_OCCLUSION: u32 = 1 << 12;
+pub(crate) const EEVEE_CLOSURE_SHADER_TO_RGBA: u32 = 1 << 13;
+const EEVEE_CLOSURE_CLEARCOAT: u32 = 1 << 14;
+fn source_simple_material_closure_flags(material: &Material) -> u32 {
+    let features = EeveeGBufferFeatures::from_material(
+        material.metallic,
+        material.transmission,
+        [
+            material.base_color[0],
+            material.base_color[1],
+            material.base_color[2],
+        ],
+        false,
+    );
+    let mut flags = 0;
+    if features.has_diffuse() {
+        flags |= EEVEE_CLOSURE_DIFFUSE;
+    }
+    if features.has_reflection() {
+        flags |= EEVEE_CLOSURE_REFLECTION;
+    }
+    if features.has_refraction() {
+        flags |= EEVEE_CLOSURE_REFRACTION;
+    }
+    if features.has_subsurface() {
+        flags |= EEVEE_CLOSURE_SUBSURFACE;
+    }
+    if features.has_translucent() {
+        flags |= EEVEE_CLOSURE_TRANSLUCENT;
+    }
+    let alpha = match material.alpha_mode.as_str() {
+        "opaque" => 1.0,
+        "clip" if material.base_color[3] >= material.alpha_threshold => 1.0,
+        "clip" => 0.0,
+        _ => material.base_color[3],
+    };
+    if gpu_socket_not_one(alpha) {
+        flags |= EEVEE_CLOSURE_TRANSPARENCY;
+    }
+    flags
+}
+
+/// Blender 5.2.2 `shader_nodes_inline.cc` resolves inputs (398-445), dispatches group/reroute/muted
+/// outputs (508-582), evaluates primitive multi-functions (1125-1217), then replaces primitive
+/// sockets and applies typed conversions (1307-1340). `FoldIndex` is the per-invocation proof.
+struct SourceFoldResolver<'a> {
+    group: &'a NodeGroup,
+    node_groups: &'a Registry<NodeGroup>,
+    material: &'a Material,
+    fold_index: &'a super::inline_fold::FoldIndex,
+    input_binding: Option<&'a GroupInputBinding<'a>>,
+    failure: &'a RefCell<Option<SourceFoldFailure>>,
+}
+
+impl<'a> SourceFoldResolver<'a> {
+    fn output_value(&self, node_id: &Id, socket: &str, link_index: usize) -> SourceFoldOutput {
+        let key = (node_id.clone(), socket.to_owned());
+        if self.fold_index.primitive_outputs.contains(&key) {
+            // Only Source-proven primitive outputs enter this evaluator. Its field guard excludes
+            // unlinked procedural positions; images and geometry nodes are never static outputs.
+            let hit_ctx = HitContext::new(self.node_groups);
+            let mut workspace = EvaluatorWorkspace::default();
+            workspace.active.reserve(self.group.links.len());
+            let empty = BTreeSet::new();
+            let mut evaluator = Evaluator {
+                group: self.group,
+                material: self.material,
+                hit_ctx,
+                workspace: &mut workspace,
+                math_semantics: crate::node_kernels::MathSemantics::Eevee,
+                alpha_linked_images: &empty,
+                links: Some(self.fold_index),
+                group_input_binding: self.input_binding,
+                group_depth: self
+                    .input_binding
+                    .map_or(0, |binding| binding.depth.saturating_add(1)),
+                texture_mapping_unsupported: &empty,
+            };
+            return match evaluator.output(node_id, socket, link_index) {
+                Ok(value) => SourceFoldOutput::Primitive(value),
+                Err(error) => {
+                    self.record_failure(error);
+                    SourceFoldOutput::Linked
+                }
+            };
+        }
+        if self
+            .fold_index
+            .dangling_outputs
+            .get(node_id)
+            .is_some_and(|outputs| outputs.contains(socket))
+        {
+            return SourceFoldOutput::Dangling;
+        }
+        if self.fold_index.unknown_outputs.contains(&key)
+            && self.group.nodes.get(node_id).is_some_and(|node| {
+                node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true)
+                    || !matches!(
+                        node.node_type.as_str(),
+                        "NodeGroupInput" | "ShaderNodeGroup"
+                    )
+            })
+        {
+            self.record_unknown_output(node_id);
+        }
+        SourceFoldOutput::Linked
+    }
+
+    fn record_unknown_output(&self, node_id: &Id) {
+        let Some(node) = self.group.nodes.get(node_id) else {
+            return;
+        };
+        if node.properties.get("mute").and_then(JsonValue::as_bool) != Some(true)
+            && matches!(
+                node.node_type.as_str(),
+                "NodeGroupInput" | "ShaderNodeGroup"
+            )
+        {
+            return;
+        }
+        self.record_failure(unsupported_node(
+            node_id,
+            &format!("{}.internal_links", node.node_type),
+        ));
+    }
+
+    fn record_failure(&self, error: PotError) {
+        let mut failure = self.failure.borrow_mut();
+        if failure.is_none() {
+            *failure = Some(SourceFoldFailure::new(error));
+        }
+    }
+
+    fn output_is_unknown(&self, node_id: &Id, socket: &str) -> bool {
+        self.fold_index
+            .unknown_outputs
+            .contains(&(node_id.clone(), socket.to_owned()))
+    }
+
+    fn output_is_dangling(&self, node_id: &Id, socket: &str) -> bool {
+        self.fold_index
+            .dangling_outputs
+            .get(node_id)
+            .is_some_and(|outputs| outputs.contains(socket))
+    }
+
+    fn input_link<'b>(
+        &'b self,
+        node_id: &Id,
+        node: &GraphNode,
+        socket: &str,
+    ) -> Option<(usize, &'a GraphLink)> {
+        self.group.links.iter().enumerate().find(|(_, link)| {
+            link.to_node == *node_id
+                && input_socket_matches(self.node_groups, node, &link.to_socket, socket)
+        })
+    }
+
+    fn scalar_input(
+        &self,
+        node_id: &Id,
+        node: &GraphNode,
+        socket: &str,
+        default: f64,
+    ) -> (bool, f64) {
+        if let Some((link_index, link)) = self.input_link(node_id, node, socket) {
+            return match self.output_value(&link.from_node, &link.from_socket, link_index) {
+                SourceFoldOutput::Primitive(value) => {
+                    if super::inline_fold::source_input_socket_flag(
+                        node,
+                        &link.to_socket,
+                        "hide_value",
+                    ) == Some(true)
+                    {
+                        (true, default)
+                    } else {
+                        (false, source_value_scalar(value, default))
+                    }
+                }
+                SourceFoldOutput::Dangling => (
+                    false,
+                    source_socket_default(node, socket)
+                        .map_or(default, |value| number(value, default)),
+                ),
+                SourceFoldOutput::Linked => (true, default),
+            };
+        }
+        (
+            false,
+            source_socket_default(node, socket).map_or(default, |value| number(value, default)),
+        )
+    }
+
+    fn vector_input(
+        &self,
+        node_id: &Id,
+        node: &GraphNode,
+        socket: &str,
+        default: DVec3,
+    ) -> (bool, DVec3) {
+        if let Some((link_index, link)) = self.input_link(node_id, node, socket) {
+            return match self.output_value(&link.from_node, &link.from_socket, link_index) {
+                SourceFoldOutput::Primitive(value) => {
+                    if super::inline_fold::source_input_socket_flag(
+                        node,
+                        &link.to_socket,
+                        "hide_value",
+                    ) == Some(true)
+                    {
+                        (true, default)
+                    } else {
+                        (false, source_value_vector(value, default))
+                    }
+                }
+                SourceFoldOutput::Dangling => (
+                    false,
+                    source_socket_default(node, socket)
+                        .map_or(default, |value| vector(value, default)),
+                ),
+                SourceFoldOutput::Linked => (true, default),
+            };
+        }
+        (
+            false,
+            source_socket_default(node, socket).map_or(default, |value| vector(value, default)),
+        )
+    }
+
+    fn color_input(
+        &self,
+        node_id: &Id,
+        node: &GraphNode,
+        socket: &str,
+        default: [f32; 3],
+    ) -> (bool, [f32; 3]) {
+        if let Some((link_index, link)) = self.input_link(node_id, node, socket) {
+            return match self.output_value(&link.from_node, &link.from_socket, link_index) {
+                SourceFoldOutput::Primitive(value) => {
+                    if super::inline_fold::source_input_socket_flag(
+                        node,
+                        &link.to_socket,
+                        "hide_value",
+                    ) == Some(true)
+                    {
+                        (true, default)
+                    } else {
+                        (false, source_value_color(value, default))
+                    }
+                }
+                SourceFoldOutput::Dangling => (
+                    false,
+                    source_socket_default(node, socket)
+                        .map_or(default, |value| source_color_value(value, default)),
+                ),
+                SourceFoldOutput::Linked => (true, default),
+            };
+        }
+        (
+            false,
+            source_socket_default(node, socket)
+                .map_or(default, |value| source_color_value(value, default)),
+        )
+    }
+}
+
+/// Source callbacks produce these bits regardless of closure weight, except for their socket tests.
+fn graph_eevee_closure_flags(
+    graph_id: &Id,
+    group: &NodeGroup,
+    node_groups: &Registry<NodeGroup>,
+    fold_index: &super::inline_fold::FoldIndex,
+    material: &Material,
+    fold_failure: &RefCell<Option<SourceFoldFailure>>,
+) -> u32 {
+    let mut flags = 0;
+    let mut group_stack = BTreeSet::from([graph_id.clone()]);
+
+    if let Some(output) = eevee_material_output(group) {
+        for link in group.links.iter().filter(|link| link.to_node == *output) {
+            flags |= graph_eevee_closure_flags_output(
+                group,
+                node_groups,
+                fold_index,
+                output,
+                &link.to_socket,
+                &mut group_stack,
+                None,
+                material,
+                fold_failure,
+            );
+        }
+    }
+    for (output, node) in &group.nodes {
+        if node.node_type == "ShaderNodeOutputAOV" {
+            for link in group.links.iter().filter(|link| link.to_node == *output) {
+                flags |= graph_eevee_closure_flags_output(
+                    group,
+                    node_groups,
+                    fold_index,
+                    output,
+                    &link.to_socket,
+                    &mut group_stack,
+                    None,
+                    material,
+                    fold_failure,
+                );
+            }
+        }
+    }
+    flags
+}
+
+/// Blender prefers a target-specific EEVEE output over the active ALL output.
+fn eevee_material_output(group: &NodeGroup) -> Option<&Id> {
+    let mut active_eevee = None;
+    let mut fallback_eevee = None;
+    let mut active_all = None;
+    let mut fallback_all = None;
+    for (id, node) in &group.nodes {
+        if !matches!(
+            node.node_type.as_str(),
+            "OutputMaterial" | "ShaderNodeOutputMaterial"
+        ) {
+            continue;
+        }
+        let target = node
+            .properties
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("ALL");
+        let active = node
+            .properties
+            .get("is_active_output")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
+        match target {
+            "EEVEE" => {
+                if active {
+                    active_eevee = Some(id);
+                } else {
+                    fallback_eevee.get_or_insert(id);
+                }
+            }
+            "ALL" => {
+                if active {
+                    active_all = Some(id);
+                } else {
+                    fallback_all.get_or_insert(id);
+                }
+            }
+            _ => {}
+        }
+    }
+    active_eevee
+        .or(fallback_eevee)
+        .or(active_all)
+        .or(fallback_all)
+}
+
+fn graph_eevee_closure_flags_output(
+    group: &NodeGroup,
+    node_groups: &Registry<NodeGroup>,
+    fold_index: &super::inline_fold::FoldIndex,
+    output: &Id,
+    output_socket: &str,
+    group_stack: &mut BTreeSet<Id>,
+    input_binding: Option<&GroupInputBinding<'_>>,
+    material: &Material,
+    fold_failure: &RefCell<Option<SourceFoldFailure>>,
+) -> u32 {
+    let source = SourceFoldResolver {
+        group,
+        node_groups,
+        material,
+        fold_index,
+        input_binding,
+        failure: fold_failure,
+    };
+    let reachable = source_nodes_reaching_socket(&source, output, output_socket);
+    let mut flags = 0;
+    for node_id in &reachable {
+        let Some(node) = group.nodes.get(node_id) else {
+            continue;
+        };
+        if node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true) {
+            continue;
+        }
+        flags |= match node.node_type.as_str() {
+            "ShaderNodeBsdfPrincipled" => {
+                source_principled_closure_flags(&source, node_id, node, material)
+            }
+            "ShaderNodeBsdfDiffuse"
+            | "ShaderNodeBsdfSheen"
+            | "ShaderNodeBsdfToon"
+            | "ShaderNodeBsdfHair"
+            | "ShaderNodeBsdfHairPrincipled" => EEVEE_CLOSURE_DIFFUSE,
+            "ShaderNodeBsdfGlossy" | "ShaderNodeBsdfAnisotropic" | "ShaderNodeBsdfMetallic" => {
+                EEVEE_CLOSURE_REFLECTION
+            }
+            "ShaderNodeBsdfGlass" => EEVEE_CLOSURE_REFLECTION | EEVEE_CLOSURE_REFRACTION,
+            "ShaderNodeBsdfRefraction" => EEVEE_CLOSURE_REFRACTION,
+            "ShaderNodeBsdfTranslucent" => EEVEE_CLOSURE_TRANSLUCENT,
+            "ShaderNodeSubsurfaceScattering" => EEVEE_CLOSURE_DIFFUSE | EEVEE_CLOSURE_SUBSURFACE,
+            "ShaderNodeEmission" => EEVEE_CLOSURE_EMISSION,
+            "ShaderNodeHoldout" => EEVEE_CLOSURE_HOLDOUT,
+            "ShaderNodeAmbientOcclusion" => EEVEE_CLOSURE_AMBIENT_OCCLUSION,
+            "ShaderNodeShaderToRGB" => EEVEE_CLOSURE_SHADER_TO_RGBA,
+            "ShaderNodeBsdfTransparent" | "ShaderNodeBsdfRayPortal" => {
+                let (color_linked, color) = source.color_input(node_id, node, "Color", [1.0; 3]);
+                if color_linked || color.iter().any(|channel| *channel != 0.0) {
+                    EEVEE_CLOSURE_TRANSPARENCY
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+    }
+
+    for node_id in &reachable {
+        let Some(node) = group.nodes.get(node_id) else {
+            continue;
+        };
+        if node.node_type != "ShaderNodeGroup"
+            || node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let Some(child_name) = node.properties.get("node_tree").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some((child_id, child)) = node_groups.get_key_value(child_name) else {
+            continue;
+        };
+        if child.kind != GraphKind::Shader || !group_stack.insert(child_id.clone()) {
+            continue;
+        }
+        let Some(child_output) = active_group_output(child) else {
+            group_stack.remove(child_id);
+            continue;
+        };
+        let Some(child_fold_index) = fold_index.children.get(node_id) else {
+            group_stack.remove(child_id);
+            continue;
+        };
+        for link in group.links.iter().filter(|link| {
+            link.from_node == *node_id
+                && (reachable.contains(&link.to_node)
+                    || (link.to_node == *output && socket_matches(&link.to_socket, output_socket)))
+        }) {
+            let Some(interface_output) =
+                child.interface.outputs.iter().find(|socket| {
+                    socket.id == link.from_socket || socket.name == link.from_socket
+                })
+            else {
+                continue;
+            };
+            let binding = GroupInputBinding {
+                group,
+                node_id,
+                binding: input_binding,
+                links: Some(fold_index),
+                depth: input_binding.map_or(0, |binding| binding.depth.saturating_add(1)),
+            };
+            flags |= graph_eevee_closure_flags_output(
+                child,
+                node_groups,
+                child_fold_index,
+                child_output,
+                &interface_output.name,
+                group_stack,
+                Some(&binding),
+                material,
+                fold_failure,
+            );
+        }
+        group_stack.remove(child_id);
+    }
+    flags
+}
+
+/// Source `node_shader_bsdf_principled.cc:371-430` tests GPU stack links/values; thresholds and
+/// clamping match `GPU_material.hh:322-330`.
+fn source_principled_closure_flags(
+    source: &SourceFoldResolver<'_>,
+    id: &Id,
+    node: &GraphNode,
+    material: &Material,
+) -> u32 {
+    if node
+        .properties
+        .get("potter_simple_material")
+        .and_then(JsonValue::as_bool)
+        == Some(true)
+    {
+        return source_simple_material_closure_flags(material);
+    }
+    let socket_not_zero = |socket: &str, default| {
+        let (linked, value) = source.scalar_input(id, node, socket, default);
+        linked || gpu_socket_not_zero(value)
+    };
+    let socket_not_one = |socket: &str, default| {
+        let (linked, value) = source.scalar_input(id, node, socket, default);
+        linked || gpu_socket_not_one(value)
+    };
+    let use_diffuse = socket_not_zero("Sheen Weight", 0.0)
+        || (socket_not_one("Metallic", 0.0) && socket_not_one("Transmission Weight", 0.0));
+    let use_subsurface = socket_not_zero("Subsurface Weight", 0.0) && use_diffuse;
+    let use_refraction =
+        socket_not_one("Metallic", 0.0) && socket_not_zero("Transmission Weight", 0.0);
+    let use_transparency = socket_not_one("Alpha", 1.0);
+    let use_coat = socket_not_zero("Coat Weight", 0.0);
+    let use_translucent = use_subsurface && socket_not_zero("Thin Wall", 0.0);
+    let mut flags = EEVEE_CLOSURE_REFLECTION;
+    if use_diffuse {
+        flags |= EEVEE_CLOSURE_DIFFUSE;
+    }
+    if use_refraction {
+        flags |= EEVEE_CLOSURE_REFRACTION;
+    }
+    if use_subsurface && socket_not_one("Thin Wall", 0.0) {
+        flags |= EEVEE_CLOSURE_SUBSURFACE;
+    }
+    if use_transparency {
+        flags |= EEVEE_CLOSURE_TRANSPARENCY;
+    }
+    if use_coat {
+        // Source COAT maps to CLEARCOAT; Principled always sets GLOSSY too.
+        flags |= EEVEE_CLOSURE_CLEARCOAT;
+    }
+    if use_translucent {
+        flags |= EEVEE_CLOSURE_TRANSLUCENT;
+    }
+    flags
+}
+
+fn source_nodes_reaching_socket(
+    source: &SourceFoldResolver<'_>,
+    sink: &Id,
+    socket: &str,
+) -> BTreeSet<Id> {
+    let mut pending: Vec<(Id, String)> = source
+        .group
+        .links
+        .iter()
+        .filter(|link| {
+            link.to_node == *sink
+                && socket_matches(&link.to_socket, socket)
+                && source_link_is_compiled(source, link)
+        })
+        .map(|link| (link.from_node.clone(), link.from_socket.clone()))
+        .collect();
+    let mut visited_outputs = BTreeSet::new();
+    let mut ancestors = BTreeSet::new();
+    while let Some((node_id, output_socket)) = pending.pop() {
+        if !visited_outputs.insert((node_id.clone(), output_socket.clone())) {
+            continue;
+        }
+        ancestors.insert(node_id.clone());
+        let Some(node) = source.group.nodes.get(&node_id) else {
+            continue;
+        };
+        if source.output_is_unknown(&node_id, &output_socket) {
+            if node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true)
+                || !matches!(
+                    node.node_type.as_str(),
+                    "NodeGroupInput" | "ShaderNodeGroup"
+                )
+            {
+                source.record_unknown_output(&node_id);
+            }
+            continue;
+        }
+        if source.output_is_dangling(&node_id, &output_socket) {
+            continue;
+        }
+        let is_passthrough = node.node_type == "NodeReroute"
+            || node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true);
+        let input_socket = super::inline_fold::source_passthrough_input_socket(
+            node,
+            &output_socket,
+            source.group,
+            &node_id,
+        );
+        if is_passthrough && input_socket.is_none() {
+            continue;
+        }
+        for link in source.group.links.iter().filter(|link| {
+            link.to_node == node_id
+                && (!is_passthrough || input_socket == Some(link.to_socket.as_str()))
+                && source_link_is_compiled(source, link)
+        }) {
+            pending.push((link.from_node.clone(), link.from_socket.clone()));
+        }
+    }
+    ancestors
+}
+
+fn source_link_is_compiled(source: &SourceFoldResolver<'_>, link: &GraphLink) -> bool {
+    let Some(from) = source.group.nodes.get(&link.from_node) else {
+        return false;
+    };
+    let Some(to) = source.group.nodes.get(&link.to_node) else {
+        return false;
+    };
+    if matches!(from.node_type.as_str(), "ShaderNodeScript" | "Script")
+        || matches!(to.node_type.as_str(), "ShaderNodeScript" | "Script")
+    {
+        return false;
+    }
+    // A muted node forwards its declared internal link, bypassing Mix branch pruning.
+    to.node_type == "NodeReroute"
+        || to.properties.get("mute").and_then(JsonValue::as_bool) == Some(true)
+        || !source_mix_input_is_pruned(source, &link.to_node, &link.to_socket, to)
+}
+
+// Avoid float_cmp without changing Source's exact IEEE equality semantics.
+fn source_float_eq(left: f32, right: f32) -> bool {
+    left.partial_cmp(&right) == Some(std::cmp::Ordering::Equal)
+}
+
+// Source-folded GPU stack constants drive these clamped 0/1 branch checks.
+fn source_mix_input_is_pruned(
+    source: &SourceFoldResolver<'_>,
+    id: &Id,
+    socket: &str,
+    node: &GraphNode,
+) -> bool {
+    match node.node_type.as_str() {
+        "ShaderNodeMixShader" => {
+            source_mix_factor(source, id, node, "Fac", 0.5, true).is_some_and(|factor| {
+                (source_float_eq(factor, 0.0) && socket_matches(socket, "Shader_001"))
+                    || (source_float_eq(factor, 1.0) && socket_matches(socket, "Shader"))
+            })
+        }
+        "ShaderNodeMix" => {
+            let data_type = node
+                .properties
+                .get("data_type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("FLOAT");
+            let clamp = node
+                .properties
+                .get("clamp_factor")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true);
+            match data_type {
+                "FLOAT" => {
+                    if !matches!(socket, "Factor_Float" | "A_Float" | "B_Float") {
+                        return true;
+                    }
+                    source_mix_factor(source, id, node, "Factor_Float", 1.0, clamp).is_some_and(
+                        |factor| {
+                            (source_float_eq(factor, 0.0) && socket == "B_Float")
+                                || (source_float_eq(factor, 1.0) && socket == "A_Float")
+                        },
+                    )
+                }
+                "VECTOR" => {
+                    let non_uniform = node
+                        .properties
+                        .get("factor_mode")
+                        .and_then(JsonValue::as_str)
+                        == Some("NON_UNIFORM");
+                    let factor_socket = if non_uniform {
+                        "Factor_Vector"
+                    } else {
+                        "Factor_Float"
+                    };
+                    if socket != factor_socket && !matches!(socket, "A_Vector" | "B_Vector") {
+                        return true;
+                    }
+                    let factor = if non_uniform {
+                        let (linked, raw) =
+                            source.vector_input(id, node, factor_socket, DVec3::splat(0.5));
+                        if linked {
+                            return false;
+                        }
+                        let values = raw.to_array().map(|value| {
+                            let value = value as f32;
+                            if clamp { value.clamp(0.0, 1.0) } else { value }
+                        });
+                        (source_float_eq(values[0], values[1])
+                            && source_float_eq(values[0], values[2]))
+                        .then_some(values[0])
+                    } else {
+                        source_mix_factor(source, id, node, factor_socket, 1.0, clamp)
+                    };
+                    factor.is_some_and(|factor| {
+                        (source_float_eq(factor, 0.0) && socket == "B_Vector")
+                            || (source_float_eq(factor, 1.0) && socket == "A_Vector")
+                    })
+                }
+                "RGBA" => {
+                    if !matches!(socket, "Factor_Float" | "A_Color" | "B_Color") {
+                        return true;
+                    }
+                    source_mix_factor(source, id, node, "Factor_Float", 1.0, clamp)
+                        .is_some_and(|factor| source_float_eq(factor, 0.0) && socket == "B_Color")
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn source_mix_factor(
+    source: &SourceFoldResolver<'_>,
+    id: &Id,
+    node: &GraphNode,
+    socket: &str,
+    default: f64,
+    clamp: bool,
+) -> Option<f32> {
+    let (linked, value) = source.scalar_input(id, node, socket, default);
+    if linked {
+        return None;
+    }
+    let factor = value as f32;
+    Some(if clamp {
+        factor.clamp(0.0, 1.0)
+    } else {
+        factor
+    })
+}
+
+fn source_socket_default<'a>(node: &'a GraphNode, socket: &str) -> Option<&'a JsonValue> {
+    node.inputs
+        .get(socket)
+        .or_else(|| {
+            node.inputs
+                .iter()
+                .find_map(|(candidate, value)| socket_matches(candidate, socket).then_some(value))
+        })
+        .or_else(|| socket_default(node, socket))
+}
+
+fn source_value_scalar(value: Value, default: f64) -> f64 {
+    match value {
+        Value::Scalar(value) => value,
+        Value::Vector(value) => value.x,
+        Value::Color(value) => value[0],
+        Value::Shader(_) => default,
+    }
+}
+
+fn source_value_vector(value: Value, default: DVec3) -> DVec3 {
+    match value {
+        Value::Scalar(value) => DVec3::splat(value),
+        Value::Vector(value) => value,
+        Value::Color(value) => DVec3::new(value[0], value[1], value[2]),
+        Value::Shader(_) => default,
+    }
+}
+
+fn source_value_color(value: Value, default: [f32; 3]) -> [f32; 3] {
+    match value {
+        Value::Scalar(value) => [value as f32; 3],
+        Value::Vector(value) => value.to_array().map(|component| component as f32),
+        Value::Color(value) => [value[0] as f32, value[1] as f32, value[2] as f32],
+        Value::Shader(_) => default,
+    }
+}
+
+fn source_color_value(value: &JsonValue, default: [f32; 3]) -> [f32; 3] {
+    let color = color(
+        value,
+        [
+            f64::from(default[0]),
+            f64::from(default[1]),
+            f64::from(default[2]),
+            1.0,
+        ],
+    );
+    [color[0] as f32, color[1] as f32, color[2] as f32]
+}
+
 /// Static EEVEE surface flags produced by source node compilers.
 #[derive(Clone, Copy, Default)]
 struct EeveeSurfaceFlags {
@@ -7802,62 +8731,73 @@ impl EeveeSurfaceFlags {
     }
 }
 
-/// Evaluates source EEVEE material flags only for nodes that reach the active Surface output.
+/// Evaluates Source EEVEE transparency/holdout flags on the same inlined surface graph.
 fn graph_eevee_surface_flags(
     graph_id: &Id,
     group: &NodeGroup,
     node_groups: &Registry<NodeGroup>,
+    fold_index: &super::inline_fold::FoldIndex,
     output: &Id,
+    material: &Material,
+    fold_failure: &RefCell<Option<SourceFoldFailure>>,
 ) -> EeveeSurfaceFlags {
-    let mut group_stack = BTreeSet::new();
-    group_stack.insert(graph_id.clone());
-    graph_eevee_surface_flags_output(group, node_groups, output, "Surface", &mut group_stack)
+    let mut group_stack = BTreeSet::from([graph_id.clone()]);
+    graph_eevee_surface_flags_output(
+        group,
+        node_groups,
+        fold_index,
+        output,
+        "Surface",
+        &mut group_stack,
+        None,
+        material,
+        fold_failure,
+    )
 }
 
 fn graph_eevee_surface_flags_output(
     group: &NodeGroup,
     node_groups: &Registry<NodeGroup>,
+    fold_index: &super::inline_fold::FoldIndex,
     output: &Id,
     output_socket: &str,
     group_stack: &mut BTreeSet<Id>,
+    input_binding: Option<&GroupInputBinding<'_>>,
+    material: &Material,
+    fold_failure: &RefCell<Option<SourceFoldFailure>>,
 ) -> EeveeSurfaceFlags {
-    let reachable = nodes_reaching_socket(group, output, output_socket);
-    let linked = |node: &Id, socket: &str| {
-        group
-            .links
-            .iter()
-            .any(|link| link.to_node == *node && link.to_socket == socket)
+    let source = SourceFoldResolver {
+        group,
+        node_groups,
+        material,
+        fold_index,
+        input_binding,
+        failure: fold_failure,
     };
+    let reachable = source_nodes_reaching_socket(&source, output, output_socket);
     let mut flags = EeveeSurfaceFlags::default();
-    for (id, node) in &group.nodes {
-        if !reachable.contains(id) {
+    for node_id in &reachable {
+        let Some(node) = group.nodes.get(node_id) else {
+            continue;
+        };
+        if node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true) {
             continue;
         }
         match node.node_type.as_str() {
             "ShaderNodeBsdfTransparent" => {
-                let color = node.inputs.get("Color").map_or([1.0; 4], |value| {
-                    color(value, [1.0; 4]).map(|channel| channel as f32)
-                });
-                let color_linked = linked(id, "Color");
-                flags.transparent |=
-                    color_linked || color[..3].iter().any(|channel| *channel != 0.0);
+                let (color_linked, color) = source.color_input(node_id, node, "Color", [1.0; 3]);
+                flags.transparent |= color_linked || color.iter().any(|channel| *channel != 0.0);
                 // GPUNodeStack::might_be_tinted() is exactly link || unequal RGB components.
                 flags.transparent_maybe_colored |=
                     color_linked || color_might_be_tinted(&[color[0], color[1], color[2]]);
             }
             "ShaderNodeBsdfPrincipled" => {
-                flags.transparent |= linked(id, "Alpha")
-                    || node
-                        .inputs
-                        .get("Alpha")
-                        .is_some_and(|value| number(value, 1.0).total_cmp(&1.0).is_ne());
+                let (linked, alpha) = source.scalar_input(node_id, node, "Alpha", 1.0);
+                flags.transparent |= linked || (alpha as f32).total_cmp(&1.0).is_ne();
             }
             "ShaderNodeBsdfRayPortal" => {
-                let color = node.inputs.get("Color").map_or([1.0; 4], |value| {
-                    color(value, [1.0; 4]).map(|channel| channel as f32)
-                });
-                flags.transparent |=
-                    linked(id, "Color") || color[..3].iter().any(|channel| *channel != 0.0);
+                let (linked, color) = source.color_input(node_id, node, "Color", [1.0; 3]);
+                flags.transparent |= linked || color.iter().any(|channel| *channel != 0.0);
             }
             "ShaderNodeHoldout" => flags.has_holdout = true,
             _ => {}
@@ -7868,7 +8808,9 @@ fn graph_eevee_surface_flags_output(
         let Some(node) = group.nodes.get(node_id) else {
             continue;
         };
-        if node.node_type != "ShaderNodeGroup" {
+        if node.node_type != "ShaderNodeGroup"
+            || node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true)
+        {
             continue;
         }
         let Some(child_name) = node.properties.get("node_tree").and_then(JsonValue::as_str) else {
@@ -7884,10 +8826,14 @@ fn graph_eevee_surface_flags_output(
             group_stack.remove(child_id);
             continue;
         };
+        let Some(child_fold_index) = fold_index.children.get(node_id) else {
+            group_stack.remove(child_id);
+            continue;
+        };
         for link in group.links.iter().filter(|link| {
             link.from_node == *node_id
                 && (reachable.contains(&link.to_node)
-                    || (link.to_node == *output && link.to_socket == output_socket))
+                    || (link.to_node == *output && socket_matches(&link.to_socket, output_socket)))
         }) {
             let Some(interface_output) =
                 child.interface.outputs.iter().find(|socket| {
@@ -7896,12 +8842,23 @@ fn graph_eevee_surface_flags_output(
             else {
                 continue;
             };
+            let binding = GroupInputBinding {
+                group,
+                node_id,
+                binding: input_binding,
+                links: Some(fold_index),
+                depth: input_binding.map_or(0, |binding| binding.depth.saturating_add(1)),
+            };
             flags.merge(graph_eevee_surface_flags_output(
                 child,
                 node_groups,
+                child_fold_index,
                 child_output,
                 &interface_output.name,
                 group_stack,
+                Some(&binding),
+                material,
+                fold_failure,
             ));
         }
         group_stack.remove(child_id);
@@ -8804,6 +9761,19 @@ mod tests {
         SheenDistribution, SubsurfaceMethod, SurfaceShading, ToonComponent, Value as ShaderValue,
         color_lerp, evaluate_displacement, evaluate_surface, layer_index, layer_uv,
     };
+
+    #[test]
+    fn source_float_equality_preserves_exact_zero_and_nan_behavior() {
+        assert!(super::source_float_eq(0.0, -0.0));
+        assert!(super::source_float_eq(-0.0, 0.0));
+        assert!(super::source_float_eq(1.0, 1.0));
+        assert!(!super::source_float_eq(
+            1.0,
+            f32::from_bits(1.0_f32.to_bits() + 1),
+        ));
+        assert!(!super::source_float_eq(f32::NAN, f32::NAN));
+    }
+
     fn set_properties(group: &mut NodeGroup, id: &str, properties: Value) {
         let Value::Object(properties) = properties else {
             unreachable!("shader test properties must be an object")
@@ -10376,6 +11346,485 @@ mod tests {
 
     fn is_transparent(graph: NodeGroup) -> bool {
         prepared_material(graph).is_transparent()
+    }
+
+    #[test]
+    fn source_folded_math_vector_mix_chain_prunes_the_compiled_shader_arm() {
+        let mut graph = NodeGroup::new("Folded Mix Branch", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "transparent",
+            "ShaderNodeBsdfTransparent",
+            json!({}),
+        );
+        insert_node(&mut graph, "diffuse", "ShaderNodeBsdfDiffuse", json!({}));
+        insert_node(&mut graph, "mix_shader", "ShaderNodeMixShader", json!({}));
+        insert_node(
+            &mut graph,
+            "math",
+            "ShaderNodeMath",
+            json!({"Value":0.5,"Value_001":0.5}),
+        );
+        set_properties(&mut graph, "math", json!({"operation":"ADD"}));
+        insert_node(
+            &mut graph,
+            "mix",
+            "ShaderNodeMix",
+            json!({
+                "A_Vector":[0.0,0.0,0.0],
+                "B_Vector":[1.0,0.0,0.0],
+                "Factor_Float":0.5
+            }),
+        );
+        set_properties(
+            &mut graph,
+            "mix",
+            json!({"data_type":"VECTOR","factor_mode":"NON_UNIFORM"}),
+        );
+        insert_node(
+            &mut graph,
+            "length",
+            "ShaderNodeVectorMath",
+            json!({"Vector_001":[0.0,0.0,0.0]}),
+        );
+        set_properties(&mut graph, "length", json!({"operation":"LENGTH"}));
+        link(&mut graph, "math", "Value", "mix", "Factor_Vector");
+        link(&mut graph, "mix", "Result_Vector", "length", "Vector");
+        link(&mut graph, "transparent", "BSDF", "mix_shader", "Shader");
+        link(&mut graph, "diffuse", "BSDF", "mix_shader", "Shader_001");
+        link(&mut graph, "length", "Value", "mix_shader", "Fac");
+        link(&mut graph, "mix_shader", "Shader", "output", "Surface");
+
+        let flags = prepared_material(graph).eevee_closure_flags().unwrap();
+        assert_ne!(flags & super::EEVEE_CLOSURE_DIFFUSE, 0);
+        assert_eq!(flags & super::EEVEE_CLOSURE_TRANSPARENCY, 0);
+    }
+
+    #[test]
+    fn source_linked_runtime_mix_control_keeps_both_compiled_shader_arms() {
+        let mut graph = NodeGroup::new("Linked Mix Branch", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "transparent",
+            "ShaderNodeBsdfTransparent",
+            json!({}),
+        );
+        insert_node(&mut graph, "diffuse", "ShaderNodeBsdfDiffuse", json!({}));
+        insert_node(&mut graph, "mix", "ShaderNodeMixShader", json!({}));
+        insert_node(&mut graph, "object", "ShaderNodeObjectInfo", json!({}));
+        link(&mut graph, "transparent", "BSDF", "mix", "Shader");
+        link(&mut graph, "diffuse", "BSDF", "mix", "Shader_001");
+        link(&mut graph, "object", "Random", "mix", "Fac");
+        link(&mut graph, "mix", "Shader", "output", "Surface");
+
+        let flags = prepared_material(graph).eevee_closure_flags().unwrap();
+        assert_ne!(flags & super::EEVEE_CLOSURE_DIFFUSE, 0);
+        assert_ne!(flags & super::EEVEE_CLOSURE_TRANSPARENCY, 0);
+    }
+
+    #[test]
+    fn source_group_invocation_alias_and_factor_clamp_select_mix_branch() {
+        let prepared_for_factor = |factor: f64| {
+            let root_id = Id::new("group_mix_root".to_owned()).unwrap();
+            let child_id = Id::new("group_mix_child".to_owned()).unwrap();
+            let mut child = NodeGroup::new("Grouped Mix", GraphKind::Shader);
+            child.interface.inputs.push(GraphSocket {
+                id: "factor_input".to_owned(),
+                name: "Factor".to_owned(),
+                socket_type: "NodeSocketFloat".to_owned(),
+                default: json!(0.5),
+            });
+            child.interface.outputs.push(GraphSocket {
+                id: "surface_output".to_owned(),
+                name: "Surface".to_owned(),
+                socket_type: "NodeSocketShader".to_owned(),
+                default: Value::Null,
+            });
+            insert_node(&mut child, "group_input", "NodeGroupInput", json!({}));
+            insert_node(&mut child, "group_output", "NodeGroupOutput", json!({}));
+            set_properties(&mut child, "group_output", json!({"is_active_output":true}));
+            insert_node(
+                &mut child,
+                "transparent",
+                "ShaderNodeBsdfTransparent",
+                json!({}),
+            );
+            insert_node(&mut child, "diffuse", "ShaderNodeBsdfDiffuse", json!({}));
+            insert_node(&mut child, "mix", "ShaderNodeMixShader", json!({}));
+            link(&mut child, "group_input", "Factor", "mix", "Fac");
+            link(&mut child, "transparent", "BSDF", "mix", "Shader");
+            link(&mut child, "diffuse", "BSDF", "mix", "Shader_001");
+            link(&mut child, "mix", "Shader", "group_output", "Surface");
+
+            let mut root = NodeGroup::new("Group Mix Root", GraphKind::Shader);
+            insert_node(&mut root, "output", "ShaderNodeOutputMaterial", json!({}));
+            insert_node(
+                &mut root,
+                "group",
+                "ShaderNodeGroup",
+                json!({"Factor":factor}),
+            );
+            set_properties(&mut root, "group", json!({"node_tree":child_id.as_str()}));
+            link(&mut root, "group", "surface_output", "output", "Surface");
+
+            let mut groups = Registry::new();
+            groups.insert(child_id, child);
+            groups.insert(root_id.clone(), root);
+            let material = Material {
+                node_tree: Some(root_id),
+                ..Material::default()
+            };
+            let prepared = PreparedMaterial::new(&material, &groups);
+            (
+                prepared.eevee_closure_flags().unwrap(),
+                prepared.is_transparent(),
+            )
+        };
+
+        let (inside, inside_transparent) = prepared_for_factor(0.9999);
+        let (clamped, clamped_transparent) = prepared_for_factor(1.0001);
+        assert_ne!(inside & super::EEVEE_CLOSURE_TRANSPARENCY, 0);
+        assert!(inside_transparent);
+        assert_eq!(clamped & super::EEVEE_CLOSURE_TRANSPARENCY, 0);
+        assert!(!clamped_transparent);
+    }
+
+    #[test]
+    fn dangling_values_fall_back_at_group_input_and_group_output_boundaries() {
+        let group_input_result = {
+            let root_id = Id::new("dangling_input_root".to_owned()).unwrap();
+            let child_id = Id::new("dangling_input_child".to_owned()).unwrap();
+            let mut child = NodeGroup::new("Dangling Group Input", GraphKind::Shader);
+            child.interface.inputs.push(GraphSocket {
+                id: "alpha_input".to_owned(),
+                name: "Alpha".to_owned(),
+                socket_type: "NodeSocketFloat".to_owned(),
+                default: json!(1.0),
+            });
+            child.interface.outputs.push(GraphSocket {
+                id: "surface_output".to_owned(),
+                name: "Surface".to_owned(),
+                socket_type: "NodeSocketShader".to_owned(),
+                default: Value::Null,
+            });
+            insert_node(&mut child, "group_input", "NodeGroupInput", json!({}));
+            insert_node(&mut child, "group_output", "NodeGroupOutput", json!({}));
+            set_properties(&mut child, "group_output", json!({"is_active_output":true}));
+            insert_node(
+                &mut child,
+                "principled",
+                "ShaderNodeBsdfPrincipled",
+                json!({"Alpha":1.0}),
+            );
+            link(&mut child, "group_input", "Alpha", "principled", "Alpha");
+            link(&mut child, "principled", "BSDF", "group_output", "Surface");
+
+            let mut root = NodeGroup::new("Dangling Group Input Root", GraphKind::Shader);
+            insert_node(&mut root, "output", "ShaderNodeOutputMaterial", json!({}));
+            insert_node(&mut root, "group", "ShaderNodeGroup", json!({"Alpha":0.4}));
+            set_properties(&mut root, "group", json!({"node_tree":child_id.as_str()}));
+            insert_node(
+                &mut root,
+                "muted",
+                "ShaderNodeMix",
+                json!({
+                    "Factor_Float":0.25,
+                    "A_Float":1.0,
+                    "B_Float":0.95
+                }),
+            );
+            set_properties(
+                &mut root,
+                "muted",
+                json!({
+                    "mute":true,
+                    "data_type":"FLOAT",
+                    "internal_links":[{"from_socket":"A_Float","to_socket":"Result_Float"}]
+                }),
+            );
+            link(&mut root, "muted", "Result_Float", "group", "Alpha");
+            link(&mut root, "group", "surface_output", "output", "Surface");
+
+            let mut groups = Registry::new();
+            groups.insert(child_id, child);
+            groups.insert(root_id.clone(), root);
+            let material = Material {
+                node_tree: Some(root_id),
+                ..Material::default()
+            };
+            let prepared = PreparedMaterial::new(&material, &groups);
+            (
+                prepared.eevee_closure_flags().unwrap(),
+                prepared.is_transparent(),
+            )
+        };
+        assert_ne!(group_input_result.0 & super::EEVEE_CLOSURE_TRANSPARENCY, 0);
+        assert!(group_input_result.1);
+
+        let group_output_result = {
+            let root_id = Id::new("dangling_output_root".to_owned()).unwrap();
+            let child_id = Id::new("dangling_output_child".to_owned()).unwrap();
+            let mut child = NodeGroup::new("Dangling Group Output", GraphKind::Shader);
+            child.interface.outputs.push(GraphSocket {
+                id: "alpha_output".to_owned(),
+                name: "Alpha".to_owned(),
+                socket_type: "NodeSocketFloat".to_owned(),
+                default: json!(0.4),
+            });
+            insert_node(
+                &mut child,
+                "group_output",
+                "NodeGroupOutput",
+                json!({"Alpha":0.4}),
+            );
+            set_properties(&mut child, "group_output", json!({"is_active_output":true}));
+            insert_node(
+                &mut child,
+                "muted",
+                "ShaderNodeMix",
+                json!({
+                    "Factor_Float":0.25,
+                    "A_Float":1.0,
+                    "B_Float":0.95
+                }),
+            );
+            set_properties(
+                &mut child,
+                "muted",
+                json!({
+                    "mute":true,
+                    "data_type":"FLOAT",
+                    "internal_links":[{"from_socket":"A_Float","to_socket":"Result_Float"}]
+                }),
+            );
+            link(&mut child, "muted", "Result_Float", "group_output", "Alpha");
+
+            let mut root = NodeGroup::new("Dangling Group Output Root", GraphKind::Shader);
+            insert_node(&mut root, "output", "ShaderNodeOutputMaterial", json!({}));
+            insert_node(
+                &mut root,
+                "principled",
+                "ShaderNodeBsdfPrincipled",
+                json!({"Alpha":1.0}),
+            );
+            insert_node(&mut root, "group", "ShaderNodeGroup", json!({}));
+            set_properties(&mut root, "group", json!({"node_tree":child_id.as_str()}));
+            link(&mut root, "group", "alpha_output", "principled", "Alpha");
+            link(&mut root, "principled", "BSDF", "output", "Surface");
+
+            let mut groups = Registry::new();
+            groups.insert(child_id, child);
+            groups.insert(root_id.clone(), root);
+            let material = Material {
+                node_tree: Some(root_id),
+                ..Material::default()
+            };
+            let prepared = PreparedMaterial::new(&material, &groups);
+            (
+                prepared.eevee_closure_flags().unwrap(),
+                prepared.is_transparent(),
+            )
+        };
+        assert_ne!(group_output_result.0 & super::EEVEE_CLOSURE_TRANSPARENCY, 0);
+        assert!(group_output_result.1);
+    }
+
+    #[test]
+    fn source_folded_values_drive_principled_and_transparent_color_flags() {
+        let mut principled = NodeGroup::new("Folded Principled Input", GraphKind::Shader);
+        insert_node(
+            &mut principled,
+            "output",
+            "ShaderNodeOutputMaterial",
+            json!({}),
+        );
+        insert_node(
+            &mut principled,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({"Coat Weight":0.0}),
+        );
+        insert_node(
+            &mut principled,
+            "weight",
+            "ShaderNodeMath",
+            json!({"Value":0.25,"Value_001":0.5}),
+        );
+        set_properties(&mut principled, "weight", json!({"operation":"ADD"}));
+        link(
+            &mut principled,
+            "weight",
+            "Value",
+            "principled",
+            "Coat Weight",
+        );
+        link(&mut principled, "principled", "BSDF", "output", "Surface");
+        assert_ne!(
+            prepared_material(principled).eevee_closure_flags().unwrap()
+                & super::EEVEE_CLOSURE_CLEARCOAT,
+            0
+        );
+
+        for node_type in ["ShaderNodeBsdfTransparent", "ShaderNodeBsdfRayPortal"] {
+            let mut graph = NodeGroup::new("Folded BSDF Color", GraphKind::Shader);
+            insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+            insert_node(
+                &mut graph,
+                "bsdf",
+                node_type,
+                json!({"Color":[1.0,1.0,1.0,1.0]}),
+            );
+            insert_node(
+                &mut graph,
+                "black",
+                "ShaderNodeMix",
+                json!({
+                    "Factor_Float":0.5,
+                    "A_Color":[0.0,0.0,0.0,1.0],
+                    "B_Color":[0.0,0.0,0.0,1.0]
+                }),
+            );
+            set_properties(&mut graph, "black", json!({"data_type":"RGBA"}));
+            link(&mut graph, "black", "Result_Color", "bsdf", "Color");
+            link(&mut graph, "bsdf", "BSDF", "output", "Surface");
+            let prepared = prepared_material(graph);
+            assert_eq!(
+                prepared.eevee_closure_flags().unwrap() & super::EEVEE_CLOSURE_TRANSPARENCY,
+                0
+            );
+            assert!(!prepared.is_transparent());
+        }
+    }
+
+    #[test]
+    fn source_reroutes_and_muted_internal_links_preserve_primitive_outputs() {
+        let mut graph = NodeGroup::new("Primitive Pass Through", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "transparent",
+            "ShaderNodeBsdfTransparent",
+            json!({}),
+        );
+        insert_node(&mut graph, "diffuse", "ShaderNodeBsdfDiffuse", json!({}));
+        insert_node(&mut graph, "mix_shader", "ShaderNodeMixShader", json!({}));
+        insert_node(
+            &mut graph,
+            "math",
+            "ShaderNodeMath",
+            json!({"Value":0.5,"Value_001":0.5}),
+        );
+        set_properties(&mut graph, "math", json!({"operation":"ADD"}));
+        insert_node(&mut graph, "reroute", "NodeReroute", json!({"Input":0.0}));
+        insert_node(
+            &mut graph,
+            "muted",
+            "ShaderNodeMix",
+            json!({
+                "Factor_Float":0.25,
+                "A_Float":0.0,
+                "B_Float":0.95
+            }),
+        );
+        set_properties(
+            &mut graph,
+            "muted",
+            json!({
+                "mute":true,
+                "data_type":"FLOAT",
+                "internal_links":[{"from_socket":"A_Float","to_socket":"Result_Float"}]
+            }),
+        );
+        link(&mut graph, "math", "Value", "reroute", "Input");
+        link(&mut graph, "reroute", "Output", "muted", "A_Float");
+        link(&mut graph, "transparent", "BSDF", "mix_shader", "Shader");
+        link(&mut graph, "diffuse", "BSDF", "mix_shader", "Shader_001");
+        link(&mut graph, "muted", "Result_Float", "mix_shader", "Fac");
+        link(&mut graph, "mix_shader", "Shader", "output", "Surface");
+
+        let prepared = prepared_material(graph);
+        assert_ne!(
+            prepared.eevee_closure_flags().unwrap() & super::EEVEE_CLOSURE_DIFFUSE,
+            0
+        );
+        assert_eq!(
+            prepared.eevee_closure_flags().unwrap() & super::EEVEE_CLOSURE_TRANSPARENCY,
+            0
+        );
+        assert!(!prepared.is_transparent());
+    }
+
+    #[test]
+    fn dangling_muted_output_uses_the_nonmuted_sink_default() {
+        let mut graph = NodeGroup::new("Dangling Muted Input", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({"Alpha":0.4}),
+        );
+        insert_node(
+            &mut graph,
+            "muted",
+            "ShaderNodeMix",
+            json!({
+                "Factor_Float":0.25,
+                "A_Float":1.0,
+                "B_Float":0.95
+            }),
+        );
+        set_properties(
+            &mut graph,
+            "muted",
+            json!({
+                "mute":true,
+                "data_type":"FLOAT",
+                "internal_links":[{"from_socket":"A_Float","to_socket":"Result_Float"}]
+            }),
+        );
+        link(&mut graph, "muted", "Result_Float", "principled", "Alpha");
+        link(&mut graph, "principled", "BSDF", "output", "Surface");
+
+        let prepared = prepared_material(graph);
+        assert_ne!(
+            prepared.eevee_closure_flags().unwrap() & super::EEVEE_CLOSURE_TRANSPARENCY,
+            0
+        );
+        assert!(prepared.is_transparent());
+    }
+
+    #[test]
+    fn unsupported_source_primitive_fold_is_not_reported_as_a_linked_value() {
+        let mut graph = NodeGroup::new("Unsupported Native Primitive", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "transparent",
+            "ShaderNodeBsdfTransparent",
+            json!({}),
+        );
+        insert_node(&mut graph, "diffuse", "ShaderNodeBsdfDiffuse", json!({}));
+        insert_node(&mut graph, "mix", "ShaderNodeMixShader", json!({}));
+        insert_node(
+            &mut graph,
+            "radial",
+            "ShaderNodeRadialTiling",
+            json!({"Vector":[1.0,0.0,0.0],"Sides":5.0,"Roundness":0.0}),
+        );
+        link(&mut graph, "transparent", "BSDF", "mix", "Shader");
+        link(&mut graph, "diffuse", "BSDF", "mix", "Shader_001");
+        link(&mut graph, "radial", "Segment ID", "mix", "Fac");
+        link(&mut graph, "mix", "Shader", "output", "Surface");
+
+        let error = prepared_material(graph).eevee_closure_flags().unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            error.details["feature_id"].as_str(),
+            Some("shader.node.ShaderNodeRadialTiling")
+        );
     }
 
     #[test]

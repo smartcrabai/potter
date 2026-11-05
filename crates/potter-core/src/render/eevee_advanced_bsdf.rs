@@ -263,7 +263,7 @@ fn f64_is_one(value: f64) -> bool {
     value.to_bits() == 1.0_f64.to_bits()
 }
 
-/// EEVEE's Principled and standalone Subsurface radius, including its legacy `4π` random-walk factor.
+/// EEVEE's Principled and standalone Subsurface radius, including its legacy `4*pi` random-walk factor.
 pub(crate) fn eevee_subsurface_radius(params: &BsdfParams) -> Option<[f64; 3]> {
     let has_subsurface = match params.model {
         BsdfModel::Subsurface => true,
@@ -340,6 +340,20 @@ pub(crate) fn eevee_gbuffer_normal(normal: DVec3) -> DVec3 {
         f64::from(y / length),
         f64::from(z / length),
     )
+}
+
+/// EEVEE's `AdditionalInfo` thickness roundtrip through its `UNORM_16_16` attachment.
+pub(crate) fn eevee_gbuffer_thickness(thickness: Thickness) -> Thickness {
+    let (value, slab) = match thickness {
+        Thickness::None => (0.0_f32, true), // Source `Thickness::zero()` reports Slab.
+        Thickness::Sphere(value) => (value as f32, false),
+        Thickness::Slab(value) => (value as f32, true),
+    };
+    let packed = value / (1.0 + 2.0 * value);
+    let packed = quantize_unorm(if slab { 1.0 - packed } else { packed }, 65_535);
+    let value = if packed > 0.5 { 1.0 - packed } else { packed };
+    let value = value / (1.0 - 2.0 * value);
+    Thickness::new(f64::from(value), packed > 0.5)
 }
 
 /// EEVEE's G-buffer `closure_color_pack` roundtrip for a closure color stored at this data layer.
@@ -936,9 +950,10 @@ fn quantize_unsigned_float(value: f32, mantissa_bits: u32) -> f32 {
 }
 #[cfg(test)]
 mod gbuffer_tests {
+    use super::super::eevee_transmission::Thickness;
     use super::{
         EeveeGBufferContext, eevee_gbuffer_ior, eevee_gbuffer_normal, eevee_gbuffer_roughness,
-        eevee_subsurface_gbuffer_profile,
+        eevee_gbuffer_thickness, eevee_subsurface_gbuffer_profile,
     };
     use glam::DVec3;
 
@@ -983,6 +998,27 @@ mod gbuffer_tests {
         let normal = eevee_gbuffer_normal(DVec3::new(0.06, 0.02, 0.998));
         let expected = DVec3::new(0.059_988_83, 0.019_985_31, 0.997_999);
         assert!(normal.distance(expected) < 2.0e-6);
+    }
+
+    #[test]
+    fn thickness_matches_additional_info_unorm16_roundtrip() {
+        // Blender stores the slab input as UNORM16 code 45133 before unpacking in f32.
+        assert_eq!(
+            eevee_gbuffer_thickness(Thickness::Slab(0.825)),
+            Thickness::Slab(f64::from(f32::from_bits(1_062_416_476)))
+        );
+        assert_eq!(
+            eevee_gbuffer_thickness(Thickness::Sphere(0.825)),
+            Thickness::Sphere(f64::from(f32::from_bits(1_062_416_473)))
+        );
+        assert_eq!(
+            eevee_gbuffer_thickness(Thickness::Sphere(1.0e-6)),
+            Thickness::None
+        );
+        assert_eq!(
+            eevee_gbuffer_thickness(Thickness::Slab(1.0e-6)),
+            Thickness::None
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@
       "eevee_sigma": 0.0020656468108460084,
       "eevee_standard_error": 0.000730316433742789,
       "eevee_offset_from_exact": 0.009559763213734584,
-      "runtime_assertion": "The realtime_transparent_tint integration test compares Potter against the same-build 64x64, 16-sample DITHERED source render with seed 0 and the existing half-float patch bound. The mean over independent y-shifts remains diagnostic, not the per-frame reference.",
+      "runtime_assertion": "BLENDED and MIX are asserted against their measured patch means within each method's tolerance. DITHERED is printed as a diagnostic beside the same-build 64x64, 16-sample source render with seed 0 (Metal fast-math dither hash), not asserted. The mean over independent y-shifts remains diagnostic, not the per-frame reference.",
       "mechanism": "EEVEE 5.2.2's depth prepass discards a fragment when average(g_transmittance) > alpha_threshold. The threshold uses primitive-interpolated world P, max(length(dFdx(P)), length(dFdy(P))), log-discretized Wyman-McGuire 3D hashes, a CDF interpolation, and a base-7 Halton jitter at sample+1 (`eevee_surf_depth.bsl.hh`, `eevee_transparency.bsl.hh`, `eevee_sampling.cc`). Final renders use alpha_hash_scale 0.1 (`eevee_pipeline.cc`); the film then accumulates kept samples with its source filter."
     }
   }

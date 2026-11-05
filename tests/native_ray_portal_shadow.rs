@@ -237,7 +237,7 @@ fn ray_portal_mesh_shadow_matches_cycles_capture() -> TestResult {
                 "Potter alpha remains opaque for {name} seed {seed}"
             );
             eprintln!(
-                "{name} seed {seed}: Blender diagnostic ratio {source_rgb:?} ± {source_stderr:?}; Potter ratio {actual_rgb:?} ± {actual_stderr:?}"
+                "{name} seed {seed}: Blender diagnostic ratio {source_rgb:?} +/- {source_stderr:?}; Potter ratio {actual_rgb:?} +/- {actual_stderr:?}"
             );
         }
     }
@@ -299,7 +299,7 @@ fn ray_portal_mesh_shadow_matches_cycles_capture() -> TestResult {
             let error = (ratio[channel] - analytic[channel]).abs();
             assert!(
                 error <= ratio_floor,
-                "Potter {name} channel {channel}: RGB ratio {} differs from source closure ratio {} by {error}, exceeding source-derived gamma_n/output budget {ratio_floor} ({} samples × {PATH_MAX_RGB_FILM_ADDITIONS_PER_SAMPLE} additions, gamma_n={gamma_n})",
+                "Potter {name} channel {channel}: RGB ratio {} differs from source closure ratio {} by {error}, exceeding source-derived gamma_n/output budget {ratio_floor} ({} samples x {PATH_MAX_RGB_FILM_ADDITIONS_PER_SAMPLE} additions, gamma_n={gamma_n})",
                 ratio[channel],
                 analytic[channel],
                 SAMPLES * PATH_MAX_RGB_FILM_ADDITIONS_PER_SAMPLE,

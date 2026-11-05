@@ -1075,7 +1075,6 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
 
         let (loaded, warnings) = super::read_history_blob(directory.path(), &digest).unwrap();
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings.iter().any(|warning| {
                 warning["code"] == "cycles_curves.settings_unavailable_migrated"

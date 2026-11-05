@@ -838,6 +838,8 @@ pub(crate) struct Layers {
     sheen: SheenLobe,
     pub(crate) lower: DVec3,
     glass: Option<GlassLobe>,
+    /// Cycles' glossy blur alpha (`bsdf_blur`) for the standalone microfacets and the principled hair; zero when unblurred.
+    pub(crate) glossy_blur_alpha: f64,
 }
 
 /// Sets up the sheen and coat layers of a shading point with normal `normal`, seen along `view`. The geometric normal
@@ -894,6 +896,7 @@ pub(crate) fn layers_at(
         sheen,
         lower,
         glass,
+        glossy_blur_alpha: 0.0,
     }
 }
 
@@ -951,6 +954,7 @@ impl Layers {
     pub(crate) fn blurred(&self, blur_alpha: f64) -> Self {
         let mut layers = *self;
         layers.specular_microfacet = layers.specular_microfacet.blurred(blur_alpha);
+        layers.glossy_blur_alpha = layers.glossy_blur_alpha.max(blur_alpha);
         if let Some(coat) = &mut layers.coat {
             coat.roughness = coat.roughness.powi(2).max(blur_alpha).sqrt();
         }
@@ -2307,8 +2311,7 @@ pub(crate) fn standalone_eval(params: &BsdfParams, layers: &Layers, light: DVec3
             );
             let cosine = layers.specular.dot(light).abs();
             if cosine > 0.0 {
-                cosine_weighted * standalone_metallic_gain(params, metallic, microfacet, layers)
-                    / cosine
+                cosine_weighted * standalone_metallic_gain(params, metallic, layers) / cosine
             } else {
                 DVec3::ZERO
             }
@@ -2411,7 +2414,7 @@ fn standalone_metallic_selection_weight(
     layers: &Layers,
     metallic: MetallicParameters,
 ) -> f64 {
-    let microfacet = standalone_metallic_microfacet(params, layers, metallic.distribution);
+    let microfacet = standalone_metallic_setup_microfacet(params, layers, metallic.distribution);
     let cosine_i = microfacet.normal.dot(layers.view);
     let roughness = (microfacet.alpha_x * microfacet.alpha_y).sqrt().sqrt();
     let estimated_albedo = match metallic.fresnel {
@@ -2424,7 +2427,7 @@ fn standalone_metallic_selection_weight(
     let mut sample_weight = estimated_albedo.element_sum() / 3.0;
     if metallic.distribution == MicrofacetDistribution::MultiGgx {
         let energy = ggx_energy(roughness, cosine_i);
-        let darkening = standalone_metallic_gain(params, metallic, microfacet, layers) * energy;
+        let darkening = standalone_metallic_gain(params, metallic, layers) * energy;
         sample_weight *= darkening.element_sum() / 3.0;
     }
     sample_weight
@@ -2677,7 +2680,11 @@ fn standalone_refraction_microfacet(
     layers: &Layers,
     distribution: MicrofacetDistribution,
 ) -> StandaloneMicrofacet {
-    let alpha = params.roughness.powi(2).clamp(0.0, 1.0);
+    let alpha = params
+        .roughness
+        .powi(2)
+        .clamp(0.0, 1.0)
+        .max(layers.glossy_blur_alpha);
     match distribution {
         MicrofacetDistribution::Beckmann | MicrofacetDistribution::Ggx => {
             StandaloneMicrofacet::isotropic(distribution, layers.specular, alpha)
@@ -2688,7 +2695,9 @@ fn standalone_refraction_microfacet(
     }
 }
 
-fn standalone_metallic_microfacet(
+/// Cycles' setup alpha of a metallic closure, before the glossy blur. Its Fresnel albedo and multiscatter gain are
+/// fixed at setup (`sample_weight`, `energy_scale`), so they read this rather than [`standalone_metallic_microfacet`].
+fn standalone_metallic_setup_microfacet(
     params: &BsdfParams,
     layers: &Layers,
     distribution: MicrofacetDistribution,
@@ -2737,6 +2746,18 @@ fn standalone_metallic_microfacet(
         alpha_y,
         anisotropic: true,
     }
+}
+
+/// The metallic microfacet after Cycles' glossy blur: `bsdf_microfacet_blur` raises both axes to `max(blur, alpha)`.
+fn standalone_metallic_microfacet(
+    params: &BsdfParams,
+    layers: &Layers,
+    distribution: MicrofacetDistribution,
+) -> StandaloneMicrofacet {
+    let mut microfacet = standalone_metallic_setup_microfacet(params, layers, distribution);
+    microfacet.alpha_x = microfacet.alpha_x.max(layers.glossy_blur_alpha);
+    microfacet.alpha_y = microfacet.alpha_y.max(layers.glossy_blur_alpha);
+    microfacet
 }
 
 fn standalone_eta(params: &BsdfParams) -> f64 {
@@ -3496,12 +3517,12 @@ fn f82_tint_b_from_f82(f0: DVec3, f82: DVec3) -> DVec3 {
 fn standalone_metallic_gain(
     params: &BsdfParams,
     metallic: MetallicParameters,
-    microfacet: StandaloneMicrofacet,
     layers: &Layers,
 ) -> DVec3 {
     if metallic.distribution != MicrofacetDistribution::MultiGgx {
         return DVec3::ONE;
     }
+    let microfacet = standalone_metallic_setup_microfacet(params, layers, metallic.distribution);
     let roughness = (microfacet.alpha_x * microfacet.alpha_y).sqrt().sqrt();
     let energy = ggx_energy(roughness, microfacet.normal.dot(layers.view));
     let missing = (1.0 - energy) / energy;
@@ -3542,7 +3563,7 @@ fn standalone_metallic_sample(
     if singular {
         StandaloneSample::Delta {
             direction,
-            weight: fresnel * standalone_metallic_gain(params, metallic, microfacet, layers),
+            weight: fresnel * standalone_metallic_gain(params, metallic, layers),
             ray: RayKind::Glossy,
             branch_pdf: 1.0,
         }
@@ -3880,6 +3901,44 @@ mod tests {
         params.coat_weight = 0.0;
         let shading = layers(&params, DVec3::Z, view);
         assert!((shading.sheen.normal - DVec3::Z).length() < 1.0e-12);
+    }
+
+    #[test]
+    fn glossy_blur_raises_standalone_refraction_alpha_and_keeps_a_larger_alpha() {
+        let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        params.model = BsdfModel::Refraction(MicrofacetDistribution::Ggx);
+        params.roughness = 0.13;
+        let sharp = layers(&params, DVec3::Z, DVec3::Z);
+        let alpha = |layers: &Layers| {
+            standalone_refraction_microfacet(&params, layers, MicrofacetDistribution::Ggx).alpha_x
+        };
+        assert!((alpha(&sharp) - 0.13_f64.powi(2)).abs() < 1.0e-12);
+        assert_eq!(alpha(&sharp.blurred(0.5)), 0.5);
+        assert!((alpha(&sharp.blurred(0.001)) - 0.13_f64.powi(2)).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn glossy_blur_raises_the_metallic_sampling_alpha_but_not_its_multiscatter_gain() {
+        let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        params.roughness = 0.3;
+        let metallic = MetallicParameters {
+            distribution: MicrofacetDistribution::MultiGgx,
+            fresnel: MetallicFresnel::PhysicalConductor,
+            edge_tint: [1.0; 3],
+            conductor_ior: [1.5; 3],
+            extinction: [1.0; 3],
+        };
+        params.model = BsdfModel::Metallic(metallic);
+        let view = DVec3::new(0.6, 0.0, 0.8);
+        let sharp = layers(&params, DVec3::Z, view);
+        let blurred = sharp.blurred(0.5);
+        let sampling = standalone_metallic_microfacet(&params, &blurred, metallic.distribution);
+        assert_eq!(sampling.alpha_x, 0.5);
+        assert_eq!(sampling.alpha_y, 0.5);
+        assert_eq!(
+            standalone_metallic_gain(&params, metallic, &sharp),
+            standalone_metallic_gain(&params, metallic, &blurred)
+        );
     }
 }
 

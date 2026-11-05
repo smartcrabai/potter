@@ -33,7 +33,7 @@
   "linear_exr": "32-bit RGBA OpenEXR",
   "canonical_material_source": {
     "blend": "path.blend",
-    "sha256": "a1ac3915c57a899cd4c18dccea1715aad4d8c38adda0be23579d2e0fe8b7055f",
+    "sha256": "d10b94245a3b0bdeba8372e65149575d4693c13e14d86770f433d5e8c40d7529",
     "case": "toon_diffuse"
   },
   "world": {
@@ -106,7 +106,7 @@
         1
       ],
       "blend": "toon_diffuse_sun_plateau.blend",
-      "blend_sha256": "ea26b85d399df30040bbadc7ef15461f5581c2cacdfaafe1b7506e9838f65b9f",
+      "blend_sha256": "82af36643894fb2d983623be117380c064bd1d9f2a6d2c9b6a0820f1ceec05a5",
       "seed_captures": [
         {
           "seed": 31,
@@ -172,7 +172,7 @@
         1
       ],
       "blend": "toon_diffuse_sun_mid_smooth.blend",
-      "blend_sha256": "97f2a456c3791d76bac868146fe6a409d5a4f64324a0d2ceaa042d8b91bff7af",
+      "blend_sha256": "fd5941a776dbbcd0ddc142c114a89a1f6b1de33ef34ecc5c37019345a8153f8d",
       "seed_captures": [
         {
           "seed": 31,
@@ -238,7 +238,7 @@
         1
       ],
       "blend": "toon_diffuse_sun_outside.blend",
-      "blend_sha256": "8727fcbeb5e30f2fca1fdb43cb189d663d40cad8677f3ab41820436ed6d13267",
+      "blend_sha256": "172c2ffb1bff30fe3507a787a0e2183eb572aa27ef1750afc9a7bbb75ff5da9e",
       "seed_captures": [
         {
           "seed": 31,

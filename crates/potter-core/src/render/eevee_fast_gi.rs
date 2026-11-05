@@ -156,6 +156,7 @@ impl FastGiSh {
 #[derive(Clone, Copy)]
 pub(crate) struct FastGiResolveClosure {
     pub(crate) bin_index: u8,
+    /// Source closure-apparent roughness for the Fast GI blend.
     pub(crate) roughness: f32,
     /// Source `bxdf_lightprobe_ray(...).dominant_direction`, in world space.
     pub(crate) dominant_direction: Vec3,
@@ -177,8 +178,8 @@ pub(crate) struct FastGiInput<'a> {
     pub(crate) depth: &'a [f32],
     /// `HiZ` values are already converted back from reverse-Z by Blender's `HiZ` build.
     pub(crate) hiz: &'a [FastGiTexture<'a, f32>],
-    /// Previous-frame radiance feedback texture, stored as `SFLOAT_16_16_16_16`.
-    pub(crate) history_radiance: FastGiTexture<'a, [f32; 4]>,
+    /// Previous per-layer feedback texture, stored as `SFLOAT_16_16_16_16`.
+    pub(crate) history_radiance: FastGiTexture<'a, [exr::prelude::f16; 4]>,
     pub(crate) history_valid: bool,
     /// Current world-space `GBuffer` normals and the `GBuffer` non-empty mask.
     pub(crate) world_normals: &'a [[f32; 3]],
@@ -468,7 +469,10 @@ impl FastGiShTexture {
 
     fn store(&mut self, index: usize, sh: FastGiSh) {
         let compressed = sh_compress(sh);
-        self.l0_m0[index] = compressed.l0_m0.to_array().map(f32_to_f16);
+        self.l0_m0[index] = compressed
+            .l0_m0
+            .to_array()
+            .map(super::eevee_raytrace_denoise::store_f16_bits_rtz);
         self.l1_mn1[index] = compressed.l1_mn1.to_array().map(unorm8);
         self.l1_m0[index] = compressed.l1_m0.to_array().map(unorm8);
         self.l1_mp1[index] = compressed.l1_mp1.to_array().map(unorm8);
@@ -519,7 +523,7 @@ fn setup(
             let previous_clip = input.history_view_projection * world_position.extend(1.0);
             let previous_uv = (previous_clip.truncate() / previous_clip.w) * 0.5 + Vec3::splat(0.5);
             let radiance = if input.history_valid {
-                sample_linear_rgba16(input.history_radiance, previous_uv.truncate()).truncate()
+                sample_nearest_rgba16(input.history_radiance, previous_uv.truncate()).truncate()
             } else {
                 Vec3::ZERO
             };
@@ -1099,21 +1103,14 @@ fn sample_nearest<T: Copy>(texture: FastGiTexture<'_, T>, pixel: Vec2) -> T {
     texture.pixels[y as usize * texture.width as usize + x as usize]
 }
 
-fn sample_linear_rgba16(texture: FastGiTexture<'_, [f32; 4]>, uv: Vec2) -> Vec4 {
-    let position = uv * Vec2::new(texture.width as f32, texture.height as f32) - Vec2::splat(0.5);
-    let base = position.floor().as_ivec2();
-    let fraction = position.fract();
-    let sample = |x: i32, y: i32| {
-        let x = x.clamp(0, texture.width as i32 - 1) as u32;
-        let y = y.clamp(0, texture.height as i32 - 1) as u32;
-        Vec4::from_array(
-            texture.pixels[y as usize * texture.width as usize + x as usize]
-                .map(|value| f16_to_f32(f32_to_f16(value))),
-        )
-    };
-    let top = sample(base.x, base.y).lerp(sample(base.x + 1, base.y), fraction.x);
-    let bottom = sample(base.x, base.y + 1).lerp(sample(base.x + 1, base.y + 1), fraction.x);
-    top.lerp(bottom, fraction.y)
+fn sample_nearest_rgba16(texture: FastGiTexture<'_, [exr::prelude::f16; 4]>, uv: Vec2) -> Vec4 {
+    let pixel = uv * Vec2::new(texture.width as f32, texture.height as f32);
+    let x = (pixel.x.floor() as i32).clamp(0, texture.width as i32 - 1) as u32;
+    let y = (pixel.y.floor() as i32).clamp(0, texture.height as i32 - 1) as u32;
+    Vec4::from_array(
+        texture.pixels[y as usize * texture.width as usize + x as usize]
+            .map(exr::prelude::f16::to_f32),
+    )
 }
 
 fn copy_radiance(texture: FastGiTexture<'_, [f32; 3]>) -> Result<FastGiImage<[f32; 3]>> {
@@ -1272,93 +1269,21 @@ fn unorm_bits(value: f32, maximum: u32) -> u32 {
 }
 
 fn pack_ufloat_r11g11b10(rgb: Vec3) -> u32 {
-    f32_to_ufloat(rgb.x, 6) | (f32_to_ufloat(rgb.y, 6) << 11) | (f32_to_ufloat(rgb.z, 5) << 22)
+    super::eevee_transmission::truncate_ufloat_bits(f64::from(rgb.x), 6)
+        | (super::eevee_transmission::truncate_ufloat_bits(f64::from(rgb.y), 6) << 11)
+        | (super::eevee_transmission::truncate_ufloat_bits(f64::from(rgb.z), 5) << 22)
 }
 
 fn unpack_ufloat_r11g11b10(packed: u32) -> Vec3 {
     Vec3::new(
-        ufloat_to_f32(packed & 0x7ff, 6),
-        ufloat_to_f32((packed >> 11) & 0x7ff, 6),
-        ufloat_to_f32((packed >> 22) & 0x3ff, 5),
+        super::eevee_transmission::ufloat_bits_to_f64(packed & 0x7ff, 6) as f32,
+        super::eevee_transmission::ufloat_bits_to_f64((packed >> 11) & 0x7ff, 6) as f32,
+        super::eevee_transmission::ufloat_bits_to_f64((packed >> 22) & 0x3ff, 5) as f32,
     )
 }
 
 fn quantize_radiance(value: Vec3) -> Vec3 {
     unpack_ufloat_r11g11b10(pack_ufloat_r11g11b10(value))
-}
-
-fn f32_to_ufloat(value: f32, mantissa_bits: u32) -> u32 {
-    if value.is_nan() {
-        return (31 << mantissa_bits) | (1 << (mantissa_bits - 1));
-    }
-    if value <= 0.0 {
-        return 0;
-    }
-    if value.is_infinite() {
-        return 31 << mantissa_bits;
-    }
-    let bits = value.to_bits();
-    let exponent_field = (bits >> 23) & 0xff;
-    let (exponent, significand) = if exponent_field == 0 {
-        (-126, bits & 0x7f_ff_ff)
-    } else {
-        (
-            exponent_field as i32 - 127,
-            (bits & 0x7f_ff_ff) | 0x80_00_00,
-        )
-    };
-    let encoded_exponent = exponent + 15;
-    if encoded_exponent <= 0 {
-        let shift = (9 - mantissa_bits as i32 - exponent).max(0) as u32;
-        return round_shift_even(significand, shift).min(1 << mantissa_bits);
-    }
-    if encoded_exponent >= 31 {
-        return 31 << mantissa_bits;
-    }
-    let mut rounded = round_shift_even(significand, 23 - mantissa_bits);
-    let mut output_exponent = encoded_exponent as u32;
-    if rounded >= 1 << (mantissa_bits + 1) {
-        rounded >>= 1;
-        output_exponent += 1;
-    }
-    if output_exponent >= 31 {
-        return 31 << mantissa_bits;
-    }
-    (output_exponent << mantissa_bits) | (rounded - (1 << mantissa_bits))
-}
-
-fn ufloat_to_f32(bits: u32, mantissa_bits: u32) -> f32 {
-    let mantissa = bits & ((1 << mantissa_bits) - 1);
-    let exponent = (bits >> mantissa_bits) & 31;
-    if exponent == 0 {
-        return mantissa as f32 * 2.0_f32.powi(-14 - mantissa_bits as i32);
-    }
-    if exponent == 31 {
-        return if mantissa == 0 {
-            f32::INFINITY
-        } else {
-            f32::NAN
-        };
-    }
-    (1.0 + mantissa as f32 / (1 << mantissa_bits) as f32) * 2.0_f32.powi(exponent as i32 - 15)
-}
-
-fn round_shift_even(value: u32, shift: u32) -> u32 {
-    if shift == 0 {
-        return value;
-    }
-    if shift > 31 {
-        return 0;
-    }
-    let truncated = value >> shift;
-    let remainder = value & ((1 << shift) - 1);
-    let halfway = 1 << (shift - 1);
-    truncated + u32::from(remainder > halfway || (remainder == halfway && truncated & 1 != 0))
-}
-
-fn f32_to_f16(value: f32) -> u16 {
-    let sign = (value.to_bits() >> 16) & 0x8000;
-    (sign | f32_to_ufloat(value.abs(), 10)) as u16
 }
 
 fn f16_to_f32(value: u16) -> f32 {
@@ -1448,4 +1373,101 @@ fn random_in_tile(sample_index: u32, tile_size: u32) -> [u32; 2] {
     hash ^= hash >> 16;
     let code = hash % (tile_size * tile_size);
     [compact_bits(code), compact_bits(code >> 1)]
+}
+#[cfg(test)]
+mod radiance_format_tests {
+    use super::{
+        FastGiSh, FastGiShTexture, FastGiTexture, pack_ufloat_r11g11b10, sample_nearest_rgba16,
+        unpack_ufloat_r11g11b10,
+    };
+    use glam::{Vec3, Vec4};
+
+    #[test]
+    fn fast_gi_radiance_matches_measured_metal_ufloat_truncation() {
+        let exact = pack_ufloat_r11g11b10(Vec3::splat(0.796_875));
+        assert_eq!(exact & 0x7ff, 0x3a6);
+        assert_eq!((exact >> 11) & 0x7ff, 0x3a6);
+        assert_eq!((exact >> 22) & 0x3ff, 0x1d3);
+        assert_eq!(unpack_ufloat_r11g11b10(exact), Vec3::splat(0.796_875));
+
+        let just_below = f32::from_bits(0x3f4b_ffff);
+        let packed = pack_ufloat_r11g11b10(Vec3::splat(just_below));
+        assert_eq!(packed & 0x7ff, 0x3a5);
+        assert_eq!((packed >> 11) & 0x7ff, 0x3a5);
+        assert_eq!((packed >> 22) & 0x3ff, 0x1d2);
+        assert_eq!(
+            unpack_ufloat_r11g11b10(packed),
+            Vec3::new(0.789_062_5, 0.789_062_5, 0.781_25)
+        );
+    }
+
+    #[test]
+    fn fast_gi_radiance_keeps_ufloat_subnormal_and_clamp_policy() {
+        let subnormals = Vec3::new(2.0_f32.powi(-20), 2.0_f32.powi(-20), 2.0_f32.powi(-19));
+        let packed_subnormals = pack_ufloat_r11g11b10(subnormals);
+        assert_eq!(packed_subnormals & 0x7ff, 1);
+        assert_eq!((packed_subnormals >> 11) & 0x7ff, 1);
+        assert_eq!((packed_subnormals >> 22) & 0x3ff, 1);
+        assert_eq!(unpack_ufloat_r11g11b10(packed_subnormals), subnormals);
+
+        let clamped = pack_ufloat_r11g11b10(Vec3::splat(f32::MAX));
+        assert_eq!(clamped & 0x7ff, 0x7bf);
+        assert_eq!((clamped >> 11) & 0x7ff, 0x7bf);
+        assert_eq!((clamped >> 22) & 0x3ff, 0x3df);
+        assert_eq!(
+            unpack_ufloat_r11g11b10(clamped),
+            Vec3::new(65_024.0, 65_024.0, 64_512.0)
+        );
+    }
+
+    #[test]
+    fn fast_gi_sh_l0_store_saturates_like_measured_half_image_store() {
+        let mut texture = FastGiShTexture {
+            width: 1,
+            height: 1,
+            l0_m0: vec![[0; 4]],
+            l1_mn1: vec![[128; 4]],
+            l1_m0: vec![[128; 4]],
+            l1_mp1: vec![[128; 4]],
+        };
+        texture.store(
+            0,
+            FastGiSh {
+                l0_m0: Vec4::splat(65_520.0),
+                l1_mn1: Vec4::ZERO,
+                l1_m0: Vec4::ZERO,
+                l1_mp1: Vec4::ZERO,
+            },
+        );
+        assert_eq!(texture.l0_m0[0], [0x7bff; 4]);
+    }
+    #[test]
+    fn fast_gi_history_uses_nearest_texels_and_clamps_to_edge() {
+        let half = exr::prelude::f16::from_f32;
+        let pixels = [
+            [half(1.0); 4],
+            [half(2.0); 4],
+            [half(3.0); 4],
+            [half(4.0); 4],
+        ];
+        let texture = FastGiTexture {
+            width: 2,
+            height: 2,
+            pixels: &pixels,
+        };
+
+        assert_eq!(
+            sample_nearest_rgba16(texture, glam::Vec2::new(0.49, 0.49)).x,
+            1.0
+        );
+        assert_eq!(
+            sample_nearest_rgba16(texture, glam::Vec2::new(0.5, 0.25)).x,
+            2.0
+        );
+        assert_eq!(
+            sample_nearest_rgba16(texture, glam::Vec2::new(-0.1, -0.1)).x,
+            1.0
+        );
+        assert_eq!(sample_nearest_rgba16(texture, glam::Vec2::ONE).x, 4.0);
+    }
 }

@@ -28,7 +28,9 @@ use native_oracle::{
     TestResult, apply_operations, checked, import_blend, pot, read_scene, run_blender_arguments,
     write_script,
 };
-use potter_core::image::{ImageData, ImageInterpolation, load_image_data, sample};
+use potter_core::image::{
+    ImageData, ImageExtension, ImageInterpolation, load_image_data, sample_with_extension_alpha,
+};
 use potter_core::model::Image;
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -157,11 +159,19 @@ fn potter_realtime_frame(project: &Path, root: &Path, name: &str) -> TestResult<
 }
 
 /// The mean over RGB of the 9 by 9 grid of a rendered frame, as the Blender oracle takes it.
+/// The source uses Blender's bottom-up pixel rows, so the closest lookup must mirror the integer row.
 fn patch_mean(data: &ImageData) -> f64 {
     let mut total = 0.0;
     for v in PATCH {
         for u in PATCH {
-            let pixel = sample(data, [u, v], false);
+            let pixel = sample_with_extension_alpha(
+                data,
+                [u, v],
+                false,
+                ImageInterpolation::Closest,
+                ImageExtension::Repeat,
+                false,
+            );
             total += (pixel[0] + pixel[1] + pixel[2]) / 3.0;
         }
     }

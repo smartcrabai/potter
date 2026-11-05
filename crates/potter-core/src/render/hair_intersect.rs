@@ -20,7 +20,7 @@ pub(crate) struct CurveHit {
 const FLOAT_EPSILON: f64 = f32::EPSILON as f64;
 const PARALLEL_EPSILON: f64 = 1.0e-18;
 
-/// Intersects the segment `keys[1]`–`keys[2]` and its Cycles-clipped endpoint caps.
+/// Intersects the segment `keys[1]`-`keys[2]` and its Cycles-clipped endpoint caps.
 ///
 /// `distance` is the ray parameter in `ray_origin + distance * ray_direction`, not necessarily
 /// metric distance. The direction is intentionally not normalized, matching Cycles' ray parameter.

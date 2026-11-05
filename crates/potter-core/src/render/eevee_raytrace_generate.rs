@@ -45,20 +45,33 @@ impl RayThickness {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RayGenerateInput {
     pub(crate) lobe: RayLobe,
-    /// Decoded G-buffer normal in view space, before transmission-context amendment.
+    /// Decoded G-buffer normal in world space, before transmission-context amendment.
     pub(crate) normal: Vec3,
-    /// Unamended view vector `V`, pointing toward the viewer in view space.
+    /// Unamended world-space view vector `V`, pointing toward the viewer.
     pub(crate) view: Vec3,
     pub(crate) roughness: f32,
     pub(crate) ior: f32,
     pub(crate) thickness: RayThickness,
 }
 
+impl RayGenerateInput {
+    pub(crate) fn apparent_roughness(self) -> f32 {
+        match self.lobe {
+            RayLobe::None => 0.0,
+            RayLobe::Diffuse | RayLobe::Translucent | RayLobe::BurleyBssrdf => 1.0,
+            RayLobe::GgxReflection | RayLobe::ThinGlassTransmission => self.roughness,
+            RayLobe::GgxRefraction => perceived_transmission_roughness(self.roughness, self.ior),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RaySample {
+    /// Sampled ray direction in world space.
     pub(crate) direction: Vec3,
+    /// Source closure PDF for the sampled direction.
     pub(crate) pdf: f32,
-    /// Source transmission entry-to-exit displacement, in the direction's view-space frame.
+    /// Source transmission entry-to-exit displacement in world space.
     pub(crate) origin_offset: Vec3,
 }
 
@@ -68,7 +81,7 @@ pub(crate) enum RayGenerateError {
     NoSampleableClosure,
 }
 
-/// Samples the same view-space direction and PDF as EEVEE's `ray_generate_direction`.
+/// Samples the same world-space direction and PDF as EEVEE's `ray_generate_direction`.
 pub(crate) fn generate_ray(
     input: RayGenerateInput,
     noise: [f32; 2],
@@ -293,12 +306,8 @@ fn amend_transmission_context(
     ior: f32,
     thickness: RayThickness,
 ) -> Vec3 {
-    let perceived_roughness_factor = if ior > 1.0 {
-        1.0 - 1.0 / ior
-    } else {
-        saturate(1.0 - ior) * 0.64
-    };
-    let perceived_roughness = roughness * sqrt_fast(perceived_roughness_factor);
+    let perceived_roughness = perceived_transmission_roughness(roughness, ior);
+
     let direction = dominant_transmission_direction(*normal, *view, ior, perceived_roughness);
     let origin_offset = if thickness.source_mode() == ThicknessMode::Sphere {
         let cos_alpha = direction.dot(-*normal);
@@ -311,6 +320,15 @@ fn amend_transmission_context(
     };
     *view = -direction;
     origin_offset
+}
+
+fn perceived_transmission_roughness(roughness: f32, ior: f32) -> f32 {
+    let perceived_roughness_factor = if ior > 1.0 {
+        1.0 - 1.0 / ior
+    } else {
+        saturate(1.0 - ior) * 0.64
+    };
+    roughness * sqrt_fast(perceived_roughness_factor)
 }
 
 fn dominant_transmission_direction(normal: Vec3, view: Vec3, ior: f32, roughness: f32) -> Vec3 {

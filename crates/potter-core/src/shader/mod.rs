@@ -11,10 +11,13 @@ mod evaluator;
 #[cfg(test)]
 pub(crate) use evaluator::RayPortalParameters;
 pub(crate) use evaluator::{
-    AnisotropyModel, BsdfModel, GeometryAttribute, GeometryAttributeValues, GlassDistribution,
-    HairComponent, HairParameters, HairParametrization, HairScatteringModel, MetallicFresnel,
-    MetallicParameters, MicrofacetDistribution, PrincipledHairParameters, SheenDistribution,
-    ToonComponent, ToonParameters, dielectric_f0, evaluate_surface_with_workspace_into_semantics,
+    AnisotropyModel, BsdfModel, EEVEE_CLOSURE_DIFFUSE, EEVEE_CLOSURE_EMISSION,
+    EEVEE_CLOSURE_REFLECTION, EEVEE_CLOSURE_REFRACTION, EEVEE_CLOSURE_SHADER_TO_RGBA,
+    EEVEE_CLOSURE_SUBSURFACE, EEVEE_CLOSURE_TRANSLUCENT, EEVEE_CLOSURE_TRANSPARENCY,
+    GeometryAttribute, GeometryAttributeValues, GlassDistribution, HairComponent, HairParameters,
+    HairParametrization, HairScatteringModel, MetallicFresnel, MetallicParameters,
+    MicrofacetDistribution, PrincipledHairParameters, SheenDistribution, ToonComponent,
+    ToonParameters, dielectric_f0, evaluate_surface_with_workspace_into_semantics,
     evaluate_surface_with_workspace_semantics, heaviest, make_orthonormals,
     shader_node_type_supported,
 };

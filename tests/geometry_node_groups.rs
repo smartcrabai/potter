@@ -131,6 +131,20 @@ menu_switch = resource_group.nodes.new("GeometryNodeMenuSwitch")
 menu_switch.enum_items.new("MODE_A")
 menu_switch.enum_items.new("MODE_B")
 resource_group.links.new(resource_input.outputs["Menu Default"], menu_switch.inputs["Menu"])
+# Deleting an item leaves sparse identifiers; the link must follow its source item.
+menu_switch_sparse = resource_group.nodes.new("GeometryNodeMenuSwitch")
+menu_switch_sparse.enum_items.new("MODE_A")
+menu_switch_sparse.enum_items.new("MODE_B")
+menu_switch_sparse.enum_items.remove(menu_switch_sparse.enum_items[0])
+menu_switch_sparse.inputs["Menu"].default_value = "MODE_B"
+resource_group.links.new(
+    resource_input.outputs["Geometry"], menu_switch_sparse.inputs["MODE_B"])
+# One remaining default choice exercises trimming to fewer items than Blender's new-node state.
+menu_switch_single = resource_group.nodes.new("GeometryNodeMenuSwitch")
+menu_switch_single.enum_items.remove(menu_switch_single.enum_items[0])
+menu_switch_single.inputs["Menu"].default_value = "B"
+resource_group.links.new(
+    resource_input.outputs["Geometry"], menu_switch_single.inputs["B"])
 resource_sockets["Menu Default"].default_value = "MODE_B"
 resource_output = resource_group.nodes.new("NodeGroupOutput")
 resource_group.links.new(resource_input.outputs["Geometry"], resource_output.inputs["Geometry"])
@@ -423,7 +437,8 @@ if bpy.app.version != (5, 2, 2):
     raise RuntimeError(f"geometry group roundtrip requires Blender 5.2.2, found {bpy.app.version_string}")
 root = Path(sys.argv[sys.argv.index("--") + 1])
 bpy.ops.wm.open_mainfile(filepath=str(root / "geometry_node_groups_roundtrip.blend"))
-tree = bpy.data.node_groups["GN Resource Defaults"]
+original_id = json.loads((root / "blender_readback_group_id.json").read_text(encoding="utf-8"))
+tree = next(group for group in bpy.data.node_groups if group.get("potter.id") == original_id)
 sockets = {item.name: item for item in tree.interface.items_tree
            if item.item_type == "SOCKET" and item.in_out == "INPUT"}
 resources = [
@@ -470,7 +485,7 @@ for name, socket_type in (("Matrix Default", "NodeSocketMatrix"),
 duplicate_id = "gn_resource_defaults_duplicate"
 duplicate = next(group for group in bpy.data.node_groups
                  if group.get("potter.id") == duplicate_id)
-original = bpy.data.node_groups["GN Resource Defaults"]
+original = tree
 assert original.get("potter.id") != duplicate_id
 subject = bpy.data.objects["GN Group Subject"]
 assert any(mod.type == "NODES" and mod.node_group == duplicate for mod in subject.modifiers)
@@ -620,11 +635,11 @@ fn blender_geometry_group_rotation_matrix_parity_and_resource_defaults_roundtrip
     assert_eq!(expected_attributes["singular_invertible"], json!(false));
     assert_eq!(expected_attributes["matrix_invertible"], json!(true));
 
-    let resource_group = imported
+    let (resource_group_id, resource_group) = imported
         .doc
         .node_groups
-        .values()
-        .find(|group| group.name == "GN Resource Defaults")
+        .iter()
+        .find(|(_, group)| group.name == "GN Resource Defaults")
         .ok_or("imported typed-default group is missing")?;
     for (socket, socket_type, id_type, name) in [
         ("Object Default", "object", "Object", "GN Default Object"),
@@ -752,6 +767,10 @@ fn blender_geometry_group_rotation_matrix_parity_and_resource_defaults_roundtrip
             blender: Some(blender.as_path()),
             context: &EvaluationContext::default(),
         },
+    )?;
+    fs::write(
+        root.join("blender_readback_group_id.json"),
+        serde_json::to_vec(resource_group_id)?,
     )?;
     run_blender_script(
         &blender,

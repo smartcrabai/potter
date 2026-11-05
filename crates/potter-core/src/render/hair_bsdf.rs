@@ -3,9 +3,9 @@
 //! Principled Huang setup consumes the real curve-normal attribute and camera pixel coverage from
 //! [`HairHitData`]. Its evaluation and sampling also advance the caller's Cycles LCG state.
 
-use std::f64::consts::{FRAC_PI_2, PI};
+use std::f64::consts::PI;
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 
 use crate::{
     model::RayKind,
@@ -25,6 +25,9 @@ pub(crate) struct HairHitData {
     pub(crate) curve_normal: DVec3,
     pub(crate) pixel_coverage: f64,
     pub(crate) ribbon_v: Option<f64>,
+    /// Cycles' glossy blur alpha for this closure (`bsdf_blur`), zero when unblurred. The Chiang and Huang setups raise
+    /// their roughness to it after mapping.
+    pub(crate) glossy_blur_alpha: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -77,7 +80,7 @@ pub(crate) fn hair_eval(
             let sigma = principled_sigma(params, hair);
             match hair.model {
                 HairScatteringModel::Chiang => {
-                    let setup = chiang_setup(hair, sigma);
+                    let setup = chiang_setup(hair, sigma, hit.glossy_blur_alpha);
                     let (value, _) =
                         chiang_eval(setup, incoming, outgoing, tangent, radial_normal, hit);
                     value
@@ -105,7 +108,8 @@ pub(crate) fn hair_pdf(
         BsdfModel::Hair(hair) => classic_hair_eval(hair, incoming, outgoing, radial_normal).1,
         BsdfModel::PrincipledHair(hair) => match hair.model {
             HairScatteringModel::Chiang => {
-                let setup = chiang_setup(hair, principled_sigma(params, hair));
+                let setup =
+                    chiang_setup(hair, principled_sigma(params, hair), hit.glossy_blur_alpha);
                 chiang_eval(setup, incoming, outgoing, tangent, radial_normal, hit).1
             }
             // Cycles sets Huang's PDF to one before all early-outs and uses the same value for
@@ -155,7 +159,7 @@ pub(crate) fn hair_sample(
         BsdfModel::Hair(hair) => classic_hair_sample(hair, incoming, closure_color(params), random),
         BsdfModel::PrincipledHair(hair) => match hair.model {
             HairScatteringModel::Chiang => chiang_sample(
-                chiang_setup(hair, principled_sigma(params, hair)),
+                chiang_setup(hair, principled_sigma(params, hair), hit.glossy_blur_alpha),
                 incoming,
                 tangent,
                 radial_normal,
@@ -257,14 +261,19 @@ struct ChiangSetup {
     primary_variance: f64,
 }
 
-fn chiang_setup(hair: crate::shader::PrincipledHairParameters, sigma: DVec3) -> ChiangSetup {
+fn chiang_setup(
+    hair: crate::shader::PrincipledHairParameters,
+    sigma: DVec3,
+    glossy_blur_alpha: f64,
+) -> ChiangSetup {
     let random_factor = random_roughness_factor(hair.random, hair.random_roughness);
     let mut variance = (hair.roughness * random_factor).clamp(0.001, 1.0);
     let mut azimuthal_scale = (hair.radial_roughness * random_factor).clamp(0.001, 1.0);
     let mut primary_variance = ((1.0 - hair.coat.clamp(0.0, 1.0)) * variance).clamp(0.001, 1.0);
-    variance = roughness_to_chiang_variance(variance);
-    azimuthal_scale = roughness_to_chiang_scale(azimuthal_scale);
-    primary_variance = roughness_to_chiang_variance(primary_variance);
+    // Cycles' bsdf_hair_chiang_blur raises the mapped variances after setup, so the blur joins after the mapping.
+    variance = roughness_to_chiang_variance(variance).max(glossy_blur_alpha);
+    azimuthal_scale = roughness_to_chiang_scale(azimuthal_scale).max(glossy_blur_alpha);
+    primary_variance = roughness_to_chiang_variance(primary_variance).max(glossy_blur_alpha);
     ChiangSetup {
         sigma,
         variance,
@@ -611,52 +620,201 @@ fn fresnel_dielectric_cos(cosine: f64, eta: f64) -> f64 {
     }
 }
 
+// Cycles util/math_fast.h scalar helpers, kept in f32 and source operation order.
+const CLASSIC_PI_F32: f32 = f32::from_bits(0x4049_0fdb);
+const CLASSIC_PI_2_F32: f32 = f32::from_bits(0x3fc9_0fdb);
+const CLASSIC_INV_PI_F32: f32 = f32::from_bits(0x3ea2_f983);
+
+fn classic_vec3(vector: DVec3) -> Vec3 {
+    Vec3::new(vector.x as f32, vector.y as f32, vector.z as f32)
+}
+
+fn classic_dot(left: Vec3, right: Vec3) -> f32 {
+    left.x * right.x + left.y * right.y + left.z * right.z
+}
+
+fn classic_cross(left: Vec3, right: Vec3) -> Vec3 {
+    Vec3::new(
+        left.y * right.z - left.z * right.y,
+        left.z * right.x - left.x * right.z,
+        left.x * right.y - left.y * right.x,
+    )
+}
+
+fn classic_normalize(vector: Vec3) -> Vec3 {
+    let inverse_length = 1.0 / classic_dot(vector, vector).sqrt();
+    Vec3::new(
+        vector.x * inverse_length,
+        vector.y * inverse_length,
+        vector.z * inverse_length,
+    )
+}
+
+fn classic_madd(a: f32, b: f32, c: f32) -> f32 {
+    a * b + c
+}
+
+// Preserve Source's add-then-half rounding rather than using f32::midpoint.
+fn classic_source_half(value: f32) -> f32 {
+    value * 0.5
+}
+
+fn classic_fast_rint(value: f32) -> i32 {
+    (value + 0.5_f32.copysign(value)) as i32
+}
+
+fn classic_fast_cosf(mut value: f32) -> f32 {
+    let q = classic_fast_rint(value * CLASSIC_INV_PI_F32);
+    let qf = q as f32;
+    value = classic_madd(qf, -0.785_156_25_f32 * 4.0, value);
+    value = classic_madd(qf, f32::from_bits(0xb97d_a000) * 4.0, value);
+    value = classic_madd(qf, f32::from_bits(0xb322_2000) * 4.0, value);
+    value = classic_madd(qf, f32::from_bits(0xabb4_611a) * 4.0, value);
+    value = CLASSIC_PI_2_F32 - (CLASSIC_PI_2_F32 - value);
+    let squared = value * value;
+    let mut result = f32::from_bits(0xb491_ed89);
+    result = classic_madd(result, squared, f32::from_bits(0x37d0_078b));
+    result = classic_madd(result, squared, f32::from_bits(0xbab6_0b58));
+    result = classic_madd(result, squared, f32::from_bits(0x3d2a_aaaa));
+    result = classic_madd(result, squared, -0.5);
+    result = classic_madd(result, squared, 1.0);
+    if (q & 1) != 0 {
+        result = -result;
+    }
+    result.clamp(-1.0, 1.0)
+}
+
+fn classic_fast_sincosf(mut value: f32) -> (f32, f32) {
+    let q = classic_fast_rint(value * CLASSIC_INV_PI_F32);
+    let qf = q as f32;
+    value = classic_madd(qf, -0.785_156_25_f32 * 4.0, value);
+    value = classic_madd(qf, f32::from_bits(0xb97d_a000) * 4.0, value);
+    value = classic_madd(qf, f32::from_bits(0xb322_2000) * 4.0, value);
+    value = classic_madd(qf, f32::from_bits(0xabb4_611a) * 4.0, value);
+    value = CLASSIC_PI_2_F32 - (CLASSIC_PI_2_F32 - value);
+    let squared = value * value;
+    if (q & 1) != 0 {
+        value = -value;
+    }
+    let mut sine = f32::from_bits(0x362f_0a87);
+    sine = classic_madd(sine, squared, f32::from_bits(0xb94f_baeb));
+    sine = classic_madd(sine, squared, f32::from_bits(0x3c08_8777));
+    sine = classic_madd(sine, squared, f32::from_bits(0xbe2a_aaa6));
+    sine = classic_madd(squared, sine * value, value);
+    let mut cosine = f32::from_bits(0xb491_ed89);
+    cosine = classic_madd(cosine, squared, f32::from_bits(0x37d0_078b));
+    cosine = classic_madd(cosine, squared, f32::from_bits(0xbab6_0b58));
+    cosine = classic_madd(cosine, squared, f32::from_bits(0x3d2a_aaaa));
+    cosine = classic_madd(cosine, squared, -0.5);
+    cosine = classic_madd(cosine, squared, 1.0);
+    if (q & 1) != 0 {
+        cosine = -cosine;
+    }
+    (sine.clamp(-1.0, 1.0), cosine.clamp(-1.0, 1.0))
+}
+
+fn classic_fast_acosf(value: f32) -> f32 {
+    let absolute = value.abs();
+    let m = if absolute < 1.0 {
+        1.0 - (1.0 - absolute)
+    } else {
+        1.0
+    };
+    let a = (1.0 - m).sqrt()
+        * (f32::from_bits(0x3fc9_0fdb)
+            + m * (f32::from_bits(0xbe5a_6b93)
+                + m * (f32::from_bits(0x3d9f_b43b) + m * -0.021_640_95_f32)));
+    if value < 0.0 { CLASSIC_PI_F32 - a } else { a }
+}
+
+fn classic_safe_asinf(value: f32) -> f32 {
+    value.clamp(-1.0, 1.0).asin()
+}
+
+fn classic_fast_atan2f(y: f32, x: f32) -> f32 {
+    let a = x.abs();
+    let b = y.abs();
+    let k = if b == 0.0 {
+        0.0
+    } else if a.partial_cmp(&b) == Some(std::cmp::Ordering::Equal) {
+        1.0
+    } else if b > a {
+        a / b
+    } else {
+        b / a
+    };
+    let s = 1.0 - (1.0 - k);
+    let t = s * s;
+    let mut result = s * classic_madd(0.431_579_74, t, 1.0)
+        / classic_madd(classic_madd(0.058_319_38, t, 0.764_439_45), t, 1.0);
+    if b > a {
+        result = CLASSIC_PI_2_F32 - result;
+    }
+    if x.to_bits() & 0x8000_0000 != 0 {
+        result = CLASSIC_PI_F32 - result;
+    }
+    result.copysign(y)
+}
+
 fn classic_hair_eval(
     hair: crate::shader::HairParameters,
     incoming: DVec3,
     outgoing: DVec3,
     radial_normal: DVec3,
 ) -> (DVec3, f64) {
-    let normal = radial_normal.normalize_or_zero();
+    let normal = classic_vec3(radial_normal);
+    let incoming = classic_vec3(incoming);
+    let outgoing = classic_vec3(outgoing);
+    let tangent = classic_vec3(hair.tangent);
     let reflection = hair.component == HairComponent::Reflection;
-    if (reflection && normal.dot(outgoing) < 0.0) || (!reflection && normal.dot(outgoing) >= 0.0) {
+    if (reflection && classic_dot(normal, outgoing) < 0.0)
+        || (!reflection && classic_dot(normal, outgoing) >= 0.0)
+    {
         return (DVec3::ZERO, 0.0);
     }
-    let tangent = hair.tangent.normalize_or_zero();
-    let roughness1 = hair.roughness_u.clamp(0.001, 1.0);
-    let roughness2 = hair.roughness_v.clamp(0.001, 1.0);
-    let offset = -hair.offset;
-    let iz = tangent.dot(incoming);
-    let locy = (incoming - tangent * iz).normalize_or_zero();
-    let theta_r = FRAC_PI_2 - iz.clamp(-1.0, 1.0).acos();
-    let wo_z = tangent.dot(outgoing);
-    let wo_y = (outgoing - tangent * wo_z).normalize_or_zero();
-    let theta_i = FRAC_PI_2 - wo_z.clamp(-1.0, 1.0).acos();
-    let cosphi_i = wo_y.dot(locy);
-    if FRAC_PI_2 - theta_i.abs() < 0.001 || (reflection && cosphi_i < 0.0) {
+    let roughness1 = (hair.roughness_u as f32).clamp(0.001, 1.0);
+    let roughness2 = (hair.roughness_v as f32).clamp(0.001, 1.0);
+    let offset = -(hair.offset as f32);
+    let iz = classic_dot(tangent, incoming);
+    let locy = classic_normalize(incoming - tangent * iz);
+    let theta_r = CLASSIC_PI_2_F32 - classic_fast_acosf(iz);
+    let wo_z = classic_dot(tangent, outgoing);
+    let wo_y = classic_normalize(outgoing - tangent * wo_z);
+    let theta_i = CLASSIC_PI_2_F32 - classic_fast_acosf(wo_z);
+    let cosphi_i = classic_dot(wo_y, locy);
+    if CLASSIC_PI_2_F32 - theta_i.abs() < 0.001 || (reflection && cosphi_i < 0.0) {
         return (DVec3::ZERO, 0.0);
     }
-    let costheta_i = theta_i.cos();
-    let theta_h = f64::midpoint(theta_i, theta_r);
+    let costheta_i = classic_fast_cosf(theta_i);
+    let roughness1_inv = 1.0 / roughness1;
+    let a = classic_fast_atan2f(
+        (classic_source_half(CLASSIC_PI_2_F32 + theta_r) - offset) * roughness1_inv,
+        1.0,
+    );
+    let b = classic_fast_atan2f(
+        (classic_source_half(-CLASSIC_PI_2_F32 + theta_r) - offset) * roughness1_inv,
+        1.0,
+    );
+    let theta_h = classic_source_half(theta_i + theta_r);
     let t = theta_h - offset;
-    let inv_roughness1 = 1.0 / roughness1;
-    let (a, b, phi_pdf) = if reflection {
-        let a = ((f64::midpoint(FRAC_PI_2, theta_r) - offset) * inv_roughness1).atan();
-        let b = ((f64::midpoint(-FRAC_PI_2, theta_r) - offset) * inv_roughness1).atan();
-        let mut phi_i = cosphi_i.clamp(-1.0, 1.0).acos() / roughness2;
-        phi_i = if phi_i.abs() < PI { phi_i } else { PI };
-        (a, b, (0.5 * phi_i).cos() * 0.25 / roughness2)
+    let phi_pdf = if reflection {
+        let roughness2_inv = 1.0 / roughness2;
+        let mut phi_i = classic_fast_acosf(cosphi_i) * roughness2_inv;
+        phi_i = if phi_i.abs() < CLASSIC_PI_F32 {
+            phi_i
+        } else {
+            CLASSIC_PI_F32
+        };
+        classic_fast_cosf(phi_i * 0.5) * 0.25 * roughness2_inv
     } else {
-        let a = ((f64::midpoint(FRAC_PI_2, theta_r) - offset) * inv_roughness1).atan();
-        let b = ((f64::midpoint(-FRAC_PI_2, theta_r) - offset) * inv_roughness1).atan();
-        let c = 2.0 * (FRAC_PI_2 / roughness2).atan();
-        let phi = cosphi_i.clamp(-1.0, 1.0).acos().abs();
-        let p = PI - phi;
-        (a, b, roughness2 / (c * (p * p + roughness2 * roughness2)))
+        let c = 2.0 * classic_fast_atan2f(CLASSIC_PI_2_F32 / roughness2, 1.0);
+        let phi_i = classic_fast_acosf(cosphi_i);
+        let p = CLASSIC_PI_F32 - phi_i.abs();
+        roughness2 / (c * (p * p + roughness2 * roughness2))
     };
     let theta_pdf = roughness1 / (2.0 * (t * t + roughness1 * roughness1) * (a - b) * costheta_i);
     let pdf = phi_pdf * theta_pdf;
-    (DVec3::splat(pdf), pdf)
+    (DVec3::splat(pdf as f64), pdf as f64)
 }
 
 fn classic_hair_sample(
@@ -665,50 +823,61 @@ fn classic_hair_sample(
     color: DVec3,
     random: [f64; 4],
 ) -> HairSample {
-    let tangent = hair.tangent.normalize_or_zero();
-    let roughness1 = hair.roughness_u.clamp(0.001, 1.0);
-    let roughness2 = hair.roughness_v.clamp(0.001, 1.0);
-    let offset = -hair.offset;
-    let iz = tangent.dot(incoming);
-    let locy = (incoming - tangent * iz).normalize_or_zero();
-    let locx = locy.cross(tangent);
-    let theta_r = FRAC_PI_2 - iz.clamp(-1.0, 1.0).acos();
-    let inv_roughness1 = 1.0 / roughness1;
-    let a = ((f64::midpoint(FRAC_PI_2, theta_r) - offset) * inv_roughness1).atan();
-    let b = ((f64::midpoint(-FRAC_PI_2, theta_r) - offset) * inv_roughness1).atan();
-    let t = roughness1 * (random[0] * (a - b) + b).tan();
-    let theta_i = 2.0 * (t + offset) - theta_r;
-    let (sin_theta_i, cos_theta_i) = theta_i.sin_cos();
+    let incoming = classic_vec3(incoming);
+    let tangent = classic_vec3(hair.tangent);
+    let roughness1 = (hair.roughness_u as f32).clamp(0.001, 1.0);
+    let roughness2 = (hair.roughness_v as f32).clamp(0.001, 1.0);
+    let offset = -(hair.offset as f32);
+    let iz = classic_dot(tangent, incoming);
+    let locy = classic_normalize(incoming - tangent * iz);
+    let locx = classic_cross(locy, tangent);
+    let theta_r = CLASSIC_PI_2_F32 - classic_fast_acosf(iz);
+    let roughness1_inv = 1.0 / roughness1;
+    let a = classic_fast_atan2f(
+        (classic_source_half(CLASSIC_PI_2_F32 + theta_r) - offset) * roughness1_inv,
+        1.0,
+    );
+    let b = classic_fast_atan2f(
+        (classic_source_half(-CLASSIC_PI_2_F32 + theta_r) - offset) * roughness1_inv,
+        1.0,
+    );
+    let random_x = random[0] as f32;
+    let random_y = random[1] as f32;
+    let t = roughness1 * (random_x * (a - b) + b).tan();
+    let theta_h = t + offset;
+    let theta_i = 2.0 * theta_h - theta_r;
+    let (sin_theta_i, cos_theta_i) = classic_fast_sincosf(theta_i);
     let (phi, phi_pdf) = if hair.component == HairComponent::Reflection {
-        let phi = 2.0 * safe_asin(1.0 - 2.0 * random[1]) * roughness2;
-        let phi_pdf = (0.5 * phi).cos() * 0.25 / roughness2;
+        let phi = 2.0 * classic_safe_asinf(1.0 - 2.0 * random_y) * roughness2;
+        let phi_pdf = classic_fast_cosf(phi * 0.5) * 0.25 / roughness2;
         (phi, phi_pdf)
     } else {
-        let c = 2.0 * (FRAC_PI_2 / roughness2).atan();
-        let p = roughness2 * (c * (random[1] - 0.5)).tan();
+        let c = 2.0 * classic_fast_atan2f(CLASSIC_PI_2_F32 / roughness2, 1.0);
+        let p = roughness2 * (c * (random_y - 0.5)).tan();
+        let phi = p + CLASSIC_PI_F32;
         let phi_pdf = roughness2 / (c * (p * p + roughness2 * roughness2));
-        (p + PI, phi_pdf)
+        (phi, phi_pdf)
     };
-    let (sin_phi, cos_phi) = phi.sin_cos();
+    let (sin_phi, cos_phi) = classic_fast_sincosf(phi);
     let direction =
-        cos_phi * cos_theta_i * locy - sin_phi * cos_theta_i * locx + sin_theta_i * tangent;
-    // Keep the source sample PDF: unlike `classic_hair_eval`, it has no cosphi/normal-support rejection.
+        (cos_phi * cos_theta_i) * locy - (sin_phi * cos_theta_i) * locx + sin_theta_i * tangent;
+    // Keep the source sample PDF: unlike eval, it has no cosphi/normal-support rejection.
     let theta_pdf = roughness1 / (2.0 * (t * t + roughness1 * roughness1) * (a - b) * cos_theta_i);
-    let pdf = if FRAC_PI_2 - theta_i.abs() < 0.001 {
+    let pdf = if CLASSIC_PI_2_F32 - theta_i.abs() < 0.001 {
         0.0
     } else {
         (phi_pdf * theta_pdf).abs()
     };
     HairSample::Continuous {
-        direction,
+        direction: DVec3::new(direction.x as f64, direction.y as f64, direction.z as f64),
         ray: if hair.component == HairComponent::Reflection {
             RayKind::Glossy
         } else {
             RayKind::Transmission
         },
         // Classic Hair's sample eval is its PDF tinted by Color once; closure weight/alpha are applied by the path.
-        eval: DVec3::splat(pdf) * color,
-        pdf,
+        eval: DVec3::splat(pdf as f64) * color,
+        pdf: pdf as f64,
     }
 }
 
@@ -784,7 +953,9 @@ fn huang_setup(
     let random_factor = random_roughness_factor(hair.random, hair.random_roughness);
     HuangSetup {
         sigma,
-        roughness: (hair.roughness * random_factor).clamp(0.001, 1.0),
+        roughness: (hair.roughness * random_factor)
+            .clamp(0.001, 1.0)
+            .max(hit.glossy_blur_alpha),
         tilt: -hair.offset,
         ior: hair.ior,
         aspect_ratio,
@@ -1366,9 +1537,12 @@ fn lcg_step_float(rng: &mut u32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        HairComponent, classic_hair_eval, logistic_cdf, sample_trimmed_logistic, wrap_angle,
+        HairComponent, HairHitData, chiang_setup, classic_hair_eval, huang_setup, logistic_cdf,
+        sample_trimmed_logistic, wrap_angle,
     };
-    use crate::shader::HairParameters;
+    use crate::shader::{
+        HairParameters, HairParametrization, HairScatteringModel, PrincipledHairParameters,
+    };
     use glam::DVec3;
     use std::f64::consts::PI;
 
@@ -1388,6 +1562,56 @@ mod tests {
     }
 
     #[test]
+    fn glossy_blur_raises_principled_hair_setup_after_mapping_and_never_lowers_it() {
+        let hair = PrincipledHairParameters {
+            model: HairScatteringModel::Chiang,
+            parametrization: HairParametrization::DirectAbsorption,
+            melanin: 0.0,
+            melanin_redness: 0.0,
+            tint: [1.0; 3],
+            absorption_coefficient: [0.0; 3],
+            aspect_ratio: 1.0,
+            roughness: 0.3,
+            radial_roughness: 0.3,
+            coat: 0.0,
+            ior: 1.55,
+            offset: 0.0,
+            random_color: 0.0,
+            random_roughness: 0.0,
+            random: 0.5,
+            reflection: 1.0,
+            transmission: 1.0,
+            secondary_reflection: 1.0,
+        };
+        let plain = chiang_setup(hair, DVec3::ZERO, 0.0);
+        let raised = chiang_setup(hair, DVec3::ZERO, 0.5);
+        assert_eq!(raised.variance, 0.5);
+        assert_eq!(raised.azimuthal_scale, 0.5);
+        assert_eq!(raised.primary_variance, 0.5);
+        let lower = chiang_setup(hair, DVec3::ZERO, 0.01);
+        assert_eq!(lower.variance, plain.variance);
+        assert_eq!(lower.azimuthal_scale, plain.azimuthal_scale);
+        assert_eq!(lower.primary_variance, plain.primary_variance);
+
+        let huang = PrincipledHairParameters {
+            model: HairScatteringModel::Huang,
+            ..hair
+        };
+        let huang_roughness = |glossy_blur_alpha| {
+            let hit = HairHitData {
+                curve_normal: DVec3::X,
+                pixel_coverage: 1.0,
+                ribbon_v: None,
+                glossy_blur_alpha,
+            };
+            huang_setup(huang, DVec3::ZERO, DVec3::Z, DVec3::X, DVec3::Y, hit).roughness
+        };
+        assert_eq!(huang_roughness(0.0), 0.3);
+        assert_eq!(huang_roughness(0.5), 0.5);
+        assert_eq!(huang_roughness(0.01), 0.3);
+    }
+
+    #[test]
     fn classic_reflection_eval_is_zero_below_radial_hemisphere() {
         let hair = HairParameters {
             component: HairComponent::Reflection,
@@ -1399,5 +1623,33 @@ mod tests {
         let (value, pdf) = classic_hair_eval(hair, DVec3::Y, -DVec3::X, DVec3::X);
         assert_eq!(value, DVec3::ZERO);
         assert_eq!(pdf, 0.0);
+    }
+
+    #[test]
+    fn classic_transmission_near_grazing_matches_source_float_boundary() {
+        let hair = HairParameters {
+            component: HairComponent::Transmission,
+            offset: 0.037_000_000_476_837_16,
+            roughness_u: 0.239_999_994_635_581_97,
+            roughness_v: 0.509_999_990_463_256_8,
+            tangent: DVec3::new(
+                0.912_986_000_593_610_1,
+                -0.327_369_290_241_145_3,
+                0.243_486_982_253_863_25,
+            ),
+        };
+        let incoming = DVec3::Z;
+        let normal = DVec3::new(
+            -0.301_091_084_490_649_64,
+            -0.137_900_921_513_774_26,
+            0.943_571_669_077_604_5,
+        );
+        let outgoing = DVec3::new(
+            0.912_710_677_293_660_8,
+            -0.328_835_206_537_221_4,
+            0.242_542_009_754_537_19,
+        );
+        let (_, eval_pdf) = classic_hair_eval(hair, incoming, outgoing, normal);
+        assert!((eval_pdf - 4.675_099_37).abs() < 1.0e-4);
     }
 }

@@ -394,6 +394,11 @@ impl<'a> WorldEvaluator<'a> {
                 }
                 let depth =
                     world_texture_integer(id, node, "turbulence_depth", 2)?.clamp(0, 10) as u8;
+                self.require_known_procedural_variant(
+                    id,
+                    node,
+                    &["Vector", "Scale", "Distortion"],
+                )?;
                 let vector = self.procedural_texture_vector(id, self.direction)?;
                 let scale = self.procedural_texture_scalar(id, "Scale", 5.0)?;
                 let distortion = self.procedural_texture_scalar(id, "Distortion", 1.0)?;
@@ -527,6 +532,19 @@ impl<'a> WorldEvaluator<'a> {
                         ));
                     }
                 };
+                if dimensions == 3 {
+                    self.require_known_procedural_variant(
+                        id,
+                        node,
+                        &[
+                            "Vector",
+                            "Scale",
+                            "Frequency",
+                            "Anisotropy",
+                            "Orientation 3D",
+                        ],
+                    )?;
+                }
                 let vector = self.procedural_texture_vector(id, self.direction)?;
                 let scale = self.procedural_texture_scalar(id, "Scale", 5.0)?;
                 let frequency = self.procedural_texture_scalar(id, "Frequency", 2.0)?;
@@ -578,6 +596,83 @@ impl<'a> WorldEvaluator<'a> {
             }
             _ => Err(world_error(id, "unknown procedural texture node")),
         }
+    }
+
+    fn require_known_procedural_variant(
+        &self,
+        id: &Id,
+        node: &GraphNode,
+        sockets: &[&str],
+    ) -> Result<()> {
+        if self.fold_index.primitive_nodes.contains(id)
+            || self
+                .fold_index
+                .has_unlinked_position_field_vector(self.group, id, node)
+        {
+            return Ok(());
+        }
+
+        let mut unknown_source = None;
+        for socket in sockets {
+            let Some(link) = self
+                .group
+                .links
+                .iter()
+                .find(|link| link.to_node == *id && socket_matches(&link.to_socket, socket))
+            else {
+                if node
+                    .inputs
+                    .iter()
+                    .find(|(name, _)| socket_matches(name, socket))
+                    .is_some_and(|(_, value)| !super::inline_fold::primitive_socket_value(value))
+                {
+                    return Ok(());
+                }
+                continue;
+            };
+            if let Some(source_id) = self
+                .fold_index
+                .unknown_fold_source(&link.from_node, &link.from_socket)
+            {
+                unknown_source.get_or_insert(source_id);
+                continue;
+            }
+            let is_primitive = self
+                .fold_index
+                .primitive_outputs
+                .iter()
+                .any(|(node, output)| node == &link.from_node && output == &link.from_socket);
+            let has_primitive_dangling_fallback = self
+                .fold_index
+                .dangling_outputs
+                .get(&link.from_node)
+                .is_some_and(|outputs| outputs.contains(&link.from_socket))
+                && node
+                    .inputs
+                    .get(&link.to_socket)
+                    .is_some_and(super::inline_fold::primitive_socket_value);
+            if !is_primitive && !has_primitive_dangling_fallback {
+                return Ok(());
+            }
+        }
+
+        let Some(source_id) = unknown_source else {
+            return Ok(());
+        };
+        let Some(source) = self.group.nodes.get(source_id) else {
+            return Ok(());
+        };
+        Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            format!(
+                "shader node behavior `{}.internal_links` is not implemented",
+                source.node_type
+            ),
+            json!({
+                "feature_id": format!("shader.node.{}.internal_links", source.node_type),
+                "node_id": source_id,
+            }),
+        ))
     }
 
     fn validate_procedural_texture_sockets(&self, id: &Id, node: &GraphNode) -> Result<()> {
@@ -1507,6 +1602,269 @@ mod tests {
             .insert("Color2".to_owned(), json!([0.0, 0.0, 1.0, 1.0]));
 
         assert_eq!(evaluate_mix_graph(mix)?, DVec3::new(0.75, 0.0, 0.25));
+        Ok(())
+    }
+
+    fn evaluate_magic_world(muted_source: bool, with_internal_links: bool) -> Result<DVec3> {
+        let source_id = Id::new("source")?;
+        let texture_id = Id::new("texture")?;
+        let background_id = Id::new("background")?;
+        let output_id = Id::new("output")?;
+        let dead_source_id = Id::new("dead_source")?;
+        let dead_texture_id = Id::new("dead_texture")?;
+        let world_id = Id::new("world")?;
+        let vector = [1.5, 0.3, 0.4];
+
+        let mut source = GraphNode::new("ShaderNodeMixRGB");
+        source
+            .properties
+            .insert("mute".to_owned(), json!(muted_source));
+        if with_internal_links {
+            source.properties.insert(
+                "internal_links".to_owned(),
+                json!([{"from_socket": "Color1", "to_socket": "Color"}]),
+            );
+        }
+        source.inputs.insert("Fac".to_owned(), json!(0.5));
+        let color = json!([vector[0], vector[1], vector[2], 1.0]);
+        source.inputs.insert("Color1".to_owned(), color.clone());
+        source.inputs.insert("Color2".to_owned(), color);
+
+        let mut texture = GraphNode::new("ShaderNodeTexMagic");
+        texture.inputs.insert("Vector".to_owned(), json!(vector));
+
+        let mut dead_source = GraphNode::new("ShaderNodeMixRGB");
+        dead_source
+            .properties
+            .insert("mute".to_owned(), json!(true));
+        let mut group = NodeGroup::new("world", GraphKind::Shader);
+        group.nodes.extend([
+            (source_id.clone(), source),
+            (texture_id.clone(), texture),
+            (
+                background_id.clone(),
+                GraphNode::new("ShaderNodeBackground"),
+            ),
+            (output_id.clone(), GraphNode::new("ShaderNodeOutputWorld")),
+            (dead_source_id.clone(), dead_source),
+            (
+                dead_texture_id.clone(),
+                GraphNode::new("ShaderNodeTexMagic"),
+            ),
+        ]);
+        group.links.extend([
+            GraphLink {
+                from_node: source_id.clone(),
+                from_socket: "Color".to_owned(),
+                to_node: texture_id.clone(),
+                to_socket: "Vector".to_owned(),
+            },
+            GraphLink {
+                from_node: texture_id,
+                from_socket: "Color".to_owned(),
+                to_node: background_id.clone(),
+                to_socket: "Color".to_owned(),
+            },
+            GraphLink {
+                from_node: background_id,
+                from_socket: "Background".to_owned(),
+                to_node: output_id,
+                to_socket: "Surface".to_owned(),
+            },
+            GraphLink {
+                from_node: dead_source_id,
+                from_socket: "Color".to_owned(),
+                to_node: dead_texture_id,
+                to_socket: "Vector".to_owned(),
+            },
+        ]);
+
+        let mut groups = Registry::new();
+        groups.insert(world_id.clone(), group);
+        let world = World {
+            node_tree: Some(world_id),
+            ..Default::default()
+        };
+        evaluate_world(
+            &world,
+            &groups,
+            &std::collections::BTreeMap::new(),
+            DVec3::Z,
+            true,
+        )
+    }
+
+    fn evaluate_magic_scale_world(
+        vector_source: Option<GraphNode>,
+        through_math: bool,
+    ) -> Result<DVec3> {
+        let source_id = Id::new("source")?;
+        let math_id = Id::new("math")?;
+        let texture_id = Id::new("texture")?;
+        let background_id = Id::new("background")?;
+        let output_id = Id::new("output")?;
+        let world_id = Id::new("world")?;
+        let coordinates_id = vector_source
+            .as_ref()
+            .map(|_| Id::new("coordinates"))
+            .transpose()?;
+
+        let mut source = GraphNode::new("ShaderNodeMixRGB");
+        source.properties.insert("mute".to_owned(), json!(true));
+        source.inputs.insert("Fac".to_owned(), json!(0.5));
+        let color = json!([2.0, 2.0, 2.0, 1.0]);
+        source.inputs.insert("Color1".to_owned(), color.clone());
+        source.inputs.insert("Color2".to_owned(), color);
+        let texture = GraphNode::new("ShaderNodeTexMagic");
+
+        let mut group = NodeGroup::new("world", GraphKind::Shader);
+        group.nodes.extend([
+            (source_id.clone(), source),
+            (texture_id.clone(), texture),
+            (
+                background_id.clone(),
+                GraphNode::new("ShaderNodeBackground"),
+            ),
+            (output_id.clone(), GraphNode::new("ShaderNodeOutputWorld")),
+        ]);
+        if through_math {
+            let mut math = GraphNode::new("ShaderNodeMath");
+            math.properties.insert("operation".to_owned(), json!("ADD"));
+            math.inputs.insert("Value_001".to_owned(), json!(1.0));
+            group.nodes.insert(math_id.clone(), math);
+        }
+        if let (Some(coordinates_id), Some(coordinates)) = (&coordinates_id, vector_source) {
+            let output_socket = if coordinates.node_type == "ShaderNodeTexCoord" {
+                "Incoming"
+            } else {
+                "Vector"
+            };
+            group.nodes.insert(coordinates_id.clone(), coordinates);
+            group.links.push(GraphLink {
+                from_node: coordinates_id.clone(),
+                from_socket: output_socket.to_owned(),
+                to_node: texture_id.clone(),
+                to_socket: "Vector".to_owned(),
+            });
+        }
+        if through_math {
+            group.links.extend([
+                GraphLink {
+                    from_node: source_id.clone(),
+                    from_socket: "Color".to_owned(),
+                    to_node: math_id.clone(),
+                    to_socket: "Value".to_owned(),
+                },
+                GraphLink {
+                    from_node: math_id,
+                    from_socket: "Value".to_owned(),
+                    to_node: texture_id.clone(),
+                    to_socket: "Scale".to_owned(),
+                },
+            ]);
+        } else {
+            group.links.push(GraphLink {
+                from_node: source_id,
+                from_socket: "Color".to_owned(),
+                to_node: texture_id.clone(),
+                to_socket: "Scale".to_owned(),
+            });
+        }
+        group.links.extend([
+            GraphLink {
+                from_node: texture_id,
+                from_socket: "Color".to_owned(),
+                to_node: background_id.clone(),
+                to_socket: "Color".to_owned(),
+            },
+            GraphLink {
+                from_node: background_id,
+                from_socket: "Background".to_owned(),
+                to_node: output_id,
+                to_socket: "Surface".to_owned(),
+            },
+        ]);
+
+        let mut groups = Registry::new();
+        groups.insert(world_id.clone(), group);
+        let world = World {
+            node_tree: Some(world_id),
+            ..Default::default()
+        };
+        evaluate_world(
+            &world,
+            &groups,
+            &std::collections::BTreeMap::new(),
+            DVec3::Z,
+            true,
+        )
+    }
+
+    #[test]
+    fn rejects_reached_unknown_muted_route_before_magic_variant_selection() -> Result<()> {
+        let error = evaluate_magic_world(true, false).err().ok_or_else(|| {
+            PotError::new(ErrorCode::InvalidOperation, "unknown route was accepted")
+        })?;
+
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            error.details["feature_id"],
+            json!("shader.node.ShaderNodeMixRGB.internal_links")
+        );
+        assert_eq!(error.details["node_id"], json!("source"));
+        Ok(())
+    }
+
+    #[test]
+    fn known_routes_preserve_magic_variant_and_ignore_dead_unknowns() -> Result<()> {
+        let vector = [1.5, 0.3, 0.4];
+        let expected_color = procedural_texture::magic(vector, 5.0, 1.0, 2).0;
+        let expected = DVec3::new(
+            f64::from(expected_color[0]),
+            f64::from(expected_color[1]),
+            f64::from(expected_color[2]),
+        );
+
+        assert_eq!(evaluate_magic_world(true, true)?, expected);
+        assert_eq!(evaluate_magic_world(false, false)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unknown_fold_through_math_when_vector_is_constant() -> Result<()> {
+        let mut coordinates = GraphNode::new("ShaderNodeCombineXYZ");
+        coordinates.inputs.insert("X".to_owned(), json!(1.5));
+        coordinates.inputs.insert("Y".to_owned(), json!(0.3));
+        coordinates.inputs.insert("Z".to_owned(), json!(0.4));
+        let error = evaluate_magic_scale_world(Some(coordinates), true)
+            .err()
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::InvalidOperation, "unknown fold was accepted")
+            })?;
+
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            error.details["feature_id"],
+            json!("shader.node.ShaderNodeMixRGB.internal_links")
+        );
+        assert_eq!(error.details["node_id"], json!("source"));
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_position_and_known_runtime_vector_preserve_shader_variant() -> Result<()> {
+        let expected_color = procedural_texture::magic_shader([0.0, 0.0, 1.0], 2.0, 1.0, 2, true).0;
+        let expected = DVec3::new(
+            f64::from(expected_color[0]),
+            f64::from(expected_color[1]),
+            f64::from(expected_color[2]),
+        );
+
+        assert_eq!(evaluate_magic_scale_world(None, false)?, expected);
+        assert_eq!(
+            evaluate_magic_scale_world(Some(GraphNode::new("ShaderNodeTexCoord")), false)?,
+            expected
+        );
         Ok(())
     }
 }

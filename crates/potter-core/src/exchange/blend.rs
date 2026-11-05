@@ -111,6 +111,459 @@ fn find_in_path(executable: &str) -> Option<PathBuf> {
     })
 }
 
+fn shader_node_metadata_error(properties: &Map<String, Value>) -> Option<String> {
+    if let Some(routes) = properties.get("internal_links") {
+        let Some(routes) = routes.as_array() else {
+            return Some("`internal_links` must be an array".to_owned());
+        };
+        for route in routes {
+            let Some(route) = route.as_object() else {
+                return Some("each `internal_links` entry must be an object".to_owned());
+            };
+            if route.len() != 2 {
+                return Some(
+                    "each `internal_links` entry must contain only its socket keys".to_owned(),
+                );
+            }
+            for key in ["from_socket", "to_socket"] {
+                if route
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Some(format!(
+                        "each `internal_links` entry needs a non-empty `{key}`"
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(flags) = properties.get("input_socket_flags") {
+        let Some(flags) = flags.as_object() else {
+            return Some("`input_socket_flags` must be an object".to_owned());
+        };
+        for (socket, value) in flags {
+            if socket.is_empty() {
+                return Some(
+                    "`input_socket_flags` keys must be non-empty socket identifiers".to_owned(),
+                );
+            }
+            let Some(value) = value.as_object() else {
+                return Some(format!("input socket `{socket}` flags must be an object"));
+            };
+            if value.len() != 2
+                || !["enabled", "hide_value"]
+                    .into_iter()
+                    .all(|key| value.get(key).and_then(Value::as_bool).is_some())
+            {
+                return Some(format!(
+                    "input socket `{socket}` flags need exactly boolean `enabled` and `hide_value`"
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn validate_shader_node_metadata(doc: &SceneDoc) -> Result<()> {
+    for (graph_id, group) in &doc.node_groups {
+        for (node_id, node) in &group.nodes {
+            if let Some(reason) = shader_node_metadata_error(&node.properties) {
+                return Err(PotError::invalid_argument(format!(
+                    "node `{node_id}` in graph `{graph_id}` has invalid Blender socket metadata: {reason}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_bridge_id(value: &Value) -> Option<&str> {
+    value
+        .get("potter_id")
+        .and_then(Value::as_str)
+        .filter(|id| crate::model::is_valid_id(id))
+}
+
+fn compatibility_name_for_id<'a>(
+    source: &'a Value,
+    entity_prefix: &str,
+    identifier: &str,
+) -> Option<&'a str> {
+    source
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .and_then(|adapter| adapter.get("id_mappings"))
+        .and_then(Value::as_object)?
+        .iter()
+        .find_map(|(reference, id)| {
+            (id.as_str() == Some(identifier))
+                .then(|| reference.strip_prefix(entity_prefix))
+                .flatten()
+        })
+}
+
+fn source_world_name<'a>(source: &'a Value, world_id: &str) -> Option<&'a str> {
+    compatibility_name_for_id(source, "World:", world_id)
+}
+
+fn reopened_graph_node<'a>(
+    tree: &'a Value,
+    node_id: &str,
+    source_node: &Value,
+) -> Option<&'a Value> {
+    let nodes = tree.get("nodes").and_then(Value::as_array)?;
+    nodes
+        .iter()
+        .find(|node| valid_bridge_id(node) == Some(node_id))
+        .or_else(|| {
+            let name = source_node.get("name").and_then(Value::as_str)?;
+            nodes.iter().find(|node| {
+                valid_bridge_id(node).is_none()
+                    && node.get("name").and_then(Value::as_str) == Some(name)
+            })
+        })
+}
+
+fn menu_switch_socket_identifiers<'source, 'actual>(
+    source_node: &'source Value,
+    actual_node: &'actual Value,
+) -> Option<(&'source [Value], &'actual [Value])> {
+    if source_node.get("type").and_then(Value::as_str) != Some("GeometryNodeMenuSwitch")
+        || actual_node.get("type").and_then(Value::as_str) != Some("GeometryNodeMenuSwitch")
+    {
+        return None;
+    }
+    let source_properties = source_node.get("properties")?.as_object()?;
+    let actual_properties = actual_node.get("properties")?.as_object()?;
+    let source_items = source_properties.get("potter_menu_items")?;
+    if actual_properties.get("potter_menu_items") != Some(source_items) {
+        return None;
+    }
+    let item_count = source_items.as_array()?.len();
+    let source_identifiers = source_properties
+        .get("potter_menu_item_identifiers")?
+        .as_array()?;
+    let actual_identifiers = actual_properties
+        .get("potter_menu_item_identifiers")?
+        .as_array()?;
+    if source_identifiers.len() != item_count || actual_identifiers.len() != item_count {
+        return None;
+    }
+    for identifiers in [source_identifiers, actual_identifiers] {
+        let mut seen = BTreeSet::new();
+        for identifier in identifiers {
+            let identifier = identifier
+                .as_str()
+                .filter(|identifier| !identifier.is_empty())?;
+            if !seen.insert(identifier) {
+                return None;
+            }
+        }
+    }
+    Some((source_identifiers, actual_identifiers))
+}
+
+fn remap_menu_switch_socket_key<'a>(
+    socket: &'a str,
+    source_identifiers: &'a [Value],
+    actual_identifiers: &'a [Value],
+) -> &'a str {
+    for (source, actual) in source_identifiers.iter().zip(actual_identifiers) {
+        if source.as_str() == Some(socket) {
+            return actual.as_str().unwrap_or(socket);
+        }
+    }
+    socket
+}
+
+fn remapped_input_socket_flags_match(
+    expected: &Value,
+    actual: &Value,
+    source_identifiers: &[Value],
+    actual_identifiers: &[Value],
+) -> bool {
+    let (Some(expected), Some(actual)) = (expected.as_object(), actual.as_object()) else {
+        return false;
+    };
+    expected.len() == actual.len()
+        && expected.iter().all(|(socket, flags)| {
+            actual.get(remap_menu_switch_socket_key(
+                socket,
+                source_identifiers,
+                actual_identifiers,
+            )) == Some(flags)
+        })
+}
+
+fn remapped_internal_links_match(
+    expected: &Value,
+    actual: &Value,
+    source_identifiers: &[Value],
+    actual_identifiers: &[Value],
+) -> bool {
+    let (Some(expected), Some(actual)) = (expected.as_array(), actual.as_array()) else {
+        return false;
+    };
+    expected.len() == actual.len()
+        && expected.iter().zip(actual).all(|(expected, actual)| {
+            let (Some(expected), Some(actual)) = (expected.as_object(), actual.as_object()) else {
+                return false;
+            };
+            expected.len() == actual.len()
+                && expected.iter().all(|(key, value)| {
+                    let Some(actual_value) = actual.get(key) else {
+                        return false;
+                    };
+                    if key == "from_socket" || key == "to_socket" {
+                        value.as_str().is_some_and(|socket| {
+                            actual_value.as_str()
+                                == Some(remap_menu_switch_socket_key(
+                                    socket,
+                                    source_identifiers,
+                                    actual_identifiers,
+                                ))
+                        })
+                    } else {
+                        actual_value == value
+                    }
+                })
+        })
+}
+
+fn reopened_node_metadata_matches(
+    source_node: &Value,
+    actual_node: Option<&Value>,
+    property: &str,
+    expected: &Value,
+) -> bool {
+    let Some(actual_properties) = actual_node
+        .and_then(|node| node.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(actual) = actual_properties.get(property) else {
+        return false;
+    };
+    let Some((source_identifiers, actual_identifiers)) =
+        actual_node.and_then(|node| menu_switch_socket_identifiers(source_node, node))
+    else {
+        return actual == expected;
+    };
+    match property {
+        "input_socket_flags" => remapped_input_socket_flags_match(
+            expected,
+            actual,
+            source_identifiers,
+            actual_identifiers,
+        ),
+        "internal_links" => {
+            remapped_internal_links_match(expected, actual, source_identifiers, actual_identifiers)
+        }
+        _ => actual == expected,
+    }
+}
+
+fn reopened_shader_node_metadata_matches(
+    source: &Value,
+    reopened: &Value,
+    graph_id: &str,
+    node_id: &str,
+    source_node: &Value,
+    property: &str,
+    expected: &Value,
+) -> bool {
+    let mut found_tree = false;
+    let mut preserved = true;
+    let source_materials = source.get("materials").and_then(Value::as_object);
+    let source_worlds = source.get("worlds").and_then(Value::as_object);
+    let root_owned = source_materials.is_some_and(|materials| {
+        materials
+            .values()
+            .any(|material| material.get("node_tree").and_then(Value::as_str) == Some(graph_id))
+    }) || source_worlds.is_some_and(|worlds| {
+        worlds
+            .values()
+            .any(|world| world.get("node_tree").and_then(Value::as_str) == Some(graph_id))
+    });
+
+    if root_owned {
+        if let Some(source_materials) = source_materials {
+            let actual_materials = reopened.get("materials").and_then(Value::as_array);
+            for (material_id, material) in source_materials.iter().filter(|(_, material)| {
+                material.get("node_tree").and_then(Value::as_str) == Some(graph_id)
+            }) {
+                let source_name = material.get("name").and_then(Value::as_str);
+                let actual = actual_materials.and_then(|actual_materials| {
+                    actual_materials.iter().find(|actual| {
+                        if let Some(actual_id) = valid_bridge_id(actual) {
+                            actual_id == material_id.as_str()
+                        } else {
+                            actual.get("name").and_then(Value::as_str) == source_name
+                                || actual
+                                    .get("nodes")
+                                    .and_then(|tree| tree.get("potter_id"))
+                                    .and_then(Value::as_str)
+                                    == Some(graph_id)
+                        }
+                    })
+                });
+                if let Some(tree) = actual.and_then(|material| material.get("nodes")) {
+                    found_tree = true;
+                    let actual_node = reopened_graph_node(tree, node_id, source_node);
+                    if !reopened_node_metadata_matches(source_node, actual_node, property, expected)
+                    {
+                        preserved = false;
+                    }
+                } else {
+                    preserved = false;
+                }
+            }
+        }
+        if let Some(source_worlds) = source_worlds {
+            let scenes = reopened.get("scenes").and_then(Value::as_array);
+            for (world_id, _) in source_worlds.iter().filter(|(_, world)| {
+                world.get("node_tree").and_then(Value::as_str) == Some(graph_id)
+            }) {
+                let world_name = source_world_name(source, world_id);
+                let mut found_world = false;
+                if let Some(scenes) = scenes {
+                    for world in scenes.iter().filter_map(|scene| scene.get("world")) {
+                        if world.is_null() {
+                            continue;
+                        }
+                        let same_world = if let Some(actual_id) = valid_bridge_id(world) {
+                            actual_id == world_id.as_str()
+                        } else {
+                            world.get("name").and_then(Value::as_str) == world_name
+                                || world
+                                    .get("nodes")
+                                    .and_then(|tree| tree.get("potter_id"))
+                                    .and_then(Value::as_str)
+                                    == Some(graph_id)
+                        };
+                        if !same_world {
+                            continue;
+                        }
+                        found_world = true;
+                        let tree = world.get("nodes");
+                        if tree.is_some() {
+                            found_tree = true;
+                        } else {
+                            preserved = false;
+                        }
+                        let actual_node =
+                            tree.and_then(|tree| reopened_graph_node(tree, node_id, source_node));
+                        if !reopened_node_metadata_matches(
+                            source_node,
+                            actual_node,
+                            property,
+                            expected,
+                        ) {
+                            preserved = false;
+                        }
+                    }
+                }
+                if !found_world {
+                    preserved = false;
+                }
+            }
+        }
+    } else if let Some(groups) = reopened.get("node_groups").and_then(Value::as_array) {
+        let mapped_group_name = compatibility_name_for_id(source, "NodeGroup:", graph_id);
+        let imported_tree_name = compatibility_name_for_id(source, "NodeTree:", graph_id);
+        let model_group_name = source
+            .get("node_groups")
+            .and_then(Value::as_object)
+            .and_then(|groups| groups.get(graph_id))
+            .and_then(|group| group.get("name"))
+            .and_then(Value::as_str);
+        let mut found_group = false;
+        for group in groups {
+            let Some(tree) = group.get("tree") else {
+                continue;
+            };
+            let group_id = valid_bridge_id(group);
+            let tree_id = valid_bridge_id(tree);
+            let matches_id = group_id == Some(graph_id) || tree_id == Some(graph_id);
+            let matches_name = group_id.is_none()
+                && tree_id.is_none()
+                && [mapped_group_name, imported_tree_name, model_group_name]
+                    .into_iter()
+                    .flatten()
+                    .any(|name| {
+                        group.get("name").and_then(Value::as_str) == Some(name)
+                            || tree.get("name").and_then(Value::as_str) == Some(name)
+                    });
+            if !matches_id && !matches_name {
+                continue;
+            }
+            found_group = true;
+            found_tree = true;
+            let actual_node = reopened_graph_node(tree, node_id, source_node);
+            if !reopened_node_metadata_matches(source_node, actual_node, property, expected) {
+                preserved = false;
+            }
+        }
+        if !found_group {
+            preserved = false;
+        }
+    }
+    found_tree && preserved
+}
+
+fn reopened_shader_node_metadata_losses(source: &Value, reopened: &Value) -> Vec<Loss> {
+    let Some(source_groups) = source.get("node_groups").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut losses = Vec::new();
+    for (graph_id, source_group) in source_groups {
+        let Some(source_nodes) = source_group.get("nodes").and_then(Value::as_object) else {
+            continue;
+        };
+        for (node_id, source_node) in source_nodes {
+            let Some(properties) = source_node.get("properties").and_then(Value::as_object) else {
+                continue;
+            };
+            for (property, feature, description) in [
+                (
+                    "internal_links",
+                    "blender.node.internal_links",
+                    "internal routing",
+                ),
+                (
+                    "input_socket_flags",
+                    "blender.node.input_socket_flags",
+                    "input socket flags",
+                ),
+            ] {
+                let Some(expected) = properties.get(property) else {
+                    continue;
+                };
+                if !reopened_shader_node_metadata_matches(
+                    source,
+                    reopened,
+                    graph_id,
+                    node_id,
+                    source_node,
+                    property,
+                    expected,
+                ) {
+                    losses.push(loss(
+                        feature,
+                        Some(node_id),
+                        &format!(
+                            "Blender did not preserve {description} on node `{node_id}`; its reopened canonical metadata is used."
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    losses
+}
+
 /// Export the supported portion of a scene graph through a clean Blender process.
 /// Unsupported source structures are reported, and fail closed unless lossy export was
 /// explicitly requested. Their JSON compatibility payload is included as an inert Text.
@@ -125,6 +578,7 @@ pub fn export_blend(
     opts: &ExportOptions<'_>,
 ) -> Result<ExportReport> {
     doc.validate()?;
+    validate_shader_node_metadata(doc)?;
     for (node_id, node) in &doc.nodes {
         let Some(settings) = node
             .properties
@@ -245,6 +699,17 @@ pub fn export_blend(
                 "Blender export did not pass reopen validation",
                 json!({"cause": error}),
             ));
+        }
+        let metadata_losses = reopened_shader_node_metadata_losses(&document, &intermediate);
+        if !metadata_losses.is_empty() {
+            if !opts.allow_lossy {
+                return Err(PotError::with_details(
+                    ErrorCode::UnrepresentableFeature,
+                    "Blender could not preserve canonical shader socket metadata; rerun with --allow-lossy",
+                    json!({"losses": metadata_losses}),
+                ));
+            }
+            losses.extend(metadata_losses);
         }
         if let Err(error) = fs::rename(&blend_temp, out) {
             forward_child_output(&exported);
@@ -3100,6 +3565,7 @@ fn validate_intermediate(raw: &Value) -> Result<()> {
                         "eevee_raytracing_denoise_spatial",
                         "eevee_raytracing_denoise_temporal",
                         "eevee_raytracing_denoise_bilateral",
+                        "use_high_quality_normals",
                     ] {
                         parse_optional_eevee_bool(render.get(field), field)?;
                     }
@@ -3905,6 +4371,10 @@ fn build_imported_graph(
         let eevee_use_raytracing = parse_eevee_use_raytracing(render.get("eevee_use_raytracing"))?;
         let eevee_use_fast_gi =
             parse_optional_eevee_bool(render.get("eevee_use_fast_gi"), "eevee_use_fast_gi")?;
+        let use_high_quality_normals = parse_optional_eevee_bool(
+            render.get("use_high_quality_normals"),
+            "use_high_quality_normals",
+        )?;
         let eevee_clamp_surface_indirect = parse_optional_eevee_float(
             render.get("eevee_clamp_surface_indirect"),
             "eevee_clamp_surface_indirect",
@@ -3970,6 +4440,7 @@ fn build_imported_graph(
                 .and_then(Value::as_str)
                 .unwrap_or("path")
                 .to_owned(),
+            use_high_quality_normals,
             use_sequencer: render
                 .get("use_sequencer")
                 .and_then(Value::as_bool)
@@ -6595,6 +7066,11 @@ fn import_node_groups(
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
+            if let Some(reason) = shader_node_metadata_error(&properties) {
+                return Err(invalid_intermediate(&format!(
+                    "node `{node_name}` has invalid Blender socket metadata: {reason}"
+                )));
+            }
             let node_type = string_field(raw_node, "type")?.to_owned();
             if matches!(
                 node_type.as_str(),
@@ -15310,6 +15786,13 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                 Some(false) => {}
             }
         }
+        if !scene_is_linked && scene.render.use_high_quality_normals.is_none() {
+            losses.push(loss(
+                "blender.scene.render.use_high_quality_normals",
+                Some(scene_id.as_str()),
+                "Scene.render.use_high_quality_normals is unknown; exporting a recreated Scene would substitute Blender's default. Reimport the source .blend or set use_high_quality_normals before export.",
+            ));
+        }
         if scene.render.engine == "realtime" && scene.render.eevee_gi_cubemap_resolution.is_none() {
             losses.push(loss(
                 "blender.scene.eevee.gi_cubemap_resolution_unknown",
@@ -18558,7 +19041,10 @@ mod tests {
             intermediate["scenes"][0]["world"]["sun_threshold"] = json!(threshold);
             assert!(validate_intermediate(&intermediate).is_ok(), "{threshold}");
         }
-        for threshold in [-f64::EPSILON, f64::from(f32::MAX) + 1.0] {
+        for threshold in [
+            -f64::EPSILON,
+            f64::from_bits(f64::from(f32::MAX).to_bits() + 1),
+        ] {
             intermediate["scenes"][0]["world"]["sun_threshold"] = json!(threshold);
             assert!(validate_intermediate(&intermediate).is_err(), "{threshold}");
         }
@@ -18602,7 +19088,8 @@ mod tests {
             assert!(validate_intermediate(&intermediate).is_ok(), "{field}");
             intermediate["scenes"][0]["world"][field] = json!(maximum);
             assert!(validate_intermediate(&intermediate).is_ok(), "{field}");
-            intermediate["scenes"][0]["world"][field] = json!(maximum + 1.0);
+            intermediate["scenes"][0]["world"][field] =
+                json!(f64::from_bits(maximum.to_bits() + 1));
             assert!(validate_intermediate(&intermediate).is_err(), "{field}");
             intermediate["scenes"][0]["world"][field] = json!(-f64::EPSILON);
             assert!(validate_intermediate(&intermediate).is_err(), "{field}");
@@ -18679,7 +19166,7 @@ mod tests {
             json!(f64::from(f32::MAX));
         assert!(validate_intermediate(&intermediate).is_ok());
         intermediate["scenes"][0]["render"]["eevee_clamp_surface_indirect"] =
-            json!(f64::from(f32::MAX) + 1.0);
+            json!(f64::from_bits(f64::from(f32::MAX).to_bits() + 1));
         assert!(validate_intermediate(&intermediate).is_err());
         intermediate["scenes"][0]["render"]["eevee_clamp_surface_indirect"] = json!(-f64::EPSILON);
         assert!(validate_intermediate(&intermediate).is_err());
@@ -19895,14 +20382,16 @@ mod tests {
     }
 
     #[test]
-    fn blender_roundtrip_preserves_eevee_use_raytracing() -> Result<()> {
+    fn blender_roundtrip_preserves_eevee_raytracing_and_mesh_normal_precision() -> Result<()> {
         let Some(blender) = optional_blender() else {
             return Ok(());
         };
         let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
         let project = Project::init(directory.path().join("project"))?;
         let scene_id = Id::from_static("scene_main");
-        for (index, value) in [true, false].into_iter().enumerate() {
+        for (index, (value, high_quality_normals)) in
+            [(true, false), (false, true)].into_iter().enumerate()
+        {
             let mut doc = roundtrip_scene()?;
             let scene = doc
                 .scenes
@@ -19911,6 +20400,29 @@ mod tests {
             scene.render.engine = "realtime".to_owned();
             scene.render.eevee_gi_cubemap_resolution = Some(1024);
             scene.render.eevee_use_raytracing = Some(value);
+            scene.render.eevee_use_fast_gi = Some(false);
+            scene.render.eevee_raytracing_method =
+                Some(crate::model::EeveeRayTracingMethod::Screen);
+            scene.render.eevee_raytracing_resolution_scale = Some(2);
+            scene.render.eevee_raytracing_screen_trace_quality = Some(0.25);
+            scene.render.eevee_raytracing_screen_trace_thickness = Some(0.1);
+            scene.render.eevee_raytracing_trace_max_roughness = Some(0.5);
+            scene.render.eevee_raytracing_use_backface_hit = Some(true);
+            scene.render.eevee_raytracing_backface_radiance_scale = Some(0.25);
+            scene.render.eevee_raytracing_use_denoise = Some(true);
+            scene.render.eevee_raytracing_denoise_spatial = Some(true);
+            scene.render.eevee_raytracing_denoise_temporal = Some(true);
+            scene.render.eevee_raytracing_denoise_bilateral = Some(true);
+            scene.render.eevee_fast_gi_bias = Some(0.05);
+            scene.render.eevee_fast_gi_resolution = Some(2);
+            scene.render.eevee_fast_gi_step_count = Some(8);
+            scene.render.eevee_fast_gi_ray_count = Some(2);
+            scene.render.eevee_fast_gi_quality = Some(0.25);
+            scene.render.eevee_fast_gi_distance = Some(0.0);
+            scene.render.eevee_fast_gi_thickness_near = Some(0.1);
+            scene.render.eevee_fast_gi_method =
+                Some(crate::model::EeveeFastGiMethod::GlobalIllumination);
+            scene.render.use_high_quality_normals = Some(high_quality_normals);
             let output = directory
                 .path()
                 .join(format!("eevee-raytracing-{index}.blend"));
@@ -19926,6 +20438,12 @@ mod tests {
             assert_eq!(
                 imported.doc.scenes[&scene_id].render.eevee_use_raytracing,
                 Some(value)
+            );
+            assert_eq!(
+                imported.doc.scenes[&scene_id]
+                    .render
+                    .use_high_quality_normals,
+                Some(high_quality_normals)
             );
         }
         Ok(())
@@ -20533,6 +21051,360 @@ mod tests {
                     .any(|node| node.node_type == "OutputMaterial")
             );
         }
+        Ok(())
+    }
+
+    fn muted_mix_shader_graph() -> Result<(NodeGroup, Id, Id)> {
+        let graph_id = Id::new("muted_mix_graph")?;
+        let material_id = Id::new("muted_mix_material")?;
+        let mut group = NodeGroup::new("Muted Mix Shader", GraphKind::Shader);
+
+        let mut constant = GraphNode::new("ShaderNodeValue");
+        constant.properties.insert(
+            "potter_output_defaults".to_owned(),
+            json!([{"identifier": "Value", "default": 1.0}]),
+        );
+        let mut mix = GraphNode::new("ShaderNodeMix");
+        mix.properties.insert("mute".to_owned(), json!(true));
+        mix.properties
+            .insert("data_type".to_owned(), json!("FLOAT"));
+        mix.inputs.insert("Factor".to_owned(), json!(0.25));
+        mix.inputs.insert("B".to_owned(), json!(0.95));
+        let mut principled = GraphNode::new("ShaderNodeBsdfPrincipled");
+        principled.inputs.insert("Alpha".to_owned(), json!(0.4));
+        let mut output = GraphNode::new("OutputMaterial");
+        output
+            .properties
+            .insert("is_active_output".to_owned(), json!(true));
+        for (id, node) in [
+            ("constant", constant),
+            ("muted_mix", mix),
+            ("principled", principled),
+            ("output", output),
+        ] {
+            group.nodes.insert(Id::new(id)?, node);
+        }
+        for (from_node, from_socket, to_node, to_socket) in [
+            ("constant", "Value", "muted_mix", "A"),
+            ("muted_mix", "Result", "principled", "Alpha"),
+            ("principled", "BSDF", "output", "Surface"),
+        ] {
+            group.links.push(GraphLink {
+                from_node: Id::new(from_node)?,
+                from_socket: from_socket.to_owned(),
+                to_node: Id::new(to_node)?,
+                to_socket: to_socket.to_owned(),
+            });
+        }
+        Ok((group, graph_id, material_id))
+    }
+
+    fn muted_mix_world_graph() -> Result<(NodeGroup, Id)> {
+        let world_graph_id = Id::new("muted_mix_world_graph")?;
+        let mut world_group = NodeGroup::new("Muted Mix World", GraphKind::Shader);
+        let mut background = GraphNode::new("ShaderNodeBackground");
+        background
+            .inputs
+            .insert("Color".to_owned(), json!([0.2, 0.3, 0.4, 1.0]));
+        background.inputs.insert("Strength".to_owned(), json!(0.75));
+        let mut world_output = GraphNode::new("ShaderNodeOutputWorld");
+        world_output
+            .properties
+            .insert("is_active_output".to_owned(), json!(true));
+        world_group
+            .nodes
+            .insert(Id::new("world_background")?, background);
+        world_group
+            .nodes
+            .insert(Id::new("world_output")?, world_output);
+        world_group.links.push(GraphLink {
+            from_node: Id::new("world_background")?,
+            from_socket: "Background".to_owned(),
+            to_node: Id::new("world_output")?,
+            to_socket: "Surface".to_owned(),
+        });
+        Ok((world_group, world_graph_id))
+    }
+
+    fn muted_mix_scene_doc() -> Result<(SceneDoc, Id, Id)> {
+        let (group, graph_id, material_id) = muted_mix_shader_graph()?;
+        let (world_group, world_graph_id) = muted_mix_world_graph()?;
+        let world_id = Id::new("muted_mix_world")?;
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.node_groups.insert(graph_id.clone(), group);
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                name: "Muted Mix".to_owned(),
+                node_tree: Some(graph_id.clone()),
+                ..Material::default()
+            },
+        );
+        doc.node_groups.insert(world_graph_id.clone(), world_group);
+        doc.worlds.insert(
+            world_id.clone(),
+            World {
+                node_tree: Some(world_graph_id),
+                ..World::default()
+            },
+        );
+        doc.scenes
+            .get_mut(&Id::from_static("scene_main"))
+            .ok_or_else(|| invalid_intermediate("test scene is missing"))?
+            .world = Some(world_id);
+        let mesh_id = Id::new("muted_mix_mesh")?;
+        doc.data_blocks.insert(
+            mesh_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(box_with_attributes(Vec::new())?),
+                ..DataBlock::default()
+            },
+        );
+        let object_id = Id::new("muted_mix_object")?;
+        let mut object = test_node("Muted Mix", mesh_id.as_str(), None, None)?;
+        object.materials = vec![Some(material_id.clone())];
+        doc.nodes.insert(object_id.clone(), object);
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .ok_or_else(|| invalid_intermediate("root collection is missing"))?
+            .objects
+            .push(object_id);
+        Ok((doc, graph_id, material_id))
+    }
+
+    fn muted_mix_closure_flags(doc: &SceneDoc, material_id: &Id) -> Result<u32> {
+        let material = doc
+            .materials
+            .get(material_id)
+            .ok_or_else(|| invalid_intermediate("muted Mix material is missing"))?;
+        PreparedMaterial::new(material, &doc.node_groups).eevee_closure_flags()
+    }
+
+    fn assert_muted_mix_route_policy(
+        source: &SceneDoc,
+        project: &Project,
+        directory: &Path,
+        blender: &Path,
+        context: &crate::eval::EvaluationContext,
+        graph_id: &Id,
+        material_id: &Id,
+        flags_before: u32,
+    ) -> Result<()> {
+        let mut wrong_route = source.clone();
+        wrong_route
+            .node_groups
+            .get_mut(graph_id)
+            .and_then(|group| group.nodes.get_mut(&Id::new("muted_mix").ok()?))
+            .ok_or_else(|| invalid_intermediate("muted Mix node is missing"))?
+            .properties
+            .insert("internal_links".to_owned(), json!([]));
+        let transparency = crate::shader::EEVEE_CLOSURE_TRANSPARENCY;
+        assert_ne!(
+            muted_mix_closure_flags(&wrong_route, material_id)? & transparency,
+            0,
+            "an empty known route map must not guess the linked A input"
+        );
+        let Err(route_strict_error) = export_blend(
+            &wrong_route,
+            project,
+            &directory.join("muted-mix-strict-route.blend"),
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(blender),
+                context,
+            },
+        ) else {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "strict Blender export accepted changed muted internal routing",
+            ));
+        };
+        assert_eq!(route_strict_error.code, ErrorCode::UnrepresentableFeature);
+        assert!(
+            route_strict_error.details["losses"]
+                .as_array()
+                .is_some_and(|losses| {
+                    losses.iter().any(|loss| {
+                        loss["feature_id"] == json!("blender.node.internal_links")
+                            && loss["data_id"] == json!("muted_mix")
+                    })
+                })
+        );
+        let lossy_route_path = directory.join("muted-mix-lossy-route.blend");
+        let route_report = export_blend(
+            &wrong_route,
+            project,
+            &lossy_route_path,
+            &ExportOptions {
+                allow_lossy: true,
+                pack: false,
+                blender: Some(blender),
+                context,
+            },
+        )?;
+        assert!(route_report.losses.iter().any(|loss| {
+            loss.feature_id == "blender.node.internal_links"
+                && loss.data_id.as_deref() == Some("muted_mix")
+        }));
+        let route_roundtrip = import_blend(&lossy_route_path, Some(blender))?;
+        assert_eq!(
+            muted_mix_closure_flags(&route_roundtrip.doc, material_id)?,
+            flags_before
+        );
+        Ok(())
+    }
+
+    fn assert_muted_mix_socket_flag_policy(
+        source: &SceneDoc,
+        project: &Project,
+        directory: &Path,
+        blender: &Path,
+        context: &crate::eval::EvaluationContext,
+        graph_id: &Id,
+        material_id: &Id,
+        flags_before: u32,
+    ) -> Result<()> {
+        let mut wrong_flags = source.clone();
+        let mix = wrong_flags
+            .node_groups
+            .get_mut(graph_id)
+            .and_then(|group| group.nodes.get_mut(&Id::new("muted_mix").ok()?))
+            .ok_or_else(|| invalid_intermediate("muted Mix node is missing"))?;
+        let socket_flags = mix
+            .properties
+            .get_mut("input_socket_flags")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| invalid_intermediate("muted Mix socket flags are missing"))?;
+        let flags = socket_flags
+            .values_mut()
+            .next()
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| invalid_intermediate("muted Mix socket flags are empty"))?;
+        let enabled = flags
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| invalid_intermediate("muted Mix enabled flag is missing"))?;
+        flags.insert("enabled".to_owned(), json!(!enabled));
+        let Err(flag_strict_error) = export_blend(
+            &wrong_flags,
+            project,
+            &directory.join("muted-mix-strict-flags.blend"),
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(blender),
+                context,
+            },
+        ) else {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "strict Blender export accepted changed read-only socket flags",
+            ));
+        };
+        assert_eq!(flag_strict_error.code, ErrorCode::UnrepresentableFeature);
+        assert!(
+            flag_strict_error.details["losses"]
+                .as_array()
+                .is_some_and(|losses| {
+                    losses.iter().any(|loss| {
+                        loss["feature_id"] == json!("blender.node.input_socket_flags")
+                            && loss["data_id"] == json!("muted_mix")
+                    })
+                })
+        );
+        let lossy_flags_path = directory.join("muted-mix-lossy-flags.blend");
+        let flag_report = export_blend(
+            &wrong_flags,
+            project,
+            &lossy_flags_path,
+            &ExportOptions {
+                allow_lossy: true,
+                pack: false,
+                blender: Some(blender),
+                context,
+            },
+        )?;
+        assert!(flag_report.losses.iter().any(|loss| {
+            loss.feature_id == "blender.node.input_socket_flags"
+                && loss.data_id.as_deref() == Some("muted_mix")
+        }));
+        let flags_roundtrip = import_blend(&lossy_flags_path, Some(blender))?;
+        assert_eq!(
+            muted_mix_closure_flags(&flags_roundtrip.doc, material_id)?,
+            flags_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blender_muted_mix_internal_links_preserve_native_closure_flags() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let (doc, graph_id, material_id) = muted_mix_scene_doc()?;
+        let context = export_context();
+        let source_path = directory.path().join("muted-mix-source.blend");
+        export_blend(
+            &doc,
+            &project,
+            &source_path,
+            &ExportOptions {
+                allow_lossy: true,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        let source = import_blend(&source_path, Some(&blender))?;
+        let flags_before = muted_mix_closure_flags(&source.doc, &material_id)?;
+        let transparency = crate::shader::EEVEE_CLOSURE_TRANSPARENCY;
+        assert_eq!(
+            flags_before & transparency,
+            0,
+            "the linked constant routed through muted Mix must keep Alpha opaque"
+        );
+
+        let normal_path = directory.path().join("muted-mix-roundtrip.blend");
+        export_blend(
+            &source.doc,
+            &project,
+            &normal_path,
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        let normal_roundtrip = import_blend(&normal_path, Some(&blender))?;
+        assert_eq!(
+            muted_mix_closure_flags(&normal_roundtrip.doc, &material_id)?,
+            flags_before
+        );
+        assert_muted_mix_route_policy(
+            &source.doc,
+            &project,
+            directory.path(),
+            &blender,
+            &context,
+            &graph_id,
+            &material_id,
+            flags_before,
+        )?;
+        assert_muted_mix_socket_flag_policy(
+            &source.doc,
+            &project,
+            directory.path(),
+            &blender,
+            &context,
+            &graph_id,
+            &material_id,
+            flags_before,
+        )?;
         Ok(())
     }
     fn blend_corner_values_by_vertex(
@@ -26891,6 +27763,30 @@ print("UNSUPPORTED_POSE " + json.dumps({
             export_losses(&doc).iter().all(|loss| {
                 loss.feature_id != "blender.scene.eevee.raytracing_settings_unknown"
             })
+        );
+    }
+    #[test]
+    fn blender_export_reports_unknown_mesh_normal_precision() {
+        let scene_id = Id::from_static("scene_main");
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let render = &mut doc.scenes.get_mut(&scene_id).expect("default scene").render;
+        render.use_high_quality_normals = None;
+        let unknown = export_losses(&doc)
+            .into_iter()
+            .find(|loss| loss.feature_id == "blender.scene.render.use_high_quality_normals")
+            .expect("unknown source normal precision is an authoring loss");
+        assert_eq!(unknown.data_id.as_deref(), Some("scene_main"));
+        assert!(unknown.reason.contains("Blender's default"));
+
+        doc.scenes
+            .get_mut(&scene_id)
+            .expect("default scene")
+            .render
+            .use_high_quality_normals = Some(true);
+        assert!(
+            export_losses(&doc)
+                .iter()
+                .all(|loss| { loss.feature_id != "blender.scene.render.use_high_quality_normals" })
         );
     }
     #[test]

@@ -256,11 +256,14 @@ fn eevee_probe_mip_extent(face_texels: usize, mip: usize) -> usize {
 }
 
 fn store_eevee_probe_texel(value: DVec3) -> EeveeProbeTexel {
+    let store_f16 = |value: f32| {
+        exr::prelude::f16::from_bits(super::eevee_raytrace_denoise::store_f16_bits_rtz(value))
+    };
     [
-        exr::prelude::f16::from_f32(value.x as f32),
-        exr::prelude::f16::from_f32(value.y as f32),
-        exr::prelude::f16::from_f32(value.z as f32),
-        exr::prelude::f16::from_f32(1.0),
+        store_f16(value.x as f32),
+        store_f16(value.y as f32),
+        store_f16(value.z as f32),
+        store_f16(1.0),
     ]
 }
 

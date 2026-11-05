@@ -284,8 +284,10 @@ pub(crate) struct Triangle {
     pub(crate) layer_uvs: Vec<[[f64; 2]; 3]>,
     /// World-space per-corner Mikk tangents for each UV layer; absent when no UV tangent graph is used.
     pub(crate) layer_tangents: Vec<[DVec3; 3]>,
-    /// World-space corner shading normals; `None` for flat faces, which keep their geometric normal.
+    /// World-space corner shading normals; realtime Source may provide them on flat faces too.
     pub(crate) normals: Option<[DVec3; 3]>,
+    /// Source face smoothness, distinct from whether packed corner normals are present.
+    pub(crate) smooth_shading: bool,
     /// Corner colors of every color layer the object carries, in `ObjectRecord::color_layers`
     /// order; empty without color layers.
     pub(crate) layer_colors: Vec<[[f64; 4]; 3]>,
@@ -322,6 +324,7 @@ impl Triangle {
             layer_uvs,
             layer_tangents,
             normals: self.normals,
+            smooth_shading: self.smooth_shading,
             layer_colors,
             geometry_vertex_slots: self.geometry_vertex_slots,
             geometry_vertex_weights,
@@ -385,10 +388,26 @@ pub(crate) struct SurfaceHit<'a> {
 /// One source-selected EEVEE G-buffer bin, before transport tracing.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EeveeRaytraceBin {
-    pub(crate) input: RayGenerateInput,
-    pub(crate) roughness: f32,
+    pub(crate) world_input: RayGenerateInput,
     pub(crate) dominant_direction: DVec3,
     pub(crate) transmission: bool,
+}
+#[derive(Clone, Copy, Default)]
+pub(crate) struct EeveeRaytraceLayerFlags {
+    /// Source closure bits after its empty-material EMISSION fallback.
+    pub(crate) has_any_closure: bool,
+    /// Source REFLECTION|DIFFUSE closure flags used to enable screen reflection.
+    pub(crate) has_reflect_closure: bool,
+    /// Source REFRACTION|TRANSLUCENT flags used to enable ray tracing on this layer.
+    pub(crate) has_transmit_closure: bool,
+    /// Source `has_transmission()` result used to decide whether the next layer refracts this one.
+    pub(crate) has_transmission: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct EeveeRaytraceLayerSummary {
+    pub(crate) opaque: EeveeRaytraceLayerFlags,
+    pub(crate) refraction: Option<EeveeRaytraceLayerFlags>,
 }
 
 /// Per-sample camera data consumed by EEVEE screen tracing.
@@ -479,6 +498,9 @@ pub(crate) trait SurfaceShader {
     fn eevee_raytracing_settings(&self) -> Result<Option<EeveeRayTracingSettings>> {
         Ok(None)
     }
+    fn eevee_raytrace_layer_flags(&self) -> Result<Option<EeveeRaytraceLayerSummary>> {
+        Ok(None)
+    }
     fn eevee_raytrace_probe_radiance(
         &self,
         _sample: &EeveeRaytraceSample,
@@ -513,6 +535,9 @@ pub(crate) trait SurfaceShaderWorker: Send {
         false
     }
     fn eevee_raytracing_settings(&self) -> Result<Option<EeveeRayTracingSettings>> {
+        Ok(None)
+    }
+    fn eevee_raytrace_layer_flags(&self) -> Result<Option<EeveeRaytraceLayerSummary>> {
         Ok(None)
     }
     fn eevee_raytrace_probe_radiance(
@@ -557,6 +582,12 @@ impl RasterShader<'_> {
         match self {
             Self::Main(shader) => shader.eevee_raytracing_settings(),
             Self::Worker(shader, _) => shader.eevee_raytracing_settings(),
+        }
+    }
+    fn eevee_raytrace_layer_flags(&self) -> Result<Option<EeveeRaytraceLayerSummary>> {
+        match self {
+            Self::Main(shader) => shader.eevee_raytrace_layer_flags(),
+            Self::Worker(shader, _) => shader.eevee_raytrace_layer_flags(),
         }
     }
     fn eevee_raytrace_probe_radiance(
@@ -642,6 +673,9 @@ pub(crate) fn smooth_shadow_origin(
     point: DVec3,
     barycentric: [f64; 3],
 ) -> DVec3 {
+    if !triangle.smooth_shading {
+        return point;
+    }
     let Some(normals) = triangle.normals else {
         return point;
     };
@@ -2309,7 +2343,7 @@ struct RasterSampleContext<
 
 impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
     fn shade(&mut self, sample: &RasterPixelSample) -> Result<RasterSampleOutput> {
-        let hit_context = if self.shader.is_some() {
+        let mut hit_context = if self.shader.is_some() {
             Some(raster_hit_context(
                 self.frame,
                 self.camera,
@@ -2322,6 +2356,9 @@ impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
         } else {
             None
         };
+        if let Some(hit_context) = hit_context.as_mut() {
+            hit_context.raytrace_layer = self.raytrace_layer;
+        }
         let (sample_ray, cached_hit, uncached_hit) = if let Some(cached) = sample.cached.as_ref() {
             (cached.ray, cached.hit.as_ref(), None)
         } else {
@@ -2577,7 +2614,36 @@ fn rasterize_eevee_raytraced_samples(
     } = request;
 
     let pixel_count = output.linear_rgba.len();
+    let source_layer_summary = if let Some(shader) = shader {
+        let summary = shader.eevee_raytrace_layer_flags()?;
+        if summary.is_none() && shader.needs_eevee_gbuffer_context() {
+            return Err(PotError::new(
+                ErrorCode::UnsupportedFeature,
+                "EEVEE ray tracing requires source deferred-layer closure flags",
+            ));
+        }
+        summary
+    } else {
+        None
+    };
+    let source_refraction_layer_present =
+        source_layer_summary.is_some_and(|summary| summary.refraction.is_some());
+    let opaque_feedback_output = source_layer_summary.is_some_and(|summary| {
+        let next_layer_has_transmission = summary
+            .refraction
+            .is_some_and(|layer| layer.has_transmission);
+        eevee_source_feedback_output(
+            summary.opaque,
+            next_layer_has_transmission,
+            summary.refraction.is_none(),
+        )
+    });
+    let refraction_feedback_output = source_layer_summary
+        .and_then(|summary| summary.refraction)
+        .is_some_and(|layer| eevee_source_feedback_output(layer, false, true));
     let mut front_feedback_color: Option<Vec<[f32; 4]>> = None;
+    let mut front_feedback_valid = false;
+    let mut opaque_feedback_valid = false;
     let mut screen_feedback_view_projection = None;
     let mut prepass_subsurface =
         allocate_filled(pixel_count, None, "EEVEE ray-tracing prepass subsurface")?;
@@ -2592,16 +2658,6 @@ fn rasterize_eevee_raytraced_samples(
         1.0
     };
     let fast_gi_active = fast_gi::fast_gi_should_run(settings.use_fast_gi, effective_trace_max);
-    let mut fast_gi_history = if fast_gi_active {
-        Some(allocate_filled(
-            pixel_count,
-            [0.0_f32; 4],
-            "EEVEE FastGI radiance history",
-        )?)
-    } else {
-        None
-    };
-    let mut fast_gi_history_valid = false;
     let mut fast_gi_history_view_projection = None;
     let denoise_plan = denoise::resolve_stage_plan(
         settings.use_denoise,
@@ -2632,7 +2688,7 @@ fn rasterize_eevee_raytraced_samples(
     } else {
         None
     };
-    let mut sample_display = if film.is_none() || fast_gi_active {
+    let mut sample_display = if film.is_none() {
         Some(allocate_filled(
             pixel_count,
             [0.0_f32; 4],
@@ -2724,20 +2780,14 @@ fn rasterize_eevee_raytraced_samples(
             shader,
             volume_pass,
         )?;
-        let has_refraction_layer = settings.method == crate::model::EeveeRayTracingMethod::Screen
-            && prepass_surfaces
-                .iter()
-                .any(|surface| EeveeRaytraceLayer::Refraction.contains(surface.as_ref()));
+        let has_refraction_layer = source_refraction_layer_present;
         let raytrace_feedback = if has_refraction_layer {
             if front_feedback_color.is_none() {
-                let mut feedback_color = allocate_filled(
+                let feedback_color = allocate_filled(
                     pixel_count,
                     [0.0_f32; 4],
                     "EEVEE previous refraction-layer color",
                 )?;
-                if let Some(previous_feedback) = previous_combined_feedback {
-                    feedback_color.copy_from_slice(previous_feedback);
-                }
                 front_feedback_color = Some(feedback_color);
             }
             if opaque_color.is_none() {
@@ -2770,7 +2820,6 @@ fn rasterize_eevee_raytraced_samples(
                     "missing EEVEE opaque-layer ray-tracing surfaces",
                 )
             })?;
-            opaque_color.fill([0.0; 4]);
             opaque_surfaces.fill(None);
             prepass_subsurface.fill(None);
             render.render_rows(
@@ -2794,14 +2843,22 @@ fn rasterize_eevee_raytraced_samples(
             {
                 eevee_screen_trace_enabled(settings.method, true, None)?;
             }
+            let fast_gi_history_top_down = if opaque_feedback_output && opaque_feedback_valid {
+                if screen_feedback_enabled {
+                    previous_combined_feedback
+                } else {
+                    Some(opaque_color.as_slice())
+                }
+            } else {
+                None
+            };
             let opaque_trace = trace_eevee_sample_frame(
                 render,
                 &trace_view,
                 settings,
                 sample_index,
                 sample.gbuffer_closure_sample.unwrap_or(0.0),
-                fast_gi_history.as_deref().unwrap_or(&[]),
-                fast_gi_history_valid,
+                fast_gi_history_top_down,
                 fast_gi_history_view_projection,
                 &mut temporal_histories,
                 opaque_surfaces,
@@ -2857,6 +2914,11 @@ fn rasterize_eevee_raytraced_samples(
                 shader,
                 volume_pass,
             )?;
+            let fast_gi_history_top_down = if refraction_feedback_output && front_feedback_valid {
+                front_feedback_color.as_deref()
+            } else {
+                None
+            };
             if refraction_temporal_histories.is_none() {
                 refraction_temporal_histories = Some(eevee_temporal_histories(
                     pixel_count,
@@ -2871,8 +2933,7 @@ fn rasterize_eevee_raytraced_samples(
                 settings,
                 sample_index,
                 sample.gbuffer_closure_sample.unwrap_or(0.0),
-                fast_gi_history.as_deref().unwrap_or(&[]),
-                fast_gi_history_valid,
+                fast_gi_history_top_down,
                 fast_gi_history_view_projection,
                 refraction_temporal_histories.as_mut().ok_or_else(|| {
                     PotError::new(
@@ -2883,12 +2944,7 @@ fn rasterize_eevee_raytraced_samples(
                 refraction_surfaces,
                 Some(opaque_color.as_slice()),
                 Some(&opaque_trace.depth),
-                Some(front_feedback_color.as_deref().ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::InternalError,
-                        "missing EEVEE previous refraction-layer color",
-                    )
-                })?),
+                fast_gi_history_top_down,
                 screen_feedback_view_projection,
                 shader,
             )?;
@@ -2937,14 +2993,22 @@ fn rasterize_eevee_raytraced_samples(
             )?;
             feedback
         } else {
+            let fast_gi_history_top_down = if opaque_feedback_output && opaque_feedback_valid {
+                if screen_feedback_enabled {
+                    previous_combined_feedback
+                } else {
+                    opaque_color.as_deref()
+                }
+            } else {
+                None
+            };
             trace_eevee_sample_frame(
                 render,
                 &trace_view,
                 settings,
                 sample_index,
                 sample.gbuffer_closure_sample.unwrap_or(0.0),
-                fast_gi_history.as_deref().unwrap_or(&[]),
-                fast_gi_history_valid,
+                fast_gi_history_top_down,
                 fast_gi_history_view_projection,
                 &mut temporal_histories,
                 &prepass_surfaces,
@@ -2985,42 +3049,6 @@ fn rasterize_eevee_raytraced_samples(
                 sample_index,
                 [sample_x, sample_y],
             )?;
-            if film.sample_subsurface.iter().any(Option::is_some)
-                && let Some(sample_display) = sample_display.as_deref_mut()
-            {
-                for (display, associated) in sample_display.iter_mut().zip(film.sample_color.iter())
-                {
-                    let alpha = associated[3];
-                    *display = if alpha > 0.0 {
-                        [
-                            associated[0] / alpha,
-                            associated[1] / alpha,
-                            associated[2] / alpha,
-                            alpha,
-                        ]
-                    } else {
-                        *associated
-                    };
-                }
-            }
-            if let (Some(history), Some(display)) =
-                (fast_gi_history.as_mut(), sample_display.as_deref())
-            {
-                for y_gl in 0..render.height {
-                    let y_top = render.height - 1 - y_gl;
-                    for x in 0..render.width {
-                        let gl_index = y_gl as usize * render.width as usize + x as usize;
-                        let top_index = y_top as usize * render.width as usize + x as usize;
-                        history[gl_index] = [
-                            exr::prelude::f16::from_f32(display[top_index][0]).to_f32(),
-                            exr::prelude::f16::from_f32(display[top_index][1]).to_f32(),
-                            exr::prelude::f16::from_f32(display[top_index][2]).to_f32(),
-                            0.0,
-                        ];
-                    }
-                }
-                fast_gi_history_valid = true;
-            }
             for pixel in 0..film.sample_color.len() {
                 let color = film.sample_color[pixel].map(f64::from);
                 store_film_sample(&mut film.sample_color, pixel, color);
@@ -3081,24 +3109,6 @@ fn rasterize_eevee_raytraced_samples(
                     };
                 }
             }
-            if let (Some(history), Some(display)) =
-                (fast_gi_history.as_mut(), Some(sample_display.as_slice()))
-            {
-                for y_gl in 0..render.height {
-                    let y_top = render.height - 1 - y_gl;
-                    for x in 0..render.width {
-                        let gl_index = y_gl as usize * render.width as usize + x as usize;
-                        let top_index = y_top as usize * render.width as usize + x as usize;
-                        history[gl_index] = [
-                            exr::prelude::f16::from_f32(display[top_index][0]).to_f32(),
-                            exr::prelude::f16::from_f32(display[top_index][1]).to_f32(),
-                            exr::prelude::f16::from_f32(display[top_index][2]).to_f32(),
-                            0.0,
-                        ];
-                    }
-                }
-                fast_gi_history_valid = true;
-            }
             let count = f64::from(sample_index + 1);
             let previous_weight = 1.0 - 1.0 / count;
             let average_display = average_display.as_mut().ok_or_else(|| {
@@ -3117,9 +3127,6 @@ fn rasterize_eevee_raytraced_samples(
                         + f64::from(sample_color[pixel][channel]) / count;
                 }
             }
-        }
-        if fast_gi_history_valid {
-            fast_gi_history_view_projection = Some(trace_view.view_projection);
         }
         if screen_feedback_enabled {
             let (history_color, history_subsurface) = if let Some(film) = film.as_mut() {
@@ -3169,11 +3176,58 @@ fn rasterize_eevee_raytraced_samples(
                     sample_index,
                     [sample_x, sample_y],
                 )?;
-                if let Some(front_feedback_color) = front_feedback_color.as_mut() {
-                    front_feedback_color.copy_from_slice(history_color);
-                }
             }
             screen_feedback_view_projection = Some(trace_view.view_projection);
+        }
+        if screen_feedback_enabled {
+            opaque_feedback_valid = opaque_feedback_output;
+            front_feedback_valid = refraction_feedback_output;
+        } else {
+            front_feedback_valid = has_refraction_layer && refraction_feedback_output;
+            opaque_feedback_valid = false;
+            if fast_gi_active && opaque_feedback_output {
+                if has_refraction_layer {
+                    opaque_feedback_valid = true;
+                } else {
+                    if opaque_color.is_none() {
+                        opaque_color = Some(allocate_filled(
+                            pixel_count,
+                            [0.0; 4],
+                            "EEVEE opaque-layer feedback color",
+                        )?);
+                    }
+                    let opaque_color = opaque_color.as_mut().ok_or_else(|| {
+                        PotError::new(ErrorCode::InternalError, "missing EEVEE opaque-layer color")
+                    })?;
+                    opaque_color.fill([0.0; 4]);
+                    prepass_subsurface.fill(None);
+                    render.render_rows(
+                        0..render.height as usize,
+                        Some(opaque_color.as_mut_slice()),
+                        None,
+                        &mut prepass_subsurface,
+                        None,
+                        Some(EeveeRaytraceLayer::Opaque),
+                        sample,
+                        sample_offset_seed,
+                        Some(&raytrace_feedback),
+                        candidates,
+                        shader,
+                        volume_pass,
+                    )?;
+                    resolve_eevee_subsurface_frame(
+                        &prepass_subsurface,
+                        opaque_color,
+                        subsurface_frame,
+                        sample_index,
+                        [sample_x, sample_y],
+                    )?;
+                    opaque_feedback_valid = true;
+                }
+            }
+        }
+        if opaque_feedback_valid || front_feedback_valid {
+            fast_gi_history_view_projection = Some(trace_view.view_projection);
         }
     }
 
@@ -3534,6 +3588,7 @@ impl denoise::SpatialKernelOps for EeveeDenoiseOps<'_> {
         &mut self,
         pixel_index: usize,
         ray_direction: [f32; 3],
+        view_normal: [f32; 3],
         view_incident: [f32; 3],
     ) -> f32 {
         let Some(bin) = self
@@ -3545,7 +3600,8 @@ impl denoise::SpatialKernelOps for EeveeDenoiseOps<'_> {
             return 0.0;
         };
         eevee_closure_evaluate_pdf(
-            bin.input,
+            bin.world_input,
+            Vec3::from_array(view_normal),
             Vec3::from_array(ray_direction),
             Vec3::from_array(view_incident),
         )
@@ -3586,14 +3642,8 @@ impl denoise::SpatialKernelOps for EeveeDenoiseOps<'_> {
         let Some(sample_bin) = sample.bins[self.closure_index] else {
             return 0.0;
         };
-        let normal = self
-            .view
-            .view_inverse
-            .transform_vector3(center_bin.input.normal);
-        let sample_normal = self
-            .view
-            .view_inverse
-            .transform_vector3(sample_bin.input.normal);
+        let normal = center_bin.world_input.normal;
+        let sample_normal = sample_bin.world_input.normal;
         let normal_dot = normal.dot(sample_normal);
         let plane_distance = normal.dot(sample.point.as_vec3() - center.point.as_vec3());
         let depth_weight = (-10_000.0 * plane_distance * plane_distance).exp2();
@@ -3634,31 +3684,36 @@ impl denoise::BilateralKernelOps for EeveeDenoiseOps<'_> {
     }
 }
 
-fn eevee_closure_evaluate_pdf(input: RayGenerateInput, direction: Vec3, view: Vec3) -> f32 {
+fn eevee_closure_evaluate_pdf(
+    input: RayGenerateInput,
+    view_normal: Vec3,
+    direction: Vec3,
+    view: Vec3,
+) -> f32 {
     match input.lobe {
         RayLobe::None => 0.0,
-        RayLobe::Diffuse | RayLobe::BurleyBssrdf => input.normal.dot(direction).clamp(0.0, 1.0),
+        RayLobe::Diffuse | RayLobe::BurleyBssrdf => view_normal.dot(direction).clamp(0.0, 1.0),
         RayLobe::Translucent => {
             if input.thickness.mode == ThicknessMode::Sphere && input.thickness.value != 0.0 {
                 0.25 / std::f32::consts::PI
             } else {
-                (-input.normal).dot(direction).clamp(0.0, 1.0)
+                (-view_normal).dot(direction).clamp(0.0, 1.0)
             }
         }
         RayLobe::GgxReflection => eevee_ggx_reflection_pdf(
-            input.normal,
+            view_normal,
             direction,
             view,
             input.roughness * input.roughness,
         ),
         RayLobe::ThinGlassTransmission => eevee_ggx_reflection_pdf(
-            -input.normal,
+            -view_normal,
             direction,
-            eevee_reflect(view, input.normal),
+            eevee_reflect(view, view_normal),
             input.roughness * input.roughness,
         ),
         RayLobe::GgxRefraction => {
-            let (normal, view, ior) = eevee_ggx_refraction_pdf_context(input, view);
+            let (normal, view, ior) = eevee_ggx_refraction_pdf_context(input, view_normal, view);
             eevee_ggx_refraction_pdf(
                 normal,
                 direction,
@@ -3688,8 +3743,7 @@ fn eevee_ggx_reflection_pdf(normal: Vec3, direction: Vec3, view: Vec3, alpha: f3
         (t - nv) / (2.0 * length_alpha_squared)
     };
     let nh = normal.dot(h).max(1.0e-8);
-    let ndf = alpha_squared
-        / (std::f32::consts::PI * ((1.0 - nh * nh) + alpha_squared * nh * nh).powi(2));
+    let ndf = eevee_ggx_ndf(nh, alpha_squared);
     base_pdf * ndf
 }
 
@@ -3706,11 +3760,7 @@ fn eevee_ggx_refraction_pdf(
     }
     let lv = direction.dot(view);
     if (ior - 1.0).abs() <= 1.0e-4 {
-        return if (lv + 1.0).abs() <= 1.0e-3 {
-            1.0e6
-        } else {
-            0.0
-        };
+        return 1.0e6;
     }
     if !if ior < 1.0 {
         lv < -ior
@@ -3740,18 +3790,16 @@ fn eevee_ggx_refraction_pdf(
     ndf * geometry_view * vh * lh * (ior * inverse_h_length).powi(2) / nv
 }
 
-fn eevee_ggx_refraction_pdf_context(input: RayGenerateInput, view: Vec3) -> (Vec3, Vec3, f32) {
-    let normal = input.normal;
+fn eevee_ggx_refraction_pdf_context(
+    input: RayGenerateInput,
+    normal: Vec3,
+    view: Vec3,
+) -> (Vec3, Vec3, f32) {
     let ior = input.ior;
     if input.thickness.value == 0.0 {
         return (normal, view, ior);
     }
-    let perceived_factor = if ior > 1.0 {
-        1.0 - 1.0 / ior
-    } else {
-        (1.0 - ior).clamp(0.0, 1.0) * 0.64
-    };
-    let perceived_roughness = input.roughness * eevee_sqrt_fast(perceived_factor);
+    let perceived_roughness = input.apparent_roughness();
     let m = perceived_roughness * perceived_roughness;
     let refracted = eevee_refract(-view, normal, 1.0 / ior);
     let smoothness = 1.0 - m;
@@ -3767,7 +3815,10 @@ fn eevee_ggx_refraction_pdf_context(input: RayGenerateInput, view: Vec3) -> (Vec
 }
 
 fn eevee_ggx_ndf(nh: f32, alpha_squared: f32) -> f32 {
-    alpha_squared / (std::f32::consts::PI * ((1.0 - nh * nh) + alpha_squared * nh * nh).powi(2))
+    // Preserve Blender d13 bxdf_ggx_D's grouped NH square in f32.
+    let nh_squared = nh * nh;
+    alpha_squared
+        / (std::f32::consts::PI * ((1.0 - nh_squared) + alpha_squared * nh_squared).powi(2))
 }
 
 fn eevee_ggx_smith_g1(nx: f32, alpha_squared: f32) -> f32 {
@@ -3786,9 +3837,6 @@ fn eevee_refract(incident: Vec3, normal: Vec3, eta: f32) -> Vec3 {
     } else {
         eta * incident - (eta * dot + k.sqrt()) * normal
     }
-}
-fn eevee_sqrt_fast(value: f32) -> f32 {
-    f32::from_bits(0x1fbd_1df5_u32.wrapping_add(value.to_bits() >> 1))
 }
 
 fn eevee_screen_thickness(
@@ -3842,11 +3890,11 @@ fn eevee_screen_trace_ray(
     view: Mat4,
     world_origin: Vec3,
     direction: Vec3,
-    origin_offset: Vec3,
+    origin_offset_world: Vec3,
     max_time: f32,
 ) -> ScreenTraceRay {
     ScreenTraceRay {
-        origin: view.transform_point3(world_origin) + origin_offset,
+        origin: view.transform_point3(world_origin) + view.transform_vector3(origin_offset_world),
         direction,
         max_time,
     }
@@ -3880,10 +3928,24 @@ fn eevee_line_plane_intersection(origin: Vec3, direction: Vec3, point: Vec3, nor
     }
 }
 
-fn eevee_world_position_derivatives(
+/// Stores a world-space ray directly in world axes for RTZ, then returns the
+/// decoded world and view forms.
+fn store_ray_direction_rtz_in_world(view: &EeveeTraceView, direction_world: Vec3) -> (Vec3, Vec3) {
+    let stored_world = [
+        exr::prelude::f16::from_bits(denoise::store_f16_bits_rtz(direction_world.x)).to_f32(),
+        exr::prelude::f16::from_bits(denoise::store_f16_bits_rtz(direction_world.y)).to_f32(),
+        exr::prelude::f16::from_bits(denoise::store_f16_bits_rtz(direction_world.z)).to_f32(),
+    ];
+    let direction_world = Vec3::from_array(stored_world);
+    (
+        direction_world,
+        view.view.transform_vector3(direction_world),
+    )
+}
+fn eevee_view_position_derivatives(
     surface: &EeveeRaytraceSample,
-    bin: EeveeRaytraceBin,
     view: &EeveeTraceView,
+    view_normal: Vec3,
     uv: Vec2,
     depth: f32,
     width: u32,
@@ -3905,23 +3967,20 @@ fn eevee_world_position_derivatives(
         uv + Vec2::new(0.0, pixel_size.y),
         depth,
     );
-    let normal = bin.input.normal.normalize_or_zero();
-    let dx = eevee_line_plane_intersection(
+    let normal = view_normal.normalize_or_zero();
+    let dx_view = eevee_line_plane_intersection(
         view_position_x,
         eevee_view_incident(view, view_position_x),
         view_position,
         normal,
     ) - view_position;
-    let dy = eevee_line_plane_intersection(
+    let dy_view = eevee_line_plane_intersection(
         view_position_y,
         eevee_view_incident(view, view_position_y),
         view_position,
         normal,
     ) - view_position;
-    let bias = 0.2_f32.max(((0.75 - bin.roughness) / (0.75 - 0.3)).clamp(0.0, 1.0));
-    let dx_world = view.view_inverse.transform_vector3(dx * bias);
-    let dy_world = view.view_inverse.transform_vector3(dy * bias);
-    [dx_world.to_array(), dy_world.to_array()]
+    [dx_view.to_array(), dy_view.to_array()]
 }
 
 // EEVEE's source coefficient 52.982_918_9 rounded to its exact f32 bit pattern.
@@ -4045,14 +4104,25 @@ fn eevee_screen_trace_enabled(
     })
 }
 
+// Matches `DeferredLayer::end_sync` using compile-time layer closure flags.
+fn eevee_source_feedback_output(
+    layer: EeveeRaytraceLayerFlags,
+    next_layer_has_transmission: bool,
+    is_last_layer: bool,
+) -> bool {
+    let use_raytracing = layer.has_transmit_closure || layer.has_reflect_closure;
+    let is_layer_refracted = next_layer_has_transmission && layer.has_any_closure;
+    let use_screen_reflection = use_raytracing && layer.has_reflect_closure;
+    (use_raytracing || is_layer_refracted) && (!is_last_layer || use_screen_reflection)
+}
+
 fn trace_eevee_sample_frame(
     render: &FilmSampleRenderContext<'_, '_, '_>,
     view: &EeveeTraceView,
     settings: EeveeRayTracingSettings,
     sample_index: u32,
     closure_random: f32,
-    fast_gi_history: &[[f32; 4]],
-    fast_gi_history_valid: bool,
+    fast_gi_history_top_down: Option<&[[f32; 4]]>,
     fast_gi_history_view_projection: Option<Mat4>,
     temporal_histories: &mut [EeveeTemporalHistory],
     surfaces_top_down: &[Option<EeveeRaytraceSample>],
@@ -4081,19 +4151,17 @@ fn trace_eevee_sample_frame(
             "EEVEE previous front-layer color does not match the render extent",
         ));
     }
-    if fast_gi::fast_gi_should_run(
-        settings.use_fast_gi,
-        if settings.use_fast_gi {
-            settings.trace_max_roughness as f32
-        } else {
-            1.0
-        },
-    ) && fast_gi_history.len() != pixel_count
-    {
+    if fast_gi_history_top_down.is_some_and(|history| history.len() != pixel_count) {
         return Err(PotError::invalid_argument(
             "EEVEE FastGI history texture must match the current sample extent",
         ));
     }
+    let trace_max_roughness = if settings.use_fast_gi {
+        settings.trace_max_roughness as f32
+    } else {
+        1.0
+    };
+    let fast_gi_active = fast_gi::fast_gi_should_run(settings.use_fast_gi, trace_max_roughness);
     let (hiz_width, hiz_height) =
         eevee_hiz_extent(width, height, settings.sphere_probe_render_extent)?;
     let mut surfaces = allocate_filled(pixel_count, None, "EEVEE lower-left sample surfaces")?;
@@ -4146,7 +4214,7 @@ fn trace_eevee_sample_frame(
                             resolve_pixels[gl_index].closures[bin_index] =
                                 Some(fast_gi::FastGiResolveClosure {
                                     bin_index: bin_index as u8,
-                                    roughness: bin.roughness,
+                                    roughness: bin.world_input.apparent_roughness(),
                                     dominant_direction: bin.dominant_direction.as_vec3(),
                                     transmission: bin.transmission,
                                 });
@@ -4154,10 +4222,18 @@ fn trace_eevee_sample_frame(
                     }
                 }
             }
-            if let Some(sample_color_top_down) = sample_color_top_down {
-                let color = sample_color_top_down[top_index];
-                let rgb = if settings.method == crate::model::EeveeRayTracingMethod::Screen {
-                    // The deferred feedback copy preserves associated RGB instead of unassociating it.
+            let history_radiance_top_down = if fast_gi_active
+                && settings.method != crate::model::EeveeRayTracingMethod::Screen
+            {
+                fast_gi_history_top_down
+            } else {
+                sample_color_top_down
+            };
+            if let Some(history_radiance_top_down) = history_radiance_top_down {
+                let color = history_radiance_top_down[top_index];
+                let rgb = if settings.method == crate::model::EeveeRayTracingMethod::Screen
+                    || fast_gi_active
+                {
                     [color[0], color[1], color[2]]
                 } else {
                     let alpha = color[3];
@@ -4168,10 +4244,10 @@ fn trace_eevee_sample_frame(
                     }
                 };
                 screen_radiance[gl_index] = [
-                    exr::prelude::f16::from_f32(rgb[0]),
-                    exr::prelude::f16::from_f32(rgb[1]),
-                    exr::prelude::f16::from_f32(rgb[2]),
-                    exr::prelude::f16::from_f32(0.0),
+                    exr::prelude::f16::from_bits(denoise::store_f16_bits_rtz(rgb[0])),
+                    exr::prelude::f16::from_bits(denoise::store_f16_bits_rtz(rgb[1])),
+                    exr::prelude::f16::from_bits(denoise::store_f16_bits_rtz(rgb[2])),
+                    exr::prelude::f16::from_bits(denoise::store_f16_bits_rtz(0.0)),
                 ];
             }
         }
@@ -4267,11 +4343,6 @@ fn trace_eevee_sample_frame(
 
     let trace_scale = eevee_source_resolution_scale(settings.resolution_scale);
     let trace_offset = eevee_random_in_tile(sample_index, trace_scale);
-    let trace_max_roughness = if settings.use_fast_gi {
-        settings.trace_max_roughness as f32
-    } else {
-        1.0
-    };
     let (raytrace_u, raytrace_w, _) = eevee_source_rng(sample_index);
     let trace_frame = EeveeTraceFrame {
         width,
@@ -4335,10 +4406,10 @@ fn trace_eevee_sample_frame(
                     let color = front_feedback[top_index];
                     let rgb = [color[0], color[1], color[2]];
                     front_screen_radiance[gl_index] = [
-                        exr::prelude::f16::from_f32(rgb[0]),
-                        exr::prelude::f16::from_f32(rgb[1]),
-                        exr::prelude::f16::from_f32(rgb[2]),
-                        exr::prelude::f16::from_f32(0.0),
+                        exr::prelude::f16::from_bits(denoise::store_f16_bits_rtz(rgb[0])),
+                        exr::prelude::f16::from_bits(denoise::store_f16_bits_rtz(rgb[1])),
+                        exr::prelude::f16::from_bits(denoise::store_f16_bits_rtz(rgb[2])),
+                        exr::prelude::f16::from_bits(denoise::store_f16_bits_rtz(0.0)),
                     ];
                 }
             }
@@ -4456,6 +4527,7 @@ fn trace_eevee_sample_frame(
                 halton_radical_inverse(3, ao_index) as f32,
             ),
         };
+        let history_pixels = front_screen_radiance.as_deref().unwrap_or(&screen_radiance);
         let output = fast_gi::run_fast_gi(&fast_gi::FastGiInput {
             width,
             height,
@@ -4464,9 +4536,9 @@ fn trace_eevee_sample_frame(
             history_radiance: fast_gi::FastGiTexture {
                 width,
                 height,
-                pixels: fast_gi_history,
+                pixels: history_pixels,
             },
-            history_valid: fast_gi_history_valid,
+            history_valid: fast_gi_history_top_down.is_some(),
             world_normals: &world_normals,
             processed: &processed,
             blue_noise: fast_gi::FastGiTexture {
@@ -4536,7 +4608,7 @@ fn trace_eevee_closure_frame(
             noise: [0.0; 2],
             view_normal: Vec3::Z.to_array(),
             view_incident: Vec3::Z.to_array(),
-            world_position_derivatives: [[0.0; 3]; 2],
+            view_position_derivatives: [[0.0; 3]; 2],
             scene_view_z: 0.0,
         },
         "EEVEE spatial denoise inputs",
@@ -4552,20 +4624,23 @@ fn trace_eevee_closure_frame(
                 continue;
             };
             let blue_noise = super::eevee_blue_noise_ba::raytrace_ba([x as usize, y as usize]);
+            let apparent_roughness = bin.world_input.apparent_roughness();
+            let view_normal = frame.view.view.transform_vector3(bin.world_input.normal);
+            let view_incident = frame.view.view.transform_vector3(bin.world_input.view);
             let view_position = frame.view.view.transform_point3(surface.point.as_vec3());
             pixels[index] = denoise::SpatialPixel {
                 closure_present: true,
-                apparent_roughness: bin.roughness,
+                apparent_roughness,
                 noise: [
                     (blue_noise[0] + frame.closure_random).fract(),
                     (blue_noise[1] + frame.closure_random).fract(),
                 ],
-                view_normal: bin.input.normal.to_array(),
-                view_incident: bin.input.view.to_array(),
-                world_position_derivatives: eevee_world_position_derivatives(
+                view_normal: view_normal.to_array(),
+                view_incident: view_incident.to_array(),
+                view_position_derivatives: eevee_view_position_derivatives(
                     &surface,
-                    bin,
                     frame.view,
+                    view_normal,
                     Vec2::new(
                         (x as f32 + 0.5) / width as f32,
                         (y as f32 + 0.5) / height as f32,
@@ -4577,7 +4652,7 @@ fn trace_eevee_closure_frame(
                 ),
                 scene_view_z: view_position.z,
             };
-            if bin.roughness < roughness_end {
+            if apparent_roughness < roughness_end {
                 let tile_index = (y / denoise::RAYTRACE_GROUP_SIZE) as usize
                     * tile_extent.width as usize
                     + (x / denoise::RAYTRACE_GROUP_SIZE) as usize;
@@ -4623,8 +4698,8 @@ fn trace_eevee_closure_frame(
                 ]) + frame.raytrace_u[1])
                     .fract(),
             ];
-            let generated = match generate_ray(bin.input, noise) {
-                Ok(sample) => sample,
+            let generated = match generate_ray(bin.world_input, noise) {
+                Ok(generated) => generated,
                 Err(RayGenerateError::NoSampleableClosure) => continue,
                 Err(RayGenerateError::InvalidInput) => {
                     return Err(PotError::new(
@@ -4638,32 +4713,27 @@ fn trace_eevee_closure_frame(
             } else {
                 (1.0 / generated.pdf).max(6.0e-8)
             };
-            let stored = [
-                exr::prelude::f16::from_f32(generated.direction.x),
-                exr::prelude::f16::from_f32(generated.direction.y),
-                exr::prelude::f16::from_f32(generated.direction.z),
-                exr::prelude::f16::from_f32(inverse_pdf),
+            let (world_direction, ray_direction) =
+                store_ray_direction_rtz_in_world(frame.view, generated.direction);
+            let direction_and_pdf_inverse = [
+                ray_direction.x,
+                ray_direction.y,
+                ray_direction.z,
+                exr::prelude::f16::from_bits(denoise::store_f16_bits_rtz(inverse_pdf)).to_f32(),
             ];
-            let direction_and_pdf_inverse = stored.map(exr::prelude::f16::to_f32);
             if direction_and_pdf_inverse[3] == 0.0 {
                 continue;
             }
-
-            let ray_direction = Vec3::new(
-                direction_and_pdf_inverse[0],
-                direction_and_pdf_inverse[1],
-                direction_and_pdf_inverse[2],
-            );
-            let world_direction = frame.view.view_inverse.transform_vector3(ray_direction);
             let mut radiance = Vec3::ZERO;
             let mut hit_time = 0.0;
             let mut hit_valid = false;
             let is_transmission = bin.transmission;
-            if eevee_screen_trace_enabled(
+            let screen_trace_enabled = eevee_screen_trace_enabled(
                 frame.settings.method,
                 is_transmission,
                 surface.screen_refraction,
-            )? {
+            )?;
+            if screen_trace_enabled {
                 let (hiz, screen_radiance) = if frame.front_hiz.is_some() && !is_transmission {
                     (
                         frame.front_hiz.ok_or_else(|| {
@@ -4682,35 +4752,39 @@ fn trace_eevee_closure_frame(
                 } else {
                     (frame.back_hiz, frame.back_radiance)
                 };
+                let apparent_roughness = bin.world_input.apparent_roughness();
+                let ray = eevee_screen_trace_ray(
+                    frame.view.view,
+                    surface.point.as_vec3(),
+                    ray_direction,
+                    generated.origin_offset,
+                    (frame.view.far - frame.view.near).abs(),
+                );
+                let stride_rand = eevee_interleaved_gradient_noise(
+                    Vec2::new(trace_x as f32, trace_y as f32),
+                    5.0,
+                    frame.raytrace_w,
+                );
                 let hit = raytrace_screen(
                     frame.view.screen_camera,
                     frame.parameters,
                     hiz,
-                    eevee_screen_trace_ray(
-                        frame.view.view,
-                        surface.point.as_vec3(),
-                        ray_direction,
-                        generated.origin_offset,
-                        (frame.view.far - frame.view.near).abs(),
-                    ),
-                    eevee_interleaved_gradient_noise(
-                        Vec2::new(trace_x as f32, trace_y as f32),
-                        5.0,
-                        frame.raytrace_w,
-                    ),
-                    bin.roughness,
+                    ray,
+                    stride_rand,
+                    apparent_roughness,
                     is_transmission,
                 )
                 .map_err(eevee_screen_trace_error)?;
                 if hit.valid {
                     if is_transmission {
+                        let sample_uv = hit.hit_uv;
                         radiance = raytrace_sample_screen(
                             frame.view.screen_camera,
                             frame.parameters,
                             screen_radiance,
                             hit,
-                            bin.roughness,
-                            hit.hit_uv,
+                            apparent_roughness,
+                            sample_uv,
                         )
                         .map_err(eevee_screen_trace_error)?;
                         hit_valid = true;
@@ -4733,7 +4807,7 @@ fn trace_eevee_closure_frame(
                                     frame.parameters,
                                     screen_radiance,
                                     hit,
-                                    bin.roughness,
+                                    apparent_roughness,
                                     history_uv,
                                 )
                                 .map_err(eevee_screen_trace_error)?;
@@ -4909,15 +4983,9 @@ fn trace_eevee_closure_frame(
         for (index, bilateral_pixel) in bilateral_pixels.iter_mut().enumerate() {
             let x = index as u32 % width;
             let y = index as u32 / width;
-            let (position, normal, bin) =
-                frame.surfaces[index].map_or(([0.0; 3], [0.0; 3], None), |surface| {
-                    let bin = surface.bins[closure_index];
-                    (
-                        surface.point.as_vec3().to_array(),
-                        surface.normal.as_vec3().to_array(),
-                        bin,
-                    )
-                });
+            let surface = frame.surfaces[index];
+            let bin = surface.and_then(|surface| surface.bins[closure_index]);
+            let position = surface.map_or([0.0; 3], |surface| surface.point.as_vec3().to_array());
             let noise = [
                 eevee_interleaved_gradient_noise(
                     Vec2::new(x as f32 + 0.5, y as f32 + 0.5),
@@ -4933,9 +5001,9 @@ fn trace_eevee_closure_frame(
             *bilateral_pixel = denoise::BilateralPixel {
                 closure_present: bin.is_some(),
                 depth: 1.0 - frame.screen_depth[index],
-                apparent_roughness: bin.map_or(1.0, |bin| bin.roughness),
+                apparent_roughness: bin.map_or(1.0, |bin| bin.world_input.apparent_roughness()),
                 world_position: position,
-                world_normal: normal,
+                world_normal: bin.map_or([0.0; 3], |bin| bin.world_input.normal.to_array()),
                 noise,
             };
         }
@@ -4960,6 +5028,7 @@ fn trace_eevee_closure_frame(
         tile_mask,
     })
 }
+
 fn rasterize_with_samples_for_eye(
     request: RasterSamplesRequest<'_, '_, '_, '_, '_, '_>,
 ) -> Result<RasterOutput> {
@@ -7073,30 +7142,7 @@ fn store_film_history_f16(value: f32) -> f32 {
 
 /// Native EEVEE 16-bit render targets and image stores truncate float mantissas.
 fn store_film_f16_truncated(value: f32) -> f32 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let significand = bits & 0x7f_ffff;
-    let half_bits = if exponent == 0xff {
-        sign | 0x7c00
-            | if significand == 0 {
-                0
-            } else {
-                ((significand >> 13) as u16).max(1)
-            }
-    } else {
-        let half_exponent = exponent - 127 + 15;
-        if half_exponent >= 0x1f {
-            sign | 0x7c00
-        } else if half_exponent > 0 {
-            sign | ((half_exponent as u16) << 10) | (significand >> 13) as u16
-        } else if half_exponent >= -10 {
-            sign | (((significand | 0x80_0000) >> (14 - half_exponent)) as u16)
-        } else {
-            sign
-        }
-    };
-    exr::prelude::f16::from_bits(half_bits).to_f32()
+    exr::prelude::f16::from_bits(denoise::store_f16_bits_rtz(value)).to_f32()
 }
 
 /// The film radius of realtime Beauty, or `None` for the one-sample render, where EEVEE's filter is zero and the sample
@@ -7135,14 +7181,15 @@ fn sample_spiral(rand_x: f64, rand_y: f64) -> (f64, f64) {
     (radius * omega.cos(), radius * omega.sin())
 }
 
-/// A film sample's offset inside its pixel: EEVEE's Halton (2, 3) sequence at index `sample_index + 1`, each dimension
-/// rotated by a fixed offset, `fract(halton + 1/2)` and `fract(halton + 2/3)` (`eevee_sampling.cc`, `Sampling::step`,
-/// with `BLI_halton_2d` from `blenlib/intern/rand.cc`). The pattern is the same for every pixel and needs no seed.
+/// A film sample's offset inside its pixel: EEVEE's Halton (2, 3) sequence at index `sample_index + 1`; it adds
+/// `0.5_f32` and `2.0_f32 / 3.0_f32` to the f64 dimensions, casts each sum to f32, then applies `fractf` before exposing
+/// the filter dimensions (`eevee_sampling.cc`, `Sampling::step`, with `BLI_halton_2d` from `blenlib/intern/rand.cc`).
+/// The pattern is the same for every pixel and needs no seed.
 fn film_sample_offset(sample_index: u32) -> (f64, f64) {
     let index = u64::from(sample_index) + 1;
-    let x_offset = (halton_radical_inverse(2, index) + 0.5).fract();
-    let y_offset = (halton_radical_inverse(3, index) + 2.0 / 3.0).fract();
-    (x_offset, y_offset)
+    let x = (halton_radical_inverse(2, index) + f64::from(0.5_f32)) as f32;
+    let y = (halton_radical_inverse(3, index) + f64::from(2.0_f32 / 3.0_f32)) as f32;
+    (f64::from(x - x.floor()), f64::from(y - y.floor()))
 }
 
 /// The radical inverse of `index` in `base`: its digits reversed about the radix point.
@@ -7192,8 +7239,7 @@ fn raster_radiance_weight(opaque_share: f64, dither: Option<EeveeDitherSample>) 
     opaque_share.clamp(0.0, 1.0) * dither.map_or(1.0, |dither| f64::from(dither.alpha_reciprocal))
 }
 
-/// EEVEE 5.2.2 `hashed_transparency::alpha_threshold`, evaluated from primitive-interpolated world position
-/// and its raster derivatives (`eevee_transparency.bsl.hh`).
+/// EEVEE 5.2.2 `hashed_transparency::alpha_threshold` from the pinned 55-line shader kernel.
 fn eevee_dither_alpha_threshold(
     point: DVec3,
     differentials: HitDifferentials,
@@ -7207,9 +7253,6 @@ fn eevee_dither_alpha_threshold(
         let y = 13.0 * point[1] + point[0];
         fract(1.0e4 * x.sin() * (0.1 + y.sin().abs()))
     }
-    fn hash_3d(point: [f32; 3]) -> f32 {
-        hash([hash([point[0], point[1]]), point[2]])
-    }
 
     let point = point.to_array().map(|value| value as f32);
     let dx = Vec3::new(
@@ -7222,38 +7265,45 @@ fn eevee_dither_alpha_threshold(
         differentials.world_dy.y as f32,
         differentials.world_dy.z as f32,
     );
-    let max_derivative = dx.length().max(dy.length());
-    let pixel_scale = 1.0 / (0.1 * max_derivative);
-    let pixel_scale_log = pixel_scale.log2();
-    let low_scale = pixel_scale_log.floor().exp2();
-    let high_scale = pixel_scale_log.ceil().exp2();
-    let low_alpha = hash_3d([
-        (low_scale * point[0]).floor(),
-        (low_scale * point[1]).floor(),
-        (low_scale * point[2]).floor(),
-    ]);
-    let high_alpha = hash_3d([
-        (high_scale * point[0]).floor(),
-        (high_scale * point[1]).floor(),
-        (high_scale * point[2]).floor(),
-    ]);
-    let fraction = fract(pixel_scale_log);
-    let x = low_alpha * (1.0 - fraction) + high_alpha * fraction;
-    let a = fraction.min(1.0 - fraction);
+    let dx_length = dx.length();
+    let dy_length = dy.length();
+    let max_deriv = dx_length.max(dy_length);
+    let hash_scale = 0.1_f32;
+    let pix_scale = 1.0 / (hash_scale * max_deriv);
+    let pix_scale_log = pix_scale.log2();
+    let pix_scales = [pix_scale_log.floor().exp2(), pix_scale_log.ceil().exp2()];
+    let low_cell = [
+        (pix_scales[0] * point[0]).floor(),
+        (pix_scales[0] * point[1]).floor(),
+        (pix_scales[0] * point[2]).floor(),
+    ];
+    let high_cell = [
+        (pix_scales[1] * point[0]).floor(),
+        (pix_scales[1] * point[1]).floor(),
+        (pix_scales[1] * point[2]).floor(),
+    ];
+    let low_inner_hash_arg = [low_cell[0], low_cell[1]];
+    let high_inner_hash_arg = [high_cell[0], high_cell[1]];
+    let low_inner_hash = hash(low_inner_hash_arg);
+    let high_inner_hash = hash(high_inner_hash_arg);
+    let low_outer_hash_arg = [low_inner_hash, low_cell[2]];
+    let high_outer_hash_arg = [high_inner_hash, high_cell[2]];
+    let alpha = [hash(low_outer_hash_arg), hash(high_outer_hash_arg)];
+    let fac = fract(pix_scale_log);
+    let x = alpha[0] * (1.0 - fac) + alpha[1] * fac;
+    let a = fac.min(1.0 - fac);
     let one_a = 1.0 - a;
-    let denominator = 1.0 / (2.0 * a * one_a);
+    let denom = 1.0 / (2.0 * a * one_a);
     let one_x = 1.0 - x;
     let cases = [
-        (x * x) * denominator,
+        (x * x) * denom,
         (x - 0.5 * a) / one_a,
-        1.0 - (one_x * one_x * denominator),
+        1.0 - (one_x * one_x * denom),
     ];
-    let threshold = if x < one_a {
-        if x < a { cases[0] } else { cases[1] }
-    } else {
-        cases[2]
-    };
-    fract(threshold + hash_offset).clamp(1.0e-6, 1.0)
+    let selected_case = usize::from(x >= a) + usize::from(x >= one_a);
+    let threshold_before_jitter = cases[selected_case];
+    let threshold_after_jitter = fract(threshold_before_jitter + hash_offset);
+    threshold_after_jitter.clamp(1.0e-6, 1.0)
 }
 
 /// The physical share that can reach the next surface after opacity and the zero-transmittance Holdout closure.
@@ -7272,6 +7322,7 @@ fn shading_normal(triangle: &PreparedTriangle, hit: Hit) -> DVec3 {
 #[derive(Clone, Copy)]
 struct RasterHitContext<'a> {
     sample_index: u32,
+    raytrace_layer: Option<EeveeRaytraceLayer>,
     camera_matrices: Option<&'a (DMat4, DMat4)>,
     x_neighbor: Option<(Ray, f64)>,
     y_neighbor: Option<(Ray, f64)>,
@@ -7414,6 +7465,7 @@ fn raster_hit_context<'a>(
         };
     Ok(RasterHitContext {
         sample_index: sample.index,
+        raytrace_layer: None,
         camera_matrices: camera_matrices.get(eye_index),
         x_neighbor,
         y_neighbor,
@@ -7569,8 +7621,9 @@ fn hit_color(
                 realtime_hit_differentials(&triangle.source, hit, ray, Some(context))
             });
             let hash_offset = halton_radical_inverse(7, u64::from(context.sample_index) + 1) as f32;
-            if dither.transparency > eevee_dither_alpha_threshold(point, differentials, hash_offset)
-            {
+            let threshold_value = eevee_dither_alpha_threshold(point, differentials, hash_offset);
+            let passed = dither.transparency <= threshold_value;
+            if dither.transparency > 0.0 && !passed {
                 return Ok(None);
             }
         }
@@ -8530,8 +8583,8 @@ fn is_finite_vec3(vector: DVec3) -> bool {
 mod tests {
     use super::{
         Camera, CameraEngine, Line, Mode, Projection, SensorFit, StereoMode, camera_frame,
-        pixel_in_bounds, projection_for_camera, rasterize_with_lines, ray_for_pixel,
-        store_film_f16_truncated, store_film_history_f16,
+        film_sample_offset, pixel_in_bounds, projection_for_camera, rasterize_with_lines,
+        ray_for_pixel, store_film_f16_truncated, store_film_history_f16,
     };
     use crate::model::{CameraData, CameraProjection};
     use glam::DVec3;
@@ -9090,6 +9143,18 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn film_filter_dimensions_match_source_sampling_uniform_bits() {
+        for (sample_index, expected_bits) in [
+            (0_u32, [0, 0]),
+            (1, [1_061_158_912, 1_051_372_204]),
+            (63, [1_057_095_680, 1_031_591_648]),
+        ] {
+            let (x, y) = film_sample_offset(sample_index);
+            assert_eq!([x as f32, y as f32].map(f32::to_bits), expected_bits);
+        }
+    }
+
+    #[test]
     fn film_half_storage_matches_native_truncation_and_single_rounding() {
         let input = store_film_f16_truncated(0.3334);
         assert_eq!(f64::from(input), 0.333_251_953_125_f64);
@@ -9097,6 +9162,157 @@ mod tests {
         assert_eq!(
             f64::from(store_film_history_f16(0.3334)),
             0.333_496_093_75_f64
+        );
+    }
+}
+
+#[cfg(test)]
+mod eevee_derivative_tests {
+    use super::{
+        EeveeRaytraceSample, EeveeTraceView, ScreenTraceCamera, eevee_view_position_derivatives,
+    };
+    use glam::{DVec3, Mat4, Vec2, Vec3, Vec4};
+
+    #[test]
+    fn closure_derivatives_are_view_space_deltas_under_rotated_perspective_camera() {
+        // A 90-degree perspective projection with near/far planes at 1 and 10.
+        let projection = Mat4::from_cols(
+            Vec4::X,
+            Vec4::Y,
+            Vec4::new(0.0, 0.0, -11.0 / 9.0, -1.0),
+            Vec4::new(0.0, 0.0, -20.0 / 9.0, 0.0),
+        );
+        let projection_inverse = projection.inverse();
+        let screen_camera = match ScreenTraceCamera::new(projection, projection_inverse) {
+            Ok(camera) => camera,
+            Err(error) => panic!("perspective projection is a valid screen camera: {error:?}"),
+        };
+        let identity = EeveeTraceView {
+            view: Mat4::IDENTITY,
+            view_inverse: Mat4::IDENTITY,
+            projection,
+            projection_inverse,
+            view_projection: projection,
+            screen_camera,
+            near: 1.0,
+            far: 10.0,
+        };
+        let rotated_view =
+            Mat4::from_cols(Vec4::new(0.0, 0.0, -1.0, 0.0), Vec4::Y, Vec4::X, Vec4::W);
+        let rotated = EeveeTraceView {
+            view: rotated_view,
+            view_inverse: rotated_view.inverse(),
+            projection,
+            projection_inverse,
+            view_projection: projection * rotated_view,
+            screen_camera,
+            near: 1.0,
+            far: 10.0,
+        };
+        let view_point = Vec3::new(0.4, -0.25, -2.5);
+        let view_normal = Vec3::new(0.0, 0.6, 0.8);
+        let make_surface = |point: Vec3, normal: Vec3| EeveeRaytraceSample {
+            point: DVec3::new(f64::from(point.x), f64::from(point.y), f64::from(point.z)),
+            normal: DVec3::new(
+                f64::from(normal.x),
+                f64::from(normal.y),
+                f64::from(normal.z),
+            ),
+            has_gbuffer_route: true,
+            screen_refraction: None,
+            bins: [None; 3],
+        };
+        let identity_surface = make_surface(view_point, view_normal);
+        let rotated_world_point = rotated.view_inverse.transform_point3(view_point);
+        let rotated_world_normal = rotated.view_inverse.transform_vector3(view_normal);
+        let rotated_surface = make_surface(rotated_world_point, rotated_world_normal);
+        let uv = Vec2::splat(0.5);
+        let identity_deltas = eevee_view_position_derivatives(
+            &identity_surface,
+            &identity,
+            view_normal,
+            uv,
+            0.5,
+            16,
+            16,
+            1,
+        );
+        let rotated_view_normal = rotated.view.transform_vector3(rotated_world_normal);
+        let rotated_deltas = eevee_view_position_derivatives(
+            &rotated_surface,
+            &rotated,
+            rotated_view_normal,
+            uv,
+            0.5,
+            16,
+            16,
+            1,
+        );
+
+        let expected_deltas = [
+            Vec3::new(-0.064_062_5, 0.25, -0.1875),
+            Vec3::new(-0.4, 0.620_689_63, -0.465_517_28),
+        ];
+        for (actual, expected) in identity_deltas.iter().zip(expected_deltas) {
+            assert!(Vec3::from_array(*actual).abs_diff_eq(expected, 1.0e-6));
+        }
+        for (rotated, identity) in rotated_deltas.iter().zip(identity_deltas) {
+            assert!(Vec3::from_array(*rotated).abs_diff_eq(Vec3::from_array(identity), 1.0e-6));
+        }
+        assert_ne!(rotated_world_point, view_point);
+        assert_ne!(rotated_world_normal, view_normal);
+        assert!(rotated_view_normal.abs_diff_eq(view_normal, 1.0e-6));
+    }
+
+    #[test]
+    fn ray_data_half_store_uses_world_axes_before_view_readback() {
+        let projection = Mat4::IDENTITY;
+        let screen_camera = match ScreenTraceCamera::new(projection, projection) {
+            Ok(camera) => camera,
+            Err(error) => panic!("identity projection is a valid screen camera: {error:?}"),
+        };
+        let view_matrix = Mat4::from_rotation_y(0.37);
+        let view = EeveeTraceView {
+            view: view_matrix,
+            view_inverse: view_matrix.inverse(),
+            projection,
+            projection_inverse: projection,
+            view_projection: projection * view_matrix,
+            screen_camera,
+            near: 1.0,
+            far: 10.0,
+        };
+        let direction_world = Vec3::new(0.796_875, 0.234_375, -0.4375);
+        let store = |value| {
+            exr::prelude::f16::from_bits(super::denoise::store_f16_bits_rtz(value)).to_f32()
+        };
+        let expected_world = Vec3::new(
+            store(direction_world.x),
+            store(direction_world.y),
+            store(direction_world.z),
+        );
+        let (stored_world, stored_view) =
+            super::store_ray_direction_rtz_in_world(&view, direction_world);
+        assert_eq!(stored_world, expected_world);
+        assert_eq!(stored_view, view.view.transform_vector3(expected_world));
+
+        let direction_view = view.view.transform_vector3(direction_world);
+        let incorrectly_stored_view = Vec3::new(
+            store(direction_view.x),
+            store(direction_view.y),
+            store(direction_view.z),
+        );
+        assert_ne!(
+            stored_view,
+            view.view.transform_vector3(incorrectly_stored_view)
+        );
+    }
+
+    #[test]
+    fn unit_ior_refraction_pdf_is_independent_of_sample_direction() {
+        assert_eq!(
+            super::eevee_ggx_refraction_pdf(Vec3::Z, Vec3::X, Vec3::Z, 0.5, 1.0, false),
+            1.0e6
         );
     }
 }
@@ -9260,10 +9476,11 @@ mod smooth_shading_tests {
             layer_tangents: Vec::new(),
             geometry_vertex_slots: [0; 3],
             geometry_vertex_weights: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            normals,
+            smooth_shading: normals.is_some(),
             layer_colors: Vec::new(),
             lit_per_pixel: false,
             ray_mask: RayVisibility::default().mask(),
+            normals,
         }
     }
 
@@ -9757,15 +9974,25 @@ mod smooth_shading_tests {
         let sphere = Triangle {
             positions: [DVec3::X, DVec3::Y, DVec3::Z],
             normals: Some([DVec3::X, DVec3::Y, DVec3::Z]),
+            smooth_shading: true,
             ..triangle(None)
         };
         let centre = DVec3::splat(1.0 / 3.0);
         let lifted = super::smooth_shadow_origin(&sphere, centre, [1.0 / 3.0; 3]);
         assert!(lifted.length() > centre.length(), "lifted {lifted:?}");
-        let flat = triangle(None);
+
+        let source_packed_normal =
+            DVec3::new(0.0, f64::from(-457_f32 / 511.0), f64::from(228_f32 / 511.0)).normalize();
+        let packed_flat = Triangle {
+            positions: [DVec3::ZERO, DVec3::X, DVec3::new(0.0, 1.0, 2.0)],
+            normals: Some([source_packed_normal; 3]),
+            smooth_shading: false,
+            ..triangle(None)
+        };
+        let flat_point = packed_flat.positions.iter().copied().sum::<DVec3>() / 3.0;
         assert_eq!(
-            super::smooth_shadow_origin(&flat, centre, [1.0 / 3.0; 3]),
-            centre
+            super::smooth_shadow_origin(&packed_flat, flat_point, [1.0 / 3.0; 3]),
+            flat_point
         );
     }
 }
@@ -9816,6 +10043,7 @@ mod visibility_tests {
             layer_uvs: Vec::new(),
             layer_tangents: Vec::new(),
             normals: None,
+            smooth_shading: false,
             geometry_vertex_slots: [0; 3],
             geometry_vertex_weights: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             layer_colors: Vec::new(),
@@ -9962,6 +10190,7 @@ mod visibility_tests {
             gbuffer_sample_offset: None,
             gbuffer_closure_random: None,
             eevee_raytrace_feedback: EeveeRaytraceFeedback::default(),
+            raytrace_layer: None,
         }
     }
 
@@ -11056,16 +11285,16 @@ mod eevee_screen_thickness_tests {
     }
 
     #[test]
-    fn screen_trace_ray_applies_generated_origin_offset_in_view_space() {
+    fn screen_trace_ray_applies_world_origin_offset_in_view_space() {
         let view =
             Mat4::from_rotation_translation(Quat::from_rotation_y(0.7), Vec3::new(3.0, -2.0, 1.0));
         let world_origin = Vec3::new(-1.0, 0.5, -4.0);
         let direction = Vec3::new(0.2, -0.1, -0.9);
-        let origin_offset = Vec3::new(-0.4, 0.0, -1.8);
-        let ray = eevee_screen_trace_ray(view, world_origin, direction, origin_offset, 12.0);
+        let origin_offset_world = Vec3::new(-0.4, 0.0, -1.8);
+        let ray = eevee_screen_trace_ray(view, world_origin, direction, origin_offset_world, 12.0);
         assert_eq!(
             ray.origin,
-            view.transform_point3(world_origin) + origin_offset
+            view.transform_point3(world_origin) + view.transform_vector3(origin_offset_world)
         );
         assert_eq!(ray.direction, direction);
         assert_eq!(ray.max_time, 12.0);

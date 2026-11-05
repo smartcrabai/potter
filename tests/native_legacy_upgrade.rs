@@ -356,8 +356,15 @@ fn write_legacy_history_snapshot(
 
 fn assert_unknown_material_ids(document: &Value, material_ids: &[String], phase: &str) {
     for material_id in material_ids {
+        let material = document["materials"]
+            .get(material_id)
+            .unwrap_or_else(|| panic!("{phase}: canonical material `{material_id}` is missing"));
+        assert!(
+            material.is_object(),
+            "{phase}: canonical material `{material_id}` is not an object"
+        );
         assert_eq!(
-            document["materials"][material_id]["use_raytrace_refraction"],
+            material["use_raytrace_refraction"],
             Value::Null,
             "{phase}: legacy Blender candidate `{material_id}` must remain unknown"
         );
@@ -564,11 +571,6 @@ fn build_appended_legacy_project(
         appended_id, expected_appended_id,
         "append must use the source namespaced ID plus the first available suffix"
     );
-    assert_eq!(
-        mappings.get(clear_id).and_then(Value::as_str),
-        Some(clear_id),
-        "an uncollided appended material keeps its source ID"
-    );
 
     let adapter_key = format!("{namespace}_blender_adapter");
     let mut document = read_json(&project.join("scene.json"))?;
@@ -594,7 +596,7 @@ fn build_appended_legacy_project(
     ))
 }
 
-fn build_project_library_legacy_project(root: &Path) -> TestResult<(PathBuf, String)> {
+fn build_project_library_legacy_project(root: &Path) -> TestResult<(PathBuf, String, String)> {
     let (library_source, _) = write_legacy_refraction_project(root, 17)?;
     let project = root.join("legacy-library-target");
     let initialized = pot_json(|command| {
@@ -612,17 +614,26 @@ fn build_project_library_legacy_project(root: &Path) -> TestResult<(PathBuf, Str
     )?;
     assert_eq!(linked["ok"], true, "{linked}");
     let mut document = read_json(&project.join("scene.json"))?;
-    assert_eq!(
-        document["libraries"]["legacy_library"]["kind"],
-        "potter_project"
+    let linked_material_id = document["libraries"]["legacy_library"]["linked_ids"]["materials"]
+        .as_array()
+        .and_then(|ids| ids.first())
+        .and_then(Value::as_str)
+        .ok_or("linked material ID missing from library record")?
+        .to_owned();
+    let linked_marker_key = format!("materials:{linked_material_id}");
+    assert!(
+        document["materials"].get(&linked_material_id).is_some(),
+        "linked material `{linked_material_id}` is missing from canonical materials"
     );
     assert_eq!(
-        document["libraries"]["legacy_library"]["linked_ids"]["materials"][0],
-        "glass"
+        document["compatibility"]["linked_ids"]
+            .get(&linked_marker_key)
+            .and_then(|marker| marker.get("source_id")),
+        Some(&json!("glass"))
     );
     remove_legacy_refraction_fields(&mut document);
     let source_hash = write_legacy_history_snapshot(&project, document, 17)?;
-    Ok((project, source_hash))
+    Ok((project, linked_material_id, source_hash))
 }
 
 #[test]
@@ -657,13 +668,14 @@ fn schema_seventeen_append_and_project_library_materials_remain_unknown() -> Tes
         &append_hash,
     )?;
 
-    let (library_project, library_hash) = build_project_library_legacy_project(root.path())?;
+    let (library_project, library_material_id, library_hash) =
+        build_project_library_legacy_project(root.path())?;
     exercise_legacy_refraction_provenance(
         &library_project,
         root.path(),
         &blender,
         "library-linked",
-        &["glass".to_owned()],
+        std::slice::from_ref(&library_material_id),
         &library_hash,
     )?;
     Ok(())

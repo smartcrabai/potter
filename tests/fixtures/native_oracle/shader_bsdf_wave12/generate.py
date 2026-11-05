@@ -25,9 +25,12 @@ TOON_SUN_ONLY = "--toon-sun-only" in CLI_ARGS
 EEVEE_SSS_TRANSMISSION_ONLY = "--eevee-sss-transmission-only" in CLI_ARGS
 EEVEE_REFRACTION_LAYERS_ONLY = "--eevee-refraction-layers-only" in CLI_ARGS
 PATH_ONLY = "--path-only" in CLI_ARGS
+PATH_SEEDS_ONLY = "--path-seeds-only" in CLI_ARGS
 OUT = CLI_ARGS[-1]
 SKIN_CROP_SIZE = 4
 SKIN_SAMPLES = 4096
+PATH_EXTRA_SEEDS = (53, 61, 71, 83, 97, 113)
+PATH_SEEDS = (SEED, 29) + PATH_EXTRA_SEEDS
 
 if bpy.app.version != (5, 2, 2):
     raise RuntimeError(f"expected Blender 5.2.2, got {bpy.app.version_string}")
@@ -225,8 +228,8 @@ def make_hair_curve(name, location, material):
     return obj
 
 
-def make_scene(name, cases, engine, output_prefix, hair_on_mesh=False, link_normal_input=False,
-               independent_backdrop_layout=False):
+def build_scene(name, cases, engine, hair_on_mesh=False, link_normal_input=False,
+                independent_backdrop_layout=False):
     scene = bpy.context.scene
     clear_scene(scene)
     scene.name = name
@@ -259,6 +262,8 @@ def make_scene(name, cases, engine, output_prefix, hair_on_mesh=False, link_norm
         scene.cycles.use_denoising = False
         scene.cycles.max_bounces = 8
         scene.cycles.transparent_max_bounces = 8
+        # Potter has no light tree; with it on, Blender adds a one-sided excess versus Potter's direct light sampling.
+        scene.cycles.use_light_tree = False
     else:
         scene.eevee.taa_render_samples = EEVEE_SAMPLES
         if hasattr(scene.eevee, "use_raytracing"):
@@ -317,16 +322,11 @@ def make_scene(name, cases, engine, output_prefix, hair_on_mesh=False, link_norm
     bpy.context.view_layer.objects.active = scene.camera
     for obj in scene.objects:
         obj.select_set(False)
-    scene.render.filepath = os.path.join(OUT, f"{output_prefix}.exr")
-    blend_path = os.path.join(OUT, f"{output_prefix}.blend")
-    bpy.ops.wm.save_as_mainfile(filepath=blend_path)
-    bpy.ops.render.render(write_still=True)
+    return scene, probes
 
-    image = bpy.data.images.load(scene.render.filepath, check_existing=False)
-    width, height = image.size[:]
-    pixels = array("f", [0.0]) * (width * height * 4)
-    image.pixels.foreach_get(pixels)
-    cases_json = []
+
+def patch_means(pixels, width, height, probes):
+    means = []
     for probe in probes:
         totals = [0.0, 0.0, 0.0, 0.0]
         count = 0
@@ -337,9 +337,38 @@ def make_scene(name, cases, engine, output_prefix, hair_on_mesh=False, link_norm
                 for channel in range(4):
                     totals[channel] += float(pixels[source_index + channel])
                 count += 1
+        means.append([value / count for value in totals])
+    return means
+
+
+def load_pixels(path, width, height):
+    image = bpy.data.images.load(path, check_existing=False)
+    if tuple(image.size) != (width, height):
+        raise RuntimeError(f"{path} is {tuple(image.size)}, expected {(width, height)}")
+    pixels = array("f", [0.0]) * (width * height * 4)
+    image.pixels.foreach_get(pixels)
+    bpy.data.images.remove(image)
+    return pixels
+
+
+def make_scene(name, cases, engine, output_prefix, hair_on_mesh=False, link_normal_input=False,
+               independent_backdrop_layout=False):
+    scene, probes = build_scene(name, cases, engine, hair_on_mesh, link_normal_input,
+                                independent_backdrop_layout)
+    scene.render.filepath = os.path.join(OUT, f"{output_prefix}.exr")
+    blend_path = os.path.join(OUT, f"{output_prefix}.blend")
+    bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+    bpy.ops.render.render(write_still=True)
+
+    image = bpy.data.images.load(scene.render.filepath, check_existing=False)
+    width, height = image.size[:]
+    pixels = array("f", [0.0]) * (width * height * 4)
+    image.pixels.foreach_get(pixels)
+    cases_json = []
+    for probe, mean in zip(probes, patch_means(pixels, width, height, probes)):
         case = {"name": probe["name"], "mode": probe["mode"], "inputs": probe["inputs"],
                 "probe": [probe["x"], probe["y"], probe["patch_radius"]],
-                "linear_rgba": [value / count for value in totals]}
+                "linear_rgba": mean}
         if probe.get("normal_linked"):
             case["normal_linked"] = True
         if probe["name"] == "holdout":
@@ -363,17 +392,8 @@ def make_scene(name, cases, engine, output_prefix, hair_on_mesh=False, link_norm
         second_pixels = array("f", [0.0]) * (width * height * 4)
         second.pixels.foreach_get(second_pixels)
         noise_cases = []
-        for probe, first_case in zip(probes, cases_json):
-            second_total = [0.0, 0.0, 0.0, 0.0]
-            count = 0
-            for dy in range(-probe["patch_radius"], probe["patch_radius"] + 1):
-                for dx in range(-probe["patch_radius"], probe["patch_radius"] + 1):
-                    x, y = probe["x"] + dx, probe["y"] + dy
-                    source_index = ((height - 1 - y) * width + x) * 4
-                    for channel in range(4):
-                        second_total[channel] += float(second_pixels[source_index + channel])
-                    count += 1
-            second_mean = [value / count for value in second_total]
+        second_means = patch_means(second_pixels, width, height, probes)
+        for probe, first_case, second_mean in zip(probes, cases_json, second_means):
             noise_cases.append({"name": probe["name"],
                                 "mean_absolute_error": sum(abs(a - b) for a, b in
                                                            zip(first_case["linear_rgba"], second_mean)) / 4.0})
@@ -381,6 +401,70 @@ def make_scene(name, cases, engine, output_prefix, hair_on_mesh=False, link_norm
             json.dump({"blender_version": bpy.app.version_string, "cases": noise_cases}, stream, indent=2)
             stream.write("\n")
         bpy.data.images.remove(second)
+
+
+def make_path_seeds_capture(scratch):
+    scene, probes = build_scene("Shader BSDF Path Wave12", CASES, "CYCLES",
+                                independent_backdrop_layout=True)
+    width, height = SIZE, SIZE
+    cycles = scene.cycles
+    settings = {"device": cycles.device, "samples": cycles.samples,
+                "use_adaptive_sampling": cycles.use_adaptive_sampling,
+                "pixel_filter_type": cycles.pixel_filter_type, "filter_width": cycles.filter_width,
+                "use_denoising": cycles.use_denoising, "max_bounces": cycles.max_bounces,
+                "transparent_max_bounces": cycles.transparent_max_bounces,
+                "threads_mode": scene.render.threads_mode, "threads": scene.render.threads}
+    seed_pixels = {}
+    for seed in PATH_SEEDS:
+        scene.cycles.seed = seed
+        scene.render.filepath = os.path.join(scratch, f"path_seed{seed}.exr")
+        bpy.ops.render.render(write_still=True)
+        seed_pixels[seed] = load_pixels(scene.render.filepath, width, height)
+    seed_means = {seed: patch_means(seed_pixels[seed], width, height, probes) for seed in PATH_SEEDS}
+
+    # The committed seed 17/29 captures must be reproduced exactly before the extra seeds are trusted.
+    fixture_pixels = {SEED: load_pixels(os.path.join(OUT, "path.exr"), width, height),
+                      29: load_pixels(os.path.join(OUT, "path_seed29.exr"), width, height)}
+    with open(os.path.join(OUT, "path.json"), encoding="utf-8") as stream:
+        committed = [case["linear_rgba"] for case in json.load(stream)["cases"]]
+    fixture_means = {SEED: committed, 29: patch_means(fixture_pixels[29], width, height, probes)}
+    reproduction = {}
+    for seed in (SEED, 29):
+        exact = seed_means[seed] == fixture_means[seed]
+        if not exact:
+            raise RuntimeError(f"seed {seed} patch means do not reproduce the committed capture")
+        reproduction[str(seed)] = {
+            "patch_means_exact": exact,
+            "max_abs_pixel_difference": max(abs(a - b) for a, b in zip(seed_pixels[seed], fixture_pixels[seed])),
+        }
+
+    build_hash = bpy.app.build_hash
+    if isinstance(build_hash, bytes):
+        build_hash = build_hash.decode("ascii")
+    cases_json = [{"name": probe["name"], "probe": [probe["x"], probe["y"], probe["patch_radius"]],
+                   "seed_captures": [{"seed": seed, "linear_rgba": seed_means[seed][index]} for seed in PATH_SEEDS]}
+                  for index, probe in enumerate(probes)]
+    capture = {
+        "blender_version": bpy.app.version_string,
+        "blender_build_hash": build_hash,
+        "blender_binary": bpy.app.binary_path,
+        "blender_binary_sha256": file_sha256(bpy.app.binary_path),
+        "generator": "blender --background --factory-startup --python generate.py -- --path-seeds-only <scratch-directory> <output-directory>",
+        "generator_sha256": file_sha256(os.path.abspath(__file__)),
+        "engine": "CYCLES",
+        "resolution": [width, height],
+        "samples": CYCLES_SAMPLES,
+        "seeds": list(PATH_SEEDS),
+        "cycles": settings,
+        "reproduction": {"seeds": [SEED, 29],
+                         "compared_against": {"17": "path.json linear_rgba", "29": "path_seed29.exr patch means"},
+                         "results": reproduction},
+        "cases": cases_json,
+    }
+    with open(os.path.join(OUT, "path_seeds.json"), "w", encoding="utf-8") as stream:
+        json.dump(capture, stream, indent=2)
+        stream.write("\n")
+
 
 def make_eevee_sheen_scenes():
     for distribution in ("ASHIKHMIN", "MICROFIBER"):
@@ -1262,6 +1346,8 @@ if PATH_ONLY:
     make_scene("Shader BSDF Path Wave12", CASES, "CYCLES", "path",
                independent_backdrop_layout=True)
     remove_blend_backups(("path",))
+elif PATH_SEEDS_ONLY:
+    make_path_seeds_capture(CLI_ARGS[-2])
 elif EEVEE_REFRACTION_LAYERS_ONLY:
     make_eevee_refraction_layers_scene()
     remove_blend_backups(("eevee_refraction_layers",))

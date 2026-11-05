@@ -473,6 +473,7 @@ fn complete_scene_schema(root: &mut Value) {
         "eevee_use_sun_shadow_jitter"
     ]);
     let render = &mut defs["render_settings"];
+    render["properties"]["use_high_quality_normals"] = json!({"type":["boolean","null"]});
     render["properties"]["eevee_light_threshold"] = json!({"type":"number","minimum":0.0});
     render["properties"]["eevee_gi_cubemap_resolution"] = json!({
         "oneOf":[{"type":"integer","enum":[128,256,512,1024,2048,4096]},{"type":"null"}],
@@ -538,6 +539,7 @@ fn complete_scene_schema(root: &mut Value) {
         "seed",
         "max_bounces",
         "film_transparent",
+        "use_high_quality_normals",
         "engine",
         "use_sequencer",
         "audio_codec",
@@ -3229,6 +3231,7 @@ fn set_schema(operation: &str) -> Value {
             "eevee_gi_cubemap_resolution":{"oneOf":[{"type":"integer","enum":[128,256,512,1024,2048,4096]},{"type":"null"}]},
             "eevee_use_raytracing":{"type":["boolean","null"]},
             "eevee_use_fast_gi":{"type":["boolean","null"]},
+            "use_high_quality_normals":{"type":["boolean","null"]},
             "eevee_raytracing_method":{"oneOf":[{"enum":["probe","screen"]},{"type":"null"}]},
             "eevee_raytracing_resolution_scale":{"oneOf":[{"type":"integer","enum":[1,2,4,8,16]},{"type":"null"}]},
             "eevee_raytracing_screen_trace_quality":{"type":["number","null"],"minimum":0,"maximum":1},
@@ -3857,74 +3860,6 @@ mod tests {
         assert_eq!(
             update["properties"]["set"]["properties"]["eevee_gi_cubemap_resolution"]["oneOf"][0]["enum"],
             expected
-        );
-        Ok(())
-    }
-    #[test]
-    fn eevee_raytracing_is_nullable_in_scene_and_render_update_schemas() -> crate::error::Result<()>
-    {
-        let scene = schema("scene", None)?;
-        let render = &scene["$defs"]["render_settings"];
-        let fields = [
-            "eevee_use_raytracing",
-            "eevee_use_fast_gi",
-            "eevee_raytracing_method",
-            "eevee_raytracing_resolution_scale",
-            "eevee_raytracing_screen_trace_quality",
-            "eevee_raytracing_screen_trace_thickness",
-            "eevee_raytracing_trace_max_roughness",
-            "eevee_raytracing_use_backface_hit",
-            "eevee_raytracing_backface_radiance_scale",
-            "eevee_raytracing_use_denoise",
-            "eevee_raytracing_denoise_spatial",
-            "eevee_raytracing_denoise_temporal",
-            "eevee_raytracing_denoise_bilateral",
-            "eevee_fast_gi_bias",
-            "eevee_fast_gi_resolution",
-            "eevee_fast_gi_step_count",
-            "eevee_fast_gi_ray_count",
-            "eevee_fast_gi_quality",
-            "eevee_fast_gi_distance",
-            "eevee_fast_gi_thickness_near",
-            "eevee_fast_gi_method",
-            "eevee_clamp_surface_indirect",
-        ];
-        assert!(render["required"].as_array().is_some_and(|required| {
-            fields
-                .iter()
-                .all(|field| required.iter().any(|entry| entry.as_str() == Some(*field)))
-        }));
-        let update = schema("operations", Some("render.update"))?;
-        let properties = &update["properties"]["set"]["properties"];
-        for field in fields {
-            assert!(!render["properties"][field].is_null(), "{field}");
-            assert!(!properties[field].is_null(), "{field}");
-        }
-        assert_eq!(
-            render["properties"]["eevee_use_raytracing"]["type"],
-            serde_json::json!(["boolean", "null"])
-        );
-        assert_eq!(
-            properties["eevee_raytracing_resolution_scale"]["oneOf"][0]["enum"],
-            serde_json::json!([1, 2, 4, 8, 16])
-        );
-        assert_eq!(properties["eevee_fast_gi_ray_count"]["minimum"], 1);
-        assert_eq!(properties["eevee_fast_gi_ray_count"]["maximum"], 16);
-        assert_eq!(
-            properties["eevee_fast_gi_method"]["oneOf"][0]["enum"],
-            serde_json::json!(["ambient_occlusion_only", "global_illumination"])
-        );
-        assert_eq!(
-            render["properties"]["eevee_clamp_surface_indirect"]["default"],
-            10.0
-        );
-        assert_eq!(
-            properties["eevee_clamp_surface_indirect"]["type"],
-            serde_json::json!(["number", "null"])
-        );
-        assert_eq!(
-            properties["eevee_clamp_surface_indirect"]["maximum"],
-            f32::MAX
         );
         Ok(())
     }

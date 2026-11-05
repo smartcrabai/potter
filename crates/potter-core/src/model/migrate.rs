@@ -21,6 +21,8 @@
 //! also recovers EEVEE sphere-probe resolution and `World.sun_threshold` from retained scene
 //! metadata; unavailable imported values remain unknown rather than substituting a default, and
 //! the sun-threshold warning is limited to realtime scenes that reference the affected World.
+//! It also recovers `Scene.render.use_high_quality_normals` from retained Blender scene metadata;
+//! unrecoverable Source imports stay unknown, while native legacy scenes use Blender's false default.
 //! Version 18 captures `Material.use_raytrace_refraction` from a retained Blender adapter when
 //! available. Ambiguous Blender-appended and Potter-linked materials remain unknown; other missing
 //! settings default to the native false.
@@ -130,7 +132,8 @@ fn parse_scene_inner(
                 && (has_materials_missing_raytrace_refraction(&value)
                     || has_imported_blender_world_missing_sun_settings(&value)
                     || has_imported_blender_eevee_clamp_surface_indirect_missing(&value)
-                    || has_imported_blender_eevee_has_local_volume_probe_grids_missing(&value))));
+                    || has_imported_blender_eevee_has_local_volume_probe_grids_missing(&value)
+                    || has_scenes_missing_use_high_quality_normals(&value))));
     let source_hash = if retain_original_hash
         && (legacy
             || has_uninitialized_limit_distance_states(&value)
@@ -656,8 +659,9 @@ fn json_error(error: &serde_json::Error) -> PotError {
 /// Cycles curve settings from the retained Blender intermediate where possible, otherwise marking
 /// unavailable imported-hair settings unknown. Version 18 captures material refraction and light
 /// shadow settings from retained Blender data where possible, otherwise marking imported values
-/// unknown. `root` is the project directory that holds image blobs and linked sources, which the
-/// version 3 to 4 step reads.
+/// unknown, and recovers `Scene.render.use_high_quality_normals`; unrecoverable Source imports stay
+/// unknown while native legacy scenes use Blender's false default. `root` is the project directory
+/// that holds image blobs and linked sources, which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     let source_schema_version = value.get("schema_version").and_then(Value::as_u64);
     let mut warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
@@ -720,6 +724,9 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
         upgrade_material_raytrace_refraction(value)?;
         upgrade_light_use_shadow(value)?;
         warnings.extend(upgrade_v18_eevee_has_local_volume_probe_grids(value)?);
+    }
+    if source_schema_version.is_none_or(|version| version <= 18) {
+        upgrade_scene_use_high_quality_normals(value)?;
     }
     upgrade_scene_gravity_from_blender_metadata(value);
     Ok(warnings)
@@ -843,6 +850,65 @@ fn retained_blender_scene<'a>(value: &'a Value, scene_id: &str) -> Option<&'a Va
             .and_then(Value::as_str)
             == Some(scene_id)
     })
+}
+fn retained_blender_scene_use_high_quality_normals(
+    value: &Value,
+) -> Result<BTreeMap<String, Option<bool>>> {
+    let Some(raw_scenes) = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .and_then(|adapter| adapter.get("intermediate"))
+        .and_then(|intermediate| intermediate.get("scenes"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(scenes) = value.get("scenes").and_then(Value::as_object) else {
+        return Ok(BTreeMap::new());
+    };
+    let mappings = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .and_then(|adapter| adapter.get("id_mappings"))
+        .and_then(Value::as_object);
+    let mut retained = BTreeMap::new();
+    for scene_id in scenes.keys() {
+        let mut setting = None;
+        for raw_scene in raw_scenes.iter().filter(|raw_scene| {
+            raw_scene.get("potter_id").and_then(Value::as_str) == Some(scene_id.as_str())
+                || raw_scene
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .and_then(|name| {
+                        mappings.and_then(|mappings| mappings.get(&format!("Scene:{name}")))
+                    })
+                    .and_then(Value::as_str)
+                    == Some(scene_id.as_str())
+        }) {
+            let raw_setting = raw_scene
+                .get("render")
+                .and_then(|render| render.get("use_high_quality_normals"));
+            let raw_setting = match raw_setting {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(value)) => Some(*value),
+                Some(_) => {
+                    return Err(invalid(
+                        "retained Blender Scene.render.use_high_quality_normals is invalid",
+                    ));
+                }
+            };
+            if setting.is_some_and(|previous| previous != raw_setting) {
+                return Err(invalid(
+                    "retained Blender Scene.render.use_high_quality_normals values conflict for one scene",
+                ));
+            }
+            setting = Some(raw_setting);
+        }
+        if let Some(setting) = setting {
+            retained.insert(scene_id.clone(), setting);
+        }
+    }
+    Ok(retained)
 }
 
 fn retained_cycles_curve_pair(value: &Value, scene_id: &str) -> Option<(Value, Value)> {
@@ -1762,6 +1828,47 @@ fn has_lights_missing_use_shadow(value: &Value) -> bool {
             })
         })
 }
+fn has_scenes_missing_use_high_quality_normals(value: &Value) -> bool {
+    value
+        .get("scenes")
+        .and_then(Value::as_object)
+        .is_some_and(|scenes| {
+            scenes.values().any(|scene| {
+                scene
+                    .get("render")
+                    .and_then(Value::as_object)
+                    .is_none_or(|render| !render.contains_key("use_high_quality_normals"))
+            })
+        })
+}
+
+fn upgrade_scene_use_high_quality_normals(value: &mut Value) -> Result<()> {
+    let retained = retained_blender_scene_use_high_quality_normals(value)?;
+    let imported_blender = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .is_some_and(Value::is_object);
+    let Some(scenes) = value.get_mut("scenes").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    for (scene_id, scene) in scenes {
+        let Some(render) = scene.get_mut("render").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if !render.contains_key("use_high_quality_normals") {
+            let setting = retained
+                .get(scene_id)
+                .copied()
+                .flatten()
+                .or_else(|| (!imported_blender).then_some(false));
+            render.insert(
+                "use_high_quality_normals".to_owned(),
+                setting.map_or(Value::Null, |setting| json!(setting)),
+            );
+        }
+    }
+    Ok(())
+}
 
 fn retained_blender_light_use_shadow(value: &Value) -> Result<BTreeMap<String, Option<bool>>> {
     let Some(compatibility) = value.get("compatibility").and_then(Value::as_object) else {
@@ -2648,7 +2755,7 @@ fn upgrade_v4(value: &mut Value) -> Result<()> {
 
 /// Upgrades a schema-version-5 scene document to version 6. Version 5 drew a fisheye camera over a full turn in two forms:
 /// the `fisheye` projection, and a `panorama` with `panorama_type` `fisheye_equidistant`. Both become a `panorama` with
-/// `fisheye_equidistant` and a `fisheye_fov` of 2π, so each keeps its image and a fisheye has one representation.
+/// `fisheye_equidistant` and a `fisheye_fov` of 2*pi, so each keeps its image and a fisheye has one representation.
 fn upgrade_v5(value: &mut Value) {
     if let Some(blocks) = value.get_mut("data_blocks").and_then(Value::as_object_mut) {
         for camera in blocks
@@ -5712,7 +5819,7 @@ fn uv_layer_names(attributes: &Map<String, Value>) -> Vec<String> {
         .collect()
 }
 
-/// `base`, or `base.001`, `base.002`, … when an attribute already has that name.
+/// `base`, or `base.001`, `base.002`, ... when an attribute already has that name.
 fn unique_name(base: &str, attributes: &Map<String, Value>) -> String {
     if !attributes.contains_key(crate::geom::attribute_keys::storage_key(base).as_ref()) {
         return base.to_owned();
@@ -5768,6 +5875,31 @@ mod tests {
         }
         Ok(source)
     }
+    fn schema_eighteen_render_normal_precision_scene(
+        blender_adapter: bool,
+        retained_setting: Option<bool>,
+    ) -> TestResult<Value> {
+        let mut source = serde_json::to_value(SceneDoc::new(
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+        ))?;
+        source["schema_version"] = json!(18);
+        source["scenes"]["scene_main"]["render"]
+            .as_object_mut()
+            .ok_or("scene render settings are missing")?
+            .remove("use_high_quality_normals");
+        if blender_adapter {
+            let mut raw_scene = json!({"name":"Scene","render":{}});
+            if let Some(setting) = retained_setting {
+                raw_scene["render"]["use_high_quality_normals"] = json!(setting);
+            }
+            source["compatibility"]["blender_adapter"] = json!({
+                "intermediate":{"scenes":[raw_scene]},
+                "id_mappings":{"Scene:Scene":"scene_main"}
+            });
+        }
+        Ok(source)
+    }
+
     fn schema_seventeen_curve_scene(
         blender_adapter: bool,
         hair_curves: bool,
@@ -6220,15 +6352,21 @@ mod tests {
     }
 
     #[test]
-    fn version_three_scenes_only_advance_their_version_without_images() {
+    fn version_three_texture_bindings_survive_upgrade_without_image_assets() {
         let mut scene = json!({
             "schema_version": 3,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
-        let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
         assert_eq!(scene["schema_version"], json!(18));
-        assert_eq!(scene["materials"], before["materials"]);
+        assert_eq!(
+            scene["materials"]["m1"]["base_color_texture"]["image"],
+            json!("img")
+        );
+        assert_eq!(
+            scene["materials"]["m1"]["base_color_texture"]["uv_layer"],
+            json!("Light")
+        );
     }
 
     #[test]
@@ -6248,7 +6386,7 @@ mod tests {
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
         assert_eq!(scene["schema_version"], json!(18));
-        // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
+        // Both forms drew a full turn in version 5, so both keep it as a 2*pi equidistant fisheye.
         for id in ["legacy", "panorama"] {
             let camera = &scene["data_blocks"][id]["camera"];
             assert_eq!(camera["projection"], json!("panorama"), "{id}");
@@ -6830,29 +6968,39 @@ mod tests {
     }
 
     #[test]
-    fn schema_thirteen_scenes_upgrade_to_eighteen_without_other_changes() {
+    fn schema_thirteen_texture_binding_survives_upgrade_to_eighteen() {
         let mut scene = json!({
             "schema_version": 13,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
-        let mut expected = scene.clone();
-        expected["schema_version"] = json!(18);
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
         assert_eq!(scene["schema_version"], json!(18));
-        assert_eq!(scene, expected);
+        assert_eq!(
+            scene["materials"]["m1"]["base_color_texture"]["image"],
+            json!("img")
+        );
+        assert_eq!(
+            scene["materials"]["m1"]["base_color_texture"]["uv_layer"],
+            json!("Light")
+        );
     }
 
     #[test]
-    fn schema_twelve_scenes_chain_migrations_to_eighteen() {
+    fn schema_twelve_texture_binding_survives_migration_chain_to_eighteen() {
         let mut scene = json!({
             "schema_version": 12,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
-        let mut expected = scene.clone();
-        expected["schema_version"] = json!(18);
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
         assert_eq!(scene["schema_version"], json!(18));
-        assert_eq!(scene, expected);
+        assert_eq!(
+            scene["materials"]["m1"]["base_color_texture"]["image"],
+            json!("img")
+        );
+        assert_eq!(
+            scene["materials"]["m1"]["base_color_texture"]["uv_layer"],
+            json!("Light")
+        );
     }
 
     #[test]
@@ -7298,6 +7446,106 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn schema_eighteen_retained_scene_normal_precision_preserves_source_hash_and_history()
+    -> TestResult<()> {
+        for setting in [false, true] {
+            let source = schema_eighteen_render_normal_precision_scene(true, Some(setting))?;
+            let expected_hash = crate::hash::sha256(&crate::hash::canonicalize(&source)?);
+            let parsed = parse_scene_with_original_hash(
+                &serde_json::to_vec(&source)?,
+                no_assets(),
+                no_assets(),
+            )?;
+            assert!(parsed.legacy);
+            assert_eq!(parsed.legacy_hash.as_deref(), Some(expected_hash.as_str()));
+            assert_eq!(parsed.doc.schema_version, 18);
+            assert_eq!(
+                parsed.doc.scenes[&Id::from_static("scene_main")]
+                    .render
+                    .use_high_quality_normals,
+                Some(setting)
+            );
+
+            let mut history = history_record(&source);
+            history["scene_hash"] = json!(expected_hash.clone());
+            let (record, warnings) =
+                parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(record.scene_hash, expected_hash);
+            assert_eq!(
+                record.snapshot.scenes[&Id::from_static("scene_main")]
+                    .render
+                    .use_high_quality_normals,
+                Some(setting)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn schema_eighteen_unrecoverable_source_scene_normal_precision_stays_unknown() -> TestResult<()>
+    {
+        let source = schema_eighteen_render_normal_precision_scene(true, None)?;
+        let expected_hash = crate::hash::sha256(&crate::hash::canonicalize(&source)?);
+        let parsed = parse_scene_with_original_hash(
+            &serde_json::to_vec(&source)?,
+            no_assets(),
+            no_assets(),
+        )?;
+        assert!(parsed.legacy);
+        assert_eq!(parsed.legacy_hash.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(
+            parsed.doc.scenes[&Id::from_static("scene_main")]
+                .render
+                .use_high_quality_normals,
+            None
+        );
+
+        let mut history = history_record(&source);
+        history["scene_hash"] = json!(expected_hash.clone());
+        let (record, _) = parse_history_record(&serde_json::to_vec(&history)?, no_assets())?;
+        assert_eq!(record.scene_hash, expected_hash);
+        assert_eq!(
+            record.snapshot.scenes[&Id::from_static("scene_main")]
+                .render
+                .use_high_quality_normals,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_eighteen_native_scene_normal_precision_uses_blender_default() -> TestResult<()> {
+        let mut source = schema_eighteen_render_normal_precision_scene(false, None)?;
+        upgrade_scene(&mut source, no_assets())?;
+        assert_eq!(
+            source["scenes"]["scene_main"]["render"]["use_high_quality_normals"],
+            json!(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_eighteen_retained_scene_normal_precision_rejects_bad_or_conflicting_values()
+    -> TestResult<()> {
+        let mut invalid = schema_eighteen_render_normal_precision_scene(true, None)?;
+        invalid["compatibility"]["blender_adapter"]["intermediate"]["scenes"][0]["render"]["use_high_quality_normals"] =
+            json!("false");
+        assert!(upgrade_scene(&mut invalid, no_assets()).is_err());
+
+        let mut conflict = schema_eighteen_render_normal_precision_scene(true, Some(true))?;
+        conflict["compatibility"]["blender_adapter"]["intermediate"]["scenes"]
+            .as_array_mut()
+            .ok_or("retained Blender scenes are missing")?
+            .push(json!({
+                "name":"Scene",
+                "render":{"use_high_quality_normals":false}
+            }));
+        assert!(upgrade_scene(&mut conflict, no_assets()).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn schema_seventeen_and_eighteen_fast_gi_clamp_migrations_preserve_zero_or_unknown()
     -> TestResult {
         let mut known = schema_seventeen_probe_scene(true, "realtime", Some(512));
@@ -7593,15 +7841,16 @@ mod tests {
             let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
             let render = &parsed.doc.scenes[&Id::from_static("scene_main")].render;
 
-            assert!(parsed.legacy);
             assert_eq!(parsed.doc.schema_version, 18);
-            assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
-            assert_eq!(
-                parsed.warnings[0]["code"],
-                json!("cycles_curves.settings_unavailable_migrated")
-            );
+            let warning = parsed
+                .warnings
+                .iter()
+                .find(|warning| {
+                    warning["code"] == json!("cycles_curves.settings_unavailable_migrated")
+                })
+                .expect("unknown curve settings warning");
             assert!(
-                parsed.warnings[0]["message"]
+                warning["message"]
                     .as_str()
                     .is_some_and(|message| message.contains("Reimport"))
             );

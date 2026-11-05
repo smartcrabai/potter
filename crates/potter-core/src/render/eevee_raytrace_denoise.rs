@@ -91,7 +91,8 @@ pub struct RaySample {
     pub radiance: [f32; 3],
 }
 
-/// Per-full-resolution-pixel values decoded from the G-buffer and view transforms.
+/// Per-full-resolution-pixel G-buffer and view values, including unbiased
+/// view-space position deltas; the spatial stage applies their roughness bias.
 #[derive(Debug, Clone, Copy)]
 pub struct SpatialPixel {
     pub closure_present: bool,
@@ -100,7 +101,7 @@ pub struct SpatialPixel {
     pub noise: [f32; 2],
     pub view_normal: [f32; 3],
     pub view_incident: [f32; 3],
-    pub world_position_derivatives: [[f32; 3]; 2],
+    pub view_position_derivatives: [[f32; 3]; 2],
     pub scene_view_z: f32,
 }
 
@@ -134,6 +135,7 @@ pub trait SpatialKernelOps: ColorTransfer {
         &mut self,
         pixel_index: usize,
         ray_direction: [f32; 3],
+        view_normal: [f32; 3],
         view_incident: [f32; 3],
     ) -> f32;
     fn depth_view_to_screen(&mut self, pixel_index: usize, view_z: f32) -> f32;
@@ -224,7 +226,9 @@ pub fn spatial_denoise(
                             let Some(ray_index) = input.trace_extent.index(x, y) else {
                                 continue;
                             };
-                            radiance[index] = quantize_radiance(input.rays[ray_index].radiance);
+                            let linear_pre_store = input.rays[ray_index].radiance;
+                            let stored_radiance = quantize_radiance(linear_pre_store);
+                            radiance[index] = stored_radiance;
                         } else {
                             let shifted = trace_coordinate([x, y], input.trace_offset);
                             let nearest = [
@@ -267,8 +271,9 @@ pub fn spatial_denoise(
                             for accumulated_channel in &mut accumulated {
                                 *accumulated_channel *= safe_rcp(weight_sum);
                             }
-                            radiance[index] =
-                                quantize_radiance(ops.scene_linear_from_log(accumulated));
+                            let linear_pre_store = ops.scene_linear_from_log(accumulated);
+                            let stored_radiance = quantize_radiance(linear_pre_store);
+                            radiance[index] = stored_radiance;
                         }
                         continue;
                     }
@@ -301,8 +306,8 @@ pub fn spatial_denoise(
                     }
                     let max_filter_radius = (RAYTRACE_GROUP_SIZE - 1) as f32;
                     let bias = 0.2_f32.max(saturate((0.75 - roughness) / (0.75 - 0.3)));
-                    let dpdx = scale3(pixel.world_position_derivatives[0], bias);
-                    let dpdy = scale3(pixel.world_position_derivatives[1], bias);
+                    let dpdx = scale3(pixel.view_position_derivatives[0], bias);
+                    let dpdy = scale3(pixel.view_position_derivatives[1], bias);
                     let filter_up = normalize2([pixel.view_normal[0], pixel.view_normal[1]]);
                     let filter_right = [-filter_up[1], filter_up[0]];
                     let aspect =
@@ -356,6 +361,7 @@ pub fn spatial_denoise(
                         let pdf = ops.closure_evaluate_pdf(
                             index,
                             corrected_direction,
+                            pixel.view_normal,
                             pixel.view_incident,
                         );
                         let weight = (pdf * ray_pdf_inverse).min(1.0e30);
@@ -382,7 +388,9 @@ pub fn spatial_denoise(
                     }
                     let hit_depth_value =
                         ops.depth_view_to_screen(index, pixel.scene_view_z - closest_hit_time);
-                    radiance[index] = quantize_radiance(ops.scene_linear_from_log(radiance_accum));
+                    let linear_pre_store = ops.scene_linear_from_log(radiance_accum);
+                    let stored_radiance = quantize_radiance(linear_pre_store);
+                    radiance[index] = stored_radiance;
                     variance[index] = quantize_f16(hit_variance);
                     hit_depth[index] = hit_depth_value;
                 }
@@ -578,6 +586,7 @@ pub struct BilateralPixel {
     pub depth: f32,
     pub apparent_roughness: f32,
     pub world_position: [f32; 3],
+    /// Closure-decoded normal transformed to world space for bilateral filtering.
     pub world_normal: [f32; 3],
     /// Interleaved-gradient-noise plus the source ray-trace RNG value.
     pub noise: [f32; 2],
@@ -1059,9 +1068,12 @@ fn radical_inverse_vdc(mut bits: u32) -> f32 {
 }
 
 fn sample_disk(sample: [f32; 2]) -> [f32; 2] {
-    let angle = sample[1] * std::f32::consts::TAU;
+    let phi = (sample[1] - 0.5) * std::f32::consts::TAU;
+    let cos_phi = phi.cos();
+    let sign_phi = if phi == 0.0 { 0.0 } else { phi.signum() };
+    let sin_phi = (1.0 - cos_phi * cos_phi).sqrt() * sign_phi;
     let radius = sample[0].sqrt();
-    [radius * angle.cos(), radius * angle.sin()]
+    [radius * cos_phi, radius * sin_phi]
 }
 
 fn write_invalid(
@@ -1175,12 +1187,12 @@ fn quantize_radiance(color: [f32; 3]) -> [f32; 3] {
     })
 }
 
-fn quantize_f16(value: f32) -> f32 {
+pub(super) fn store_f16_bits_rtz(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exponent = ((bits >> 23) & 0xff) as i32;
     let significand = bits & 0x7f_ffff;
-    let half_bits = if exponent == 0xff {
+    if exponent == 0xff {
         sign | 0x7c00
             | if significand == 0 {
                 0
@@ -1190,7 +1202,7 @@ fn quantize_f16(value: f32) -> f32 {
     } else {
         let half_exponent = exponent - 127 + 15;
         if half_exponent >= 0x1f {
-            sign | 0x7c00
+            sign | 0x7bff
         } else if half_exponent > 0 {
             sign | ((half_exponent as u16) << 10) | (significand >> 13) as u16
         } else if half_exponent >= -10 {
@@ -1198,8 +1210,11 @@ fn quantize_f16(value: f32) -> f32 {
         } else {
             sign
         }
-    };
-    exr::prelude::f16::from_bits(half_bits).to_f32()
+    }
+}
+
+fn quantize_f16(value: f32) -> f32 {
+    exr::prelude::f16::from_bits(store_f16_bits_rtz(value)).to_f32()
 }
 
 #[cfg(test)]
@@ -1217,6 +1232,52 @@ mod tests {
     fn safe_rcp_preserves_nan_reciprocal_semantics() {
         assert!(safe_rcp(f32::NAN).is_nan());
     }
+
+    #[test]
+    fn sample_disk_matches_source_cardinal_directions_and_zero_sign() {
+        let samples = [
+            ([0.25, 0.5], [0.5, 0.0]),
+            ([0.25, 0.75], [0.0, 0.5]),
+            ([0.25, 0.25], [0.0, -0.5]),
+        ];
+
+        for (sample, expected) in samples {
+            let actual = super::sample_disk(sample);
+            assert!(
+                (actual[0] - expected[0]).abs() < 1.0e-6
+                    && (actual[1] - expected[1]).abs() < 1.0e-6,
+                "sample {sample:?} produced {actual:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_f16_stores_match_measured_signed_rtz_boundaries() {
+        let vectors = [
+            (f32::from_bits(0xbf4b_ffff), 0xba5f),
+            (0.796_875, 0x3a60),
+            (f32::from_bits(0x3f4b_ffff), 0x3a5f),
+            (f32::from_bits(0x3f8f_ffff), 0x3c7f),
+            (1.125, 0x3c80),
+            (f32::from_bits(0x3380_0000), 0x0001),
+            (f32::from_bits(0x337f_ffff), 0x0000),
+            (f32::from_bits(0xb37f_ffff), 0x8000),
+            (65520.0, 0x7bff),
+            (f32::MAX, 0x7bff),
+            (f32::INFINITY, 0x7c00),
+            (f32::NEG_INFINITY, 0xfc00),
+            (f32::from_bits(0x7f80_0001), 0x7c01),
+        ];
+        for (value, expected) in vectors {
+            assert_eq!(
+                super::store_f16_bits_rtz(value),
+                expected,
+                "input bits {:#010x}",
+                value.to_bits()
+            );
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct TestColor;
 

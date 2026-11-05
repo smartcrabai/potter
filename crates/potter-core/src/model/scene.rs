@@ -2405,6 +2405,9 @@ pub struct RenderSettings {
     #[serde(default = "default_filter_size")]
     pub filter_size: f64,
     pub engine: String,
+    /// Blender's `RenderSettings.use_high_quality_normals`; unknown source values stay `None`.
+    #[serde(default)]
+    pub use_high_quality_normals: Option<bool>,
     pub use_sequencer: bool,
     pub audio_codec: String,
     #[serde(default)]
@@ -2632,6 +2635,7 @@ impl Default for RenderSettings {
             film_transparent: false,
             filter_size: default_filter_size(),
             engine: "path".to_owned(),
+            use_high_quality_normals: Some(false),
             use_sequencer: false,
             audio_codec: "wav".to_owned(),
             passes: vec!["combined".to_owned()],
@@ -4898,7 +4902,7 @@ mod tests {
         }
         for threshold in [
             Some(-f64::EPSILON),
-            Some(f64::from(f32::MAX) + 1.0),
+            Some(f64::from_bits(f64::from(f32::MAX).to_bits() + 1)),
             Some(f64::INFINITY),
         ] {
             let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
@@ -4957,7 +4961,7 @@ mod tests {
                 ..super::World::default()
             },
             super::World {
-                eevee_sun_shadow_jitter_overblur: Some(100.0 + f64::EPSILON),
+                eevee_sun_shadow_jitter_overblur: Some(f64::from_bits(100.0_f64.to_bits() + 1)),
                 ..super::World::default()
             },
             super::World {
@@ -5460,7 +5464,9 @@ mod tests {
                 ..super::RenderSettings::default()
             },
             super::RenderSettings {
-                eevee_clamp_surface_indirect: Some(f64::from(f32::MAX) + 1.0),
+                eevee_clamp_surface_indirect: Some(f64::from_bits(
+                    f64::from(f32::MAX).to_bits() + 1,
+                )),
                 ..super::RenderSettings::default()
             },
         ] {

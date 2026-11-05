@@ -39,6 +39,7 @@ const SET_FIELDS: &[&str] = &[
     "eevee_gi_cubemap_resolution",
     "eevee_use_raytracing",
     "eevee_use_fast_gi",
+    "use_high_quality_normals",
     "eevee_raytracing_method",
     "eevee_raytracing_resolution_scale",
     "eevee_raytracing_screen_trace_quality",
@@ -274,6 +275,7 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         .transpose()?;
     let eevee_use_raytracing = optional_nullable_bool(engine, set, "eevee_use_raytracing")?;
     let eevee_use_fast_gi = optional_nullable_bool(engine, set, "eevee_use_fast_gi")?;
+    let use_high_quality_normals = optional_nullable_bool(engine, set, "use_high_quality_normals")?;
     let eevee_raytracing_method = set
         .get("eevee_raytracing_method")
         .map(|value| {
@@ -664,6 +666,7 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
             scene.render.eevee_gi_cubemap_resolution = value;
         }
         eevee_use_raytracing.apply_to(&mut scene.render.eevee_use_raytracing);
+        use_high_quality_normals.apply_to(&mut scene.render.use_high_quality_normals);
         eevee_use_fast_gi.apply_to(&mut scene.render.eevee_use_fast_gi);
         if let Some(value) = eevee_raytracing_method {
             scene.render.eevee_raytracing_method = value;
@@ -950,6 +953,40 @@ mod tests {
             ),
             "subdivisions beyond Blender's RNA range must be rejected"
         );
+        Ok(())
+    }
+    #[test]
+    fn high_quality_normals_render_update_sets_and_clears_source_value() -> crate::error::Result<()>
+    {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let scene_id = Id::from_static("scene_main");
+        assert_eq!(
+            doc.scenes[&scene_id].render.use_high_quality_normals,
+            Some(false)
+        );
+        for (value, expected) in [
+            (json!(true), Some(true)),
+            (json!(false), Some(false)),
+            (json!(null), None),
+        ] {
+            doc = apply_batch(
+                &doc,
+                &json!({
+                    "schema_version": 1,
+                    "base_revision": doc.revision,
+                    "operations": [{
+                        "op": "render.update",
+                        "target": {"id": "scene_main"},
+                        "set": {"use_high_quality_normals": value}
+                    }]
+                }),
+            )?
+            .doc;
+            assert_eq!(
+                doc.scenes[&scene_id].render.use_high_quality_normals,
+                expected
+            );
+        }
         Ok(())
     }
     #[test]
