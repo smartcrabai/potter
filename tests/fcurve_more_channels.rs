@@ -927,14 +927,19 @@ fn extended_camera_light_visibility_and_custom_property_curves_match_blender_ora
     let import_losses = imported["result"]["losses"]
         .as_array()
         .ok_or("import losses are missing")?;
+    // The checked-in fixture keeps Blender's default Cycles denoising, which Potter reports as a loss.
+    let mut loss_features: Vec<_> = import_losses
+        .iter()
+        .filter_map(|loss| loss["feature_id"].as_str())
+        .collect();
+    loss_features.sort_unstable();
     assert_eq!(
-        import_losses.len(),
-        1,
+        loss_features,
+        [
+            "blender.scene.cycles.use_denoising",
+            "modifier.uv_project.animated_camera_parameters",
+        ],
         "unexpected Blender import losses: {import_losses:?}"
-    );
-    assert_eq!(
-        import_losses[0]["feature_id"],
-        "modifier.uv_project.animated_camera_parameters"
     );
     assert_channels_match(&project, &expected, tolerance, "source import")?;
     assert_native_clamps(&project, &expected, "source import")?;
@@ -1050,9 +1055,19 @@ fn extended_camera_light_visibility_and_custom_property_curves_match_blender_ora
         .arg(&exported_blend)
         .arg("--blender")
         .arg(&blender)
+        .arg("--allow-lossy")
         .arg("--json");
     let exported = pot_json(export, "exporting F-Curve channel fixture")?;
-    assert_eq!(exported["result"]["losses"], Value::Array(Vec::new()));
+    // The retained source scene enables Cycles denoising, which Potter's path tracer cannot reproduce.
+    assert_eq!(
+        exported["result"]["losses"]
+            .as_array()
+            .ok_or("export losses are missing")?
+            .iter()
+            .map(|loss| &loss["feature_id"])
+            .collect::<Vec<_>>(),
+        ["blender.scene.cycles.use_denoising"]
+    );
     assert_exported_nla_matches_blender(&exported_blend, &blender, &expected, tolerance)?;
 
     let round_trip_project = directory.path().join("round_trip_project");

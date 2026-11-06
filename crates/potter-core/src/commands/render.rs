@@ -87,6 +87,10 @@ pub fn run(args: RenderArgs) -> Result<(Option<SceneInfo>, Value)> {
         || !(0.0..=1e8).contains(&settings.sample_clamp_indirect)
         || !settings.light_sampling_threshold.is_finite()
         || !(0.0..=1.0).contains(&settings.light_sampling_threshold)
+        || !settings.film_exposure.is_finite()
+        || !(0.0..=4_294_967_296.0).contains(&settings.film_exposure)
+        || !settings.film_transparent_roughness.is_finite()
+        || !(0.0..=1.0).contains(&settings.film_transparent_roughness)
     {
         return Err(PotError::new(
             ErrorCode::SceneInvalid,

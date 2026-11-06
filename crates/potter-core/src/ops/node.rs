@@ -656,6 +656,10 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "render_visible",
             "selectable",
             "ray_visibility",
+            "is_holdout",
+            "shadow_terminator_normal_offset",
+            "shadow_terminator_geometry_offset",
+            "shadow_terminator_shading_offset",
             "action",
             "track_axis",
             "up_axis",
@@ -741,6 +745,29 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         .get("ray_visibility")
         .map(|value| read_ray_visibility(engine, value))
         .transpose()?;
+    let is_holdout = read_optional_bool(engine, set, "is_holdout")?;
+    let read_shadow_offset = |field: &str| -> Result<Option<f64>> {
+        set.get(field)
+            .map(|value| {
+                value
+                    .as_f64()
+                    .filter(|value| {
+                        value.is_finite() && (0.0..=f64::from(f32::MAX)).contains(value)
+                    })
+                    .ok_or_else(|| {
+                        engine.error(
+                            ErrorCode::InvalidOperation,
+                            format!("{field} must be finite and in 0..=FLT_MAX"),
+                            &operation_pointer(engine.operation_index, &format!("set/{field}")),
+                        )
+                    })
+            })
+            .transpose()
+    };
+    let shadow_terminator_normal_offset = read_shadow_offset("shadow_terminator_normal_offset")?;
+    let shadow_terminator_geometry_offset =
+        read_shadow_offset("shadow_terminator_geometry_offset")?;
+    let shadow_terminator_shading_offset = read_shadow_offset("shadow_terminator_shading_offset")?;
     let action = set
         .get("action")
         .map(|value| {
@@ -873,6 +900,33 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                             item_changed = true;
                         }
                     }
+                }
+            }
+            if let Some(value) = is_holdout
+                && node.is_holdout != value
+            {
+                node.is_holdout = value;
+                item_changed = true;
+            }
+            for (value, property) in [
+                (
+                    shadow_terminator_normal_offset,
+                    &mut node.shadow_terminator_normal_offset,
+                ),
+                (
+                    shadow_terminator_geometry_offset,
+                    &mut node.shadow_terminator_geometry_offset,
+                ),
+                (
+                    shadow_terminator_shading_offset,
+                    &mut node.shadow_terminator_shading_offset,
+                ),
+            ] {
+                if let Some(value) = value
+                    && !crate::float::equal_f64(*property, value)
+                {
+                    *property = value;
+                    item_changed = true;
                 }
             }
             item_changed

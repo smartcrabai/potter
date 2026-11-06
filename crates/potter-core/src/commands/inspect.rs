@@ -533,6 +533,10 @@ fn node_item(
         "visible": evaluated.evaluated_visible.unwrap_or(node.visible),
         "render_visible": evaluated.evaluated_render_visible.unwrap_or(node.render_visible),
         "selectable": node.selectable,
+        "is_holdout": node.is_holdout,
+        "shadow_terminator_normal_offset": node.shadow_terminator_normal_offset,
+        "shadow_terminator_geometry_offset": node.shadow_terminator_geometry_offset,
+        "shadow_terminator_shading_offset": node.shadow_terminator_shading_offset,
         "properties": properties,
         "library": linkage["library"],
         "library_name": linkage["library_name"],
@@ -751,7 +755,8 @@ fn scene_item(doc: &SceneDoc, id: &Id, scene: &Scene) -> Value {
         .as_ref()
         .and_then(|world_id| doc.worlds.get(world_id));
     json!({ "type": "scene", "id": id, "name": scene.name, "root_collection": scene.root_collection,
-        "view_layers": scene.view_layers.keys().collect::<Vec<_>>(), "frame_current": scene.frame_current,
+        "view_layers": scene.view_layers.keys().collect::<Vec<_>>(),
+        "view_layer_settings": scene.view_layers, "frame_current": scene.frame_current,
         "frame_start": scene.frame_start, "frame_end": scene.frame_end, "fps": scene.fps, "fps_base": scene.fps_base,
         "camera": scene.camera, "world": scene.world, "world_data": world_data, "unit": scene.unit,
         "render": scene.render, "markers": scene.markers, "rigid_body_world": scene.rigid_body_world })

@@ -30,6 +30,7 @@ SEEDS = range(8)
 scene = bpy.context.scene
 scene.render.engine = "CYCLES"
 scene.cycles.samples = SAMPLES
+scene.cycles.use_denoising = False
 # Potter samples each pixel with a one-pixel box, so the oracle uses Cycles' box filter of width 1.
 scene.cycles.pixel_filter_type = "BOX"
 scene.cycles.filter_width = 1.0

@@ -48,6 +48,7 @@ for obj in list(bpy.data.objects):
 
 scene = bpy.context.scene
 scene.render.engine = "CYCLES"
+scene.cycles.use_denoising = False
 world = bpy.data.worlds.new("Black")
 world.use_nodes = True
 background = world.node_tree.nodes["Background"]
@@ -108,6 +109,7 @@ for obj in list(bpy.data.objects):
 
 scene = bpy.context.scene
 scene.render.engine = "CYCLES"
+scene.cycles.use_denoising = False
 world = bpy.data.worlds.new("Black")
 world.use_nodes = True
 background = world.node_tree.nodes["Background"]
@@ -166,6 +168,7 @@ for obj in list(bpy.data.objects):
 
 scene = bpy.context.scene
 scene.render.engine = "CYCLES"
+scene.cycles.use_denoising = False
 world = bpy.data.worlds.new("Black")
 world.use_nodes = True
 background = world.node_tree.nodes["Background"]

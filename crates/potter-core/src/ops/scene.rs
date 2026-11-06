@@ -34,6 +34,7 @@ pub(super) fn apply(
     match name {
         "scene.create" => create(engine, operation),
         "scene.update" => update(engine, operation),
+        "view_layer.update" => update_view_layer(engine, operation),
         _ => Err(engine.error(
             ErrorCode::InternalError,
             "invalid scene operation dispatch",
@@ -127,6 +128,12 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             ViewLayer {
                 name: "View Layer".to_owned(),
                 excluded_collections: Vec::new(),
+                use_solid: true,
+                use_strand: true,
+                use_volumes: true,
+                use_motion_blur: true,
+                material_override: None,
+                world_override: None,
             },
         )]),
         eevee_has_local_volume_probe_grids: None,
@@ -556,6 +563,227 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             scene.unit.scale_length = scale_length;
             changed = true;
         }
+    }
+    if changed {
+        engine.mark("scenes", &scene_id, ChangeKind::Updated);
+    }
+    Ok(changed)
+}
+fn update_view_layer(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
+    check_fields(
+        engine,
+        operation,
+        &["op", "target", "set"],
+        &["target", "set"],
+    )?;
+    let target = operation
+        .get("target")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "view-layer target must be an object",
+                &operation_pointer(engine.operation_index, "target"),
+            )
+        })?;
+    if let Some(key) = target
+        .keys()
+        .find(|key| !matches!(key.as_str(), "scene_id" | "id"))
+    {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            format!("unknown view-layer target field `{key}`"),
+            &operation_pointer(
+                engine.operation_index,
+                &format!("target/{}", pointer_escape(key)),
+            ),
+        ));
+    }
+    let scene_id = target
+        .get("scene_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "view-layer target requires a scene ID",
+                &operation_pointer(engine.operation_index, "target/scene_id"),
+            )
+        })
+        .and_then(|value| {
+            parse_id(
+                engine,
+                value,
+                &operation_pointer(engine.operation_index, "target/scene_id"),
+            )
+        })?;
+    let view_layer_id = target
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "view-layer target requires an ID",
+                &operation_pointer(engine.operation_index, "target/id"),
+            )
+        })
+        .and_then(|value| {
+            parse_id(
+                engine,
+                value,
+                &operation_pointer(engine.operation_index, "target/id"),
+            )
+        })?;
+    let set = operation
+        .get("set")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "view-layer set must be an object",
+                &operation_pointer(engine.operation_index, "set"),
+            )
+        })?;
+    if set.is_empty() {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "view-layer set must not be empty",
+            &operation_pointer(engine.operation_index, "set"),
+        ));
+    }
+    if let Some(key) = set.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "use_solid"
+                | "use_strand"
+                | "use_volumes"
+                | "use_motion_blur"
+                | "material_override"
+                | "world_override"
+        )
+    }) {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            format!("unknown view-layer setting `{key}`"),
+            &operation_pointer(
+                engine.operation_index,
+                &format!("set/{}", pointer_escape(key)),
+            ),
+        ));
+    }
+    let read_bool = |field: &str| -> Result<Option<bool>> {
+        set.get(field)
+            .map(|value| {
+                value.as_bool().ok_or_else(|| {
+                    engine.error(
+                        ErrorCode::InvalidOperation,
+                        format!("{field} must be a boolean"),
+                        &operation_pointer(engine.operation_index, &format!("set/{field}")),
+                    )
+                })
+            })
+            .transpose()
+    };
+    let use_solid = read_bool("use_solid")?;
+    let use_strand = read_bool("use_strand")?;
+    let use_volumes = read_bool("use_volumes")?;
+    let use_motion_blur = read_bool("use_motion_blur")?;
+    let read_override = |field: &str| -> Result<Option<Option<crate::model::Id>>> {
+        set.get(field)
+            .map(|value| {
+                if value.is_null() {
+                    return Ok(None);
+                }
+                let text = value.as_str().ok_or_else(|| {
+                    engine.error(
+                        ErrorCode::InvalidOperation,
+                        format!("{field} must be an ID or null"),
+                        &operation_pointer(engine.operation_index, &format!("set/{field}")),
+                    )
+                })?;
+                parse_id(
+                    engine,
+                    text,
+                    &operation_pointer(engine.operation_index, &format!("set/{field}")),
+                )
+                .map(Some)
+            })
+            .transpose()
+    };
+    let material_override = read_override("material_override")?;
+    let world_override = read_override("world_override")?;
+    let scene = engine.doc.scenes.get(&scene_id).ok_or_else(|| {
+        engine.error(
+            ErrorCode::TargetNotFound,
+            format!("scene `{scene_id}` was not found"),
+            &operation_pointer(engine.operation_index, "target/scene_id"),
+        )
+    })?;
+    if !scene.view_layers.contains_key(&view_layer_id) {
+        return Err(engine.error(
+            ErrorCode::TargetNotFound,
+            format!("view layer `{view_layer_id}` was not found in scene `{scene_id}`"),
+            &operation_pointer(engine.operation_index, "target/id"),
+        ));
+    }
+    if material_override
+        .as_ref()
+        .and_then(Option::as_ref)
+        .is_some_and(|id| !engine.doc.materials.contains_key(id))
+    {
+        return Err(engine.error(
+            ErrorCode::TargetNotFound,
+            "material_override references a missing material",
+            &operation_pointer(engine.operation_index, "set/material_override"),
+        ));
+    }
+    if world_override
+        .as_ref()
+        .and_then(Option::as_ref)
+        .is_some_and(|id| !engine.doc.worlds.contains_key(id))
+    {
+        return Err(engine.error(
+            ErrorCode::TargetNotFound,
+            "world_override references a missing world",
+            &operation_pointer(engine.operation_index, "set/world_override"),
+        ));
+    }
+    let scene = engine.doc.scenes.get_mut(&scene_id).ok_or_else(|| {
+        crate::error::PotError::new(
+            ErrorCode::InternalError,
+            "scene disappeared during view-layer update",
+        )
+    })?;
+    let view_layer = scene.view_layers.get_mut(&view_layer_id).ok_or_else(|| {
+        crate::error::PotError::new(
+            ErrorCode::InternalError,
+            "view layer disappeared during update",
+        )
+    })?;
+    let mut changed = false;
+    for (value, property) in [
+        (use_solid, &mut view_layer.use_solid),
+        (use_strand, &mut view_layer.use_strand),
+        (use_volumes, &mut view_layer.use_volumes),
+        (use_motion_blur, &mut view_layer.use_motion_blur),
+    ] {
+        if let Some(value) = value
+            && *property != value
+        {
+            *property = value;
+            changed = true;
+        }
+    }
+    if let Some(value) = material_override
+        && view_layer.material_override != value
+    {
+        view_layer.material_override = value;
+        changed = true;
+    }
+    if let Some(value) = world_override
+        && view_layer.world_override != value
+    {
+        view_layer.world_override = value;
+        changed = true;
     }
     if changed {
         engine.mark("scenes", &scene_id, ChangeKind::Updated);
