@@ -113,13 +113,25 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
     let glass_weight = layers.glass.map_or(0.0, |glass| {
         (1.0 - metallic) * transmission * glass.selection_weight()
     });
-    // The dielectric specular layer is weighted `(1 - metallic) · (1 - transmission)`, as `specular_lobe`
-    // evaluates it.
-    let specular_weight = (metallic
-        + dielectric_f0(params.ior, params.specular_ior_level)
-            * (1.0 - metallic)
-            * (1.0 - transmission))
-        .max(1.0e-4);
+    // Cycles estimates a thin-film closure's sample weight from its view-angle Fresnel instead of the roughness LUT.
+    let dielectric_weight = if params.thin_film_thickness > THICKNESS_CUTOFF {
+        specular_layer(params, true).map_or(0.0, |layer| {
+            thin_film_dielectric_fresnel(
+                layers.normal.dot(layers.view).max(0.0),
+                params.thin_film_thickness,
+                params.thin_film_ior.max(1.0e-5),
+                layer.eta,
+                layer.f0_tinted,
+            )
+            .0
+            .element_sum()
+                / 3.0
+        })
+    } else {
+        dielectric_f0(params.ior, params.specular_ior_level)
+    };
+    let specular_weight =
+        (metallic + dielectric_weight * (1.0 - metallic) * (1.0 - transmission)).max(1.0e-4);
     let total = diffuse_weight
         + subsurface_weight
         + sheen_weight

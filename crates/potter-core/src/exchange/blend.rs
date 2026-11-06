@@ -5046,6 +5046,7 @@ fn build_imported_graph(
                 alpha_threshold: number_field(item, "alpha_threshold", 0.5),
                 metallic: number_field(item, "metallic", 0.0),
                 roughness: number_field(item, "roughness", 0.8),
+                emission_color: vec3_field(item, "emission_color", [0.0; 3]),
                 emission_sampling: emission_sampling_field(name, item)?,
                 emission_strength: number_field(item, "emission_strength", 0.0),
                 transmission: number_field(item, "transmission", 0.0),

@@ -967,8 +967,8 @@ fn world_nee_uses_receiver_closure_visibility_not_the_incoming_camera_ray()
                 "visibility":{
                     "camera":camera_visible,
                     "diffuse":diffuse_visible,
-                    "glossy":true,
-                    "transmission":true,
+                    "glossy":false,
+                    "transmission":false,
                     "scatter":true
                 }
             }}),
@@ -1009,7 +1009,7 @@ fn realtime_voxel_volume_ignores_cycles_area_portal_flag() -> Result<(), Box<dyn
                 "dims":[2,2,2],"voxel_size":1.0,"origin":[-0.5,-0.5,-0.5],
                 "values":[1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]
             }]}),
-            json!({"op":"light.create","id":"key","light_type":"area","energy":100.0,"volume_factor":1.0,"is_portal":is_portal,"transform":{"translation":[0.0,0.0,2.0]}}),
+            json!({"op":"light.create","id":"key","light_type":"area","energy":100.0,"is_portal":is_portal,"transform":{"translation":[0.0,0.0,2.0]}}),
             json!({"op":"camera.create","id":"camera_main","projection":"orthographic","ortho_scale":2.0,"transform":{"translation":[0.0,0.0,3.0]}}),
             json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}}),
             json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":16,"resolution_y":16,"samples":1,"seed":31,"eevee_use_volumetric_shadows":false}}),

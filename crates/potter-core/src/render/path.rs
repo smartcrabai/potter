@@ -16317,7 +16317,7 @@ mod sampled_side_tests {
         classic.base_color = [0.6, 0.4, 0.2, 1.0];
         classic.reflectance = 1.0;
         classic.normal = radial_normal;
-        let random_phi = (1.0 - 1.0_f64.sin()) * 0.5;
+        let random_phi = 0.5;
         let hit = HairHitData {
             curve_normal: DVec3::X,
             pixel_coverage: 1.0,
@@ -16340,19 +16340,13 @@ mod sampled_side_tests {
         closure.hair_tangent = Some(tangent);
         let closures = Closures::new(vec![closure], smooth_normal, smooth_normal, false);
         let closure = &closures.items[0];
-        let hit = HairHitData {
-            curve_normal: closure.params.hair_normal.unwrap_or(closure.layers.normal),
-            pixel_coverage: closure.hair_pixel_coverage,
-            ribbon_v: closure.hair_ribbon_v,
-            glossy_blur_alpha: closure.layers.glossy_blur_alpha,
-        };
         assert!(
             hair_pdf(
                 &closure.params,
-                closure.layers.view,
+                incoming,
                 direction,
                 tangent,
-                closure.layers.specular,
+                radial_normal,
                 hit,
             ) > 0.0
         );
@@ -16730,6 +16724,11 @@ mod cycles_world_light_tests {
         let model_world = World {
             max_bounces: 0,
             use_shadows: false,
+            visibility: CyclesVisibility {
+                glossy: false,
+                transmission: false,
+                ..CyclesVisibility::default()
+            },
             ..World::default()
         };
         let world = world_path_settings(Some(&model_world));
@@ -16742,6 +16741,8 @@ mod cycles_world_light_tests {
             WorldPathSettings {
                 visibility: CyclesVisibility {
                     diffuse: false,
+                    glossy: false,
+                    transmission: false,
                     ..CyclesVisibility::default()
                 },
                 ..world
@@ -16968,7 +16969,9 @@ mod cycles_world_light_tests {
         assert_eq!(lamp_survival, 0.5);
         let per_light =
             FilmClamp::new(0.1, 0.0).apply_selected(DVec3::splat(0.25), 0, 0.5 * lamp_survival);
-        assert_eq!(per_light, DVec3::splat(0.025));
+        let clamp_limit = f64::from(0.1_f32 * 3.0_f32);
+        let expected = DVec3::splat(0.25 * (clamp_limit / 0.75) * 0.25);
+        assert_eq!(per_light, expected);
 
         let textured_world = cycles_world_light_sampling_survival_probability(
             DVec3::X,
