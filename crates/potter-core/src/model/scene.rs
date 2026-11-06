@@ -94,6 +94,12 @@ impl SceneDoc {
                     ViewLayer {
                         name: "View Layer".to_owned(),
                         excluded_collections: Vec::new(),
+                        use_solid: true,
+                        use_strand: true,
+                        use_volumes: true,
+                        use_motion_blur: true,
+                        material_override: None,
+                        world_override: None,
                     },
                 )]),
                 eevee_has_local_volume_probe_grids: Some(false),
@@ -281,6 +287,23 @@ impl SceneDoc {
             }
         }
         for (scene_id, scene) in &self.scenes {
+            for (view_layer_id, view_layer) in &scene.view_layers {
+                if view_layer
+                    .material_override
+                    .as_ref()
+                    .is_some_and(|material_id| !self.materials.contains_key(material_id))
+                    || view_layer
+                        .world_override
+                        .as_ref()
+                        .is_some_and(|world_id| !self.worlds.contains_key(world_id))
+                {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "view-layer overrides must reference existing materials and worlds",
+                        json!({"scene_id":scene_id,"view_layer_id":view_layer_id}),
+                    ));
+                }
+            }
             scene.render.validate()?;
             if let Some(groups) = &scene.cycles_hair_shadow_groups {
                 let mut group_keys = Vec::new();
@@ -440,6 +463,21 @@ impl SceneDoc {
             }
         }
         for (node_id, node) in &self.nodes {
+            let terminator_offsets = [
+                node.shadow_terminator_normal_offset,
+                node.shadow_terminator_geometry_offset,
+                node.shadow_terminator_shading_offset,
+            ];
+            if terminator_offsets
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=f64::from(f32::MAX)).contains(value))
+            {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "Object shadow terminator offsets are outside Blender RNA range 0..=FLT_MAX",
+                    json!({"node_id":node_id}),
+                ));
+            }
             if let Some(index) = node.active_vertex_group_index {
                 let valid = node
                     .data
@@ -2432,6 +2470,12 @@ pub struct RenderSettings {
         skip_serializing_if = "is_default_transparent_max_bounces"
     )]
     pub transparent_max_bounces: u32,
+    /// Blender's `scene.cycles.caustics_reflective`; false excludes reflective caustic paths.
+    #[serde(default = "default_true")]
+    pub caustics_reflective: bool,
+    /// Blender's `scene.cycles.caustics_refractive`; false excludes refractive caustic paths.
+    #[serde(default = "default_true")]
+    pub caustics_refractive: bool,
     /// Blender's Filter Glossy (`scene.cycles.blur_glossy`): the widening of the ray differentials after a bounce,
     /// which bump nodes read. Omitted when equal to Blender's default of 1.0.
     #[serde(
@@ -2452,6 +2496,15 @@ pub struct RenderSettings {
     )]
     pub filter_width: f64,
     pub film_transparent: bool,
+    /// Blender's `scene.cycles.film_exposure`, a linear radiance scale separate from color management.
+    #[serde(default = "default_film_exposure")]
+    pub film_exposure: f64,
+    /// Blender's `scene.cycles.film_transparent_glass`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub film_transparent_glass: bool,
+    /// Blender's `scene.cycles.film_transparent_roughness`.
+    #[serde(default = "default_film_transparent_roughness")]
+    pub film_transparent_roughness: f64,
     /// Blender's `render.filter_size` (`scene.r.gauss`, `rna_scene.cc`): the reconstruction radius, in pixels, of
     /// EEVEE's film (`eevee_film.cc`). Realtime Beauty uses it; Solid and the path tracer do not.
     #[serde(default = "default_filter_size")]
@@ -2573,6 +2626,21 @@ pub struct RenderSettings {
 
 impl RenderSettings {
     fn validate(&self) -> Result<()> {
+        if !self.film_exposure.is_finite() || !(0.0..=4_294_967_296.0).contains(&self.film_exposure)
+        {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "Cycles film_exposure is outside Blender RNA range 0..=2^32",
+            ));
+        }
+        if !self.film_transparent_roughness.is_finite()
+            || !(0.0..=1.0).contains(&self.film_transparent_roughness)
+        {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "Cycles film_transparent_roughness is outside Blender RNA range 0..=1",
+            ));
+        }
         if self.diffuse_bounces > 1024
             || self.glossy_bounces > 1024
             || self.transmission_bounces > 1024
@@ -2708,6 +2776,8 @@ impl Default for RenderSettings {
             samples: 64,
             seed: 0,
             max_bounces: 4,
+            caustics_reflective: true,
+            caustics_refractive: true,
             diffuse_bounces: 4,
             glossy_bounces: 4,
             transmission_bounces: 12,
@@ -2722,6 +2792,9 @@ impl Default for RenderSettings {
             pixel_filter_type: PixelFilterType::BlackmanHarris,
             filter_width: DEFAULT_FILTER_WIDTH,
             film_transparent: false,
+            film_exposure: default_film_exposure(),
+            film_transparent_glass: false,
+            film_transparent_roughness: default_film_transparent_roughness(),
             filter_size: default_filter_size(),
             engine: "path".to_owned(),
             use_high_quality_normals: Some(false),
@@ -2793,6 +2866,18 @@ pub struct ViewLayer {
     pub name: String,
     #[serde(default)]
     pub excluded_collections: Vec<Id>,
+    #[serde(default = "default_true")]
+    pub use_solid: bool,
+    #[serde(default = "default_true")]
+    pub use_strand: bool,
+    #[serde(default = "default_true")]
+    pub use_volumes: bool,
+    #[serde(default = "default_true")]
+    pub use_motion_blur: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material_override: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_override: Option<Id>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3932,6 +4017,18 @@ pub struct Node {
     /// [`Node::resolved_ray_visibility`]. Omitted from JSON when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ray_visibility: Option<RayVisibility>,
+    /// Blender's `Object.is_holdout`; EEVEE and Cycles apply this through their own render paths.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_holdout: bool,
+    /// Blender's `Object.shadow_terminator_normal_offset`.
+    #[serde(default)]
+    pub shadow_terminator_normal_offset: f64,
+    /// Blender's `Object.shadow_terminator_geometry_offset`.
+    #[serde(default = "default_shadow_terminator_geometry_offset")]
+    pub shadow_terminator_geometry_offset: f64,
+    /// Blender's `Object.shadow_terminator_shading_offset`.
+    #[serde(default)]
+    pub shadow_terminator_shading_offset: f64,
 }
 
 impl Default for Node {
@@ -3970,6 +4067,10 @@ impl Default for Node {
             constraints: Vec::new(),
             drivers: Vec::new(),
             ray_visibility: None,
+            is_holdout: false,
+            shadow_terminator_normal_offset: 0.0,
+            shadow_terminator_geometry_offset: default_shadow_terminator_geometry_offset(),
+            shadow_terminator_shading_offset: 0.0,
         }
     }
 }
@@ -4256,6 +4357,17 @@ fn default_simulation_frame_end() -> i32 {
 
 fn default_true() -> bool {
     true
+}
+fn default_film_exposure() -> f64 {
+    1.0
+}
+
+fn default_film_transparent_roughness() -> f64 {
+    0.1
+}
+
+fn default_shadow_terminator_geometry_offset() -> f64 {
+    0.1
 }
 
 #[expect(
@@ -5700,6 +5812,25 @@ mod tests {
         assert_eq!(render.sample_clamp_direct, 0.0);
         assert_eq!(render.sample_clamp_indirect, 10.0);
         assert_eq!(render.light_sampling_threshold, 0.01);
+        assert!(render.caustics_reflective);
+        assert!(render.caustics_refractive);
+        assert_eq!(render.film_exposure, 1.0);
+        assert!(!render.film_transparent_glass);
+        assert_eq!(render.film_transparent_roughness, 0.1);
+        let node: super::Node = serde_json::from_value(serde_json::json!({
+            "name": "Node",
+            "kind": "empty"
+        }))
+        .unwrap();
+        assert_eq!(node.shadow_terminator_normal_offset, 0.0);
+        assert_eq!(node.shadow_terminator_geometry_offset, 0.1);
+        assert_eq!(node.shadow_terminator_shading_offset, 0.0);
+        let layer: super::ViewLayer = serde_json::from_value(serde_json::json!({
+            "name": "View Layer"
+        }))
+        .unwrap();
+        assert!(layer.use_solid && layer.use_strand && layer.use_volumes && layer.use_motion_blur);
+        assert!(layer.material_override.is_none() && layer.world_override.is_none());
 
         let serialized = serde_json::to_value(&render).unwrap();
         for field in [
@@ -5768,10 +5899,61 @@ mod tests {
                 light_sampling_threshold: 1.01,
                 ..super::RenderSettings::default()
             },
+            super::RenderSettings {
+                film_exposure: f64::INFINITY,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                film_exposure: 4_294_967_297.0,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                film_transparent_roughness: -f64::EPSILON,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                film_transparent_roughness: 1.01,
+                ..super::RenderSettings::default()
+            },
         ] {
             assert!(invalid.validate().is_err());
         }
     }
+    #[test]
+    fn object_shadow_terminator_offsets_validate_blender_rna_ranges() {
+        let mut doc = super::SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let root = doc.scenes[&doc.active_scene].root_collection.clone();
+        let node_id = super::Id::new("terminator_object").unwrap();
+        doc.nodes.insert(node_id.clone(), super::Node::default());
+        doc.collections
+            .get_mut(&root)
+            .unwrap()
+            .objects
+            .push(node_id.clone());
+        assert!(doc.validate().is_ok());
+
+        {
+            let node = doc.nodes.get_mut(&node_id).unwrap();
+            node.shadow_terminator_normal_offset = f64::from(f32::MAX);
+            node.shadow_terminator_geometry_offset = f64::from(f32::MAX);
+            node.shadow_terminator_shading_offset = f64::from(f32::MAX);
+        }
+        assert!(doc.validate().is_ok());
+
+        for (normal, geometry, shading) in [
+            (-f64::EPSILON, 0.1, 0.0),
+            (0.0, -f64::EPSILON, 0.0),
+            (0.0, 0.1, f64::INFINITY),
+            (0.0, 0.1, f64::from(f32::MAX) * 2.0),
+        ] {
+            let node = doc.nodes.get_mut(&node_id).unwrap();
+            node.shadow_terminator_normal_offset = normal;
+            node.shadow_terminator_geometry_offset = geometry;
+            node.shadow_terminator_shading_offset = shading;
+            assert!(doc.validate().is_err());
+        }
+    }
+
     #[test]
     fn eevee_raytracing_setting_round_trips_true_false_and_unknown() {
         for value in [Some(true), Some(false), None] {

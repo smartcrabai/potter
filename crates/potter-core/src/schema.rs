@@ -255,6 +255,26 @@ fn scene_schema() -> Value {
     root["$defs"]["node"]["properties"]["ray_visibility"] = json!({
         "oneOf":[{"type":"null"},{"type":"object","required":["camera","diffuse","glossy","transmission","volume_scatter","shadow"],"properties":{"camera":{"type":"boolean"},"diffuse":{"type":"boolean"},"glossy":{"type":"boolean"},"transmission":{"type":"boolean"},"volume_scatter":{"type":"boolean"},"shadow":{"type":"boolean"}},"additionalProperties":false}]
     });
+    root["$defs"]["node"]["properties"]["is_holdout"] = json!({"type":"boolean","default":false});
+    root["$defs"]["node"]["properties"]["shadow_terminator_normal_offset"] =
+        json!({"type":"number","minimum":0,"maximum":f32::MAX,"default":0.0});
+    root["$defs"]["node"]["properties"]["shadow_terminator_geometry_offset"] =
+        json!({"type":"number","minimum":0,"maximum":f32::MAX,"default":0.1});
+    root["$defs"]["node"]["properties"]["shadow_terminator_shading_offset"] =
+        json!({"type":"number","minimum":0,"maximum":f32::MAX,"default":0.0});
+    for (field, default) in [
+        ("use_solid", true),
+        ("use_strand", true),
+        ("use_volumes", true),
+        ("use_motion_blur", true),
+    ] {
+        root["$defs"]["view_layer"]["properties"][field] =
+            json!({"type":"boolean","default":default});
+    }
+    root["$defs"]["view_layer"]["properties"]["material_override"] =
+        json!({"oneOf":[id_schema(),{"type":"null"}],"default":null});
+    root["$defs"]["view_layer"]["properties"]["world_override"] =
+        json!({"oneOf":[id_schema(),{"type":"null"}],"default":null});
     root["$defs"]["node"]["properties"]["action_blend_type"] =
         json!({"enum":["replace","add","subtract","multiply","combine"],"default":"replace"});
     root["$defs"]["node"]["properties"]["action_extrapolation"] =
@@ -610,6 +630,13 @@ fn complete_scene_schema(root: &mut Value) {
         json!({"type":"number","minimum":0,"maximum":100_000_000.0,"default":10.0});
     render["properties"]["light_sampling_threshold"] =
         json!({"type":"number","minimum":0.0,"maximum":1.0,"default":0.01});
+    render["properties"]["caustics_reflective"] = json!({"type":"boolean","default":true});
+    render["properties"]["caustics_refractive"] = json!({"type":"boolean","default":true});
+    render["properties"]["film_exposure"] =
+        json!({"type":"number","minimum":0,"maximum":4_294_967_296.0,"default":1.0});
+    render["properties"]["film_transparent_glass"] = json!({"type":"boolean","default":false});
+    render["properties"]["film_transparent_roughness"] =
+        json!({"type":"number","minimum":0,"maximum":1,"default":0.1});
     render["properties"]["cycles_curves_shape"] = json!({
         "oneOf":[{"enum":["ribbons","thick","thick_linear"]},{"type":"null"}]
     });
@@ -1277,6 +1304,13 @@ fn operation_contract(name: &str) -> OperationContract {
             "scene",
             "none",
             json!({"name":"id","root_collection":"generated when omitted","view_layer":"view_main","active":false}),
+        ),
+        "view_layer.update" => (
+            vec!["target", "set"],
+            vec!["op", "target", "set"],
+            "view_layer",
+            "none",
+            json!({}),
         ),
         "scene.update" | "render.update" => (
             vec!["target", "set"],
@@ -2698,6 +2732,14 @@ fn field_schema(operation: &str, field: &str) -> Value {
         return json!({"type":"array","items":{"type":"string"},"default":[]});
     }
     if field == "target" {
+        if operation == "view_layer.update" {
+            return json!({
+                "type":"object",
+                "required":["scene_id","id"],
+                "properties":{"scene_id":id_schema(),"id":id_schema()},
+                "additionalProperties":false
+            });
+        }
         if [
             "scene.update",
             "sequencer.strip_create",
@@ -3286,6 +3328,10 @@ fn set_schema(operation: &str) -> Value {
             "visible":{"type":"boolean"},"render_visible":{"type":"boolean"},"selectable":{"type":"boolean"},
             "track_axis":{"enum":["POS_X","POS_Y","POS_Z","NEG_X","NEG_Y","NEG_Z"]},"up_axis":{"enum":["X","Y","Z"]},
             "ray_visibility":{"type":"object","properties":{"camera":{"type":"boolean"},"diffuse":{"type":"boolean"},"glossy":{"type":"boolean"},"transmission":{"type":"boolean"},"volume_scatter":{"type":"boolean"},"shadow":{"type":"boolean"}},"additionalProperties":false},
+            "is_holdout":{"type":"boolean"},
+            "shadow_terminator_normal_offset":{"type":"number","minimum":0,"maximum":f32::MAX},
+            "shadow_terminator_geometry_offset":{"type":"number","minimum":0,"maximum":f32::MAX},
+            "shadow_terminator_shading_offset":{"type":"number","minimum":0,"maximum":f32::MAX},
             "action":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]}
         }),
         "shape_key.update" => json!({
@@ -3403,6 +3449,11 @@ fn set_schema(operation: &str) -> Value {
             "filter_width":{"type":"number","minimum":crate::model::FILTER_WIDTH_MIN,"maximum":crate::model::FILTER_WIDTH_MAX},
             "filter_glossy":{"type":"number","minimum":0,"maximum":10},
             "film_transparent":{"type":"boolean"},
+            "caustics_reflective":{"type":"boolean"},
+            "caustics_refractive":{"type":"boolean"},
+            "film_exposure":{"type":"number","minimum":0,"maximum":4_294_967_296.0},
+            "film_transparent_glass":{"type":"boolean"},
+            "film_transparent_roughness":{"type":"number","minimum":0,"maximum":1},
             "eevee_use_volumetric_shadows":{"type":"boolean","default":false},
             "eevee_volumetric_tile_size":{"type":"integer","enum":[1,2,4,8,16]},
             "eevee_volumetric_samples":{"type":"integer","minimum":1,"maximum":256},
@@ -3417,6 +3468,14 @@ fn set_schema(operation: &str) -> Value {
             "motion_blur":{"type":"boolean"},
             "shutter":{"type":"number","exclusiveMinimum":0,"maximum":2},
             "motion_blur_samples":{"type":"integer","minimum":1,"maximum":64}
+        }),
+        "view_layer.update" => json!({
+            "use_solid":{"type":"boolean"},
+            "use_strand":{"type":"boolean"},
+            "use_volumes":{"type":"boolean"},
+            "use_motion_blur":{"type":"boolean"},
+            "material_override":{"oneOf":[id_schema(),{"type":"null"}]},
+            "world_override":{"oneOf":[id_schema(),{"type":"null"}]}
         }),
         _ => json!({}),
     };

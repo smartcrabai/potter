@@ -3494,6 +3494,120 @@ fn validate_intermediate(raw: &Value) -> Result<()> {
                         "eevee_has_local_volume_probe_grids",
                     )?;
                 }
+                if collection == "objects" {
+                    if item
+                        .get("is_holdout")
+                        .is_some_and(|value| !value.is_boolean())
+                    {
+                        return Err(invalid_intermediate("Object.is_holdout must be a boolean"));
+                    }
+                    for (field, default) in [
+                        ("shadow_terminator_normal_offset", 0.0),
+                        ("shadow_terminator_geometry_offset", 0.1),
+                        ("shadow_terminator_shading_offset", 0.0),
+                    ] {
+                        cycles_f64_field(item, field, default, 0.0, f64::from(f32::MAX), "Object")?;
+                    }
+                    if let Some(cycles) = item.get("cycles") {
+                        if !cycles.is_object() {
+                            return Err(invalid_intermediate("Object.cycles must be an object"));
+                        }
+                        for (field, default) in [
+                            ("use_motion_blur", true),
+                            ("use_deform_motion", true),
+                            ("use_camera_cull", false),
+                            ("use_distance_cull", false),
+                        ] {
+                            cycles_bool_field(cycles, field, default, "Object")?;
+                        }
+                        cycles_u32_field(cycles, "motion_steps", 1, 1, 7, "Object")?;
+                    }
+                }
+                if collection == "scenes" {
+                    if let Some(layers) = item.get("view_layers") {
+                        let layers = layers.as_array().ok_or_else(|| {
+                            invalid_intermediate("scene view_layers must be an array")
+                        })?;
+                        for layer in layers {
+                            for field in
+                                ["use_solid", "use_strand", "use_volumes", "use_motion_blur"]
+                            {
+                                if layer.get(field).is_some_and(|value| !value.is_boolean()) {
+                                    return Err(invalid_intermediate(&format!(
+                                        "ViewLayer.{field} must be a boolean"
+                                    )));
+                                }
+                            }
+                            for field in ["material_override", "world_override"] {
+                                if layer
+                                    .get(field)
+                                    .is_some_and(|value| !value.is_null() && !value.is_string())
+                                {
+                                    return Err(invalid_intermediate(&format!(
+                                        "ViewLayer.{field} must be a name or null"
+                                    )));
+                                }
+                            }
+                            if let Some(names) = layer.get("object_names")
+                                && !names
+                                    .as_array()
+                                    .is_some_and(|names| names.iter().all(Value::is_string))
+                            {
+                                return Err(invalid_intermediate(
+                                    "ViewLayer.object_names must be an array of names",
+                                ));
+                            }
+                            if let Some(cycles) = layer.get("cycles") {
+                                if !cycles.is_object() {
+                                    return Err(invalid_intermediate(
+                                        "ViewLayer.cycles must be an object",
+                                    ));
+                                }
+                                cycles_bool_field(cycles, "use_denoising", true, "ViewLayer")?;
+                            }
+                        }
+                    }
+                    if let Some(cycles) = item.get("cycles") {
+                        if !cycles.is_object() {
+                            return Err(invalid_intermediate("Scene.cycles must be an object"));
+                        }
+                        for (field, default) in [
+                            ("use_camera_cull", false),
+                            ("use_distance_cull", false),
+                            ("use_fast_gi", false),
+                            ("use_denoising", true),
+                        ] {
+                            cycles_bool_field(cycles, field, default, "Scene")?;
+                        }
+                        cycles_string_field(cycles, "texture_limit_render", "OFF", "Scene")?;
+                        cycles_f64_field(
+                            cycles,
+                            "texture_resolution_render",
+                            1.0,
+                            0.00001,
+                            1.0,
+                            "Scene",
+                        )?;
+                        if cycles.get("rolling_shutter_type").is_some_and(|value| {
+                            !value
+                                .as_str()
+                                .is_some_and(|kind| matches!(kind, "NONE" | "TOP"))
+                        }) {
+                            return Err(invalid_intermediate(
+                                "Scene.rolling_shutter_type is unknown",
+                            ));
+                        }
+                    }
+                    if let Some(names) = item.get("object_names")
+                        && !names
+                            .as_array()
+                            .is_some_and(|names| names.iter().all(Value::is_string))
+                    {
+                        return Err(invalid_intermediate(
+                            "scene object_names must be an array of names",
+                        ));
+                    }
+                }
                 if collection == "scenes"
                     && let Some(world) = item.get("world").filter(|world| world.is_object())
                 {
@@ -3569,6 +3683,32 @@ fn validate_intermediate(raw: &Value) -> Result<()> {
                         "use_high_quality_normals",
                     ] {
                         parse_optional_eevee_bool(render.get(field), field)?;
+                    }
+                    for field in [
+                        "caustics_reflective",
+                        "caustics_refractive",
+                        "film_transparent_glass",
+                        "motion_blur",
+                    ] {
+                        if render.get(field).is_some_and(|value| !value.is_boolean()) {
+                            return Err(invalid_intermediate(&format!(
+                                "render {field} must be a boolean"
+                            )));
+                        }
+                    }
+                    for (field, minimum, maximum) in [
+                        ("film_exposure", 0.0, 4_294_967_296.0),
+                        ("film_transparent_roughness", 0.0, 1.0),
+                    ] {
+                        if render.get(field).is_some_and(|value| {
+                            !value.as_f64().is_some_and(|value| {
+                                value.is_finite() && (minimum..=maximum).contains(&value)
+                            })
+                        }) {
+                            return Err(invalid_intermediate(&format!(
+                                "render {field} is outside Blender's RNA range"
+                            )));
+                        }
                     }
                     for field in [
                         "eevee_raytracing_screen_trace_quality",
@@ -4251,6 +4391,14 @@ fn build_imported_graph(
     let actions = array(raw, "actions")?;
     let images = optional_array(raw, "images")?;
     let volumes = optional_array(raw, "volumes")?;
+    let mut world_items = optional_array(raw, "worlds")?.iter().collect::<Vec<_>>();
+    if world_items.is_empty() {
+        world_items.extend(
+            scenes
+                .iter()
+                .filter_map(|scene| scene.get("world").filter(|world| !world.is_null())),
+        );
+    }
     let mut mappings = BTreeMap::<String, String>::new();
     let (resource_ids, mut resource_assets) = import_blender_resources(raw, file, &mut doc)?;
     let cache_resource_hashes = doc
@@ -4333,6 +4481,24 @@ fn build_imported_graph(
                     ViewLayer {
                         name: layer_name.to_owned(),
                         excluded_collections,
+                        use_solid: view_layer
+                            .get("use_solid")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
+                        use_strand: view_layer
+                            .get("use_strand")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
+                        use_volumes: view_layer
+                            .get("use_volumes")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
+                        use_motion_blur: view_layer
+                            .get("use_motion_blur")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
+                        material_override: None,
+                        world_override: None,
                     },
                 );
             }
@@ -4343,6 +4509,12 @@ fn build_imported_graph(
                 ViewLayer {
                     name: "View Layer".to_owned(),
                     excluded_collections: Vec::new(),
+                    use_solid: true,
+                    use_strand: true,
+                    use_volumes: true,
+                    use_motion_blur: true,
+                    material_override: None,
+                    world_override: None,
                 },
             );
         }
@@ -4428,6 +4600,14 @@ fn build_imported_graph(
                 8,
             ))
             .map_err(|_| invalid_intermediate("render transparent_max_bounces is out of range"))?,
+            caustics_reflective: render
+                .get("caustics_reflective")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            caustics_refractive: render
+                .get("caustics_refractive")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
             pixel_filter_type: match render
                 .get("pixel_filter_type")
                 .and_then(Value::as_str)
@@ -4453,6 +4633,12 @@ fn build_imported_graph(
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             filter_size: number_field(&render, "filter_size", 1.5),
+            film_exposure: number_field(&render, "film_exposure", 1.0),
+            film_transparent_glass: render
+                .get("film_transparent_glass")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            film_transparent_roughness: number_field(&render, "film_transparent_roughness", 0.1),
             engine: render
                 .get("engine")
                 .and_then(Value::as_str)
@@ -4674,11 +4860,7 @@ fn build_imported_graph(
         doc.scenes.insert(id, scene);
     }
     let mut world_ids = BTreeMap::<String, Id>::new();
-    for item in scenes {
-        let scene_name = string_field(item, "name")?;
-        let Some(world) = item.get("world").filter(|world| !world.is_null()) else {
-            continue;
-        };
+    for world in &world_items {
         let name = string_field(world, "name")?;
         let world_id = if let Some(id) = world_ids.get(name) {
             id.clone()
@@ -4763,6 +4945,17 @@ fn build_imported_graph(
                 },
             );
         }
+    }
+    for scene_item in scenes {
+        let Some(world) = scene_item.get("world").filter(|world| !world.is_null()) else {
+            continue;
+        };
+        let world_name = string_field(world, "name")?;
+        let world_id = world_ids
+            .get(world_name)
+            .cloned()
+            .ok_or_else(|| invalid_intermediate("scene references an unknown World"))?;
+        let scene_name = string_field(scene_item, "name")?;
         if let Some(scene_id) = scene_ids.get(scene_name)
             && let Some(scene) = doc.scenes.get_mut(scene_id)
         {
@@ -5090,6 +5283,53 @@ fn build_imported_graph(
             },
         );
     }
+    for scene_item in scenes {
+        let scene_name = string_field(scene_item, "name")?;
+        let scene_id = scene_ids
+            .get(scene_name)
+            .ok_or_else(|| invalid_intermediate("view-layer Scene mapping is missing"))?;
+        for raw_layer in optional_array(scene_item, "view_layers")? {
+            let layer_name = string_field(raw_layer, "name")?;
+            let view_layer_id = doc
+                .scenes
+                .get(scene_id)
+                .and_then(|scene| {
+                    scene
+                        .view_layers
+                        .iter()
+                        .find_map(|(id, layer)| (layer.name == layer_name).then(|| id.clone()))
+                })
+                .ok_or_else(|| invalid_intermediate("view-layer mapping is missing"))?;
+            let resolve_override =
+                |field: &str, ids: &BTreeMap<String, Id>| -> Result<Option<Id>> {
+                    match raw_layer.get(field) {
+                        None | Some(Value::Null) => Ok(None),
+                        Some(Value::String(name)) => {
+                            ids.get(name).cloned().map(Some).ok_or_else(|| {
+                                invalid_intermediate(&format!(
+                                    "view-layer {field} references an unknown datablock"
+                                ))
+                            })
+                        }
+                        Some(_) => Err(invalid_intermediate(&format!(
+                            "view-layer {field} must be a name or null"
+                        ))),
+                    }
+                };
+            let material_override = resolve_override("material_override", &material_ids)?;
+            let world_override = resolve_override("world_override", &world_ids)?;
+            let scene = doc
+                .scenes
+                .get_mut(scene_id)
+                .ok_or_else(|| invalid_intermediate("view-layer Scene mapping is missing"))?;
+            let layer = scene
+                .view_layers
+                .get_mut(&view_layer_id)
+                .ok_or_else(|| invalid_intermediate("view-layer mapping is missing"))?;
+            layer.material_override = material_override;
+            layer.world_override = world_override;
+        }
+    }
     let grease_pencil_ids =
         import_grease_pencils(grease_pencils, &material_ids, &mut doc, &mut mappings)?;
     import_data_material_slots(meshes, &mesh_ids, &material_ids, &mut doc)?;
@@ -5233,10 +5473,7 @@ fn build_imported_graph(
         shader_group_names.insert(material_name.to_owned(), graph_name);
     }
     let mut world_shader_group_names = BTreeMap::new();
-    for scene in scenes {
-        let Some(world) = scene.get("world").filter(|world| !world.is_null()) else {
-            continue;
-        };
+    for world in &world_items {
         let world_name = string_field(world, "name")?;
         if world_shader_group_names.contains_key(world_name) {
             continue;
@@ -6160,6 +6397,34 @@ fn build_imported_graph(
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             ray_visibility: imported_ray_visibility(item, kind),
+            is_holdout: item
+                .get("is_holdout")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            shadow_terminator_normal_offset: cycles_f64_field(
+                item,
+                "shadow_terminator_normal_offset",
+                0.0,
+                0.0,
+                f64::from(f32::MAX),
+                "Object",
+            )?,
+            shadow_terminator_geometry_offset: cycles_f64_field(
+                item,
+                "shadow_terminator_geometry_offset",
+                0.1,
+                0.0,
+                f64::from(f32::MAX),
+                "Object",
+            )?,
+            shadow_terminator_shading_offset: cycles_f64_field(
+                item,
+                "shadow_terminator_shading_offset",
+                0.0,
+                0.0,
+                f64::from(f32::MAX),
+                "Object",
+            )?,
             render_visible: !item
                 .get("hide_render")
                 .and_then(Value::as_bool)
@@ -11942,9 +12207,8 @@ fn root_matrix_requires_approximation(node: &Node) -> bool {
     false
 }
 
-/// Blender's `visible_*` object flags are owned by the typed `Node::ray_visibility`, so they are
-/// kept out of the opaque RNA dump.
-fn rna_properties_without_ray_visibility(item: &Value) -> Value {
+/// Ray visibility and typed Object render fields stay out of the opaque RNA dump.
+fn rna_properties_without_typed_object_fields(item: &Value) -> Value {
     match item.get("rna_properties").and_then(Value::as_object) {
         Some(rna) => Value::Object(
             rna.iter()
@@ -11952,6 +12216,13 @@ fn rna_properties_without_ray_visibility(item: &Value) -> Value {
                     !RayKind::ALL
                         .iter()
                         .any(|ray| ray.rna_property() == key.as_str())
+                        && !matches!(
+                            key.as_str(),
+                            "is_holdout"
+                                | "shadow_terminator_normal_offset"
+                                | "shadow_terminator_geometry_offset"
+                                | "shadow_terminator_shading_offset"
+                        )
                 })
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
@@ -11998,7 +12269,7 @@ fn object_properties(item: &Value) -> Map<String, Value> {
         "delta_location": item.get("delta_location"), "delta_rotation_euler": item.get("delta_rotation_euler"),
         "delta_rotation_quaternion": item.get("delta_rotation_quaternion"), "delta_scale": item.get("delta_scale"),
         "matrix_basis": item.get("matrix_basis"), "matrix_local": item.get("matrix_local"),
-        "matrix_world": item.get("matrix_world"), "rna_properties": rna_properties_without_ray_visibility(item),
+        "matrix_world": item.get("matrix_world"), "rna_properties": rna_properties_without_typed_object_fields(item),
     }));
     props
 }
@@ -13766,6 +14037,66 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 ));
             }
         }
+        if engine == Some("path") {
+            let scene_world = scene.get("world").filter(|world| !world.is_null());
+            let scene_world_name = scene_world
+                .and_then(|world| world.get("name"))
+                .and_then(Value::as_str);
+            let mut selected_world_names = BTreeSet::new();
+            if let Some(layers) = scene
+                .get("view_layers")
+                .and_then(Value::as_array)
+                .filter(|layers| !layers.is_empty())
+            {
+                for layer in layers {
+                    let world_name = layer
+                        .get("world_override")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .or(scene_world_name);
+                    if let Some(world_name) = world_name {
+                        selected_world_names.insert(world_name.to_owned());
+                    }
+                }
+            } else if let Some(world_name) = scene_world_name {
+                selected_world_names.insert(world_name.to_owned());
+            }
+            let worlds = raw.get("worlds").and_then(Value::as_array);
+            let mut volume_world_names = Vec::new();
+            for world_name in selected_world_names {
+                let world = worlds
+                    .into_iter()
+                    .flatten()
+                    .find(|world| {
+                        world.get("name").and_then(Value::as_str) == Some(world_name.as_str())
+                    })
+                    .or_else(|| {
+                        scene_world.filter(|world| {
+                            world.get("name").and_then(Value::as_str) == Some(world_name.as_str())
+                        })
+                    });
+                let volume_reachable = world
+                    .and_then(|world| world.get("nodes"))
+                    .map(|tree| {
+                        shader_graph_nodes_reaching_output_socket(
+                            tree,
+                            "ShaderNodeOutputWorld",
+                            Some("Volume"),
+                        )
+                    })
+                    .unwrap_or_default();
+                if !volume_reachable.is_empty() {
+                    volume_world_names.push(world_name);
+                }
+            }
+            if !volume_world_names.is_empty() {
+                let reason = format!(
+                    "Cycles path rendering refuses reachable OutputWorld.Volume on effective World(s) `{}` because Potter does not implement Cycles World Volume closures",
+                    volume_world_names.join("`, `"),
+                );
+                losses.push(loss("render.path.world_volume", scene_name, &reason));
+            }
+        }
         if scene
             .get("eevee_has_local_volume_probe_grids")
             .and_then(Value::as_bool)
@@ -14877,6 +15208,327 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             .and_then(|render| render.get("use_simplify"))
             .and_then(Value::as_bool)
             == Some(true);
+        let cycles = scene.get("cycles");
+        let cycles_engine = native_engine == Some("CYCLES");
+        let scene_name = scene.get("name").and_then(Value::as_str);
+        let scene_object_names = scene
+            .get("object_names")
+            .and_then(Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let view_layers = scene
+            .get("view_layers")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        let has_layer_object_names = view_layers
+            .iter()
+            .any(|layer| layer.get("object_names").is_some());
+        let layer_object_names = view_layers
+            .iter()
+            .flat_map(|layer| {
+                layer
+                    .get("object_names")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+            })
+            .collect::<BTreeSet<_>>();
+        let motion_object_names = view_layers
+            .iter()
+            .filter(|layer| layer.get("use_motion_blur").and_then(Value::as_bool) != Some(false))
+            .flat_map(|layer| {
+                layer
+                    .get("object_names")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+            })
+            .collect::<BTreeSet<_>>();
+        let scene_objects = raw
+            .get("objects")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|object| {
+                let name = object.get("name").and_then(Value::as_str);
+                name.is_some_and(|name| scene_object_names.contains(name))
+                    && (!has_layer_object_names
+                        || name.is_some_and(|name| layer_object_names.contains(name)))
+                    && object.get("hide_render").and_then(Value::as_bool) != Some(true)
+            })
+            .collect::<Vec<_>>();
+        if cycles_engine {
+            if cycles
+                .and_then(|settings| settings.get("use_fast_gi"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                losses.push(loss(
+                    "blender.scene.cycles.use_fast_gi",
+                    scene_name,
+                    "Cycles Fast GI is enabled but Potter does not implement the fast GI approximation",
+                ));
+            }
+            // Cycles denoises a final render only when both the Scene and the View Layer enable it
+            // (`blender/sync.cpp` `get_denoise_params`); Potter's path tracer has no denoiser.
+            let layer_denoising = view_layers.iter().any(|layer| {
+                layer
+                    .get("cycles")
+                    .and_then(|settings| settings.get("use_denoising"))
+                    .and_then(Value::as_bool)
+                    != Some(false)
+            });
+            if layer_denoising
+                && cycles
+                    .and_then(|settings| settings.get("use_denoising"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            {
+                losses.push(loss(
+                    "blender.scene.cycles.use_denoising",
+                    scene_name,
+                    "Cycles final-render denoising is enabled on the Scene and a View Layer, but Potter's path tracer has no denoiser",
+                ));
+            }
+            if render
+                .and_then(|settings| settings.get("motion_blur"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                for object in &scene_objects {
+                    let settings = object.get("cycles");
+                    let object_name = object.get("name").and_then(Value::as_str);
+                    let object_id = object
+                        .get("potter_id")
+                        .and_then(Value::as_str)
+                        .or(object_name);
+                    if has_layer_object_names
+                        && !object_name.is_some_and(|name| motion_object_names.contains(name))
+                    {
+                        continue;
+                    }
+                    let object_motion_enabled = settings
+                        .and_then(|settings| settings.get("use_motion_blur"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    if object_motion_enabled {
+                        if settings
+                            .and_then(|settings| settings.get("use_deform_motion"))
+                            .and_then(Value::as_bool)
+                            == Some(false)
+                        {
+                            losses.push(loss(
+                                "blender.object.cycles.use_deform_motion",
+                                object_id,
+                                "non-default per-object Cycles deformation motion is effective, but Potter does not implement object motion blur settings",
+                            ));
+                        }
+                        if settings
+                            .and_then(|settings| settings.get("motion_steps"))
+                            .and_then(Value::as_u64)
+                            .is_some_and(|steps| steps != 1)
+                        {
+                            losses.push(loss(
+                                "blender.object.cycles.motion_steps",
+                                object_id,
+                                "non-default per-object Cycles motion steps are effective, but Potter does not implement object motion blur settings",
+                            ));
+                        }
+                    } else {
+                        losses.push(loss(
+                            "blender.object.cycles.use_motion_blur",
+                            object_id,
+                            "non-default per-object Cycles motion blur is effective, but Potter does not implement object motion blur settings",
+                        ));
+                    }
+                }
+                if cycles
+                    .and_then(|settings| settings.get("rolling_shutter_type"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind != "NONE")
+                    && scene
+                        .get("camera")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.is_empty())
+                {
+                    losses.push(loss(
+                        "blender.scene.cycles.rolling_shutter_type",
+                        scene_name,
+                        "non-default Cycles rolling shutter is effective with motion blur, but Potter does not implement rolling shutter",
+                    ));
+                }
+            }
+            if scene
+                .get("camera")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.is_empty())
+            {
+                for (scene_field, object_field) in [
+                    ("use_camera_cull", "use_camera_cull"),
+                    ("use_distance_cull", "use_distance_cull"),
+                ] {
+                    let scene_enabled = cycles
+                        .and_then(|settings| settings.get(scene_field))
+                        .and_then(Value::as_bool)
+                        == Some(true);
+                    let object_enabled = scene_objects.iter().any(|object| {
+                        object
+                            .get("cycles")
+                            .and_then(|settings| settings.get(object_field))
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                    });
+                    if scene_enabled && object_enabled {
+                        losses.push(loss(
+                            format!("blender.scene.cycles.{scene_field}"),
+                            scene_name,
+                            "Cycles scene culling is enabled for an object that opts into it, but Potter does not implement Cycles object culling",
+                        ));
+                    }
+                }
+            }
+            let texture_effective = render
+                .and_then(|settings| settings.get("simplify_effective"))
+                .and_then(|settings| settings.get("textures"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            if simplify_on && texture_effective {
+                let texture_limit = cycles
+                    .and_then(|settings| settings.get("texture_limit_render"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("OFF");
+                if texture_limit != "OFF" {
+                    losses.push(loss(
+                        "blender.scene.cycles.texture_limit_render",
+                        scene_name,
+                        "Cycles render texture limit is effective with render simplify, but Potter does not apply it",
+                    ));
+                }
+                if cycles
+                    .and_then(|settings| settings.get("texture_resolution_render"))
+                    .and_then(Value::as_f64)
+                    .is_some_and(|value| (value - 1.0).abs() > 1.0e-9)
+                {
+                    losses.push(loss(
+                        "blender.scene.cycles.texture_resolution_render",
+                        scene_name,
+                        "Cycles render texture resolution is effective with render simplify, but Potter does not scale render textures",
+                    ));
+                }
+            }
+        }
+        let eevee_engine = matches!(native_engine, Some("BLENDER_EEVEE" | "BLENDER_EEVEE_NEXT"));
+        let eevee_shadow_effective = eevee_engine
+            && scene
+                .get("camera")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.is_empty())
+            && scene_objects.iter().any(|object| {
+                object.get("type").and_then(Value::as_str) == Some("LIGHT")
+                    && raw
+                        .get("lights")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .any(|light| {
+                            light.get("name").and_then(Value::as_str)
+                                == object.get("data_name").and_then(Value::as_str)
+                                && light.get("use_shadow").and_then(Value::as_bool) != Some(false)
+                        })
+            });
+        if eevee_shadow_effective {
+            for object in &scene_objects {
+                if !matches!(
+                    object.get("type").and_then(Value::as_str),
+                    Some("MESH" | "CURVE" | "SURFACE" | "FONT" | "META" | "CURVES")
+                ) {
+                    continue;
+                }
+                let normal_offset = object
+                    .get("shadow_terminator_normal_offset")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let object_id = object
+                    .get("potter_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| object.get("name").and_then(Value::as_str));
+                if normal_offset > 0.0 {
+                    losses.push(loss(
+                        "blender.object.shadow_terminator_normal_offset",
+                        object_id,
+                        "EEVEE uses the Object shadow terminator normal offset for shadow-ray origins; Potter's realtime renderer does not apply this Blender setting",
+                    ));
+                    if object
+                        .get("shadow_terminator_geometry_offset")
+                        .and_then(Value::as_f64)
+                        .is_some_and(|value| (value - 0.1).abs() > 1.0e-6)
+                    {
+                        losses.push(loss(
+                            "blender.object.shadow_terminator_geometry_offset",
+                            object_id,
+                            "EEVEE uses the Object shadow terminator geometry offset only with a nonzero normal offset; Potter's realtime renderer does not apply this Blender setting",
+                        ));
+                    }
+                }
+            }
+        }
+        if simplify_on {
+            let effective = render.and_then(|settings| settings.get("simplify_effective"));
+            let settings = render
+                .and_then(|settings| settings.get("simplify_settings"))
+                .and_then(Value::as_object);
+            for (category, fields) in [
+                (
+                    "subdivision",
+                    &["simplify_subdivision", "simplify_subdivision_render"][..],
+                ),
+                (
+                    "particles",
+                    &[
+                        "simplify_child_particles",
+                        "simplify_child_particles_render",
+                    ][..],
+                ),
+                (
+                    "grease_pencil",
+                    &[
+                        "simplify_gpencil",
+                        "simplify_gpencil_antialiasing",
+                        "simplify_gpencil_view_fill",
+                        "simplify_gpencil_modifier",
+                        "simplify_gpencil_shader_fx",
+                        "simplify_gpencil_tint",
+                    ][..],
+                ),
+            ] {
+                if effective
+                    .and_then(|features| features.get(category))
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                {
+                    continue;
+                }
+                for field in fields {
+                    let Some(setting) = settings.and_then(|settings| settings.get(*field)) else {
+                        continue;
+                    };
+                    if setting.get("value") != setting.get("default") {
+                        losses.push(loss(
+                            format!("blender.scene.render.{field}"),
+                            scene_name,
+                            "non-default render simplify settings are effective, but Potter does not apply Blender render simplify",
+                        ));
+                    }
+                }
+            }
+        }
         let simplify_volumes = render
             .and_then(|render| render.get("simplify_volumes"))
             .and_then(Value::as_f64);
@@ -27891,6 +28543,98 @@ print("UNSUPPORTED_POSE " + json.dumps({
             loss.feature_id != "render.world.volume_absorption"
                 && loss.feature_id != "render.eevee.world_probe.local_volume_grids"
         }));
+    }
+    #[test]
+    fn cycles_world_volume_loss_uses_effective_view_layer_world() {
+        let volume_world = json!({
+            "nodes": [
+                {
+                    "name": "World Output",
+                    "type": "ShaderNodeOutputWorld",
+                    "properties": {"is_active_output": true}
+                },
+                {"name": "Absorption", "type": "ShaderNodeVolumeAbsorption"}
+            ],
+            "links": [{
+                "from_node": "Absorption",
+                "from_socket": "Volume",
+                "to_node": "World Output",
+                "to_socket": "Volume"
+            }]
+        });
+        let surface_world = json!({
+            "nodes": [{
+                "name": "World Output",
+                "type": "ShaderNodeOutputWorld",
+                "properties": {"is_active_output": true}
+            }],
+            "links": []
+        });
+        let raw = json!({
+            "worlds": [
+                {"name": "Surface", "nodes": surface_world.clone()},
+                {"name": "Volume", "nodes": volume_world.clone()},
+                {"name": "Volume Base", "nodes": volume_world.clone()},
+                {"name": "Surface Override", "nodes": surface_world.clone()}
+            ],
+            "scenes": [
+                {
+                    "name": "OverrideVolume",
+                    "render": {"engine": "path"},
+                    "world": {"name": "Surface", "nodes": surface_world.clone()},
+                    "view_layers": [{"name": "Layer", "world_override": "Volume", "use_volumes": false}]
+                },
+                {
+                    "name": "SceneWorldFallback",
+                    "render": {"engine": "path"},
+                    "world": {"name": "Volume Base", "nodes": volume_world.clone()},
+                    "view_layers": [{"name": "Layer", "world_override": null, "use_volumes": false}]
+                },
+                {
+                    "name": "OverrideSurface",
+                    "render": {"engine": "path"},
+                    "world": {"name": "Volume Base", "nodes": volume_world},
+                    "view_layers": [{"name": "Layer", "world_override": "Surface Override", "use_volumes": false}]
+                }
+            ]
+        });
+        let losses = import_losses(&raw);
+        for scene_name in ["OverrideVolume", "SceneWorldFallback"] {
+            assert!(losses.iter().any(|loss| {
+                loss.feature_id == "render.path.world_volume"
+                    && loss.data_id.as_deref() == Some(scene_name)
+            }));
+        }
+        assert!(losses.iter().all(|loss| {
+            loss.feature_id != "render.path.world_volume"
+                || loss.data_id.as_deref() != Some("OverrideSurface")
+        }));
+    }
+    #[test]
+    fn cycles_denoising_loss_requires_scene_and_view_layer_denoising() {
+        let scene = |name: &str, engine: &str, scene_denoise: bool, layer_denoise: bool| {
+            json!({
+                "name": name,
+                "render": {"engine_native": engine},
+                "cycles": {"use_denoising": scene_denoise},
+                "view_layers": [
+                    {"name": "Off", "cycles": {"use_denoising": false}},
+                    {"name": "Layer", "cycles": {"use_denoising": layer_denoise}}
+                ]
+            })
+        };
+        let raw = json!({"scenes": [
+            scene("Denoised", "CYCLES", true, true),
+            scene("SceneOff", "CYCLES", false, true),
+            scene("LayersOff", "CYCLES", true, false),
+            scene("Eevee", "BLENDER_EEVEE", true, true)
+        ]});
+        let denoised: Vec<_> = import_losses(&raw)
+            .into_iter()
+            .filter(|loss| loss.feature_id == "blender.scene.cycles.use_denoising")
+            .filter_map(|loss| loss.data_id)
+            .collect();
+        assert_eq!(denoised, ["Denoised"]);
     }
     #[test]
     fn import_losses_report_hair_curves_custom_knots() {

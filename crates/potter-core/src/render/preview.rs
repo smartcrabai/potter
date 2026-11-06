@@ -419,7 +419,8 @@ pub(crate) fn render_camera_frame(
         .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
     // Realtime Beauty shows the world along each ray, from its node tree or colour, as EEVEE does. Its constant is
     // black, so only the film's alpha of the constant is used.
-    let scene_world = scene.world.as_ref().and_then(|id| doc.worlds.get(id));
+    let scene_world =
+        super::scene::selected_world_id(doc, &snapshot).and_then(|id| doc.worlds.get(id));
     let beauty_world = scene_world.filter(|_| matches!(mode, Mode::Beauty));
     let background = match beauty_world {
         Some(_) => [
@@ -842,11 +843,8 @@ fn background_color(doc: &SceneDoc, snapshot: &Snapshot, mode: Mode, transparent
     if matches!(mode, Mode::Solid) {
         // Workbench's render background is the scene world's horizon colour (`World.color`, not
         // scaled by strength), and black with no world (`workbench_state.cc`, `background_color`).
-        let world = doc
-            .scenes
-            .get(&snapshot.scene_id)
-            .and_then(|value| value.world.as_ref())
-            .and_then(|id| doc.worlds.get(id));
+        let world =
+            super::scene::selected_world_id(doc, snapshot).and_then(|id| doc.worlds.get(id));
         return world.map_or([0, 0, 0, alpha], |value| {
             [
                 linear_to_byte(value.color[0]),
@@ -856,10 +854,7 @@ fn background_color(doc: &SceneDoc, snapshot: &Snapshot, mode: Mode, transparent
             ]
         });
     }
-    let scene = doc.scenes.get(&snapshot.scene_id);
-    let world = scene
-        .and_then(|value| value.world.as_ref())
-        .and_then(|id| doc.worlds.get(id));
+    let world = super::scene::selected_world_id(doc, snapshot).and_then(|id| doc.worlds.get(id));
     world.map_or([13, 13, 13, alpha], |value| {
         [
             linear_to_byte(value.color[0] * value.strength),
@@ -943,9 +938,7 @@ fn manifest_value(
         },
         "interocular_distance": prepared.camera.interocular_distance,
     });
-    let has_world = scene
-        .world
-        .as_ref()
+    let has_world = super::scene::selected_world_id(doc, snapshot)
         .is_some_and(|world_id| doc.worlds.contains_key(world_id));
     let has_lights = doc.nodes.values().any(|node| {
         node.data

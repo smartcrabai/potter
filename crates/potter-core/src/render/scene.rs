@@ -114,6 +114,18 @@ pub(super) struct ObjectRecord {
     pub object_pass_index: f64,
     #[serde(skip)]
     pub object_random_number: Option<f64>,
+    #[serde(skip)]
+    pub is_holdout: bool,
+    #[serde(skip)]
+    pub shadow_terminator_normal_offset: f64,
+    #[serde(skip)]
+    pub shadow_terminator_geometry_offset: f64,
+    #[serde(skip)]
+    pub shadow_terminator_shading_offset: f64,
+    #[serde(skip)]
+    pub view_layer_use_solid: bool,
+    #[serde(skip)]
+    pub view_layer_use_volumes: bool,
 }
 
 /// Color state per material of one object, keyed by `Triangle::material_index` and sorted by it, so a hit
@@ -270,6 +282,7 @@ struct PointShadowMap {
 struct ShadowScene<'a> {
     bvh: &'a Bvh,
     triangles: &'a [Triangle],
+    objects: &'a [ObjectRecord],
     prepared_materials: &'a [PreparedMaterial],
     has_volume_only: bool,
     point_maps: &'a BTreeMap<Id, PointShadowMap>,
@@ -413,7 +426,13 @@ fn ray_transmittance(
     distance: f64,
     opaque_blocks: bool,
 ) -> f64 {
-    if opaque_blocks && shadow.occluders.is_none() {
+    if opaque_blocks
+        && shadow.occluders.is_none()
+        && shadow
+            .objects
+            .iter()
+            .all(|object| object.view_layer_use_solid)
+    {
         return if shadow.bvh.any_hit_where(
             shadow.triangles,
             origin,
@@ -438,6 +457,14 @@ fn ray_transmittance(
             kind: Some(RayKind::Shadow),
         },
         |hit, origin| {
+            let surface_visible = shadow
+                .triangles
+                .get(hit.triangle_index)
+                .and_then(|triangle| object_for_index(shadow.objects, triangle.object_index))
+                .is_none_or(|object| object.view_layer_use_solid);
+            if !surface_visible {
+                return true;
+            }
             match shadow
                 .occluders
                 .and_then(|occluders| occluders.pass(hit, origin, direction))
@@ -766,6 +793,10 @@ fn append_hair_instance_object(
     member: &CyclesHairShadowMember,
     material_index: usize,
     materials: &[Material],
+    is_holdout: bool,
+    shadow_terminator_normal_offset: f64,
+    shadow_terminator_geometry_offset: f64,
+    shadow_terminator_shading_offset: f64,
     force_context: bool,
 ) -> Result<u32> {
     if !member.instance.is_instance && !force_context {
@@ -834,6 +865,10 @@ fn append_hair_instance_object(
             world_to_local,
             material_index,
             materials,
+            is_holdout,
+            shadow_terminator_normal_offset,
+            shadow_terminator_geometry_offset,
+            shadow_terminator_shading_offset,
         );
         objects.push(object);
     } else {
@@ -851,6 +886,10 @@ fn append_hair_instance_object(
             world_to_local,
             material_index,
             materials,
+            is_holdout,
+            shadow_terminator_normal_offset,
+            shadow_terminator_geometry_offset,
+            shadow_terminator_shading_offset,
         );
     }
     Ok(index)
@@ -864,6 +903,10 @@ fn update_hair_member_object_record(
     world_to_local: DMat4,
     material_index: usize,
     materials: &[Material],
+    is_holdout: bool,
+    shadow_terminator_normal_offset: f64,
+    shadow_terminator_geometry_offset: f64,
+    shadow_terminator_shading_offset: f64,
 ) {
     object.index = index;
     object.node_id = member.instance.real_object_node_id.clone();
@@ -874,6 +917,10 @@ fn update_hair_member_object_record(
     object.object_random_number = Some(f64::from(
         crate::blender_rng::cycles_object_random_number_from_signed_id(member.object_random_id),
     ));
+    object.is_holdout = is_holdout;
+    object.shadow_terminator_normal_offset = shadow_terminator_normal_offset;
+    object.shadow_terminator_geometry_offset = shadow_terminator_geometry_offset;
+    object.shadow_terminator_shading_offset = shadow_terminator_shading_offset;
     if let Some(material) = materials.get(material_index) {
         object.material_colors.insert(
             material_index,
@@ -1214,6 +1261,23 @@ fn eevee_world_volume_absorption_refusal(scene_id: &Id) -> PotError {
         serde_json::json!({"feature_id":"render.world.volume_absorption","scene_id":scene_id.as_str()}),
     )
 }
+pub(super) fn selected_view_layer<'a>(
+    doc: &'a SceneDoc,
+    snapshot: &Snapshot,
+) -> Option<&'a crate::model::ViewLayer> {
+    let scene = doc.scenes.get(&snapshot.scene_id)?;
+    snapshot
+        .view_layer
+        .as_ref()
+        .and_then(|id| scene.view_layers.get(id))
+}
+
+pub(super) fn selected_world_id<'a>(doc: &'a SceneDoc, snapshot: &Snapshot) -> Option<&'a Id> {
+    let scene = doc.scenes.get(&snapshot.scene_id)?;
+    selected_view_layer(doc, snapshot)
+        .and_then(|layer| layer.world_override.as_ref())
+        .or(scene.world.as_ref())
+}
 
 pub(super) fn extract_geometry(
     doc: &SceneDoc,
@@ -1257,7 +1321,7 @@ pub(super) fn extract_geometry_with_semantics(
     };
     if matches!(mode, Mode::Beauty)
         && math_semantics == crate::node_kernels::MathSemantics::Eevee
-        && super::path::scene_has_world_volume(doc, &snapshot.scene_id)
+        && super::path::scene_has_world_volume(doc, snapshot)
     {
         return Err(eevee_world_volume_absorption_refusal(&snapshot.scene_id));
     }
@@ -1269,10 +1333,11 @@ pub(super) fn extract_geometry_with_semantics(
         Some(CyclesCurveShape::ThickLinear) => HairCurveRenderMode::ThickLinear,
     };
     let curve_ribbon_subdivisions = scene.render.cycles_curves_subdivisions.unwrap_or(2) as usize;
-    let view_layer = snapshot
-        .view_layer
-        .as_ref()
-        .and_then(|id| scene.view_layers.get(id));
+    let view_layer = selected_view_layer(doc, snapshot);
+    let view_layer_use_solid = view_layer.is_none_or(|layer| layer.use_solid);
+    let view_layer_use_volumes = view_layer.is_none_or(|layer| layer.use_volumes);
+    let view_layer_use_strand = view_layer.is_none_or(|layer| layer.use_strand);
+    let material_override = view_layer.and_then(|layer| layer.material_override.as_ref());
     let excluded: HashSet<Id> = view_layer
         .map(|layer| layer.excluded_collections.iter().cloned().collect())
         .unwrap_or_default();
@@ -1290,6 +1355,7 @@ pub(super) fn extract_geometry_with_semantics(
     let mut hair_group_nodes = HashSet::new();
     if path_traced
         && matches!(mode, Mode::Beauty)
+        && view_layer_use_strand
         && let Some(groups) = scene.cycles_hair_shadow_groups.as_deref()
     {
         for (group_index, group) in groups.iter().enumerate() {
@@ -1327,7 +1393,11 @@ pub(super) fn extract_geometry_with_semantics(
             }
         }
     }
-    if path_traced && matches!(mode, Mode::Beauty) && scene.cycles_hair_shadow_groups.is_some() {
+    if path_traced
+        && matches!(mode, Mode::Beauty)
+        && view_layer_use_strand
+        && scene.cycles_hair_shadow_groups.is_some()
+    {
         for (node_id, node) in &doc.nodes {
             let has_hair = node
                 .data
@@ -1443,8 +1513,13 @@ pub(super) fn extract_geometry_with_semantics(
             .data
             .as_ref()
             .and_then(|data_id| doc.data_blocks.get(data_id));
-        let path_curves_enabled = path_traced && matches!(mode, Mode::Beauty);
-        let source_hair = data_block.and_then(|data| data.hair_curves.as_ref());
+        let path_curves_enabled =
+            path_traced && matches!(mode, Mode::Beauty) && view_layer_use_strand;
+        let source_hair = if view_layer_use_strand {
+            data_block.and_then(|data| data.hair_curves.as_ref())
+        } else {
+            None
+        };
         let source_material_id = snapshot.slot_material(node_id, node, data_block, 0);
         let hair_shadow_group_index = if path_curves_enabled {
             cycles_hair_shadow_group_index(
@@ -1471,7 +1546,9 @@ pub(super) fn extract_geometry_with_semantics(
                 })
                 .and_then(|member| member.slot_0_material_id.as_ref())
         });
-        let material_id = if evaluated_hair.is_some() {
+        let material_id = if let Some(override_id) = material_override {
+            Some(override_id)
+        } else if evaluated_hair.is_some() {
             member_material_id.or(source_material_id)
         } else {
             source_material_id.or(member_material_id)
@@ -1716,6 +1793,12 @@ pub(super) fn extract_geometry_with_semantics(
             object_color,
             object_pass_index,
             object_random_number,
+            is_holdout: node.is_holdout,
+            shadow_terminator_normal_offset: node.shadow_terminator_normal_offset,
+            shadow_terminator_geometry_offset: node.shadow_terminator_geometry_offset,
+            shadow_terminator_shading_offset: node.shadow_terminator_shading_offset,
+            view_layer_use_solid,
+            view_layer_use_volumes,
         });
         if let Some(mesh) = mesh
             && !mesh.vertices.is_empty()
@@ -1879,7 +1962,8 @@ pub(super) fn extract_geometry_with_semantics(
                     uv_render: render_layer,
                     uv_available_mask,
                 });
-                let material_id = snapshot.slot_material(node_id, node, data_block, binding_slot);
+                let material_id = material_override
+                    .or_else(|| snapshot.slot_material(node_id, node, data_block, binding_slot));
                 let slot_color_render = color_render_layers.get(binding_slot).copied().flatten();
                 let slot_color_mask = if face_reads_colors {
                     color_available_masks.get(binding_slot).cloned().flatten()
@@ -2669,7 +2753,8 @@ pub(super) fn extract_geometry_with_semantics(
                                 "Cycles Hair member index is out of range",
                             )
                         })?;
-                        if evaluated_hair.is_some()
+                        if material_override.is_none()
+                            && evaluated_hair.is_some()
                             && member
                                 .slot_0_material_id
                                 .as_ref()
@@ -2684,12 +2769,25 @@ pub(super) fn extract_geometry_with_semantics(
                                 }),
                             ));
                         }
+                        let member_object = doc
+                            .nodes
+                            .get(&member.instance.real_object_node_id)
+                            .ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::InternalError,
+                                    "Cycles Hair member object record is missing",
+                                )
+                            })?;
                         let member_object_index = append_hair_instance_object(
                             &mut objects,
                             object_index,
                             member,
                             material_index,
                             &materials,
+                            member_object.is_holdout,
+                            member_object.shadow_terminator_normal_offset,
+                            member_object.shadow_terminator_geometry_offset,
+                            member_object.shadow_terminator_shading_offset,
                             hair_instance_only,
                         )?;
                         let use_prepared_curves = if hair_instance_only {
@@ -3156,8 +3254,13 @@ pub(super) fn extract_geometry_with_semantics(
             .zip(&geometry.prepared)
             .map(|(material, prepared)| casts_transparent_shadow(material, prepared))
             .collect();
-        let shadow_maps =
-            build_point_shadow_maps(doc, snapshot, &geometry.triangles, &caster_materials)?;
+        let shadow_maps = build_point_shadow_maps(
+            doc,
+            snapshot,
+            &geometry.triangles,
+            &geometry.objects,
+            &caster_materials,
+        )?;
         let bvh = Bvh::build(&geometry.triangles)?;
         let transparent_casters = geometry.triangles.iter().any(|triangle| {
             caster_materials
@@ -3182,16 +3285,19 @@ fn build_point_shadow_maps(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     triangles: &[Triangle],
+    objects: &[ObjectRecord],
     caster_materials: &[bool],
 ) -> Result<BTreeMap<Id, PointShadowMap>> {
-    // A triangle that casts a transparent shadow is left out: its occlusion is the ray pass of `ray_transmittance`.
+    // Transparent and view-layer-hidden surfaces are handled by shadow-ray traversal, not the opaque depth map.
     let opaque: Vec<&Triangle> = triangles
         .iter()
         .filter(|triangle| {
-            !caster_materials
-                .get(triangle.material_index)
-                .copied()
-                .unwrap_or(false)
+            object_for_index(objects, triangle.object_index)
+                .is_none_or(|object| object.view_layer_use_solid)
+                && !caster_materials
+                    .get(triangle.material_index)
+                    .copied()
+                    .unwrap_or(false)
         })
         .collect();
     let mut maps = BTreeMap::new();
@@ -4705,11 +4811,10 @@ impl SceneShaderCore<'_> {
     fn world_probe(&self) -> Result<Option<&WorldProbe>> {
         let cached = self.world_probe.get_or_init(|| {
             let scene = self.doc.scenes.get(&self.snapshot.scene_id);
-            let world = scene
-                .and_then(|scene| scene.world.as_ref())
+            let world = selected_world_id(self.doc, self.snapshot)
                 .and_then(|id| self.doc.worlds.get(id));
             if self.math_semantics == crate::node_kernels::MathSemantics::Eevee
-                && super::path::scene_has_world_volume(self.doc, &self.snapshot.scene_id)
+                && super::path::scene_has_world_volume(self.doc, self.snapshot)
             {
                 return Err(eevee_world_volume_absorption_refusal(
                     &self.snapshot.scene_id,
@@ -4797,12 +4902,7 @@ impl SceneShaderCore<'_> {
         {
             return Ok(EeveeWorldSunState::default());
         }
-        let Some(scene) = self.doc.scenes.get(&self.snapshot.scene_id) else {
-            return Ok(EeveeWorldSunState::default());
-        };
-        let Some(world) = scene
-            .world
-            .as_ref()
+        let Some(world) = selected_world_id(self.doc, self.snapshot)
             .and_then(|world_id| self.doc.worlds.get(world_id))
         else {
             return Ok(EeveeWorldSunState::default());
@@ -4872,6 +4972,18 @@ impl SceneShaderCore<'_> {
     ) -> Result<SurfaceSample> {
         let material = self.geometry.materials.get(triangle.material_index);
         let prepared = self.geometry.prepared.get(triangle.material_index);
+        let object = object_for_index(self.geometry.objects, triangle.object_index);
+        if object.is_some_and(|object| !object.view_layer_use_solid) {
+            return Ok(SurfaceSample {
+                color: [0.0; 4],
+                has_surface: false,
+                transparent_tint: [1.0; 3],
+                holdout_weight: 0.0,
+                subsurface: None,
+                eevee_raytrace: None,
+                eevee_dither: None,
+            });
+        }
         if matches!(self.mode, Mode::Beauty)
             && prepared.is_some_and(PreparedMaterial::is_volume_only)
         {
@@ -4933,6 +5045,32 @@ impl SceneShaderCore<'_> {
                 recorded.push(warning);
             }
         }
+        if matches!(self.mode, Mode::Beauty)
+            && self.math_semantics == crate::node_kernels::MathSemantics::Eevee
+            && object.is_some_and(|object| object.is_holdout)
+        {
+            let tint = beauty_tint(
+                material,
+                surface_tint(closures),
+                !self.eevee_colored_transparency,
+            );
+            let transparency = if material.is_some_and(|material| material.alpha_mode == "blend") {
+                let opacity =
+                    (opaque_share(closures) + eevee_holdout_weight(closures)).clamp(0.0, 1.0);
+                (1.0 - opacity) * (tint[0] + tint[1] + tint[2]) / 3.0
+            } else {
+                0.0
+            };
+            return Ok(SurfaceSample {
+                color: [0.0; 4],
+                has_surface: true,
+                transparent_tint: tint,
+                holdout_weight: (1.0 - transparency).clamp(0.0, 1.0),
+                subsurface: None,
+                eevee_raytrace: None,
+                eevee_dither: None,
+            });
+        }
         if matches!(self.mode, Mode::Solid) {
             // A back face is lit as its front: Workbench turns the normal toward the viewer
             // before it encodes it (`workbench_normal_encode`, `front_face`).
@@ -4981,8 +5119,7 @@ impl SceneShaderCore<'_> {
         } else {
             hit.normal
         };
-        let thickness = object_for_index(self.geometry.objects, triangle.object_index)
-            .map_or(0.0, |object| object.thickness);
+        let thickness = object.map_or(0.0, |object| object.thickness);
         // Select BLENDED from the source Material before graph opacity is routed through Triangle coverage.
         // Other EEVEE surfaces use deferred resolution; Triangle retains its separate mask semantics.
         let gbuffer_route = if matches!(self.mode, Mode::Beauty)
@@ -5013,6 +5150,7 @@ impl SceneShaderCore<'_> {
         let shadow = self.geometry.shadows.map(|shadows| ShadowScene {
             bvh: &shadows.bvh,
             triangles: self.geometry.triangles,
+            objects: self.geometry.objects,
             prepared_materials: self.geometry.prepared,
             has_volume_only: shadows.has_volume_only,
             point_maps: &shadows.point_maps,
@@ -9065,19 +9203,22 @@ mod shading_normal_tests {
     use crate::error::{ErrorCode, PotError};
 
     use super::{
-        ColorSlotReferences, FaceNormalValues, MeshAttributePrecision, blend_corner_normals,
-        carried_color_layers, color_layer_references, corner_normals, corner_values,
+        ColorSlotReferences, FaceNormalValues, MaterialColors, MeshAttributePrecision,
+        ObjectRecord, ShadowScene, blend_corner_normals, carried_color_layers,
+        color_layer_references, corner_normals, corner_values,
         eevee_registered_raytrace_layer_summary, extract_geometry, extract_geometry_with_semantics,
-        mesh_mikk_tangents, mesh_vertex_positions, scene_shader_with_semantics,
+        mesh_mikk_tangents, mesh_vertex_positions, ray_transmittance, scene_shader_with_semantics,
         source_has_color_layer, source_quantized_mesh_attribute, subdivide_displaced,
         surface_shader, triangle_corners, triangle_layer_colors, triangle_layer_uvs,
         world_face_normals,
     };
+    use crate::render::bvh::Bvh;
     use crate::render::principled_bsdf::{
         diffuse_coefficient, layers as principled_layers, specular_coefficient,
     };
     use crate::render::raster::{
-        Camera, EeveeRaytraceFeedback, Projection, StereoMode, SurfaceShader, ViewBasis,
+        Camera, EeveeRaytraceFeedback, Projection, StereoMode, SurfaceHit, SurfaceSample,
+        SurfaceShader, ViewBasis,
     };
     use crate::shader::BsdfParams;
     use crate::{
@@ -9094,7 +9235,7 @@ mod shading_normal_tests {
             light_model::{
                 AreaShape, area_irradiance_per_radiance, area_radiance, area_visibility_samples,
             },
-            raster::{AlphaMode, Mode, SurfaceHit, Triangle},
+            raster::{AlphaMode, Mode, Triangle},
         },
     };
 
@@ -10752,6 +10893,205 @@ mod shading_normal_tests {
             output.x > 0.0,
             "visible upper strip must retain diffuse light: {output:?}"
         );
+    }
+    #[test]
+    fn view_layer_hidden_surfaces_do_not_block_realtime_shadow_rays() -> crate::error::Result<()> {
+        let mut triangle = source_triangle(
+            [
+                DVec3::new(-1.0, -1.0, 0.0),
+                DVec3::new(1.0, -1.0, 0.0),
+                DVec3::new(0.0, 1.0, 0.0),
+            ],
+            [DVec3::Z; 3],
+        );
+        triangle.object_index = 1;
+        triangle.ray_mask = RayKind::Shadow.bit();
+        let triangles = [triangle];
+        let bvh = Bvh::build(&triangles)?;
+        let point_maps = BTreeMap::new();
+        let mut object = ObjectRecord {
+            index: 1,
+            node_id: Id::new("object").expect("valid object ID"),
+            data_id: None,
+            instance_path: Vec::new(),
+            uv_layers: Vec::new(),
+            uv_render: None,
+            color_layers: Vec::new(),
+            material_colors: MaterialColors::default(),
+            color_layer_indices: Vec::new(),
+            geometry_attributes: Vec::new(),
+            thickness: 0.0,
+            object_to_world: DMat4::IDENTITY,
+            world_to_local: Some(DMat4::IDENTITY),
+            object_color: [1.0; 4],
+            object_pass_index: 0.0,
+            object_random_number: None,
+            is_holdout: false,
+            shadow_terminator_normal_offset: 0.0,
+            shadow_terminator_geometry_offset: 0.1,
+            shadow_terminator_shading_offset: 0.0,
+            view_layer_use_solid: false,
+            view_layer_use_volumes: true,
+        };
+        let hidden = ShadowScene {
+            bvh: &bvh,
+            triangles: &triangles,
+            objects: std::slice::from_ref(&object),
+            prepared_materials: &[],
+            has_volume_only: false,
+            point_maps: &point_maps,
+            occluders: None,
+        };
+        let origin = DVec3::Z;
+        let direction = -DVec3::Z;
+        assert_eq!(ray_transmittance(hidden, origin, direction, 2.0, true), 1.0);
+
+        object.view_layer_use_solid = true;
+        let visible = ShadowScene {
+            bvh: &bvh,
+            triangles: &triangles,
+            objects: std::slice::from_ref(&object),
+            prepared_materials: &[],
+            has_volume_only: false,
+            point_maps: &point_maps,
+            occluders: None,
+        };
+        assert_eq!(
+            ray_transmittance(visible, origin, direction, 2.0, true),
+            0.0
+        );
+        Ok(())
+    }
+    fn eevee_sample(doc: &SceneDoc) -> crate::error::Result<SurfaceSample> {
+        let snapshot = Snapshot::evaluate(doc, &EvaluationContext::default())?;
+        let images = BTreeMap::new();
+        let geometry = extract_geometry_with_semantics(
+            doc,
+            &snapshot,
+            Mode::Beauty,
+            false,
+            &images,
+            crate::node_kernels::MathSemantics::Eevee,
+        )?;
+        let view = ViewBasis::from_camera(&Camera {
+            position: DVec3::new(0.0, 0.0, 2.5),
+            target: DVec3::ZERO,
+            up: DVec3::Y,
+            near: 0.1,
+            far: 100.0,
+            projection: Projection::Orthographic { height: 2.0 },
+            shift: [0.0; 2],
+            depth_of_field: None,
+            stereo_mode: StereoMode::None,
+            interocular_distance: 0.065,
+        })?;
+        let shader = scene_shader_with_semantics(
+            doc,
+            &snapshot,
+            &images,
+            &geometry,
+            Mode::Beauty,
+            &view,
+            crate::node_kernels::MathSemantics::Eevee,
+        );
+        let triangle = geometry.triangles.first().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "EEVEE isolation plane has no triangle",
+            )
+        })?;
+        let point = triangle.positions.iter().copied().sum::<DVec3>() / 3.0;
+        shader.shade(
+            triangle,
+            &SurfaceHit {
+                point,
+                shadow_point: point,
+                normal: DVec3::Z,
+                geometric: DVec3::Z,
+                geometric_normal: DVec3::Z,
+                back_facing: false,
+                realtime_differentials: crate::shader::HitDifferentials {
+                    world_dx: DVec3::ZERO,
+                    world_dy: DVec3::ZERO,
+                    uv_dx: [0.0; 2],
+                    uv_dy: [0.0; 2],
+                },
+                camera_matrices: None,
+                barycentric: [1.0 / 3.0; 3],
+                gbuffer_frag_coord: Some([0.5, 0.5]),
+                gbuffer_sample_offset: Some([0.5; 3]),
+                gbuffer_closure_random: Some(0.5),
+                view: DVec3::Z,
+                eevee_raytrace_feedback: EeveeRaytraceFeedback::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn eevee_object_holdout_and_cycles_only_settings_are_isolated() -> crate::error::Result<()> {
+        let initial = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let applied = crate::ops::apply_batch(
+            &initial,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [
+                    {"op":"node.create","id":"plane","kind":"plane","params":{"size":1.0}}
+                ]
+            }),
+        )?;
+        let mut doc = applied.doc;
+        let material_id = Id::new("eevee_emission")?;
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                emission_color: [0.5, 0.25, 0.125],
+                emission_strength: 1.0,
+                ..Material::default()
+            },
+        );
+        let node = doc.nodes.get_mut(&Id::new("plane")?).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "EEVEE isolation plane is missing")
+        })?;
+        node.materials = vec![Some(material_id)];
+        node.material_links = vec![MaterialLink::Object];
+        let baseline = eevee_sample(&doc)?;
+        assert!(baseline.color[..3].iter().any(|channel| *channel > 0.0));
+
+        let mut changed = doc.clone();
+        let scene = changed.scenes.values_mut().next().ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "EEVEE isolation scene is missing")
+        })?;
+        scene.render.caustics_reflective = false;
+        scene.render.caustics_refractive = false;
+        scene.render.film_exposure = 8.0;
+        scene.render.film_transparent_glass = true;
+        scene.render.film_transparent_roughness = 0.0;
+        let node_id = Id::new("plane")?;
+        changed
+            .nodes
+            .get_mut(&node_id)
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "EEVEE isolation plane is missing")
+            })?
+            .shadow_terminator_shading_offset = 2.0;
+        let changed_sample = eevee_sample(&changed)?;
+        assert_eq!(changed_sample.color, baseline.color);
+        assert_eq!(changed_sample.holdout_weight, baseline.holdout_weight);
+
+        let mut held_out = doc;
+        held_out
+            .nodes
+            .get_mut(&node_id)
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "EEVEE holdout plane is missing")
+            })?
+            .is_holdout = true;
+        let holdout_sample = eevee_sample(&held_out)?;
+        assert!(holdout_sample.has_surface);
+        assert_eq!(holdout_sample.holdout_weight, 1.0);
+        assert_eq!(holdout_sample.color, [0.0; 4]);
+        Ok(())
     }
 }
 

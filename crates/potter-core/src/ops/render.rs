@@ -31,6 +31,11 @@ const SET_FIELDS: &[&str] = &[
     "filter_width",
     "filter_glossy",
     "film_transparent",
+    "caustics_reflective",
+    "caustics_refractive",
+    "film_exposure",
+    "film_transparent_glass",
+    "film_transparent_roughness",
     "filter_size",
     "engine",
     "use_sequencer",
@@ -537,6 +542,45 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
             })
         })
         .transpose()?;
+    let caustics_reflective = set
+        .get("caustics_reflective")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "caustics_reflective must be a boolean",
+                    &operation_pointer(engine.operation_index, "set/caustics_reflective"),
+                )
+            })
+        })
+        .transpose()?;
+    let caustics_refractive = set
+        .get("caustics_refractive")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "caustics_refractive must be a boolean",
+                    &operation_pointer(engine.operation_index, "set/caustics_refractive"),
+                )
+            })
+        })
+        .transpose()?;
+    let film_exposure = optional_f64(engine, set, "film_exposure", 0.0, 4_294_967_296.0)?;
+    let film_transparent_glass = set
+        .get("film_transparent_glass")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "film_transparent_glass must be a boolean",
+                    &operation_pointer(engine.operation_index, "set/film_transparent_glass"),
+                )
+            })
+        })
+        .transpose()?;
+    let film_transparent_roughness =
+        optional_f64(engine, set, "film_transparent_roughness", 0.0, 1.0)?;
     let render_engine = set
         .get("engine")
         .map(|value| {
@@ -644,6 +688,21 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         }
         if let Some(value) = film_transparent {
             scene.render.film_transparent = value;
+        }
+        if let Some(value) = caustics_reflective {
+            scene.render.caustics_reflective = value;
+        }
+        if let Some(value) = caustics_refractive {
+            scene.render.caustics_refractive = value;
+        }
+        if let Some(value) = film_exposure {
+            scene.render.film_exposure = value;
+        }
+        if let Some(value) = film_transparent_glass {
+            scene.render.film_transparent_glass = value;
+        }
+        if let Some(value) = film_transparent_roughness {
+            scene.render.film_transparent_roughness = value;
         }
         if let Some(value) = eevee_use_volumetric_shadows {
             scene.render.eevee_use_volumetric_shadows = value;

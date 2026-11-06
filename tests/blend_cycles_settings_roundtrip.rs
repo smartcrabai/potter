@@ -9,8 +9,8 @@ mod process;
 
 use blender_checked::blender_executable;
 use native_oracle::{
-    TestResult, export_raw, import_blend_allow_lossy, node_id, pot, pot_json, read_scene,
-    run_blender_arguments, write_script,
+    TestResult, export_raw, import_blend, import_blend_allow_lossy, node_id, pot, pot_json,
+    read_scene, run_blender_arguments, write_script,
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -24,6 +24,18 @@ if bpy.app.version != (5, 2, 2):
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
 scene.render.engine = "CYCLES"
+scene.cycles.caustics_reflective = False
+scene.cycles.caustics_refractive = False
+scene.cycles.film_exposure = 1.75
+scene.cycles.film_transparent_glass = True
+scene.cycles.film_transparent_roughness = 0.37
+scene.cycles.use_fast_gi = True
+view_layer = bpy.context.view_layer
+view_layer.use_solid = False
+view_layer.use_strand = False
+view_layer.use_volumes = False
+view_layer.use_motion_blur = False
+view_layer.cycles.use_denoising = False
 
 world = bpy.data.worlds.new("Cycles Settings World")
 world.color = (0.2, 0.3, 0.4)
@@ -47,9 +59,31 @@ material.cycles.volume_sampling = "DISTANCE"
 material.cycles.volume_interpolation = "CUBIC"
 material.cycles.emission_sampling = "FRONT_BACK"
 material.cycles.volume_step_rate = 2.5
+view_layer.material_override = material
+view_layer.world_override = world
 bpy.ops.mesh.primitive_cube_add()
-bpy.context.object.name = "Cycles Settings Material Holder"
-bpy.context.object.data.materials.append(material)
+holder = bpy.context.object
+holder.name = "Cycles Settings Material Holder"
+holder.data.materials.append(material)
+holder.is_holdout = True
+holder.shadow_terminator_normal_offset = 0.42
+holder.shadow_terminator_geometry_offset = 0.71
+holder.shadow_terminator_shading_offset = 0.53
+eevee_scene = bpy.data.scenes.new("EEVEE Terminator Scene")
+eevee_scene.render.engine = "BLENDER_EEVEE"
+terminator_mesh = bpy.data.meshes.new("EEVEE Terminator Mesh")
+terminator_mesh.from_pydata(
+    [(-1, -1, 0), (1, -1, 0), (0, 1, 0)], [], [(0, 1, 2)])
+terminator_object = bpy.data.objects.new("EEVEE Terminator", terminator_mesh)
+eevee_scene.collection.objects.link(terminator_object)
+terminator_object.shadow_terminator_normal_offset = 0.25
+camera_data = bpy.data.cameras.new("EEVEE Terminator Camera")
+camera = bpy.data.objects.new("EEVEE Terminator Camera", camera_data)
+eevee_scene.collection.objects.link(camera)
+eevee_scene.camera = camera
+light_data = bpy.data.lights.new("EEVEE Terminator Light", type="POINT")
+light = bpy.data.objects.new("EEVEE Terminator Light", light_data)
+eevee_scene.collection.objects.link(light)
 
 light = bpy.data.lights.new("Cycles Settings Area", type="AREA")
 light.cycles.is_portal = True
@@ -89,6 +123,28 @@ assert {
 assert world.cycles.volume_sampling == "DISTANCE"
 assert world.cycles.volume_interpolation == "CUBIC"
 assert world.cycles.volume_step_size == 0.125
+scene = bpy.data.scenes.get("Scene")
+assert scene is not None and scene.render.engine == "CYCLES"
+assert scene.cycles.caustics_reflective is False
+assert scene.cycles.caustics_refractive is False
+assert scene.cycles.film_exposure == 1.75
+assert scene.cycles.film_transparent_glass is True
+assert abs(scene.cycles.film_transparent_roughness - 0.37) < 1e-6
+view_layer = scene.view_layers[0]
+assert view_layer.use_solid is False
+assert view_layer.use_strand is False
+assert view_layer.use_volumes is False
+assert view_layer.use_motion_blur is False
+assert view_layer.material_override.name == "Cycles Settings Material"
+assert view_layer.world_override.name == "Cycles Settings World"
+holder = bpy.data.objects.get("Cycles Settings Material Holder")
+assert holder is not None and holder.is_holdout is True
+assert abs(holder.shadow_terminator_normal_offset - 0.42) < 1e-6
+assert abs(holder.shadow_terminator_geometry_offset - 0.71) < 1e-6
+assert abs(holder.shadow_terminator_shading_offset - 0.53) < 1e-6
+eevee_object = bpy.data.objects.get("EEVEE Terminator")
+assert eevee_object is not None
+assert abs(eevee_object.shadow_terminator_normal_offset - 0.25) < 1e-6
 
 material = bpy.data.materials.get("Cycles Settings Material")
 assert material is not None
@@ -193,12 +249,14 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
         .ok_or("import losses are missing")?;
     assert_eq!(
         import_losses.len(),
-        2,
+        4,
         "unexpected import losses: {imported}"
     );
     for feature in [
         "blender.world.cycles.is_caustics_light",
         "blender.light.cycles.is_caustics_light",
+        "blender.scene.cycles.use_fast_gi",
+        "blender.object.shadow_terminator_normal_offset",
     ] {
         assert!(
             import_losses
@@ -208,6 +266,7 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
         );
     }
     for feature in [
+        "blender.scene.cycles.use_denoising",
         "blender.world.cycles.max_bounces",
         "blender.world.cycles.use_shadows",
         "blender.world.cycles_visibility.camera",
@@ -224,6 +283,10 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
         "blender.material.cycles.volume_sampling",
         "blender.material.cycles.volume_interpolation",
         "blender.material.cycles.volume_step_rate",
+        "blender.scene.cycles.caustics_reflective",
+        "blender.scene.cycles.caustics_refractive",
+        "blender.object.shadow_terminator_geometry_offset",
+        "blender.object.shadow_terminator_shading_offset",
         "blender.cycles.world.settings",
         "blender.cycles.material.settings",
         "blender.cycles.light.settings",
@@ -243,6 +306,61 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
         .as_str()
         .ok_or("active scene has no world")?;
     let material_id = entity_id(&scene, "materials", "Cycles Settings Material")?;
+    let scene_id = entity_id(&scene, "scenes", "Scene")?;
+    let main_scene = &scene["scenes"][scene_id];
+    let render = &main_scene["render"];
+    assert_eq!(render["caustics_reflective"], false);
+    assert_eq!(render["caustics_refractive"], false);
+    assert_eq!(render["film_exposure"], 1.75);
+    assert_eq!(render["film_transparent_glass"], true);
+    assert!(
+        (render["film_transparent_roughness"]
+            .as_f64()
+            .ok_or("film roughness missing")?
+            - 0.37)
+            .abs()
+            < 1e-6
+    );
+    let view_layers = main_scene["view_layers"]
+        .as_object()
+        .ok_or("ViewLayer registry is missing")?;
+    let (view_layer_id, view_layer) = view_layers
+        .iter()
+        .find(|(_, layer)| layer["name"] == "ViewLayer")
+        .ok_or("default ViewLayer is missing")?;
+    for field in ["use_solid", "use_strand", "use_volumes", "use_motion_blur"] {
+        assert_eq!(view_layer[field], false, "ViewLayer.{field}");
+    }
+    assert_eq!(view_layer["material_override"], material_id);
+    assert_eq!(view_layer["world_override"], world_id);
+    let holder_id = node_id(&scene, "Cycles Settings Material Holder")?;
+    let holder = &scene["nodes"][&holder_id];
+    assert_eq!(holder["is_holdout"], true);
+    for (field, expected) in [
+        ("shadow_terminator_normal_offset", 0.42),
+        ("shadow_terminator_geometry_offset", 0.71),
+        ("shadow_terminator_shading_offset", 0.53),
+    ] {
+        assert!(
+            (holder[field]
+                .as_f64()
+                .ok_or("terminator offset is missing")?
+                - expected)
+                .abs()
+                < 1e-6,
+            "Object.{field}"
+        );
+    }
+    let eevee_scene_id = entity_id(&scene, "scenes", "EEVEE Terminator Scene")?;
+    let eevee_node_id = node_id(&scene, "EEVEE Terminator")?;
+    assert_eq!(
+        scene["scenes"][eevee_scene_id]["render"]["engine"],
+        "realtime"
+    );
+    assert_eq!(
+        scene["nodes"][&eevee_node_id]["shadow_terminator_normal_offset"],
+        0.25
+    );
     let world = &scene["worlds"][world_id];
     assert_eq!(world["sampling_method"], "manual");
     assert_eq!(world["sample_map_resolution"], 4096);
@@ -325,6 +443,32 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
     assert_eq!(inspected_light["light"]["is_portal"], true);
     assert_eq!(inspected_light["light"]["max_bounces"], 31);
     assert_eq!(inspected_light["light"]["is_caustics_light"], true);
+    let inspected_scene = inspect_id(&project, scene_id)?;
+    for field in [
+        "caustics_reflective",
+        "caustics_refractive",
+        "film_exposure",
+        "film_transparent_glass",
+        "film_transparent_roughness",
+    ] {
+        assert_eq!(
+            inspected_scene["render"][field], render[field],
+            "render.{field}"
+        );
+    }
+    assert_eq!(
+        inspected_scene["view_layer_settings"][view_layer_id.as_str()],
+        *view_layer
+    );
+    let inspected_holder = inspect_id(&project, &holder_id)?;
+    for field in [
+        "is_holdout",
+        "shadow_terminator_normal_offset",
+        "shadow_terminator_geometry_offset",
+        "shadow_terminator_shading_offset",
+    ] {
+        assert_eq!(inspected_holder[field], holder[field], "Object.{field}");
+    }
 
     let invalid_updates = [
         (
@@ -371,6 +515,18 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
             "max_bounces",
             json!({"op":"light.update","target":{"id":light_node_id},"set":{"max_bounces":1025}}),
         ),
+        (
+            "film_exposure",
+            json!({"op":"render.update","target":{"id":scene_id},"set":{"film_exposure":4_294_967_297.0}}),
+        ),
+        (
+            "shadow_terminator_shading_offset",
+            json!({"op":"node.update","target":{"id":holder_id},"set":{"shadow_terminator_shading_offset":-0.01}}),
+        ),
+        (
+            "use_solid",
+            json!({"op":"view_layer.update","target":{"scene_id":scene_id,"id":view_layer_id},"set":{"use_solid":1}}),
+        ),
     ];
     for (index, (field, operation)) in invalid_updates.into_iter().enumerate() {
         assert_update_rejected(&project, root, index, &operation, field)?;
@@ -388,10 +544,12 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
     let export_losses = report["result"]["losses"]
         .as_array()
         .ok_or("export losses are missing")?;
-    assert_eq!(export_losses.len(), 2, "unexpected export losses: {report}");
+    assert_eq!(export_losses.len(), 4, "unexpected export losses: {report}");
     for feature in [
         "blender.world.cycles.is_caustics_light",
         "blender.light.cycles.is_caustics_light",
+        "blender.scene.cycles.use_fast_gi",
+        "blender.object.shadow_terminator_normal_offset",
     ] {
         assert!(
             export_losses
@@ -402,5 +560,18 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
     }
     let readback = write_script(root, "read_cycles_settings.py", BLENDER_READBACK)?;
     run_blender_arguments(&blender, &readback, Some(&exported), &[])?;
+    let default_blend = root.join("default-startup.blend");
+    let default_script = write_script(
+        root,
+        "save_default_startup.py",
+        "import bpy, sys\nbpy.ops.wm.save_as_mainfile(filepath=sys.argv[sys.argv.index('--') + 1])\n",
+    )?;
+    run_blender_arguments(&blender, &default_script, None, &[default_blend.as_path()])?;
+    let (_, default_import) = import_blend(&blender, root, "default-project", &default_blend)?;
+    assert_eq!(
+        default_import["result"]["losses"],
+        json!([]),
+        "default startup scene reported losses: {default_import}"
+    );
     Ok(())
 }

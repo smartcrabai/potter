@@ -873,12 +873,17 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 .iter()
                 .flatten()
                 .any(|material| material == id)
+        }) || engine.doc.scenes.values().any(|scene| {
+            scene
+                .view_layers
+                .values()
+                .any(|view_layer| view_layer.material_override.as_ref() == Some(id))
         });
         if is_referenced && reassign.is_none() {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!(
-                    "material `{id}` is assigned to nodes or data blocks; provide an explicit reassign policy"
+                    "material `{id}` is assigned to nodes, data blocks, or view layers; provide an explicit reassign policy"
                 ),
                 &pointer,
             ));
@@ -957,6 +962,27 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             changed_data_blocks.insert(data_id.clone());
         }
     }
+    let mut changed_scenes = std::collections::BTreeSet::new();
+    for (scene_id, scene) in &mut engine.doc.scenes {
+        let mut changed = false;
+        for view_layer in scene.view_layers.values_mut() {
+            if view_layer
+                .material_override
+                .as_ref()
+                .is_some_and(|material| targets.contains(material))
+            {
+                view_layer.material_override = match &reassign {
+                    Some(Some(replacement)) => Some(replacement.clone()),
+                    Some(None) => None,
+                    None => continue,
+                };
+                changed = true;
+            }
+        }
+        if changed {
+            changed_scenes.insert(scene_id.clone());
+        }
+    }
     for id in targets {
         if engine.doc.materials.remove(&id).is_some() {
             engine.mark("materials", &id, ChangeKind::Deleted);
@@ -977,6 +1003,9 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     }
     for data_id in changed_data_blocks {
         engine.mark("data_blocks", &data_id, ChangeKind::Updated);
+    }
+    for scene_id in changed_scenes {
+        engine.mark("scenes", &scene_id, ChangeKind::Updated);
     }
     Ok(true)
 }
@@ -1373,7 +1402,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn reassignment_updates_data_slots_without_touching_object_overrides() {
+    fn material_reassignment_updates_data_slots_and_view_layer_overrides() {
         let mut doc = SceneDoc::new("scene-test".to_owned());
         let blue = Id::new("blue").unwrap();
         let green = Id::new("green").unwrap();
@@ -1381,6 +1410,15 @@ mod tests {
         for id in [&blue, &green, &red] {
             doc.materials.insert(id.clone(), Material::default());
         }
+        let scene_id = doc.active_scene.clone();
+        doc.scenes
+            .get_mut(&scene_id)
+            .unwrap()
+            .view_layers
+            .values_mut()
+            .next()
+            .unwrap()
+            .material_override = Some(blue.clone());
         let data_id = Id::new("shared_data").unwrap();
         doc.data_blocks.insert(
             data_id.clone(),
@@ -1430,7 +1468,23 @@ mod tests {
         assert!(delete(&mut engine, operation.as_object().unwrap()).unwrap());
         assert_eq!(
             engine.doc.data_blocks[&data_id].materials,
-            vec![Some(green), None, Some(red.clone())]
+            vec![Some(green.clone()), None, Some(red.clone())]
+        );
+        assert_eq!(
+            engine.doc.scenes[&scene_id]
+                .view_layers
+                .values()
+                .next()
+                .unwrap()
+                .material_override,
+            Some(green)
+        );
+        assert!(
+            engine
+                .changes
+                .registries
+                .get("scenes")
+                .is_some_and(|scenes| scenes.contains_key(scene_id.as_str()))
         );
         assert_eq!(
             engine.doc.nodes[&data_user].materials,
@@ -1448,5 +1502,74 @@ mod tests {
             engine.doc.nodes[&object_user].material_links[0],
             MaterialLink::Object
         );
+    }
+    #[test]
+    fn material_delete_default_clears_view_layer_override() {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let material_id = Id::new("override_material").unwrap();
+        doc.materials
+            .insert(material_id.clone(), Material::default());
+        let scene_id = doc.active_scene.clone();
+        doc.scenes
+            .get_mut(&scene_id)
+            .unwrap()
+            .view_layers
+            .values_mut()
+            .next()
+            .unwrap()
+            .material_override = Some(material_id.clone());
+        let missing_reassign = json!({
+            "op":"material.delete",
+            "target":{"id":"override_material"}
+        });
+        {
+            let mut engine = Engine {
+                doc: &mut doc,
+                changes: ChangeSet::default(),
+                id_mappings: Map::new(),
+                operation_index: 0,
+                evaluation_frame: 1.0,
+                asset_root: None,
+                cache_directory: None,
+                pending_assets: std::collections::BTreeMap::default(),
+                warnings: Vec::new(),
+            };
+            assert!(delete(&mut engine, missing_reassign.as_object().unwrap()).is_err());
+        }
+        assert!(doc.materials.contains_key(&material_id));
+        let operation = json!({
+            "op":"material.delete",
+            "target":{"id":"override_material"},
+            "reassign":"default"
+        });
+        let mut engine = Engine {
+            doc: &mut doc,
+            changes: ChangeSet::default(),
+            id_mappings: Map::new(),
+            operation_index: 0,
+            evaluation_frame: 1.0,
+            asset_root: None,
+            cache_directory: None,
+            pending_assets: std::collections::BTreeMap::default(),
+            warnings: Vec::new(),
+        };
+        assert!(delete(&mut engine, operation.as_object().unwrap()).unwrap());
+        assert!(
+            engine.doc.scenes[&scene_id]
+                .view_layers
+                .values()
+                .next()
+                .unwrap()
+                .material_override
+                .is_none()
+        );
+        assert!(
+            engine
+                .changes
+                .registries
+                .get("scenes")
+                .is_some_and(|scenes| scenes.contains_key(scene_id.as_str()))
+        );
+        engine.doc.validate().unwrap();
     }
 }

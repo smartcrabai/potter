@@ -275,6 +275,7 @@ pub const OP_NAMES: &[&str] = &[
     "vertex_group.assign",
     "vertex_group.create",
     "vertex_group.remove",
+    "view_layer.update",
     "volume.create",
     "volume.update",
     "world.create",
@@ -643,7 +644,9 @@ fn apply_batch_internal(
                 }
                 result
             }
-            "scene.create" | "scene.update" => scene::apply(&mut engine, name, object),
+            "scene.create" | "scene.update" | "view_layer.update" => {
+                scene::apply(&mut engine, name, object)
+            }
             "extension.register" => extension::apply(&mut engine, name, object),
             "collection.create"
             | "collection.instance_create"

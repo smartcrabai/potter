@@ -2904,6 +2904,7 @@ def object_dump(obj):
         action_influence = 1.0
         action_extrapolation = "HOLD"
         nla_tweak_mode = False
+    cycles = getattr(obj, "cycles", None)
     return {"name": obj.name_full, "potter_id": obj.get("potter.id"), "type": obj.type,
             "library": library_reference(obj), "override_library": _override_dump(obj),
             "data_name": data.name_full if data else None, "parent": obj.parent.name_full if obj.parent else None,
@@ -2921,6 +2922,20 @@ def object_dump(obj):
             "delta_rotation_euler": plain(obj.delta_rotation_euler), "delta_rotation_quaternion": plain(obj.delta_rotation_quaternion),
             "delta_scale": plain(obj.delta_scale), "matrix_basis": matrix_rows(obj.matrix_basis),
             "matrix_local": matrix_rows(obj.matrix_local), "matrix_world": matrix_rows(obj.matrix_world),
+            "is_holdout": bool(obj.is_holdout),
+            "shadow_terminator_normal_offset": float(
+                obj.shadow_terminator_normal_offset),
+            "shadow_terminator_geometry_offset": float(
+                obj.shadow_terminator_geometry_offset),
+            "shadow_terminator_shading_offset": float(
+                obj.shadow_terminator_shading_offset),
+            "cycles": {
+                "use_motion_blur": bool(getattr(cycles, "use_motion_blur", True)),
+                "use_deform_motion": bool(getattr(cycles, "use_deform_motion", True)),
+                "motion_steps": int(getattr(cycles, "motion_steps", 1)),
+                "use_camera_cull": bool(getattr(cycles, "use_camera_cull", False)),
+                "use_distance_cull": bool(getattr(cycles, "use_distance_cull", False)),
+            },
             "hide_viewport": hide_viewport, "hide_set": hide_set,
             "hide_set_by_view_layer": hide_set_by_view_layer,
             "hide_render": bool(obj.hide_render),
@@ -2937,7 +2952,13 @@ def object_dump(obj):
             "force_field": _force_field_dump(obj), "custom_properties": custom_props(obj),
             "custom_property_ui": custom_property_ui(obj),
             "volume_bounds": volume_bounds,
-            "rna_properties": rna_props(obj, ("data", "parent", "children", "users_collection", "modifiers", "constraints", "animation_data", "material_slots", "track_axis", "up_axis", "dimensions"))}
+            "rna_properties": rna_props(obj, ("data", "parent", "children", "users_collection",
+                                                   "modifiers", "constraints", "animation_data",
+                                                   "material_slots", "track_axis", "up_axis",
+                                                   "dimensions", "is_holdout",
+                                                   "shadow_terminator_normal_offset",
+                                                   "shadow_terminator_geometry_offset",
+                                                   "shadow_terminator_shading_offset"))}
 
 
 def _action_slot_assigned_objects(action, slot):
@@ -4182,6 +4203,104 @@ def _cycles_hair_shadow_groups_for_view_layer(scene, view_layer):
     return captures[0]
 
 
+def _world_dump(world):
+    color = list(plain(world.color))[:3]
+    background_color = None
+    strength = 1.0
+    if world.use_nodes and world.node_tree:
+        for node in world.node_tree.nodes:
+            if node.type == "BACKGROUND":
+                try:
+                    strength = float(node.inputs.get("Strength").default_value)
+                    background_color = list(plain(node.inputs.get("Color").default_value))[:3]
+                except Exception:
+                    pass
+                break
+    return {
+        "name": world.name_full,
+        "potter_id": world.get("potter.id"),
+        "library": library_reference(world),
+        "color": color,
+        "background_color": background_color,
+        "strength": strength,
+        "sampling_method": world.cycles.sampling_method.lower(),
+        "sample_map_resolution": int(world.cycles.sample_map_resolution),
+        "max_bounces": int(world.cycles.max_bounces),
+        "use_shadows": bool(world.cycles.use_shadows),
+        "is_caustics_light": bool(world.cycles.is_caustics_light),
+        "visibility": {
+            "camera": bool(world.cycles_visibility.camera),
+            "diffuse": bool(world.cycles_visibility.diffuse),
+            "glossy": bool(world.cycles_visibility.glossy),
+            "transmission": bool(world.cycles_visibility.transmission),
+            "scatter": bool(world.cycles_visibility.scatter),
+        },
+        "volume_sampling": world.cycles.volume_sampling.lower(),
+        "volume_interpolation": world.cycles.volume_interpolation.lower(),
+        "volume_step_size": float(world.cycles.volume_step_size),
+        "sun_threshold": _rna_optional_float(world, "sun_threshold"),
+        "sun_angle": _rna_optional_float(world, "sun_angle"),
+        "use_sun_shadow": _rna_optional_bool(world, "use_sun_shadow"),
+        "sun_shadow_maximum_resolution": _rna_optional_float(
+            world, "sun_shadow_maximum_resolution"),
+        "sun_shadow_jitter_overblur": _rna_optional_float(
+            world, "sun_shadow_jitter_overblur"),
+        "sun_shadow_filter_radius": _rna_optional_float(
+            world, "sun_shadow_filter_radius"),
+        "use_sun_shadow_jitter": _rna_optional_bool(world, "use_sun_shadow_jitter"),
+        "nodes": tree_dump(world.node_tree),
+        "custom_properties": custom_props(world),
+        "fake_user": bool(world.use_fake_user),
+        "users": int(world.users),
+    }
+
+
+def _tree_uses_image_texture(tree):
+    return tree is not None and any(
+        node.type == "TEX_IMAGE" and getattr(node, "image", None) is not None
+        for node in tree.nodes
+    )
+
+
+def _simplify_settings_dump(render):
+    return {
+        prop.identifier: {
+            "value": plain(getattr(render, prop.identifier)),
+            "default": plain(prop.default),
+        }
+        for prop in render.bl_rna.properties
+        if prop.identifier.startswith("simplify_")
+    }
+
+
+def _simplify_effective_features(scene, objects):
+    materials = (
+        slot.material
+        for obj in objects
+        for slot in obj.material_slots
+        if slot.material is not None
+    )
+    image_textures = any(
+        _tree_uses_image_texture(material.node_tree) for material in materials
+    )
+    world = scene.world
+    image_textures = image_textures or (
+        world is not None
+        and world.use_nodes
+        and _tree_uses_image_texture(world.node_tree)
+    )
+    return {
+        "textures": image_textures,
+        "subdivision": any(
+            modifier.type in ("SUBSURF", "MULTIRES")
+            for obj in objects
+            for modifier in obj.modifiers
+        ),
+        "particles": any(bool(getattr(obj, "particle_systems", ())) for obj in objects),
+        "grease_pencil": any(obj.type in ("GPENCIL", "GREASEPENCIL") for obj in objects),
+    }
+
+
 def dump_scene(scene):
     layers = []
     view_layer_ids = _id_map(scene, "potter.view_layer_ids_json")
@@ -4193,8 +4312,34 @@ def dump_scene(scene):
             for child in layer_collection.children:
                 walk(child)
         walk(view_layer.layer_collection)
-        layers.append({"name": view_layer.name, "potter_id": view_layer_ids.get(view_layer.name),
-                       "excluded_collections": excluded})
+        layers.append({
+            "name": view_layer.name,
+            "potter_id": view_layer_ids.get(view_layer.name),
+            "excluded_collections": excluded,
+            "object_names": [obj.name_full for obj in view_layer.objects],
+            "use_solid": bool(view_layer.use_solid),
+            "use_strand": bool(view_layer.use_strand),
+            "use_volumes": bool(view_layer.use_volumes),
+            "use_motion_blur": bool(view_layer.use_motion_blur),
+            "material_override": (
+                view_layer.material_override.name_full
+                if view_layer.material_override else None
+            ),
+            "world_override": (
+                view_layer.world_override.name_full
+                if view_layer.world_override else None
+            ),
+            "cycles": {
+                "use_denoising": bool(
+                    getattr(getattr(view_layer, "cycles", None), "use_denoising", True)
+                ),
+            },
+        })
+    scene_objects = list(scene.objects)
+    simplify_effective = (
+        _simplify_effective_features(scene, scene_objects)
+        if scene.render.use_simplify else {}
+    )
     cycles_hair_shadow_groups = None
     if scene.camera is not None:
         cycles_hair_shadow_groups = []
@@ -4202,52 +4347,7 @@ def dump_scene(scene):
             cycles_hair_shadow_groups.extend(
                 _cycles_hair_shadow_groups_for_view_layer(scene, view_layer)
             )
-    world = scene.world
-    world_info = None
-    if world:
-        color = list(plain(world.color))[:3]
-        background_color = None
-        strength = 1.0
-        if world.use_nodes and world.node_tree:
-            for node in world.node_tree.nodes:
-                if node.type == "BACKGROUND":
-                    try:
-                        strength = float(node.inputs.get("Strength").default_value)
-                        background_color = list(plain(node.inputs.get("Color").default_value))[:3]
-                    except Exception:
-                        pass
-                    break
-        world_info = {"name": world.name_full, "potter_id": world.get("potter.id"),
-                      "library": library_reference(world), "color": color,
-                      "background_color": background_color, "strength": strength,
-                      "sampling_method": world.cycles.sampling_method.lower(),
-                      "sample_map_resolution": int(world.cycles.sample_map_resolution),
-                      "max_bounces": int(world.cycles.max_bounces),
-                      "use_shadows": bool(world.cycles.use_shadows),
-                      "is_caustics_light": bool(world.cycles.is_caustics_light),
-                      "visibility": {
-                          "camera": bool(world.cycles_visibility.camera),
-                          "diffuse": bool(world.cycles_visibility.diffuse),
-                          "glossy": bool(world.cycles_visibility.glossy),
-                          "transmission": bool(world.cycles_visibility.transmission),
-                          "scatter": bool(world.cycles_visibility.scatter),
-                      },
-                      "volume_sampling": world.cycles.volume_sampling.lower(),
-                      "volume_interpolation": world.cycles.volume_interpolation.lower(),
-                      "volume_step_size": float(world.cycles.volume_step_size),
-                      "sun_threshold": _rna_optional_float(world, "sun_threshold"),
-                      "sun_angle": _rna_optional_float(world, "sun_angle"),
-                      "use_sun_shadow": _rna_optional_bool(world, "use_sun_shadow"),
-                      "sun_shadow_maximum_resolution": _rna_optional_float(
-                          world, "sun_shadow_maximum_resolution"),
-                      "sun_shadow_jitter_overblur": _rna_optional_float(
-                          world, "sun_shadow_jitter_overblur"),
-                      "sun_shadow_filter_radius": _rna_optional_float(
-                          world, "sun_shadow_filter_radius"),
-                      "use_sun_shadow_jitter": _rna_optional_bool(world, "use_sun_shadow_jitter"),
-                      "nodes": tree_dump(world.node_tree),
-                      "custom_properties": custom_props(world), "fake_user": bool(world.use_fake_user),
-                      "users": int(world.users)}
+    world_info = _world_dump(scene.world) if scene.world else None
     camera = scene.camera.name_full if scene.camera else None
     unit = scene.unit_settings
     render_engine = scene.render.engine
@@ -4296,6 +4396,13 @@ def dump_scene(scene):
                 "audio_codec": potter_audio_codec(getattr(getattr(scene.render, "ffmpeg", None),
                                                           "audio_codec", "PCM")),
                 "film_transparent": bool(scene.render.film_transparent),
+                "caustics_reflective": bool(getattr(cycles, "caustics_reflective", True)),
+                "caustics_refractive": bool(getattr(cycles, "caustics_refractive", True)),
+                "film_exposure": float(getattr(cycles, "film_exposure", 1.0)),
+                "film_transparent_glass": bool(getattr(cycles, "film_transparent_glass", False)),
+                "film_transparent_roughness": float(
+                    getattr(cycles, "film_transparent_roughness", 0.1)),
+                "motion_blur": bool(getattr(scene.render, "use_motion_blur", False)),
                 "filter_size": float(scene.render.filter_size),
                 "use_high_quality_normals": getattr(scene.render, "use_high_quality_normals", None),
                 "engine": "path" if render_engine == "CYCLES" else "realtime",
@@ -4323,7 +4430,22 @@ def dump_scene(scene):
                 "eevee_volumetric_end": _eevee_volumetric_end(scene),
                 "use_simplify": bool(scene.render.use_simplify),
                 "simplify_volumes": float(scene.render.simplify_volumes),
+                "simplify_settings": _simplify_settings_dump(scene.render),
+                "simplify_effective": simplify_effective,
             },
+            "cycles": {
+                "use_camera_cull": bool(getattr(cycles, "use_camera_cull", False)),
+                "use_distance_cull": bool(getattr(cycles, "use_distance_cull", False)),
+                "use_fast_gi": bool(getattr(cycles, "use_fast_gi", False)),
+                "use_denoising": bool(getattr(cycles, "use_denoising", True)),
+                "texture_limit_render": str(
+                    getattr(cycles, "texture_limit_render", "OFF")),
+                "texture_resolution_render": float(
+                    getattr(cycles, "texture_resolution_render", 1.0)),
+                "rolling_shutter_type": str(
+                    getattr(cycles, "rolling_shutter_type", "NONE")),
+            },
+            "object_names": [obj.name_full for obj in scene_objects],
             "use_compositing": bool(getattr(scene.render, "use_compositing", False)),
             "compositor": _scene_compositor(scene),
             "color_management": _color_management_dump(scene),
@@ -4559,10 +4681,19 @@ def dump_all():
         pointer: next(iter(owner_types)) if len(owner_types) == 1 else None
         for pointer, owner_types in data_action_owners.items()
     }
+    used_world_pointers = set()
+    for scene in bpy.data.scenes:
+        if scene.world is not None:
+            used_world_pointers.add(scene.world.as_pointer())
+        for view_layer in scene.view_layers:
+            if view_layer.world_override is not None:
+                used_world_pointers.add(view_layer.world_override.as_pointer())
     data = {"bridge_version": 2, "blender_version": "%d.%d.%d" % bpy.app.version,
             "file_version": list(getattr(bpy.app, "version_file", bpy.app.version)),
             "active_scene": bpy.context.scene.name_full,
             "scenes": [dump_scene(item) for item in bpy.data.scenes],
+            "worlds": [_world_dump(world) for world in bpy.data.worlds
+                       if world.as_pointer() in used_world_pointers],
             "collections": collection_dumps(),
             "objects": [object_dump(item) for item in bpy.data.objects
                         if not item.get("_potter.taper_proxy", False)],
@@ -10353,6 +10484,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         scene.render.resolution_y = int(render.get("resolution_y", 1080))
         scene.render.resolution_percentage = int(render.get("resolution_percentage", 100))
         scene.render.film_transparent = bool(render.get("film_transparent", False))
+        scene.render.use_motion_blur = bool(render.get("motion_blur", False))
         scene.render.filter_size = float(render.get("filter_size", 1.5))
         scene.render.use_sequencer = bool(render.get("use_sequencer", False))
         high_quality_normals = render.get("use_high_quality_normals")
@@ -10380,6 +10512,8 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.render.ffmpeg.audio_codec = blender_audio_codec(render.get("audio_codec", "wav"))
         if engine == "CYCLES" and hasattr(scene, "cycles"):
             scene.cycles.max_bounces = int(render.get("max_bounces", 4))
+            # Potter's path tracer has no denoiser, so the exported Cycles scene renders without one.
+            scene.cycles.use_denoising = False
             if "diffuse_bounces" in render:
                 scene.cycles.diffuse_bounces = int(render["diffuse_bounces"])
             if "glossy_bounces" in render:
@@ -10425,6 +10559,15 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.cycles.offscreen_dicing_scale = float(render.get("offscreen_dicing_scale", 4.0))
             scene.cycles.pixel_filter_type = str(render.get("pixel_filter_type", "BLACKMAN_HARRIS"))
             scene.cycles.filter_width = float(render.get("filter_width", 1.5))
+            scene.cycles.caustics_reflective = bool(
+                render.get("caustics_reflective", True))
+            scene.cycles.caustics_refractive = bool(
+                render.get("caustics_refractive", True))
+            scene.cycles.film_exposure = float(render.get("film_exposure", 1.0))
+            scene.cycles.film_transparent_glass = bool(
+                render.get("film_transparent_glass", False))
+            scene.cycles.film_transparent_roughness = float(
+                render.get("film_transparent_roughness", 0.1))
         if engine == "CYCLES" and hasattr(scene, "cycles"):
             scene.cycles.samples = int(render.get("samples", 64))
             scene.cycles.seed = int(render.get("seed", 0))
@@ -10592,6 +10735,8 @@ def export_doc(doc, target, pack, scene_hash, context):
             else:
                 view_layer = scene.view_layers.new(name=layer_item["name"])
             view_layer_ids[view_layer.name] = layer_id
+            for field in ("use_solid", "use_strand", "use_volumes", "use_motion_blur"):
+                setattr(view_layer, field, bool(layer_item.get(field, True)))
             excluded_ids = set(layer_item.get("excluded_collections", []))
             def apply_exclusion(layer_collection):
                 if layer_collection.collection.get("potter.id") in excluded_ids:
@@ -11071,6 +11216,13 @@ def export_doc(doc, target, pack, scene_hash, context):
         obj.track_axis = item.get("track_axis", "POS_Y")
         obj.up_axis = item.get("up_axis", "Z")
         set_props(obj, item.get("properties", {}))
+        obj.is_holdout = bool(item.get("is_holdout", False))
+        obj.shadow_terminator_normal_offset = float(
+            item.get("shadow_terminator_normal_offset", 0.0))
+        obj.shadow_terminator_geometry_offset = float(
+            item.get("shadow_terminator_geometry_offset", 0.1))
+        obj.shadow_terminator_shading_offset = float(
+            item.get("shadow_terminator_shading_offset", 0.0))
         set_custom_property_ui(
             obj, (item.get("properties") or {}).get("_blender_custom_property_ui", {}))
         hide_rna = {
@@ -11640,6 +11792,22 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.camera = object_map[item["camera"]]
         if item.get("world") in world_map:
             scene.world = world_map[item["world"]]
+        layer_items = item.get("view_layers", {})
+        for layer_id, layer_item in layer_items.items():
+            view_layer = next(
+                (layer for layer in scene.view_layers
+                 if layer.name == layer_item["name"]),
+                None)
+            if view_layer is None:
+                raise ValueError("view layer %s is missing during override restore" % layer_id)
+            material_override_id = layer_item.get("material_override")
+            view_layer.material_override = (
+                material_map[material_override_id]
+                if material_override_id is not None else None)
+            world_override_id = layer_item.get("world_override")
+            view_layer.world_override = (
+                world_map[world_override_id]
+                if world_override_id is not None else None)
         dicing_camera_id = item.get("render", {}).get("dicing_camera")
         if hasattr(scene, "cycles"):
             if dicing_camera_id is None:

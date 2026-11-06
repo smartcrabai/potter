@@ -125,6 +125,19 @@ pub fn render_sequence(
         .scenes
         .get(scene_id)
         .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
+    let selected_view_layer = context
+        .view_layer
+        .as_ref()
+        .and_then(|id| scene.view_layers.get(id))
+        .or_else(|| {
+            context
+                .view_layer
+                .is_none()
+                .then(|| scene.view_layers.values().next())
+                .flatten()
+        });
+    let motion_blur = scene.render.motion_blur
+        && selected_view_layer.is_none_or(|view_layer| view_layer.use_motion_blur);
     let uses_sequencer = scene.render.use_sequencer && !scene.sequencer.strips.is_empty();
     if !uses_sequencer && camera_id.is_none() {
         return Err(PotError::new(
@@ -207,7 +220,7 @@ pub fn render_sequence(
                 let camera_id = camera_id.ok_or_else(|| {
                     PotError::new(ErrorCode::TargetNotFound, "render scene has no camera")
                 })?;
-                let (snapshot, raster) = if scene.render.motion_blur {
+                let (snapshot, raster) = if motion_blur {
                     render_motion_blurred_frame(
                         doc,
                         &frame_context,
@@ -269,12 +282,12 @@ pub fn render_sequence(
                 "evaluation_hash": snapshot.evaluation_hash,
                 "samples": samples,
                 "seed": seed,
-                "motion_blur_samples": if scene.render.motion_blur {
+                "motion_blur_samples": if motion_blur {
                     scene.render.motion_blur_samples
                 } else {
                     1
                 },
-                "shutter": if scene.render.motion_blur {
+                "shutter": if motion_blur {
                     scene.render.shutter
                 } else {
                     0.0
@@ -326,7 +339,7 @@ pub fn render_sequence(
             "samples": samples,
             "seed": seed,
             "motion_blur": {
-                "enabled": scene.render.motion_blur,
+                "enabled": motion_blur,
                 "shutter": scene.render.shutter,
                 "samples": scene.render.motion_blur_samples,
             },
