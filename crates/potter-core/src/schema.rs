@@ -594,6 +594,22 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["filter_size"] = json!({"type":"number","minimum":0,"maximum":500});
     render["properties"]["filter_glossy"] = json!({"type":"number","minimum":0,"maximum":10});
     render["properties"]["volume_bounces"] = json!({"type":"integer","minimum":0,"maximum":1024});
+    render["properties"]["diffuse_bounces"] =
+        json!({"type":"integer","minimum":0,"maximum":1024,"default":4});
+    render["properties"]["glossy_bounces"] =
+        json!({"type":"integer","minimum":0,"maximum":1024,"default":4});
+    render["properties"]["transmission_bounces"] =
+        json!({"type":"integer","minimum":0,"maximum":1024,"default":12});
+    render["properties"]["min_light_bounces"] =
+        json!({"type":"integer","minimum":0,"maximum":1024,"default":0});
+    render["properties"]["min_transparent_bounces"] =
+        json!({"type":"integer","minimum":0,"maximum":1024,"default":0});
+    render["properties"]["sample_clamp_direct"] =
+        json!({"type":"number","minimum":0,"maximum":100_000_000.0,"default":0.0});
+    render["properties"]["sample_clamp_indirect"] =
+        json!({"type":"number","minimum":0,"maximum":100_000_000.0,"default":10.0});
+    render["properties"]["light_sampling_threshold"] =
+        json!({"type":"number","minimum":0.0,"maximum":1.0,"default":0.01});
     render["properties"]["cycles_curves_shape"] = json!({
         "oneOf":[{"enum":["ribbons","thick","thick_linear"]},{"type":"null"}]
     });
@@ -662,6 +678,39 @@ fn complete_scene_schema(root: &mut Value) {
         json!({"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3});
     material["properties"]["volume_anisotropy"] =
         json!({"type":"number","minimum":-0.999,"maximum":0.999});
+    defs["light"]["properties"]["is_portal"] = json!({"type":"boolean","default":false});
+    defs["light"]["properties"]["max_bounces"] =
+        json!({"type":"integer","minimum":0,"maximum":1024,"default":1024});
+    defs["light"]["properties"]["is_caustics_light"] = json!({"type":"boolean","default":false});
+    defs["material"]["properties"]["emission_sampling"] =
+        json!({"enum":["none","auto","front","back","front_back"],"default":"auto"});
+    defs["material"]["properties"]["volume_step_rate"] =
+        json!({"type":"number","minimum":0.001,"maximum":1000,"default":1.0});
+    defs["world"]["properties"]["sampling_method"] =
+        json!({"enum":["none","automatic","manual"],"default":"automatic"});
+    defs["world"]["properties"]["sample_map_resolution"] =
+        json!({"type":"integer","minimum":4,"maximum":8192,"default":1024});
+    defs["world"]["properties"]["max_bounces"] =
+        json!({"type":"integer","minimum":0,"maximum":1024,"default":1024});
+    defs["world"]["properties"]["use_shadows"] = json!({"type":"boolean","default":true});
+    defs["world"]["properties"]["is_caustics_light"] = json!({"type":"boolean","default":false});
+    defs["world"]["properties"]["visibility"] = json!({
+        "type":"object",
+        "properties":{
+            "camera":{"type":"boolean","default":true},
+            "diffuse":{"type":"boolean","default":true},
+            "glossy":{"type":"boolean","default":true},
+            "transmission":{"type":"boolean","default":true},
+            "scatter":{"type":"boolean","default":true}
+        },
+        "additionalProperties":false,
+        "default":{"camera":true,"diffuse":true,"glossy":true,"transmission":true,"scatter":true}
+    });
+    defs["world"]["properties"]["volume_sampling"] =
+        json!({"enum":["distance","equiangular","multiple_importance"],"default":"equiangular"});
+    defs["world"]["properties"]["volume_interpolation"] =
+        json!({"enum":["linear","cubic"],"default":"linear"});
+    defs["world"]["properties"]["volume_step_size"] = json!({"type":"number","minimum":crate::model::WORLD_VOLUME_STEP_SIZE_MIN,"maximum":crate::model::WORLD_VOLUME_STEP_SIZE_MAX,"default":1.0});
     complete_data_block_schemas(defs);
 }
 
@@ -1372,6 +1421,8 @@ fn operation_contract(name: &str) -> OperationContract {
                 "volume_density",
                 "volume_color",
                 "volume_anisotropy",
+                "emission_sampling",
+                "volume_step_rate",
                 "volume_sampling",
                 "volume_interpolation",
                 "displacement_scale",
@@ -2127,6 +2178,9 @@ fn operation_contract(name: &str) -> OperationContract {
                 "radius",
                 "soft_falloff",
                 "use_multiple_importance_sampling",
+                "is_portal",
+                "max_bounces",
+                "is_caustics_light",
                 "spread",
                 "spot_size",
                 "spot_blend",
@@ -2145,7 +2199,21 @@ fn operation_contract(name: &str) -> OperationContract {
             json!({}),
         ),
         "world.create" => (
-            vec!["id", "color", "strength", "node_tree"],
+            vec![
+                "id",
+                "color",
+                "strength",
+                "node_tree",
+                "sampling_method",
+                "sample_map_resolution",
+                "max_bounces",
+                "use_shadows",
+                "is_caustics_light",
+                "visibility",
+                "volume_sampling",
+                "volume_interpolation",
+                "volume_step_size",
+            ],
             vec!["op", "id"],
             "world",
             "none",
@@ -2846,8 +2914,71 @@ fn field_schema(operation: &str, field: &str) -> Value {
             _ => common_field_schema(field),
         };
     }
+    if operation == "light.create"
+        && ["is_portal", "max_bounces", "is_caustics_light"].contains(&field)
+    {
+        return match field {
+            "is_portal" | "is_caustics_light" => {
+                json!({"type":"boolean","default":false})
+            }
+            "max_bounces" => {
+                json!({"type":"integer","minimum":0,"maximum":1024,"default":1024})
+            }
+            _ => common_field_schema(field),
+        };
+    }
     if operation == "world.create" && field == "node_tree" {
         return json!({"oneOf":[id_schema(),{"type":"null"}]});
+    }
+    if operation == "world.create"
+        && [
+            "sampling_method",
+            "sample_map_resolution",
+            "max_bounces",
+            "use_shadows",
+            "is_caustics_light",
+            "visibility",
+            "volume_sampling",
+            "volume_interpolation",
+            "volume_step_size",
+        ]
+        .contains(&field)
+    {
+        return match field {
+            "sampling_method" => {
+                json!({"enum":["none","automatic","manual"],"default":"automatic"})
+            }
+            "sample_map_resolution" => {
+                json!({"type":"integer","minimum":4,"maximum":8192,"default":1024})
+            }
+            "max_bounces" => {
+                json!({"type":"integer","minimum":0,"maximum":1024,"default":1024})
+            }
+            "use_shadows" => json!({"type":"boolean","default":true}),
+            "is_caustics_light" => json!({"type":"boolean","default":false}),
+            "visibility" => json!({
+                "type":"object",
+                "properties":{
+                    "camera":{"type":"boolean","default":true},
+                    "diffuse":{"type":"boolean","default":true},
+                    "glossy":{"type":"boolean","default":true},
+                    "transmission":{"type":"boolean","default":true},
+                    "scatter":{"type":"boolean","default":true}
+                },
+                "additionalProperties":false,
+                "default":{"camera":true,"diffuse":true,"glossy":true,"transmission":true,"scatter":true}
+            }),
+            "volume_sampling" => {
+                json!({"enum":["distance","equiangular","multiple_importance"],"default":"equiangular"})
+            }
+            "volume_interpolation" => {
+                json!({"enum":["linear","cubic"],"default":"linear"})
+            }
+            "volume_step_size" => {
+                json!({"type":"number","minimum":crate::model::WORLD_VOLUME_STEP_SIZE_MIN,"maximum":crate::model::WORLD_VOLUME_STEP_SIZE_MAX,"default":1.0})
+            }
+            _ => common_field_schema(field),
+        };
     }
     if ["material.create", "material.update"].contains(&operation) {
         return match field {
@@ -2859,6 +2990,12 @@ fn field_schema(operation: &str, field: &str) -> Value {
                 json!({"type":"number","minimum":0,"maximum":1})
             }
             "displacement_method" => json!({"enum":["bump","displacement"]}),
+            "emission_sampling" => {
+                json!({"enum":["none","auto","front","back","front_back"],"default":"auto"})
+            }
+            "volume_step_rate" => {
+                json!({"type":"number","minimum":0.001,"maximum":1000,"default":1.0})
+            }
             "volume_sampling" => json!({"enum":["distance","equiangular","multiple_importance"]}),
             "volume_interpolation" => json!({"enum":["linear","cubic"]}),
             "volume_density" => json!({"type":"number","minimum":0}),
@@ -3253,6 +3390,14 @@ fn set_schema(operation: &str) -> Value {
             "eevee_fast_gi_method":{"oneOf":[{"enum":["ambient_occlusion_only","global_illumination"]},{"type":"null"}]},
             "eevee_clamp_surface_indirect":{"type":["number","null"],"minimum":0,"maximum":f32::MAX},
             "volume_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "diffuse_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "glossy_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "transmission_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "min_light_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "min_transparent_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "sample_clamp_direct":{"type":"number","minimum":0,"maximum":100_000_000.0},
+            "sample_clamp_indirect":{"type":"number","minimum":0,"maximum":100_000_000.0},
+            "light_sampling_threshold":{"type":"number","minimum":0,"maximum":1},
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "pixel_filter_type":{"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"]},
             "filter_width":{"type":"number","minimum":crate::model::FILTER_WIDTH_MIN,"maximum":crate::model::FILTER_WIDTH_MAX},
@@ -3506,8 +3651,27 @@ fn material_set_properties() -> Value {
         "volume_density":{"type":"number","minimum":0},
         "volume_color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},
         "volume_anisotropy":{"type":"number","minimum":-0.999,"maximum":0.999},
+        "emission_sampling":{"enum":["none","auto","front","back","front_back"],"default":"auto"},
+        "volume_step_rate":{"type":"number","minimum":0.001,"maximum":1000,"default":1.0},
         "displacement_scale":{"type":"number"},
         "displacement_midlevel":{"type":"number","minimum":0,"maximum":1}
+    })
+}
+fn light_set_properties() -> Value {
+    json!({
+        "light_type":{"enum":["point","sun","spot","area"]},
+        "color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},
+        "energy":{"type":"number","minimum":0},
+        "radius":{"type":"number","minimum":0},
+        "soft_falloff":{"type":"boolean"},
+        "use_multiple_importance_sampling":{"type":"boolean"},
+        "is_portal":{"type":"boolean","default":false},
+        "max_bounces":{"type":"integer","minimum":0,"maximum":1024,"default":1024},
+        "is_caustics_light":{"type":"boolean","default":false},
+        "spread":{"type":"number","minimum":0,"maximum":std::f64::consts::PI},
+        "spot_size":{"type":"number","exclusiveMinimum":0,"maximum":std::f64::consts::TAU},
+        "spot_blend":{"type":"number","minimum":0,"maximum":1},
+        "use_shadow":light_shadow_schema()
     })
 }
 
@@ -3545,10 +3709,6 @@ fn camera_data_schema() -> Value {
     json!({"type":"object","properties":properties,"additionalProperties":false})
 }
 
-fn light_set_properties() -> Value {
-    json!({"light_type":{"enum":["point","sun","spot","area"]},"color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},"energy":{"type":"number","minimum":0},"radius":{"type":"number","minimum":0},"soft_falloff":{"type":"boolean"},"use_multiple_importance_sampling":{"type":"boolean"},"spread":{"type":"number","minimum":0,"maximum":std::f64::consts::PI},"spot_size":{"type":"number","exclusiveMinimum":0,"maximum":std::f64::consts::TAU},"spot_blend":{"type":"number","minimum":0,"maximum":1},"use_shadow":light_shadow_schema()})
-}
-
 fn light_shadow_schema() -> Value {
     json!({"type":"boolean","default":true,"description":"Whether this light casts shadows.","examples":[false,true]})
 }
@@ -3556,7 +3716,27 @@ fn world_set_properties() -> Value {
     json!({
         "color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},
         "strength":{"type":"number","minimum":0},
-        "node_tree":{"oneOf":[id_schema(),{"type":"null"}]}
+        "node_tree":{"oneOf":[id_schema(),{"type":"null"}]},
+        "sampling_method":{"enum":["none","automatic","manual"],"default":"automatic"},
+        "sample_map_resolution":{"type":"integer","minimum":4,"maximum":8192,"default":1024},
+        "max_bounces":{"type":"integer","minimum":0,"maximum":1024,"default":1024},
+        "use_shadows":{"type":"boolean","default":true},
+        "is_caustics_light":{"type":"boolean","default":false},
+        "visibility":{
+            "type":"object",
+            "properties":{
+                "camera":{"type":"boolean","default":true},
+                "diffuse":{"type":"boolean","default":true},
+                "glossy":{"type":"boolean","default":true},
+                "transmission":{"type":"boolean","default":true},
+                "scatter":{"type":"boolean","default":true}
+            },
+            "additionalProperties":false,
+            "default":{"camera":true,"diffuse":true,"glossy":true,"transmission":true,"scatter":true}
+        },
+        "volume_sampling":{"enum":["distance","equiangular","multiple_importance"],"default":"equiangular"},
+        "volume_interpolation":{"enum":["linear","cubic"],"default":"linear"},
+        "volume_step_size":{"type":"number","minimum":crate::model::WORLD_VOLUME_STEP_SIZE_MIN,"maximum":crate::model::WORLD_VOLUME_STEP_SIZE_MAX,"default":1.0}
     })
 }
 fn rigid_body_world_properties() -> Value {
@@ -3837,6 +4017,59 @@ mod tests {
         );
         assert_eq!(set["cycles_curves_subdivisions"]["minimum"], 0);
         assert_eq!(set["cycles_curves_subdivisions"]["maximum"], 24);
+        Ok(())
+    }
+
+    #[test]
+    fn cycles_path_state_settings_have_schema_ranges_and_defaults() -> crate::error::Result<()> {
+        let scene = schema("scene", None)?;
+        let render = &scene["$defs"]["render_settings"]["properties"];
+        for (field, default) in [
+            ("diffuse_bounces", serde_json::json!(4)),
+            ("glossy_bounces", serde_json::json!(4)),
+            ("transmission_bounces", serde_json::json!(12)),
+            ("min_light_bounces", serde_json::json!(0)),
+            ("min_transparent_bounces", serde_json::json!(0)),
+            ("sample_clamp_direct", serde_json::json!(0.0)),
+            ("sample_clamp_indirect", serde_json::json!(10.0)),
+            ("light_sampling_threshold", serde_json::json!(0.01)),
+        ] {
+            assert_eq!(render[field]["default"], default);
+        }
+        assert!(
+            !scene["$defs"]["render_settings"]["required"]
+                .as_array()
+                .is_some_and(|required| {
+                    required
+                        .iter()
+                        .any(|field| field == "light_sampling_threshold")
+                })
+        );
+
+        let update = schema("operations", Some("render.update"))?;
+        let set = &update["properties"]["set"]["properties"];
+        for field in [
+            "diffuse_bounces",
+            "glossy_bounces",
+            "transmission_bounces",
+            "min_light_bounces",
+            "min_transparent_bounces",
+        ] {
+            assert_eq!(set[field]["minimum"], 0);
+            assert_eq!(set[field]["maximum"], 1024);
+        }
+        for field in ["sample_clamp_direct", "sample_clamp_indirect"] {
+            assert_eq!(set[field]["minimum"], 0);
+            assert_eq!(set[field]["maximum"], 100_000_000.0);
+        }
+        assert_eq!(
+            set["light_sampling_threshold"]["minimum"].as_f64(),
+            Some(0.0)
+        );
+        assert_eq!(
+            set["light_sampling_threshold"]["maximum"].as_f64(),
+            Some(1.0)
+        );
         Ok(())
     }
 

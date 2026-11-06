@@ -4220,6 +4220,21 @@ def dump_scene(scene):
         world_info = {"name": world.name_full, "potter_id": world.get("potter.id"),
                       "library": library_reference(world), "color": color,
                       "background_color": background_color, "strength": strength,
+                      "sampling_method": world.cycles.sampling_method.lower(),
+                      "sample_map_resolution": int(world.cycles.sample_map_resolution),
+                      "max_bounces": int(world.cycles.max_bounces),
+                      "use_shadows": bool(world.cycles.use_shadows),
+                      "is_caustics_light": bool(world.cycles.is_caustics_light),
+                      "visibility": {
+                          "camera": bool(world.cycles_visibility.camera),
+                          "diffuse": bool(world.cycles_visibility.diffuse),
+                          "glossy": bool(world.cycles_visibility.glossy),
+                          "transmission": bool(world.cycles_visibility.transmission),
+                          "scatter": bool(world.cycles_visibility.scatter),
+                      },
+                      "volume_sampling": world.cycles.volume_sampling.lower(),
+                      "volume_interpolation": world.cycles.volume_interpolation.lower(),
+                      "volume_step_size": float(world.cycles.volume_step_size),
                       "sun_threshold": _rna_optional_float(world, "sun_threshold"),
                       "sun_angle": _rna_optional_float(world, "sun_angle"),
                       "use_sun_shadow": _rna_optional_bool(world, "use_sun_shadow"),
@@ -4263,6 +4278,14 @@ def dump_scene(scene):
                 "samples": samples,
                 "seed": seed,
                 "max_bounces": int(getattr(getattr(scene, "cycles", None), "max_bounces", 4)),
+                "diffuse_bounces": int(getattr(getattr(scene, "cycles", None), "diffuse_bounces", 4)),
+                "glossy_bounces": int(getattr(getattr(scene, "cycles", None), "glossy_bounces", 4)),
+                "transmission_bounces": int(getattr(getattr(scene, "cycles", None), "transmission_bounces", 12)),
+                "min_light_bounces": int(getattr(getattr(scene, "cycles", None), "min_light_bounces", 0)),
+                "min_transparent_bounces": int(getattr(getattr(scene, "cycles", None), "min_transparent_bounces", 0)),
+                "sample_clamp_direct": float(getattr(getattr(scene, "cycles", None), "sample_clamp_direct", 0.0)),
+                "sample_clamp_indirect": float(getattr(getattr(scene, "cycles", None), "sample_clamp_indirect", 10.0)),
+                "light_sampling_threshold": float(getattr(getattr(scene, "cycles", None), "light_sampling_threshold", 0.01)),
                 "volume_bounces": int(getattr(getattr(scene, "cycles", None), "volume_bounces", 0)),
                 "transparent_max_bounces": int(getattr(getattr(scene, "cycles", None), "transparent_max_bounces", 8)),
                 "pixel_filter_type": str(getattr(getattr(scene, "cycles", None), "pixel_filter_type", "BLACKMAN_HARRIS")),
@@ -4452,6 +4475,8 @@ def material_dump(material):
             "thickness_mode": "slab" if getattr(material, "thickness_mode", "SPHERE") == "SLAB" else "sphere",
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
             "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
+            "emission_sampling": material.cycles.emission_sampling.lower(),
+            "volume_step_rate": float(material.cycles.volume_step_rate),
             "use_bump_map_correction": bool(getattr(getattr(material, "cycles", None), "use_bump_map_correction", True)),
             "use_backface_culling_shadow": bool(getattr(material, "use_backface_culling_shadow", False)),
             "alpha_mode": alpha_mode,
@@ -4579,6 +4604,9 @@ def dump_all():
                         "sun_angle": float(getattr(x, "angle", math.radians(0.526))),
                         "soft_falloff": bool(getattr(x, "use_soft_falloff", True)),
                         "use_multiple_importance_sampling": bool(x.cycles.use_multiple_importance_sampling),
+                        "max_bounces": int(x.cycles.max_bounces),
+                        "is_portal": bool(x.cycles.is_portal),
+                        "is_caustics_light": bool(x.cycles.is_caustics_light),
                         "spot_size": float(getattr(x, "spot_size", math.pi / 4)),
                         "spot_blend": float(getattr(x, "spot_blend", 0.15)),
                         "shape": getattr(x, "shape", None), "custom_properties": custom_props(x),
@@ -10352,6 +10380,22 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.render.ffmpeg.audio_codec = blender_audio_codec(render.get("audio_codec", "wav"))
         if engine == "CYCLES" and hasattr(scene, "cycles"):
             scene.cycles.max_bounces = int(render.get("max_bounces", 4))
+            if "diffuse_bounces" in render:
+                scene.cycles.diffuse_bounces = int(render["diffuse_bounces"])
+            if "glossy_bounces" in render:
+                scene.cycles.glossy_bounces = int(render["glossy_bounces"])
+            if "transmission_bounces" in render:
+                scene.cycles.transmission_bounces = int(render["transmission_bounces"])
+            if "min_light_bounces" in render:
+                scene.cycles.min_light_bounces = int(render["min_light_bounces"])
+            if "min_transparent_bounces" in render:
+                scene.cycles.min_transparent_bounces = int(render["min_transparent_bounces"])
+            if "sample_clamp_direct" in render:
+                scene.cycles.sample_clamp_direct = float(render["sample_clamp_direct"])
+            if "sample_clamp_indirect" in render:
+                scene.cycles.sample_clamp_indirect = float(render["sample_clamp_indirect"])
+            if "light_sampling_threshold" in render:
+                scene.cycles.light_sampling_threshold = float(render["light_sampling_threshold"])
             scene.cycles.volume_bounces = int(render.get("volume_bounces", 0))
             if "transparent_max_bounces" in render:
                 scene.cycles.transparent_max_bounces = int(render["transparent_max_bounces"])
@@ -10782,6 +10826,9 @@ def export_doc(doc, target, pack, scene_hash, context):
                 light.spot_blend = raw.get("spot_blend", 0.15)
             light.cycles.use_multiple_importance_sampling = bool(
                 raw.get("use_multiple_importance_sampling", True))
+            light.cycles.max_bounces = int(raw.get("max_bounces", 1024))
+            light.cycles.is_portal = bool(raw.get("is_portal", False))
+            light.cycles.is_caustics_light = bool(raw.get("is_caustics_light", False))
             if raw.get("light_type") == "sun":
                 light.angle = float(raw.get("sun_angle", math.radians(0.526)))
             light.use_custom_distance = bool(raw.get("use_custom_distance", False))
@@ -10801,6 +10848,17 @@ def export_doc(doc, target, pack, scene_hash, context):
             continue
         world = bpy.data.worlds.new(compatibility_name(doc, "World", world_id, world_id))
         world.color = item["color"]
+        world.cycles.sampling_method = item.get("sampling_method", "automatic").upper()
+        world.cycles.sample_map_resolution = int(item.get("sample_map_resolution", 1024))
+        world.cycles.max_bounces = int(item.get("max_bounces", 1024))
+        world.cycles.use_shadows = bool(item.get("use_shadows", True))
+        world.cycles.is_caustics_light = bool(item.get("is_caustics_light", False))
+        visibility = item.get("visibility", {})
+        for setting in ("camera", "diffuse", "glossy", "transmission", "scatter"):
+            setattr(world.cycles_visibility, setting, bool(visibility.get(setting, True)))
+        world.cycles.volume_sampling = item.get("volume_sampling", "equiangular").upper()
+        world.cycles.volume_interpolation = item.get("volume_interpolation", "linear").upper()
+        world.cycles.volume_step_size = float(item.get("volume_step_size", 1.0))
         threshold = item.get("eevee_sun_threshold")
         if threshold is not None:
             if not hasattr(world, "sun_threshold"):
@@ -10855,10 +10913,14 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.use_transparent_shadow = bool(item.get("use_transparent_shadow", True))
         mat.cycles.use_bump_map_correction = bool(item.get("use_bump_map_correction", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
-        mat.cycles.volume_sampling = {"distance": "DISTANCE", "equiangular": "EQUIANGULAR"}.get(
-            item.get("volume_sampling"), "MULTIPLE_IMPORTANCE")
+        mat.cycles.volume_sampling = {
+            "distance": "DISTANCE", "equiangular": "EQUIANGULAR",
+            "multiple_importance": "MULTIPLE_IMPORTANCE",
+        }.get(item.get("volume_sampling"), "MULTIPLE_IMPORTANCE")
         mat.cycles.volume_interpolation = {"linear": "LINEAR", "cubic": "CUBIC"}.get(
             item.get("volume_interpolation"), "LINEAR")
+        mat.cycles.emission_sampling = item.get("emission_sampling", "auto").upper()
+        mat.cycles.volume_step_rate = float(item.get("volume_step_rate", 1.0))
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
         set_props(mat, source.get("custom_properties", {}))

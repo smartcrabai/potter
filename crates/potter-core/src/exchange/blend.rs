@@ -26,19 +26,20 @@ use crate::{
         Constraint, ConstraintType, CurveData, CurveDimensions, CurveFillMode, CurveFillRule,
         CurveFillSolver, CurveHandleType, CurvePoint, CurveSpline, CurveSplineType,
         CurveTaperRadiusMode, CyclesCurveShape, CyclesHairShadowGeometryKey, CyclesHairShadowGroup,
-        CyclesHairShadowInstanceKey, CyclesHairShadowMember, DEFAULT_FILTER_WIDTH, DataBlock,
-        Driver, DriverType, DriverVariable, DriverVariableType, Extrapolation, FCurve,
-        FCurveAutoSmoothing, FCurveHandleType, FCurveModifier, ForceField, ForceFieldType,
-        GreasePencilData, GreasePencilFrame, GreasePencilLayer, GreasePencilPoint,
-        GreasePencilStroke, HairCurvesData, Id, Image, ImageAlphaMode, ImageColorspace,
-        ImageSource, ImageTile, Interpolation, Keyframe, Library, LibraryKind, LibraryOverride,
-        LibraryOverrideProperty, LibraryStatus, LightData, LightType, Material, MaterialLink,
-        Modifier, ModifierParameterBinding, MovieClip, MovieTracking, NlaBlendType,
-        NlaExtrapolation, NlaStrip, NlaTrack, Node, ParentType, PixelFilterType, Profile, RayKind,
-        RayVisibility, Registry, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType,
-        RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint,
-        TextCharacterFormat, TextObjectData, TimelineMarker, Transform, UnitSettings, VertexGroup,
-        ViewLayer, ViewportDisplay, VolumeInterpolation, VolumeSampling, World, is_identity_matrix,
+        CyclesHairShadowInstanceKey, CyclesHairShadowMember, CyclesVisibility,
+        DEFAULT_FILTER_WIDTH, DataBlock, Driver, DriverType, DriverVariable, DriverVariableType,
+        EmissionSampling, Extrapolation, FCurve, FCurveAutoSmoothing, FCurveHandleType,
+        FCurveModifier, ForceField, ForceFieldType, GreasePencilData, GreasePencilFrame,
+        GreasePencilLayer, GreasePencilPoint, GreasePencilStroke, HairCurvesData, Id, Image,
+        ImageAlphaMode, ImageColorspace, ImageSource, ImageTile, Interpolation, Keyframe, Library,
+        LibraryKind, LibraryOverride, LibraryOverrideProperty, LibraryStatus, LightData, LightType,
+        Material, MaterialLink, Modifier, ModifierParameterBinding, MovieClip, MovieTracking,
+        NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack, Node, ParentType, PixelFilterType,
+        Profile, RayKind, RayVisibility, Registry, RenderSettings, RigidBody, RigidBodyShape,
+        RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData, SurfaceData,
+        SurfacePoint, TextCharacterFormat, TextObjectData, TimelineMarker, Transform, UnitSettings,
+        VertexGroup, ViewLayer, ViewportDisplay, VolumeInterpolation, VolumeSampling, World,
+        WorldSamplingMethod, is_identity_matrix,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, SequencerColorSpace, Strip as SequenceStrip,
@@ -4402,6 +4403,23 @@ fn build_imported_graph(
                 .map_err(|_| invalid_intermediate("render seed is out of range"))?,
             max_bounces: u32::try_from(integer_field(&render, "max_bounces", 4))
                 .map_err(|_| invalid_intermediate("render max_bounces is out of range"))?,
+            diffuse_bounces: u32::try_from(integer_field(&render, "diffuse_bounces", 4))
+                .map_err(|_| invalid_intermediate("render diffuse_bounces is out of range"))?,
+            glossy_bounces: u32::try_from(integer_field(&render, "glossy_bounces", 4))
+                .map_err(|_| invalid_intermediate("render glossy_bounces is out of range"))?,
+            transmission_bounces: u32::try_from(integer_field(&render, "transmission_bounces", 12))
+                .map_err(|_| invalid_intermediate("render transmission_bounces is out of range"))?,
+            min_light_bounces: u32::try_from(integer_field(&render, "min_light_bounces", 0))
+                .map_err(|_| invalid_intermediate("render min_light_bounces is out of range"))?,
+            min_transparent_bounces: u32::try_from(integer_field(
+                &render,
+                "min_transparent_bounces",
+                0,
+            ))
+            .map_err(|_| invalid_intermediate("render min_transparent_bounces is out of range"))?,
+            sample_clamp_direct: number_field(&render, "sample_clamp_direct", 0.0),
+            sample_clamp_indirect: number_field(&render, "sample_clamp_indirect", 10.0),
+            light_sampling_threshold: number_field(&render, "light_sampling_threshold", 0.01),
             volume_bounces: u32::try_from(integer_field(&render, "volume_bounces", 0))
                 .map_err(|_| invalid_intermediate("render volume_bounces is out of range"))?,
             transparent_max_bounces: u32::try_from(integer_field(
@@ -4682,6 +4700,34 @@ fn build_imported_graph(
                     color: vec3_field(world, "color", [1.0; 3]),
                     background_color: world.get("background_color").and_then(parse_vec3_value),
                     strength: number_field(world, "strength", 1.0),
+                    sampling_method: world_sampling_method_field(name, world)?,
+                    sample_map_resolution: cycles_u32_field(
+                        world,
+                        "sample_map_resolution",
+                        1024,
+                        4,
+                        8192,
+                        "World",
+                    )?,
+                    max_bounces: cycles_u32_field(world, "max_bounces", 1024, 0, 1024, "World")?,
+                    use_shadows: cycles_bool_field(world, "use_shadows", true, "World")?,
+                    is_caustics_light: cycles_bool_field(
+                        world,
+                        "is_caustics_light",
+                        false,
+                        "World",
+                    )?,
+                    visibility: world_cycles_visibility_field(name, world)?,
+                    volume_sampling: world_volume_sampling_field(name, world)?,
+                    volume_interpolation: world_volume_interpolation_field(name, world)?,
+                    volume_step_size: cycles_f64_field(
+                        world,
+                        "volume_step_size",
+                        1.0,
+                        crate::model::WORLD_VOLUME_STEP_SIZE_MIN,
+                        crate::model::WORLD_VOLUME_STEP_SIZE_MAX,
+                        "World",
+                    )?,
                     eevee_sun_threshold: parse_eevee_world_sun_threshold(
                         world.get("sun_threshold"),
                     )?,
@@ -4887,6 +4933,14 @@ fn build_imported_graph(
                 mesh: None,
                 camera: None,
                 light: Some(LightData {
+                    is_portal: cycles_bool_field(item, "is_portal", false, "Light")?,
+                    max_bounces: cycles_u32_field(item, "max_bounces", 1024, 0, 1024, "Light")?,
+                    is_caustics_light: cycles_bool_field(
+                        item,
+                        "is_caustics_light",
+                        false,
+                        "Light",
+                    )?,
                     light_type,
                     use_shadow: item.get("use_shadow").and_then(Value::as_bool),
                     color: vec3_field(item, "color", [1.0; 3]),
@@ -4992,7 +5046,7 @@ fn build_imported_graph(
                 alpha_threshold: number_field(item, "alpha_threshold", 0.5),
                 metallic: number_field(item, "metallic", 0.0),
                 roughness: number_field(item, "roughness", 0.8),
-                emission_color: vec3_field(item, "emission_color", [0.0; 3]),
+                emission_sampling: emission_sampling_field(name, item)?,
                 emission_strength: number_field(item, "emission_strength", 0.0),
                 transmission: number_field(item, "transmission", 0.0),
                 use_raytrace_refraction: item
@@ -5020,6 +5074,14 @@ fn build_imported_graph(
                 displacement_midlevel: number_field(item, "displacement_midlevel", 0.5),
                 volume_density: number_field(item, "volume_density", 0.0),
                 volume_color: vec3_field(item, "volume_color", [0.5; 3]),
+                volume_step_rate: cycles_f64_field(
+                    item,
+                    "volume_step_rate",
+                    1.0,
+                    0.001,
+                    1000.0,
+                    "Material",
+                )?,
                 volume_anisotropy: number_field(item, "volume_anisotropy", 0.0),
                 volume_sampling: volume_sampling_field(name, item)?,
                 volume_interpolation: volume_interpolation_field(name, item)?,
@@ -9132,35 +9194,180 @@ fn displacement_method_field(name: &str, item: &Value) -> Result<String> {
     }
 }
 
-/// Potter's volume sampling from a bridge material (Blender's `cycles.volume_sampling`). Absent means Blender's
-/// default, multiple importance sampling.
-fn volume_sampling_field(name: &str, item: &Value) -> Result<VolumeSampling> {
-    match item
-        .get("volume_sampling")
-        .and_then(Value::as_str)
-        .unwrap_or("multiple_importance")
-    {
-        "distance" => Ok(VolumeSampling::Distance),
-        "equiangular" => Ok(VolumeSampling::Equiangular),
-        "multiple_importance" => Ok(VolumeSampling::MultipleImportance),
-        other => Err(invalid_intermediate(&format!(
-            "material `{name}` has unknown volume_sampling `{other}`"
+fn cycles_string_field<'a>(
+    item: &'a Value,
+    field: &str,
+    default: &'a str,
+    owner: &str,
+) -> Result<&'a str> {
+    match item.get(field) {
+        None => Ok(default),
+        Some(Value::String(value)) => Ok(value),
+        Some(_) => Err(invalid_intermediate(&format!(
+            "{owner}.{field} must be a string"
         ))),
     }
 }
 
-/// Potter's volume interpolation from a bridge material (Blender's `cycles.volume_interpolation`). Absent means
-/// Blender's default, linear.
-fn volume_interpolation_field(name: &str, item: &Value) -> Result<VolumeInterpolation> {
-    match item
-        .get("volume_interpolation")
-        .and_then(Value::as_str)
-        .unwrap_or("linear")
-    {
+fn cycles_bool_field(item: &Value, field: &str, default: bool, owner: &str) -> Result<bool> {
+    match item.get(field) {
+        None => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(invalid_intermediate(&format!(
+            "{owner}.{field} must be a boolean"
+        ))),
+    }
+}
+
+fn cycles_u32_field(
+    item: &Value,
+    field: &str,
+    default: u32,
+    minimum: u32,
+    maximum: u32,
+    owner: &str,
+) -> Result<u32> {
+    let value = match item.get(field) {
+        None => default,
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                invalid_intermediate(&format!("{owner}.{field} must be a 32-bit integer"))
+            })?,
+    };
+    if !(minimum..=maximum).contains(&value) {
+        return Err(invalid_intermediate(&format!(
+            "{owner}.{field} must be in {minimum}..={maximum}"
+        )));
+    }
+    Ok(value)
+}
+
+fn cycles_f64_field(
+    item: &Value,
+    field: &str,
+    default: f64,
+    minimum: f64,
+    maximum: f64,
+    owner: &str,
+) -> Result<f64> {
+    let value = match item.get(field) {
+        None => default,
+        Some(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| {
+                invalid_intermediate(&format!("{owner}.{field} must be a finite number"))
+            })?,
+    };
+    if !(minimum..=maximum).contains(&value) {
+        return Err(invalid_intermediate(&format!(
+            "{owner}.{field} must be in {minimum}..={maximum}"
+        )));
+    }
+    Ok(value)
+}
+
+fn world_sampling_method_field(name: &str, item: &Value) -> Result<WorldSamplingMethod> {
+    let owner = format!("World `{name}`");
+    match cycles_string_field(item, "sampling_method", "automatic", &owner)? {
+        "none" => Ok(WorldSamplingMethod::None),
+        "automatic" => Ok(WorldSamplingMethod::Automatic),
+        "manual" => Ok(WorldSamplingMethod::Manual),
+        other => Err(invalid_intermediate(&format!(
+            "{owner} has unknown sampling_method `{other}`"
+        ))),
+    }
+}
+
+fn world_cycles_visibility_field(name: &str, item: &Value) -> Result<CyclesVisibility> {
+    const FIELDS: [&str; 5] = ["camera", "diffuse", "glossy", "transmission", "scatter"];
+    let owner = format!("World `{name}`.visibility");
+    let Some(settings) = item.get("visibility") else {
+        return Ok(CyclesVisibility {
+            camera: true,
+            diffuse: true,
+            glossy: true,
+            transmission: true,
+            scatter: true,
+        });
+    };
+    let Some(object) = settings.as_object() else {
+        return Err(invalid_intermediate(&format!("{owner} must be an object")));
+    };
+    if object.keys().any(|field| !FIELDS.contains(&field.as_str())) {
+        return Err(invalid_intermediate(&format!(
+            "{owner} contains an unknown field"
+        )));
+    }
+    Ok(CyclesVisibility {
+        camera: cycles_bool_field(settings, "camera", true, &owner)?,
+        diffuse: cycles_bool_field(settings, "diffuse", true, &owner)?,
+        glossy: cycles_bool_field(settings, "glossy", true, &owner)?,
+        transmission: cycles_bool_field(settings, "transmission", true, &owner)?,
+        scatter: cycles_bool_field(settings, "scatter", true, &owner)?,
+    })
+}
+
+fn world_volume_sampling_field(name: &str, item: &Value) -> Result<VolumeSampling> {
+    let owner = format!("World `{name}`");
+    match cycles_string_field(item, "volume_sampling", "equiangular", &owner)? {
+        "distance" => Ok(VolumeSampling::Distance),
+        "equiangular" => Ok(VolumeSampling::Equiangular),
+        "multiple_importance" => Ok(VolumeSampling::MultipleImportance),
+        other => Err(invalid_intermediate(&format!(
+            "{owner} has unknown volume_sampling `{other}`"
+        ))),
+    }
+}
+
+fn world_volume_interpolation_field(name: &str, item: &Value) -> Result<VolumeInterpolation> {
+    let owner = format!("World `{name}`");
+    match cycles_string_field(item, "volume_interpolation", "linear", &owner)? {
         "linear" => Ok(VolumeInterpolation::Linear),
         "cubic" => Ok(VolumeInterpolation::Cubic),
         other => Err(invalid_intermediate(&format!(
-            "material `{name}` has unknown volume_interpolation `{other}`"
+            "{owner} has unknown volume_interpolation `{other}`"
+        ))),
+    }
+}
+
+fn emission_sampling_field(name: &str, item: &Value) -> Result<EmissionSampling> {
+    let owner = format!("Material `{name}`");
+    match cycles_string_field(item, "emission_sampling", "auto", &owner)? {
+        "none" => Ok(EmissionSampling::None),
+        "auto" => Ok(EmissionSampling::Auto),
+        "front" => Ok(EmissionSampling::Front),
+        "back" => Ok(EmissionSampling::Back),
+        "front_back" => Ok(EmissionSampling::FrontBack),
+        other => Err(invalid_intermediate(&format!(
+            "{owner} has unknown emission_sampling `{other}`"
+        ))),
+    }
+}
+
+/// Potter's volume sampling from a bridge material. Absent means Blender's default, multiple importance sampling.
+fn volume_sampling_field(name: &str, item: &Value) -> Result<VolumeSampling> {
+    let owner = format!("Material `{name}`");
+    match cycles_string_field(item, "volume_sampling", "multiple_importance", &owner)? {
+        "distance" => Ok(VolumeSampling::Distance),
+        "equiangular" => Ok(VolumeSampling::Equiangular),
+        "multiple_importance" => Ok(VolumeSampling::MultipleImportance),
+        other => Err(invalid_intermediate(&format!(
+            "{owner} has unknown volume_sampling `{other}`"
+        ))),
+    }
+}
+
+/// Potter's volume interpolation from a bridge material. Absent means Blender's default, linear.
+fn volume_interpolation_field(name: &str, item: &Value) -> Result<VolumeInterpolation> {
+    let owner = format!("Material `{name}`");
+    match cycles_string_field(item, "volume_interpolation", "linear", &owner)? {
+        "linear" => Ok(VolumeInterpolation::Linear),
+        "cubic" => Ok(VolumeInterpolation::Cubic),
+        other => Err(invalid_intermediate(&format!(
+            "{owner} has unknown volume_interpolation `{other}`"
         ))),
     }
 }
@@ -13475,6 +13682,57 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             name,
             "Blender's USD cache file is not supported; the cache resource is kept but its Mesh Cache and Mesh Sequence Cache modifiers fail at evaluation",
         ));
+    }
+    let mut reported_worlds = BTreeSet::new();
+    for scene in raw
+        .get("scenes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(world) = scene.get("world").filter(|world| !world.is_null()) else {
+            continue;
+        };
+        let identity = world
+            .get("potter_id")
+            .and_then(Value::as_str)
+            .or_else(|| world.get("name").and_then(Value::as_str));
+        let is_caustics_light = world
+            .get("is_caustics_light")
+            .and_then(Value::as_bool)
+            .is_some_and(|value| value);
+        if !is_caustics_light
+            || identity.is_some_and(|identity| !reported_worlds.insert(identity.to_owned()))
+        {
+            continue;
+        }
+        losses.push(loss(
+            "blender.world.cycles.is_caustics_light",
+            identity,
+            "non-default Cycles World is_caustics_light is preserved but Potter does not apply it during rendering",
+        ));
+    }
+    for light in raw
+        .get("lights")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let identity = light
+            .get("potter_id")
+            .and_then(Value::as_str)
+            .or_else(|| light.get("name").and_then(Value::as_str));
+        if light
+            .get("is_caustics_light")
+            .and_then(Value::as_bool)
+            .is_some_and(|value| value)
+        {
+            losses.push(loss(
+                "blender.light.cycles.is_caustics_light",
+                identity,
+                "non-default Cycles Light is_caustics_light is preserved but Potter does not apply it during rendering",
+            ));
+        }
     }
     for scene in raw
         .get("scenes")
@@ -20344,6 +20602,49 @@ mod tests {
             assert_eq!(render.cycles_curves_shape, Some(shape), "{expected}");
             assert_eq!(render.cycles_curves_subdivisions, Some(2), "{expected}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn blender_roundtrip_preserves_cycles_path_state_settings() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let scene_id = Id::from_static("scene_main");
+        let mut doc = roundtrip_scene()?;
+        let scene = doc
+            .scenes
+            .get_mut(&scene_id)
+            .ok_or_else(|| invalid_intermediate("roundtrip scene is missing"))?;
+        scene.render.diffuse_bounces = 6;
+        scene.render.glossy_bounces = 7;
+        scene.render.transmission_bounces = 9;
+        scene.render.min_light_bounces = 2;
+        scene.render.min_transparent_bounces = 3;
+        scene.render.sample_clamp_direct = 2.5;
+        scene.render.sample_clamp_indirect = 24.0;
+        scene.render.light_sampling_threshold = 0.25;
+        let output = directory.path().join("cycles-path-state.blend");
+        let context = crate::eval::EvaluationContext::default();
+        let options = ExportOptions {
+            allow_lossy: false,
+            pack: false,
+            blender: Some(&blender),
+            context: &context,
+        };
+        export_blend(&doc, &project, &output, &options)?;
+        let imported = import_blend(&output, Some(&blender))?;
+        let render = &imported.doc.scenes[&scene_id].render;
+        assert_eq!(render.diffuse_bounces, 6);
+        assert_eq!(render.glossy_bounces, 7);
+        assert_eq!(render.transmission_bounces, 9);
+        assert_eq!(render.min_light_bounces, 2);
+        assert_eq!(render.min_transparent_bounces, 3);
+        assert_eq!(render.sample_clamp_direct, 2.5);
+        assert_eq!(render.sample_clamp_indirect, 24.0);
+        assert_eq!(render.light_sampling_threshold, 0.25);
         Ok(())
     }
 
@@ -27391,6 +27692,162 @@ print("UNSUPPORTED_POSE " + json.dumps({
             ]
         );
     }
+    #[test]
+    fn cycles_settings_import_defaults_validation_and_losses() -> Result<()> {
+        let world = json!({});
+        assert_eq!(
+            world_sampling_method_field("World", &world)?,
+            WorldSamplingMethod::Automatic
+        );
+        assert_eq!(
+            world_volume_sampling_field("World", &world)?,
+            VolumeSampling::Equiangular
+        );
+        assert_eq!(
+            world_volume_interpolation_field("World", &world)?,
+            VolumeInterpolation::Linear
+        );
+        let visibility = world_cycles_visibility_field("World", &world)?;
+        assert!(visibility.camera);
+        assert!(visibility.diffuse);
+        assert!(visibility.glossy);
+        assert!(visibility.transmission);
+        assert!(visibility.scatter);
+        assert_eq!(
+            emission_sampling_field("Material", &json!({}))?,
+            EmissionSampling::Auto
+        );
+        assert_eq!(
+            volume_sampling_field("Material", &json!({}))?,
+            VolumeSampling::MultipleImportance
+        );
+        assert_eq!(
+            volume_interpolation_field("Material", &json!({}))?,
+            VolumeInterpolation::Linear
+        );
+        assert_eq!(
+            cycles_u32_field(&json!({}), "max_bounces", 1024, 0, 1024, "Light")?,
+            1024
+        );
+        assert!(!cycles_bool_field(&json!({}), "is_portal", false, "Light")?);
+
+        assert!(
+            world_sampling_method_field("World", &json!({"sampling_method": "invalid"})).is_err()
+        );
+        assert!(
+            world_cycles_visibility_field("World", &json!({"visibility": {"camera": 1}})).is_err()
+        );
+        assert!(
+            cycles_u32_field(
+                &json!({"sample_map_resolution": 3}),
+                "sample_map_resolution",
+                1024,
+                4,
+                8192,
+                "World"
+            )
+            .is_err()
+        );
+        assert!(
+            cycles_f64_field(
+                &json!({"volume_step_size": 100_000.1}),
+                "volume_step_size",
+                1.0,
+                crate::model::WORLD_VOLUME_STEP_SIZE_MIN,
+                crate::model::WORLD_VOLUME_STEP_SIZE_MAX,
+                "World"
+            )
+            .is_err()
+        );
+        assert!(
+            emission_sampling_field("Material", &json!({"emission_sampling": "invalid"})).is_err()
+        );
+        assert!(
+            cycles_f64_field(
+                &json!({"volume_step_rate": 0.0}),
+                "volume_step_rate",
+                1.0,
+                0.001,
+                1000.0,
+                "Material"
+            )
+            .is_err()
+        );
+        assert!(
+            cycles_u32_field(
+                &json!({"max_bounces": 1025}),
+                "max_bounces",
+                1024,
+                0,
+                1024,
+                "Light"
+            )
+            .is_err()
+        );
+
+        let losses = import_losses(&json!({
+            "scenes": [{
+                "name": "Scene",
+                "world": {
+                    "name": "World", "sampling_method": "manual", "sample_map_resolution": 2048,
+                    "max_bounces": 16, "use_shadows": false, "is_caustics_light": true,
+                    "visibility": {
+                        "camera": false, "diffuse": true, "glossy": false,
+                        "transmission": true, "scatter": true
+                    },
+                    "volume_sampling": "distance", "volume_interpolation": "cubic",
+                    "volume_step_size": 2.0
+                }
+            }],
+            "materials": [{
+                "name": "Glass", "emission_sampling": "none", "volume_sampling": "distance",
+                "volume_interpolation": "cubic", "volume_step_rate": 2.0
+            }],
+            "lights": [{
+                "name": "Portal", "is_portal": true, "max_bounces": 16,
+                "is_caustics_light": true
+            }]
+        }));
+        let reported = losses
+            .iter()
+            .filter(|loss| {
+                loss.feature_id.starts_with("blender.world.cycles.")
+                    || loss
+                        .feature_id
+                        .starts_with("blender.world.cycles_visibility.")
+                    || loss.feature_id.starts_with("blender.light.cycles.")
+            })
+            .map(|loss| loss.feature_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            reported,
+            [
+                "blender.world.cycles.is_caustics_light",
+                "blender.light.cycles.is_caustics_light",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(
+            losses
+                .iter()
+                .all(|loss| !loss.feature_id.starts_with("blender.material.cycles."))
+        );
+        let defaults = import_losses(&json!({
+            "scenes": [{"name": "Scene", "world": {"name": "World"}}],
+            "materials": [{"name": "Material"}],
+            "lights": [{"name": "Light"}]
+        }));
+        assert!(defaults.iter().all(|loss| {
+            !loss.feature_id.starts_with("blender.world.cycles.")
+                && !loss
+                    .feature_id
+                    .starts_with("blender.world.cycles_visibility.")
+                && !loss.feature_id.starts_with("blender.light.cycles.")
+        }));
+        Ok(())
+    }
+
     #[test]
     fn import_losses_report_unmodeled_world_volume_and_local_grid_cache_inputs() {
         let mut raw = json!({

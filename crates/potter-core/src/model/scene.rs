@@ -2274,6 +2274,10 @@ pub const DEFAULT_FILTER_WIDTH: f64 = 1.5;
 /// `0.01_f32` widened: a `.blend` holding the clamped minimum reads back as this value exactly.
 pub const FILTER_WIDTH_MIN: f64 = 0.01_f32 as f64;
 pub const FILTER_WIDTH_MAX: f64 = 10.0;
+/// Blender's `World.cycles.volume_step_size` RNA range (`properties.py`); the float32 minimum is widened as for
+/// `FILTER_WIDTH_MIN`.
+pub const WORLD_VOLUME_STEP_SIZE_MIN: f64 = 1.0e-7_f32 as f64;
+pub const WORLD_VOLUME_STEP_SIZE_MAX: f64 = 1.0e5;
 
 fn default_pixel_filter_type() -> PixelFilterType {
     PixelFilterType::BlackmanHarris
@@ -2369,6 +2373,54 @@ pub struct RenderSettings {
     pub samples: u32,
     pub seed: u32,
     pub max_bounces: u32,
+    /// Blender Cycles `scene.cycles.diffuse_bounces`; omitted at its Blender default of 4.
+    #[serde(
+        default = "default_diffuse_bounces",
+        skip_serializing_if = "is_default_diffuse_bounces"
+    )]
+    pub diffuse_bounces: u32,
+    /// Blender Cycles `scene.cycles.glossy_bounces`; omitted at its Blender default of 4.
+    #[serde(
+        default = "default_glossy_bounces",
+        skip_serializing_if = "is_default_glossy_bounces"
+    )]
+    pub glossy_bounces: u32,
+    /// Blender Cycles `scene.cycles.transmission_bounces`; omitted at its Blender default of 12.
+    #[serde(
+        default = "default_transmission_bounces",
+        skip_serializing_if = "is_default_transmission_bounces"
+    )]
+    pub transmission_bounces: u32,
+    /// Blender Cycles `scene.cycles.min_light_bounces`; omitted at its Blender default of 0.
+    #[serde(
+        default = "default_min_light_bounces",
+        skip_serializing_if = "is_default_min_light_bounces"
+    )]
+    pub min_light_bounces: u32,
+    /// Blender Cycles `scene.cycles.min_transparent_bounces`; omitted at its Blender default of 0.
+    #[serde(
+        default = "default_min_transparent_bounces",
+        skip_serializing_if = "is_default_min_transparent_bounces"
+    )]
+    pub min_transparent_bounces: u32,
+    /// Blender Cycles `scene.cycles.sample_clamp_direct`; omitted at its Blender default of 0.0.
+    #[serde(
+        default = "default_sample_clamp_direct",
+        skip_serializing_if = "is_default_sample_clamp_direct"
+    )]
+    pub sample_clamp_direct: f64,
+    /// Blender Cycles `scene.cycles.sample_clamp_indirect`; omitted at its Blender default of 10.0.
+    #[serde(
+        default = "default_sample_clamp_indirect",
+        skip_serializing_if = "is_default_sample_clamp_indirect"
+    )]
+    pub sample_clamp_indirect: f64,
+    /// Blender Cycles `scene.cycles.light_sampling_threshold`; omitted at its Blender default of 0.01.
+    #[serde(
+        default = "default_light_sampling_threshold",
+        skip_serializing_if = "is_default_light_sampling_threshold"
+    )]
+    pub light_sampling_threshold: f64,
     /// Cycles' `volume_bounces`: a volume path takes `volume_bounces + 1` scatter vertices with direct light, and each
     /// later segment only attenuates (`max_volume_bounce`, `intern/cycles/scene/integrator.cpp`). Omitted when equal to
     /// Blender's default of 0.
@@ -2521,6 +2573,35 @@ pub struct RenderSettings {
 
 impl RenderSettings {
     fn validate(&self) -> Result<()> {
+        if self.diffuse_bounces > 1024
+            || self.glossy_bounces > 1024
+            || self.transmission_bounces > 1024
+            || self.min_light_bounces > 1024
+            || self.min_transparent_bounces > 1024
+        {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "Cycles bounce settings are outside Blender RNA range 0..=1024",
+            ));
+        }
+        if !self.sample_clamp_direct.is_finite()
+            || !(0.0..=1e8).contains(&self.sample_clamp_direct)
+            || !self.sample_clamp_indirect.is_finite()
+            || !(0.0..=1e8).contains(&self.sample_clamp_indirect)
+        {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "Cycles sample clamp settings are outside Blender RNA range 0..=100000000",
+            ));
+        }
+        if !self.light_sampling_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.light_sampling_threshold)
+        {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "Cycles light_sampling_threshold is outside Blender RNA range 0..=1",
+            ));
+        }
         if !self.dicing_rate.is_finite()
             || !(0.1..=1000.0).contains(&self.dicing_rate)
             || !self.preview_dicing_rate.is_finite()
@@ -2627,6 +2708,14 @@ impl Default for RenderSettings {
             samples: 64,
             seed: 0,
             max_bounces: 4,
+            diffuse_bounces: 4,
+            glossy_bounces: 4,
+            transmission_bounces: 12,
+            min_light_bounces: 0,
+            min_transparent_bounces: 0,
+            sample_clamp_direct: 0.0,
+            sample_clamp_indirect: 10.0,
+            light_sampling_threshold: default_light_sampling_threshold(),
             volume_bounces: 0,
             transparent_max_bounces: 8,
             filter_glossy: 1.0,
@@ -2913,6 +3002,16 @@ pub struct LightData {
     /// hit is weighted against light sampling. When `false`, the light is only light-sampled.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub use_multiple_importance_sampling: bool,
+    /// Blender's Cycles `Light.is_portal` setting; retained for every light type.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_portal: bool,
+    #[serde(
+        default = "default_cycles_max_bounces",
+        skip_serializing_if = "is_default_cycles_max_bounces"
+    )]
+    pub max_bounces: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_caustics_light: bool,
     /// Blender's sun `angle` (`light.sun_angle`, `rna_light.cc`): the sun's angular diameter, in radians. EEVEE draws the
     /// sun's disc from it (`eevee_light.cc`, `shape_radius = tan(angle / 2)`). Omitted at Blender's default.
     #[serde(
@@ -2977,6 +3076,9 @@ impl Default for LightData {
             area_size_y: 0.25,
             spread: std::f64::consts::PI,
             use_multiple_importance_sampling: true,
+            is_portal: false,
+            max_bounces: default_cycles_max_bounces(),
+            is_caustics_light: false,
             sun_angle: default_sun_angle(),
             use_custom_distance: false,
             cutoff_distance: default_cutoff_distance(),
@@ -3032,6 +3134,46 @@ fn default_volume_color() -> [f64; 3] {
     [0.5; 3]
 }
 
+fn default_cycles_max_bounces() -> u32 {
+    1024
+}
+
+fn is_default_cycles_max_bounces<T: Into<u32> + Copy>(value: &T) -> bool {
+    (*value).into() == default_cycles_max_bounces()
+}
+
+fn default_world_sample_map_resolution() -> u32 {
+    1024
+}
+
+fn is_default_world_sample_map_resolution<T: Into<u32> + Copy>(value: &T) -> bool {
+    (*value).into() == default_world_sample_map_resolution()
+}
+
+fn default_world_volume_sampling() -> VolumeSampling {
+    VolumeSampling::Equiangular
+}
+
+fn is_default_world_volume_sampling<T: Into<VolumeSampling> + Copy>(value: &T) -> bool {
+    (*value).into() == default_world_volume_sampling()
+}
+
+fn default_world_volume_step_size() -> f64 {
+    1.0
+}
+
+fn is_default_world_volume_step_size<T: Into<f64> + Copy>(value: &T) -> bool {
+    (*value).into().to_bits() == default_world_volume_step_size().to_bits()
+}
+
+fn default_material_volume_step_rate() -> f64 {
+    1.0
+}
+
+fn is_default_material_volume_step_rate<T: Into<f64> + Copy>(value: &T) -> bool {
+    (*value).into().to_bits() == default_material_volume_step_rate().to_bits()
+}
+
 /// Blender's `cycles.volume_sampling` for a material: distance, equiangular, or multiple importance sampling of
 /// both (Blender's default). A volume's direct light is sampled along its ray in the chosen way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -3058,6 +3200,53 @@ pub enum VolumeInterpolation {
     Cubic,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldSamplingMethod {
+    None,
+    #[default]
+    Automatic,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmissionSampling {
+    None,
+    #[default]
+    Auto,
+    Front,
+    Back,
+    FrontBack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CyclesVisibility {
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub camera: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub diffuse: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub glossy: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub transmission: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub scatter: bool,
+}
+
+impl Default for CyclesVisibility {
+    fn default() -> Self {
+        Self {
+            camera: true,
+            diffuse: true,
+            glossy: true,
+            transmission: true,
+            scatter: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct World {
@@ -3067,6 +3256,36 @@ pub struct World {
     pub background_color: Option<[f64; 3]>,
     pub strength: f64,
     pub node_tree: Option<Id>,
+    #[serde(default, skip_serializing_if = "is_serialised_default")]
+    pub sampling_method: WorldSamplingMethod,
+    #[serde(
+        default = "default_world_sample_map_resolution",
+        skip_serializing_if = "is_default_world_sample_map_resolution"
+    )]
+    pub sample_map_resolution: u32,
+    #[serde(
+        default = "default_cycles_max_bounces",
+        skip_serializing_if = "is_default_cycles_max_bounces"
+    )]
+    pub max_bounces: u32,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub use_shadows: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_caustics_light: bool,
+    #[serde(default, skip_serializing_if = "is_serialised_default")]
+    pub visibility: CyclesVisibility,
+    #[serde(
+        default = "default_world_volume_sampling",
+        skip_serializing_if = "is_default_world_volume_sampling"
+    )]
+    pub volume_sampling: VolumeSampling,
+    #[serde(default, skip_serializing_if = "is_serialised_default")]
+    pub volume_interpolation: VolumeInterpolation,
+    #[serde(
+        default = "default_world_volume_step_size",
+        skip_serializing_if = "is_default_world_volume_step_size"
+    )]
+    pub volume_step_size: f64,
     /// Blender's `World.sun_threshold`, which clamps world radiance during EEVEE sphere-probe capture.
     pub eevee_sun_threshold: Option<f64>,
     /// Blender's `World.sun_angle`, the extracted sun's angular diameter.
@@ -3090,6 +3309,15 @@ impl Default for World {
             background_color: None,
             strength: 1.0,
             node_tree: None,
+            sampling_method: WorldSamplingMethod::default(),
+            sample_map_resolution: default_world_sample_map_resolution(),
+            max_bounces: default_cycles_max_bounces(),
+            use_shadows: true,
+            is_caustics_light: false,
+            visibility: CyclesVisibility::default(),
+            volume_sampling: default_world_volume_sampling(),
+            volume_interpolation: VolumeInterpolation::default(),
+            volume_step_size: default_world_volume_step_size(),
             eevee_sun_threshold: Some(10.0),
             eevee_sun_angle: Some(f64::from(0.526_f32.to_radians())),
             eevee_use_sun_shadow: Some(true),
@@ -4061,6 +4289,99 @@ fn is_default_transparent_max_bounces(value: &u32) -> bool {
 fn default_transparent_max_bounces() -> u32 {
     8
 }
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_diffuse_bounces(value: &u32) -> bool {
+    *value == 4
+}
+
+fn default_diffuse_bounces() -> u32 {
+    4
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_glossy_bounces(value: &u32) -> bool {
+    *value == 4
+}
+
+fn default_glossy_bounces() -> u32 {
+    4
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_transmission_bounces(value: &u32) -> bool {
+    *value == 12
+}
+
+fn default_transmission_bounces() -> u32 {
+    12
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_min_light_bounces(value: &u32) -> bool {
+    *value == 0
+}
+
+fn default_min_light_bounces() -> u32 {
+    0
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_min_transparent_bounces(value: &u32) -> bool {
+    *value == 0
+}
+
+fn default_min_transparent_bounces() -> u32 {
+    0
+}
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_sample_clamp_direct(value: &f64) -> bool {
+    value.to_bits() == 0.0_f64.to_bits()
+}
+
+fn default_sample_clamp_direct() -> f64 {
+    0.0
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_sample_clamp_indirect(value: &f64) -> bool {
+    value.to_bits() == 10.0_f64.to_bits()
+}
+
+fn default_sample_clamp_indirect() -> f64 {
+    10.0
+}
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_light_sampling_threshold(value: &f64) -> bool {
+    value.to_bits() == 0.01_f64.to_bits()
+}
+
+fn default_light_sampling_threshold() -> f64 {
+    0.01
+}
 
 fn default_filter_glossy() -> f64 {
     1.0
@@ -4750,6 +5071,13 @@ pub struct Material {
     pub volume_color: [f64; 3],
     #[serde(default)]
     pub volume_anisotropy: f64,
+    #[serde(default, skip_serializing_if = "is_serialised_default")]
+    pub emission_sampling: EmissionSampling,
+    #[serde(
+        default = "default_material_volume_step_rate",
+        skip_serializing_if = "is_default_material_volume_step_rate"
+    )]
+    pub volume_step_rate: f64,
     /// Blender's `cycles.volume_sampling`: how a volume's direct light is sampled (Cycles' `volume_stack_sample_method`).
     #[serde(default, skip_serializing_if = "is_serialised_default")]
     pub volume_sampling: VolumeSampling,
@@ -4790,6 +5118,8 @@ impl Default for Material {
             volume_density: 0.0,
             volume_color: default_volume_color(),
             volume_anisotropy: 0.0,
+            emission_sampling: EmissionSampling::default(),
+            volume_step_rate: default_material_volume_step_rate(),
             volume_sampling: VolumeSampling::default(),
             volume_interpolation: VolumeInterpolation::default(),
             viewport_display: None,
@@ -5356,6 +5686,90 @@ mod tests {
             "eevee_volumetric_end",
         ] {
             assert!(value.get(field).is_none(), "{field} should be omitted");
+        }
+    }
+
+    #[test]
+    fn cycles_bounce_settings_keep_blender_defaults_implicit_and_validate_ranges() {
+        let render: super::RenderSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(render.diffuse_bounces, 4);
+        assert_eq!(render.glossy_bounces, 4);
+        assert_eq!(render.transmission_bounces, 12);
+        assert_eq!(render.min_light_bounces, 0);
+        assert_eq!(render.min_transparent_bounces, 0);
+        assert_eq!(render.sample_clamp_direct, 0.0);
+        assert_eq!(render.sample_clamp_indirect, 10.0);
+        assert_eq!(render.light_sampling_threshold, 0.01);
+
+        let serialized = serde_json::to_value(&render).unwrap();
+        for field in [
+            "diffuse_bounces",
+            "glossy_bounces",
+            "transmission_bounces",
+            "min_light_bounces",
+            "min_transparent_bounces",
+            "sample_clamp_direct",
+            "sample_clamp_indirect",
+            "light_sampling_threshold",
+        ] {
+            assert!(serialized.get(field).is_none(), "{field} should be omitted");
+        }
+
+        let render = super::RenderSettings {
+            diffuse_bounces: 7,
+            glossy_bounces: 6,
+            transmission_bounces: 11,
+            min_light_bounces: 3,
+            min_transparent_bounces: 2,
+            sample_clamp_direct: 1.5,
+            sample_clamp_indirect: 24.0,
+            light_sampling_threshold: 0.25,
+            ..super::RenderSettings::default()
+        };
+        assert!(render.validate().is_ok());
+        let round_trip: super::RenderSettings =
+            serde_json::from_value(serde_json::to_value(&render).unwrap()).unwrap();
+        assert_eq!(round_trip, render);
+
+        for invalid in [
+            super::RenderSettings {
+                diffuse_bounces: 1025,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                glossy_bounces: 1025,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                transmission_bounces: 1025,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                min_light_bounces: 1025,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                min_transparent_bounces: 1025,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                sample_clamp_direct: 100_000_001.0,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                sample_clamp_indirect: f64::INFINITY,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                light_sampling_threshold: f64::INFINITY,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                light_sampling_threshold: 1.01,
+                ..super::RenderSettings::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
         }
     }
     #[test]

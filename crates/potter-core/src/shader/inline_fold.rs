@@ -604,7 +604,7 @@ impl FoldResolver {
 
 /// Blender forwards a reroute's sole input and muted outputs through `internal_links`
 /// (`shader_nodes_inline.cc:477-482, 508-526, 585-623`).
-pub(super) fn source_passthrough_input_socket<'a>(
+pub(crate) fn source_passthrough_input_socket<'a>(
     node: &'a GraphNode,
     output_socket: &str,
     graph: &NodeGroup,
@@ -693,7 +693,7 @@ fn source_muted_default_input_socket(
     }
     selected
 }
-fn source_input_socket_matches(node: &GraphNode, linked: &str, candidate: &str) -> bool {
+pub(crate) fn source_input_socket_matches(node: &GraphNode, linked: &str, candidate: &str) -> bool {
     linked == candidate
         || (node.node_type == "ShaderNodeMix"
             && ((candidate == "A_Color" && linked == "A")
