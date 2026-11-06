@@ -53,7 +53,19 @@ fn render_patch_mean(project: &Path, root: &Path, name: &str, seed: u64) -> Test
         .arg("--json");
     let output = checked(&mut render, name)?;
     let response: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(response["result"]["warnings"], json!([]), "{response}");
+    let expected_warnings = if name == "uv_sphere_tangent_emission" {
+        json!([{
+            "code": "UNSUPPORTED_FEATURE",
+            "feature_id": "render.path.sample_clamp_emissive_mesh",
+            "message": "Cycles sample clamping includes emissive mesh next-event estimates; Potter's path tracer does not sample emissive mesh triangles directly."
+        }])
+    } else {
+        json!([])
+    };
+    assert_eq!(
+        response["result"]["warnings"], expected_warnings,
+        "{response}"
+    );
 
     let exr = frames.join("frame_0001.exr");
     let loaded = apply_operations(

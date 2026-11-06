@@ -3,9 +3,10 @@ use serde_json::{Map, Value};
 use crate::{
     error::{ErrorCode, Result},
     image::{ImageExtension, ImageInterpolation},
-    model::VolumeInterpolation,
-    model::VolumeSampling,
-    model::{Id, Material, TextureRef, ThicknessMode},
+    model::{
+        EmissionSampling, Id, Material, TextureRef, ThicknessMode, VolumeInterpolation,
+        VolumeSampling,
+    },
 };
 
 use super::{
@@ -78,6 +79,8 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "volume_density",
             "volume_color",
             "volume_anisotropy",
+            "emission_sampling",
+            "volume_step_rate",
             "displacement_scale",
             "displacement_midlevel",
         ],
@@ -159,6 +162,23 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             engine,
             value,
             &operation_pointer(engine.operation_index, "volume_anisotropy"),
+        )?;
+    }
+    if let Some(value) = operation.get("emission_sampling") {
+        material.emission_sampling = parse_emission_sampling(
+            engine,
+            value,
+            &operation_pointer(engine.operation_index, "emission_sampling"),
+        )?;
+    }
+    if let Some(value) = operation.get("volume_step_rate") {
+        material.volume_step_rate = read_bounded_number(
+            engine,
+            value,
+            "volume_step_rate",
+            &operation_pointer(engine.operation_index, "volume_step_rate"),
+            0.001,
+            1000.0,
         )?;
     }
     if let Some(value) = operation.get("displacement_scale") {
@@ -327,6 +347,8 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "volume_density",
             "volume_color",
             "volume_anisotropy",
+            "emission_sampling",
+            "volume_step_rate",
             "displacement_scale",
             "displacement_midlevel",
         ]
@@ -559,6 +581,29 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             )
         })
         .transpose()?;
+    let emission_sampling = set
+        .get("emission_sampling")
+        .map(|value| {
+            parse_emission_sampling(
+                engine,
+                value,
+                &operation_pointer(engine.operation_index, "set/emission_sampling"),
+            )
+        })
+        .transpose()?;
+    let volume_step_rate = set
+        .get("volume_step_rate")
+        .map(|value| {
+            read_bounded_number(
+                engine,
+                value,
+                "volume_step_rate",
+                &operation_pointer(engine.operation_index, "set/volume_step_rate"),
+                0.001,
+                1000.0,
+            )
+        })
+        .transpose()?;
     let displacement_scale = set
         .get("displacement_scale")
         .map(|value| {
@@ -734,6 +779,18 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 && !crate::float::equal_f64(material.volume_anisotropy, value)
             {
                 material.volume_anisotropy = value;
+                item_changed = true;
+            }
+            if let Some(value) = emission_sampling
+                && material.emission_sampling != value
+            {
+                material.emission_sampling = value;
+                item_changed = true;
+            }
+            if let Some(value) = volume_step_rate
+                && !crate::float::equal_f64(material.volume_step_rate, value)
+            {
+                material.volume_step_rate = value;
                 item_changed = true;
             }
             if let Some(value) = displacement_scale
@@ -1155,6 +1212,25 @@ fn read_positive(engine: &Engine<'_>, value: &Value, field: &str, pointer: &str)
     Ok(number)
 }
 
+fn read_bounded_number(
+    engine: &Engine<'_>,
+    value: &Value,
+    field: &str,
+    pointer: &str,
+    minimum: f64,
+    maximum: f64,
+) -> Result<f64> {
+    let number = read_finite_number(engine, value, field, pointer)?;
+    if !(minimum..=maximum).contains(&number) {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            format!("{field} must be in {minimum}..={maximum}"),
+            pointer,
+        ));
+    }
+    Ok(number)
+}
+
 fn parse_displacement_method(engine: &Engine<'_>, value: &Value, pointer: &str) -> Result<String> {
     match value.as_str() {
         Some("bump" | "displacement") => value.as_str().map(str::to_owned).ok_or_else(|| {
@@ -1216,6 +1292,25 @@ fn parse_volume_interpolation(
         _ => Err(engine.error(
             ErrorCode::InvalidOperation,
             "volume_interpolation must be linear or cubic",
+            pointer,
+        )),
+    }
+}
+
+fn parse_emission_sampling(
+    engine: &Engine<'_>,
+    value: &Value,
+    pointer: &str,
+) -> Result<EmissionSampling> {
+    match value.as_str() {
+        Some("none") => Ok(EmissionSampling::None),
+        Some("auto") => Ok(EmissionSampling::Auto),
+        Some("front") => Ok(EmissionSampling::Front),
+        Some("back") => Ok(EmissionSampling::Back),
+        Some("front_back") => Ok(EmissionSampling::FrontBack),
+        _ => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "emission_sampling must be none, auto, front, back, or front_back",
             pointer,
         )),
     }

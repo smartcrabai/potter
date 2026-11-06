@@ -910,3 +910,209 @@ fn realtime_motion_blur_reports_the_scene_sample_count() -> Result<(), Box<dyn E
     assert_eq!(manifest["motion_blur"]["samples"], 4, "{manifest}");
     Ok(())
 }
+
+#[test]
+fn world_use_shadows_controls_nee_through_a_camera_invisible_occluder() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempdir()?;
+    let mut luminances = Vec::new();
+    for use_shadows in [true, false] {
+        let label = if use_shadows {
+            "shadowed"
+        } else {
+            "unshadowed"
+        };
+        let scene = directory.path().join(label);
+        let operations = vec![
+            json!({"op":"world.create","id":"world_main","color":[1.0,1.0,1.0],"strength":1.0}),
+            json!({"op":"node.create","id":"receiver","kind":"plane","params":{"size":2.0},"transform":{"translation":[0.0,0.0,-1.5]}}),
+            json!({"op":"node.create","id":"occluder","kind":"sphere","params":{"radius":2.0,"segments":24,"ring_count":12}}),
+            json!({"op":"node.update","target":{"id":"occluder"},"set":{"ray_visibility":{"camera":false}}}),
+            json!({"op":"camera.create","id":"camera_main","projection":"orthographic","ortho_scale":2.0,"transform":{"translation":[0.0,0.0,5.0]}}),
+            json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
+            json!({"op":"world.update","target":{"id":"world_main"},"set":{"use_shadows":use_shadows}}),
+            json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":16,"resolution_y":16,"samples":16,"seed":31,"max_bounces":0,"pixel_filter_type":"BOX","filter_width":1.0}}),
+        ];
+        make_scene(&scene, &operations)?;
+        let (width, height, pixels) =
+            render_png(&scene, &directory.path().join(label), Some("path"))?;
+        assert_eq!(width, 16);
+        assert_eq!(height, 16);
+        luminances.push(luminance(pixel(&pixels, width, height, 8, 8)?));
+    }
+    assert!(
+        luminances[0] < luminances[1],
+        "World.use_shadows must occlude world NEE only when enabled: {luminances:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn world_nee_uses_receiver_closure_visibility_not_the_incoming_camera_ray()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let mut luminances = Vec::new();
+    for (label, camera_visible, diffuse_visible) in [
+        ("camera-visible-diffuse-hidden", true, false),
+        ("camera-hidden-diffuse-visible", false, true),
+    ] {
+        let scene = directory.path().join(label);
+        let operations = vec![
+            json!({"op":"world.create","id":"world_main","color":[1.0,1.0,1.0],"strength":1.0}),
+            json!({"op":"node.create","id":"receiver","kind":"plane","params":{"size":2.0},"transform":{"translation":[0.0,0.0,-1.5]}}),
+            json!({"op":"camera.create","id":"camera_main","projection":"orthographic","ortho_scale":2.0,"transform":{"translation":[0.0,0.0,5.0]}}),
+            json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
+            json!({"op":"world.update","target":{"id":"world_main"},"set":{
+                "use_shadows":false,
+                "visibility":{
+                    "camera":camera_visible,
+                    "diffuse":diffuse_visible,
+                    "glossy":false,
+                    "transmission":false,
+                    "scatter":true
+                }
+            }}),
+            json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":16,"resolution_y":16,"samples":16,"seed":31,"max_bounces":0,"pixel_filter_type":"BOX","filter_width":1.0}}),
+        ];
+        make_scene(&scene, &operations)?;
+        let (width, height, pixels) =
+            render_png(&scene, &directory.path().join(label), Some("path"))?;
+        luminances.push(luminance(pixel(&pixels, width, height, 8, 8)?));
+    }
+
+    assert_eq!(luminances[0], 0, "diffuse-hidden World NEE lit the floor");
+    assert!(
+        luminances[1] > 0,
+        "camera-hidden but diffuse-visible World NEE did not light the floor"
+    );
+    Ok(())
+}
+
+#[test]
+fn realtime_voxel_volume_ignores_cycles_area_portal_flag() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let mut centers = Vec::new();
+    for is_portal in [false, true] {
+        let label = if is_portal {
+            "portal-flag"
+        } else {
+            "ordinary-area"
+        };
+        let scene = directory.path().join(label);
+        let operations = vec![
+            json!({"op":"graph.create","id":"volume_graph","kind":"shader"}),
+            json!({"op":"graph.node_add","graph":"volume_graph","id":"output","type":"ShaderNodeOutputMaterial"}),
+            json!({"op":"graph.node_add","graph":"volume_graph","id":"volume","type":"ShaderNodeVolumePrincipled","inputs":{"Density":1.0,"Color":[1.0,1.0,1.0,1.0],"Anisotropy":0.0}}),
+            json!({"op":"graph.link","graph":"volume_graph","from_node":"volume","from_socket":"Volume","to_node":"output","to_socket":"Volume"}),
+            json!({"op":"material.create","id":"fog","graph":"volume_graph"}),
+            json!({"op":"volume.create","id":"fog_volume","materials":["fog"],"grids":[{
+                "dims":[2,2,2],"voxel_size":1.0,"origin":[-0.5,-0.5,-0.5],
+                "values":[1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]
+            }]}),
+            json!({"op":"light.create","id":"key","light_type":"area","energy":100.0,"is_portal":is_portal,"transform":{"translation":[0.0,0.0,2.0]}}),
+            json!({"op":"camera.create","id":"camera_main","projection":"orthographic","ortho_scale":2.0,"transform":{"translation":[0.0,0.0,3.0]}}),
+            json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}}),
+            json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":16,"resolution_y":16,"samples":1,"seed":31,"eevee_use_volumetric_shadows":false}}),
+        ];
+        make_scene(&scene, &operations)?;
+        let (width, height, pixels) =
+            render_png(&scene, &directory.path().join(label), Some("realtime"))?;
+        centers.push(pixel(&pixels, width, height, 8, 8)?);
+    }
+
+    assert!(
+        luminance(centers[0]) > 0,
+        "area light did not illuminate the voxel volume"
+    );
+    assert_eq!(centers[0], centers[1]);
+    Ok(())
+}
+
+#[test]
+fn path_clamp_warnings_require_active_world_sampling_and_resolution_mismatch()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    for clamp_active in [false, true] {
+        let label = if clamp_active {
+            "portal-clamped"
+        } else {
+            "portal-unclamped"
+        };
+        let scene = directory.path().join(label);
+        let operations = vec![
+            json!({"op":"world.create","id":"world_main","color":[1.0,1.0,1.0],"strength":1.0}),
+            json!({"op":"light.create","id":"portal","light_type":"area","energy":10.0,"is_portal":true}),
+            json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,4.0]},"projection":"orthographic","ortho_scale":2.0}),
+            json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
+            json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":4,"resolution_y":4,"samples":1,"seed":31,"sample_clamp_direct":if clamp_active { 1.0 } else { 0.0 },"sample_clamp_indirect":0.0}}),
+        ];
+        make_scene(&scene, &operations)?;
+        let output = pot()
+            .arg("render")
+            .arg(&scene)
+            .args(["--engine", "path", "--format", "png", "--out"])
+            .arg(directory.path().join(label))
+            .arg("--json")
+            .output()?;
+        let report = assert_cli_success(&output)?;
+        let warnings = report["result"]["warnings"]
+            .as_array()
+            .ok_or("render warnings are missing")?;
+        let portal_warning = warnings
+            .iter()
+            .any(|warning| warning["feature_id"] == "render.path.sample_clamp_light_portal");
+        assert_eq!(portal_warning, clamp_active, "{report}");
+    }
+
+    for clamp_active in [false, true] {
+        let label = if clamp_active {
+            "world-map-clamped"
+        } else {
+            "world-map-unclamped"
+        };
+        let scene = directory.path().join(label);
+        let mut operations = vec![json!({
+            "op":"image.create","id":"environment","width":2,"height":1,
+            "colorspace":"linear","fill_color":[1.0,1.0,1.0,1.0]
+        })];
+        append_world_texture_graph(
+            &mut operations,
+            "environment_graph",
+            "ShaderNodeTexEnvironment",
+            &json!({}),
+            &json!({"image":"environment","interpolation":"closest"}),
+        );
+        append_camera_and_render(
+            &mut operations,
+            &json!({"translation":[0.0,0.0,4.0]}),
+            &json!({"projection":"orthographic","ortho_scale":2.0}),
+            &json!({
+                "resolution_x":4,"resolution_y":4,"samples":1,"seed":31,
+                "sample_clamp_direct":if clamp_active {1.0}else{0.0},
+                "sample_clamp_indirect":0.0
+            }),
+            Some("world_main"),
+        );
+        operations.push(json!({
+            "op":"world.update","target":{"id":"world_main"},
+            "set":{"sampling_method":"manual","sample_map_resolution":8}
+        }));
+        make_scene(&scene, &operations)?;
+        let output = pot()
+            .arg("render")
+            .arg(&scene)
+            .args(["--engine", "path", "--format", "png", "--out"])
+            .arg(directory.path().join(label))
+            .arg("--json")
+            .output()?;
+        let report = assert_cli_success(&output)?;
+        let warnings = report["result"]["warnings"]
+            .as_array()
+            .ok_or("render warnings are missing")?;
+        let map_warning = warnings
+            .iter()
+            .any(|warning| warning["feature_id"] == "render.path.sample_clamp_world_map");
+        assert_eq!(map_warning, clamp_active, "{report}");
+    }
+    Ok(())
+}

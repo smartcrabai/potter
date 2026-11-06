@@ -76,6 +76,17 @@ pub fn run(args: RenderArgs) -> Result<(Option<SceneInfo>, Value)> {
         || settings.max_bounces > 1024
         || settings.volume_bounces > 1024
         || settings.transparent_max_bounces > 1024
+        || settings.diffuse_bounces > 1024
+        || settings.glossy_bounces > 1024
+        || settings.transmission_bounces > 1024
+        || settings.min_light_bounces > 1024
+        || settings.min_transparent_bounces > 1024
+        || !settings.sample_clamp_direct.is_finite()
+        || !(0.0..=1e8).contains(&settings.sample_clamp_direct)
+        || !settings.sample_clamp_indirect.is_finite()
+        || !(0.0..=1e8).contains(&settings.sample_clamp_indirect)
+        || !settings.light_sampling_threshold.is_finite()
+        || !(0.0..=1.0).contains(&settings.light_sampling_threshold)
     {
         return Err(PotError::new(
             ErrorCode::SceneInvalid,

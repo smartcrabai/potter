@@ -17,6 +17,14 @@ const SET_FIELDS: &[&str] = &[
     "samples",
     "seed",
     "max_bounces",
+    "diffuse_bounces",
+    "glossy_bounces",
+    "transmission_bounces",
+    "min_light_bounces",
+    "min_transparent_bounces",
+    "sample_clamp_direct",
+    "sample_clamp_indirect",
+    "light_sampling_threshold",
     "volume_bounces",
     "transparent_max_bounces",
     "pixel_filter_type",
@@ -159,6 +167,14 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
     let max_bounces = optional_u32(engine, set, "max_bounces", 0, 1024)?;
     let volume_bounces = optional_u32(engine, set, "volume_bounces", 0, 1024)?;
     let transparent_max_bounces = optional_u32(engine, set, "transparent_max_bounces", 0, 1024)?;
+    let diffuse_bounces = optional_u32(engine, set, "diffuse_bounces", 0, 1024)?;
+    let glossy_bounces = optional_u32(engine, set, "glossy_bounces", 0, 1024)?;
+    let transmission_bounces = optional_u32(engine, set, "transmission_bounces", 0, 1024)?;
+    let min_light_bounces = optional_u32(engine, set, "min_light_bounces", 0, 1024)?;
+    let min_transparent_bounces = optional_u32(engine, set, "min_transparent_bounces", 0, 1024)?;
+    let sample_clamp_direct = optional_f64(engine, set, "sample_clamp_direct", 0.0, 1e8)?;
+    let sample_clamp_indirect = optional_f64(engine, set, "sample_clamp_indirect", 0.0, 1e8)?;
+    let light_sampling_threshold = optional_f64(engine, set, "light_sampling_threshold", 0.0, 1.0)?;
     let pixel_filter_type = set
         .get("pixel_filter_type")
         .map(|value| {
@@ -593,6 +609,30 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         if let Some(value) = transparent_max_bounces {
             scene.render.transparent_max_bounces = value;
         }
+        if let Some(value) = diffuse_bounces {
+            scene.render.diffuse_bounces = value;
+        }
+        if let Some(value) = glossy_bounces {
+            scene.render.glossy_bounces = value;
+        }
+        if let Some(value) = transmission_bounces {
+            scene.render.transmission_bounces = value;
+        }
+        if let Some(value) = min_light_bounces {
+            scene.render.min_light_bounces = value;
+        }
+        if let Some(value) = min_transparent_bounces {
+            scene.render.min_transparent_bounces = value;
+        }
+        if let Some(value) = sample_clamp_direct {
+            scene.render.sample_clamp_direct = value;
+        }
+        if let Some(value) = sample_clamp_indirect {
+            scene.render.sample_clamp_indirect = value;
+        }
+        if let Some(value) = light_sampling_threshold {
+            scene.render.light_sampling_threshold = value;
+        }
         if let Some(value) = pixel_filter_type {
             scene.render.pixel_filter_type = value;
         }
@@ -953,6 +993,73 @@ mod tests {
             ),
             "subdivisions beyond Blender's RNA range must be rejected"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cycles_bounce_and_sample_clamp_render_update_sets_and_validates() -> crate::error::Result<()>
+    {
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let updated = apply_batch(
+            &doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [{
+                    "op": "render.update",
+                    "target": {"id": "scene_main"},
+                    "set": {
+                        "diffuse_bounces": 6,
+                        "glossy_bounces": 7,
+                        "transmission_bounces": 9,
+                        "min_light_bounces": 2,
+                        "min_transparent_bounces": 1,
+                        "sample_clamp_direct": 2.5,
+                        "sample_clamp_indirect": 24.0,
+                        "light_sampling_threshold": 0.25
+                    }
+                }]
+            }),
+        )?;
+        let render = &updated.doc.scenes[&Id::from_static("scene_main")].render;
+        assert_eq!(render.diffuse_bounces, 6);
+        assert_eq!(render.glossy_bounces, 7);
+        assert_eq!(render.transmission_bounces, 9);
+        assert_eq!(render.min_light_bounces, 2);
+        assert_eq!(render.min_transparent_bounces, 1);
+        assert_eq!(render.sample_clamp_direct, 2.5);
+        assert_eq!(render.sample_clamp_indirect, 24.0);
+        assert_eq!(render.light_sampling_threshold, 0.25);
+
+        for set in [
+            json!({"diffuse_bounces": 1025}),
+            json!({"glossy_bounces": 1025}),
+            json!({"transmission_bounces": 1025}),
+            json!({"min_light_bounces": 1025}),
+            json!({"min_transparent_bounces": 1025}),
+            json!({"sample_clamp_direct": -0.01}),
+            json!({"sample_clamp_direct": 100_000_001.0}),
+            json!({"sample_clamp_indirect": 100_000_001.0}),
+            json!({"light_sampling_threshold": -0.01}),
+            json!({"light_sampling_threshold": 1.01}),
+        ] {
+            let batch = json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [{
+                    "op": "render.update",
+                    "target": {"id": "scene_main"},
+                    "set": set
+                }]
+            });
+            assert!(
+                matches!(
+                    apply_batch(&doc, &batch),
+                    Err(error) if error.code == ErrorCode::InvalidOperation
+                ),
+                "out-of-range Cycles setting must be rejected: {set}"
+            );
+        }
         Ok(())
     }
     #[test]

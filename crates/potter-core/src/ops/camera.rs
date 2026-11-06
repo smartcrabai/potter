@@ -2,7 +2,10 @@ use serde_json::{Map, Value};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    model::{CameraData, CameraProjection, Id, LightData, LightType, World},
+    model::{
+        CameraData, CameraProjection, CyclesVisibility, Id, LightData, LightType,
+        VolumeInterpolation, VolumeSampling, World, WorldSamplingMethod,
+    },
 };
 
 use super::{ChangeKind, Engine, check_fields, operation_pointer, parse_id, resolve_node_targets};
@@ -418,6 +421,9 @@ fn create_light(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "radius",
             "soft_falloff",
             "use_multiple_importance_sampling",
+            "is_portal",
+            "max_bounces",
+            "is_caustics_light",
             "spread",
             "spot_size",
             "spot_blend",
@@ -439,6 +445,9 @@ fn create_light(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "radius",
             "soft_falloff",
             "use_multiple_importance_sampling",
+            "is_portal",
+            "max_bounces",
+            "is_caustics_light",
             "spread",
             "spot_size",
             "spot_blend",
@@ -507,6 +516,9 @@ fn apply_light_values(
             "radius",
             "soft_falloff",
             "use_multiple_importance_sampling",
+            "is_portal",
+            "max_bounces",
+            "is_caustics_light",
             "spread",
             "spot_size",
             "spot_blend",
@@ -565,6 +577,17 @@ fn apply_light_values(
                 ),
             )
         })?;
+    }
+    if let Some(value) = values.get("is_portal") {
+        light.is_portal = read_boolean_value(engine, value, &format!("{prefix}is_portal"))?;
+    }
+    if let Some(value) = values.get("max_bounces") {
+        light.max_bounces =
+            read_bounded_u32(engine, value, &format!("{prefix}max_bounces"), 0, 1024)?;
+    }
+    if let Some(value) = values.get("is_caustics_light") {
+        light.is_caustics_light =
+            read_boolean_value(engine, value, &format!("{prefix}is_caustics_light"))?;
     }
     if let Some(value) = values.get("use_shadow") {
         light.use_shadow = Some(value.as_bool().ok_or_else(|| {
@@ -640,7 +663,22 @@ fn create_world(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
     check_fields(
         engine,
         operation,
-        &["op", "id", "color", "strength", "node_tree"],
+        &[
+            "op",
+            "id",
+            "color",
+            "strength",
+            "node_tree",
+            "sampling_method",
+            "sample_map_resolution",
+            "max_bounces",
+            "use_shadows",
+            "is_caustics_light",
+            "visibility",
+            "volume_sampling",
+            "volume_interpolation",
+            "volume_step_size",
+        ],
         &["id"],
     )?;
     let id = read_id(engine, operation, "id")?;
@@ -652,7 +690,23 @@ fn create_world(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         ));
     }
     let mut world = World::default();
-    let world_values = selected_values(operation, &["color", "strength", "node_tree"]);
+    let world_values = selected_values(
+        operation,
+        &[
+            "color",
+            "strength",
+            "node_tree",
+            "sampling_method",
+            "sample_map_resolution",
+            "max_bounces",
+            "use_shadows",
+            "is_caustics_light",
+            "visibility",
+            "volume_sampling",
+            "volume_interpolation",
+            "volume_step_size",
+        ],
+    );
     apply_world_values(engine, &world_values, "", &mut world)?;
     engine.doc.worlds.insert(id.clone(), world);
     engine.mark("worlds", &id, ChangeKind::Created);
@@ -700,7 +754,25 @@ fn apply_world_values(
     prefix: &str,
     world: &mut World,
 ) -> Result<()> {
-    check_camera_set_fields(engine, values, &["color", "strength", "node_tree"], prefix)?;
+    check_camera_set_fields(
+        engine,
+        values,
+        &[
+            "color",
+            "strength",
+            "node_tree",
+            "sampling_method",
+            "sample_map_resolution",
+            "max_bounces",
+            "use_shadows",
+            "is_caustics_light",
+            "visibility",
+            "volume_sampling",
+            "volume_interpolation",
+            "volume_step_size",
+        ],
+        prefix,
+    )?;
     if let Some(value) = values.get("color") {
         world.color = read_vec3(engine, value, &format!("{prefix}color"))?;
         if world.color.iter().any(|component| *component < 0.0) {
@@ -742,7 +814,186 @@ fn apply_world_values(
             Some(id)
         };
     }
+    if let Some(value) = values.get("sampling_method") {
+        world.sampling_method = match value.as_str() {
+            Some("none") => WorldSamplingMethod::None,
+            Some("automatic") => WorldSamplingMethod::Automatic,
+            Some("manual") => WorldSamplingMethod::Manual,
+            _ => {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    "sampling_method must be none, automatic, or manual",
+                    &operation_pointer(engine.operation_index, &format!("{prefix}sampling_method")),
+                ));
+            }
+        };
+    }
+    if let Some(value) = values.get("sample_map_resolution") {
+        world.sample_map_resolution = read_bounded_u32(
+            engine,
+            value,
+            &format!("{prefix}sample_map_resolution"),
+            4,
+            8192,
+        )?;
+    }
+    if let Some(value) = values.get("max_bounces") {
+        world.max_bounces =
+            read_bounded_u32(engine, value, &format!("{prefix}max_bounces"), 0, 1024)?;
+    }
+    if let Some(value) = values.get("use_shadows") {
+        world.use_shadows = read_boolean_value(engine, value, &format!("{prefix}use_shadows"))?;
+    }
+    if let Some(value) = values.get("is_caustics_light") {
+        world.is_caustics_light =
+            read_boolean_value(engine, value, &format!("{prefix}is_caustics_light"))?;
+    }
+    if let Some(value) = values.get("visibility") {
+        world.visibility = parse_cycles_visibility(engine, value, &format!("{prefix}visibility"))?;
+    }
+    if let Some(value) = values.get("volume_sampling") {
+        world.volume_sampling =
+            parse_volume_sampling(engine, value, &format!("{prefix}volume_sampling"))?;
+    }
+    if let Some(value) = values.get("volume_interpolation") {
+        world.volume_interpolation =
+            parse_volume_interpolation(engine, value, &format!("{prefix}volume_interpolation"))?;
+    }
+    if let Some(value) = values.get("volume_step_size") {
+        world.volume_step_size = read_bounded_number(
+            engine,
+            value,
+            &format!("{prefix}volume_step_size"),
+            crate::model::WORLD_VOLUME_STEP_SIZE_MIN,
+            crate::model::WORLD_VOLUME_STEP_SIZE_MAX,
+        )?;
+    }
     Ok(())
+}
+
+fn read_boolean_value(engine: &Engine<'_>, value: &Value, field: &str) -> Result<bool> {
+    value.as_bool().ok_or_else(|| {
+        engine.error(
+            ErrorCode::InvalidOperation,
+            format!("{field} must be true or false"),
+            &operation_pointer(engine.operation_index, field),
+        )
+    })
+}
+
+fn read_bounded_u32(
+    engine: &Engine<'_>,
+    value: &Value,
+    field: &str,
+    minimum: u32,
+    maximum: u32,
+) -> Result<u32> {
+    value
+        .as_u64()
+        .and_then(|number| u32::try_from(number).ok())
+        .filter(|number| (minimum..=maximum).contains(number))
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                format!("{field} must be an integer in {minimum}..={maximum}"),
+                &operation_pointer(engine.operation_index, field),
+            )
+        })
+}
+
+fn read_bounded_number(
+    engine: &Engine<'_>,
+    value: &Value,
+    field: &str,
+    minimum: f64,
+    maximum: f64,
+) -> Result<f64> {
+    let number = super::finite_number(
+        engine,
+        Some(value),
+        field,
+        super::FiniteNumberMessage::Field,
+    )?;
+    if !(minimum..=maximum).contains(&number) {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            format!("{field} must be in {minimum}..={maximum}"),
+            &operation_pointer(engine.operation_index, field),
+        ));
+    }
+    Ok(number)
+}
+
+fn parse_volume_sampling(
+    engine: &Engine<'_>,
+    value: &Value,
+    field: &str,
+) -> Result<VolumeSampling> {
+    match value.as_str() {
+        Some("distance") => Ok(VolumeSampling::Distance),
+        Some("equiangular") => Ok(VolumeSampling::Equiangular),
+        Some("multiple_importance") => Ok(VolumeSampling::MultipleImportance),
+        _ => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "volume_sampling must be distance, equiangular, or multiple_importance",
+            &operation_pointer(engine.operation_index, field),
+        )),
+    }
+}
+
+fn parse_volume_interpolation(
+    engine: &Engine<'_>,
+    value: &Value,
+    field: &str,
+) -> Result<VolumeInterpolation> {
+    match value.as_str() {
+        Some("linear") => Ok(VolumeInterpolation::Linear),
+        Some("cubic") => Ok(VolumeInterpolation::Cubic),
+        _ => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "volume_interpolation must be linear or cubic",
+            &operation_pointer(engine.operation_index, field),
+        )),
+    }
+}
+
+fn parse_cycles_visibility(
+    engine: &Engine<'_>,
+    value: &Value,
+    field: &str,
+) -> Result<CyclesVisibility> {
+    const FIELDS: [&str; 5] = ["camera", "diffuse", "glossy", "transmission", "scatter"];
+    let visibility = value.as_object().ok_or_else(|| {
+        engine.error(
+            ErrorCode::InvalidOperation,
+            "visibility must be an object",
+            &operation_pointer(engine.operation_index, field),
+        )
+    })?;
+    for key in visibility.keys() {
+        if !FIELDS.contains(&key.as_str()) {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("unknown visibility field `{key}`"),
+                &operation_pointer(
+                    engine.operation_index,
+                    &format!("{field}/{}", super::pointer_escape(key)),
+                ),
+            ));
+        }
+    }
+    let flag = |key: &str| {
+        visibility.get(key).map_or(Ok(true), |value| {
+            read_boolean_value(engine, value, &format!("{field}/{key}"))
+        })
+    };
+    Ok(CyclesVisibility {
+        camera: flag("camera")?,
+        diffuse: flag("diffuse")?,
+        glossy: flag("glossy")?,
+        transmission: flag("transmission")?,
+        scatter: flag("scatter")?,
+    })
 }
 fn selected_values(values: &Map<String, Value>, fields: &[&str]) -> Map<String, Value> {
     fields

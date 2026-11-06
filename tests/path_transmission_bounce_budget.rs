@@ -96,6 +96,131 @@ if with_fog:
 bpy.ops.wm.save_as_mainfile(filepath=out_path)
 "#;
 
+const DIFFUSE_CAP_SCENE_SCRIPT: &str = r#"
+import bpy
+import sys
+
+argv = sys.argv[sys.argv.index("--") + 1:]
+out_path = argv[0]
+
+for obj in list(bpy.data.objects):
+    bpy.data.objects.remove(obj, do_unlink=True)
+
+scene = bpy.context.scene
+scene.render.engine = "CYCLES"
+world = bpy.data.worlds.new("Black")
+world.use_nodes = True
+background = world.node_tree.nodes["Background"]
+background.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+background.inputs["Strength"].default_value = 0.0
+scene.world = world
+
+bpy.ops.mesh.primitive_plane_add(size=2.0, location=(0.0, 0.0, 0.0))
+floor = bpy.context.object
+floor_material = bpy.data.materials.new("Diffuse floor")
+floor_material.use_nodes = True
+tree = floor_material.node_tree
+output = next(node for node in tree.nodes if node.type == "OUTPUT_MATERIAL")
+for node in list(tree.nodes):
+    if node.type == "BSDF_PRINCIPLED":
+        tree.nodes.remove(node)
+diffuse = tree.nodes.new("ShaderNodeBsdfDiffuse")
+tree.links.new(diffuse.outputs["BSDF"], output.inputs["Surface"])
+floor.data.materials.append(floor_material)
+
+bpy.ops.mesh.primitive_plane_add(
+    size=4.0,
+    location=(1.0, 0.0, 2.0),
+    rotation=(0.0, -1.5707963267948966, 0.0),
+)
+bounce_receiver = bpy.context.object
+bounce_receiver.data.materials.append(floor_material)
+
+light_data = bpy.data.lights.new("Key", type="POINT")
+light_data.energy = 400.0
+light = bpy.data.objects.new("Key", light_data)
+scene.collection.objects.link(light)
+light.location = (-5.0, 0.0, 5.0)
+
+camera_data = bpy.data.cameras.new("Camera")
+camera_data.type = "ORTHO"
+camera_data.ortho_scale = 0.8
+camera = bpy.data.objects.new("Camera", camera_data)
+scene.collection.objects.link(camera)
+camera.location = (0.0, 0.0, 10.0)
+camera.rotation_euler = (0.0, 0.0, 0.0)
+scene.camera = camera
+
+bpy.ops.wm.save_as_mainfile(filepath=out_path)
+"#;
+
+const GLOSSY_CAP_SCENE_SCRIPT: &str = r#"
+import bpy
+import sys
+
+argv = sys.argv[sys.argv.index("--") + 1:]
+out_path = argv[0]
+
+for obj in list(bpy.data.objects):
+    bpy.data.objects.remove(obj, do_unlink=True)
+
+scene = bpy.context.scene
+scene.render.engine = "CYCLES"
+world = bpy.data.worlds.new("Black")
+world.use_nodes = True
+background = world.node_tree.nodes["Background"]
+background.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+background.inputs["Strength"].default_value = 0.0
+scene.world = world
+
+bpy.ops.mesh.primitive_plane_add(size=2.0, location=(0.0, 0.0, 0.0))
+floor = bpy.context.object
+floor_material = bpy.data.materials.new("Glossy floor")
+floor_material.use_nodes = True
+principled = next(
+    node for node in floor_material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"
+)
+principled.inputs["Metallic"].default_value = 1.0
+principled.inputs["Roughness"].default_value = 0.8
+floor.data.materials.append(floor_material)
+
+receiver_material = bpy.data.materials.new("Indirect diffuse receiver")
+receiver_material.use_nodes = True
+receiver_tree = receiver_material.node_tree
+receiver_output = next(
+    node for node in receiver_tree.nodes if node.type == "OUTPUT_MATERIAL"
+)
+for node in list(receiver_tree.nodes):
+    if node.type == "BSDF_PRINCIPLED":
+        receiver_tree.nodes.remove(node)
+receiver_diffuse = receiver_tree.nodes.new("ShaderNodeBsdfDiffuse")
+receiver_tree.links.new(receiver_diffuse.outputs["BSDF"], receiver_output.inputs["Surface"])
+bpy.ops.mesh.primitive_plane_add(
+    size=4.0,
+    location=(1.0, 0.0, 2.0),
+    rotation=(0.0, -1.5707963267948966, 0.0),
+)
+bounce_receiver = bpy.context.object
+bounce_receiver.data.materials.append(receiver_material)
+
+light_data = bpy.data.lights.new("Key", type="POINT")
+light_data.energy = 400.0
+light = bpy.data.objects.new("Key", light_data)
+scene.collection.objects.link(light)
+light.location = (-5.0, 0.0, 5.0)
+
+camera_data = bpy.data.cameras.new("Camera")
+camera_data.type = "ORTHO"
+camera_data.ortho_scale = 0.8
+camera = bpy.data.objects.new("Camera", camera_data)
+scene.collection.objects.link(camera)
+camera.location = (0.0, 0.0, 10.0)
+camera.rotation_euler = (0.0, 0.0, 0.0)
+scene.camera = camera
+
+bpy.ops.wm.save_as_mainfile(filepath=out_path)
+"#;
+
 #[test]
 fn transmission_events_follow_cycles_bounce_budget() -> TestResult {
     let Some(blender) = blender_executable() else {
@@ -170,6 +295,94 @@ fn terminal_bounce_ray_attenuates_through_fog_without_in_scatter() -> TestResult
     assert!(
         largest_difference <= 1.0e-6,
         "fog changed a max_bounces = 0 render by {largest_difference}: the floor's bounce ray scatters in fog"
+    );
+    Ok(())
+}
+
+/// With a diffuse-only surface, a zero diffuse kernel cap and a zero global cap both terminate the same first diffuse
+/// continuation (`integrator.cpp:222, 224`; `path_state.h:143-222`); the sampled label advances one
+/// `PRNG_BOUNCE_NUM` dimension (`path_state.h:241`).
+#[test]
+fn zero_diffuse_bounces_matches_zero_global_bounces() -> TestResult {
+    zero_lobe_cap_matches_global("diffuse", "diffuse_bounces", DIFFUSE_CAP_SCENE_SCRIPT)
+}
+
+/// With a metallic-only surface, the zero glossy kernel cap matches the global cap after its first glossy sample
+/// (`integrator.cpp:222, 224`; `path_state.h:143-222`; `PRNG_BOUNCE_NUM` at `path_state.h:241`).
+#[test]
+fn zero_glossy_bounces_matches_zero_global_bounces() -> TestResult {
+    zero_lobe_cap_matches_global("glossy", "glossy_bounces", GLOSSY_CAP_SCENE_SCRIPT)
+}
+
+// The off-camera wall provides an indirect positive control for the zero-cap comparison.
+fn zero_lobe_cap_matches_global(case: &str, setting: &str, scene_script: &str) -> TestResult {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping {case} bounce equivalence; no executable Blender was found");
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let script = write_script(root.path(), &format!("{case}_cap_scene.py"), scene_script)?;
+    let blend = root.path().join(format!("{case}_cap.blend"));
+    run_blender_arguments(&blender, &script, None, &[blend.as_path()])?;
+    let (project, _) = import_blend(
+        &blender,
+        root.path(),
+        &format!("{case}_cap_project"),
+        &blend,
+    )?;
+
+    let samples = 8;
+    configure_render(&project, root.path(), 17, 0, samples)?;
+    let global_cap = render_frame(&project, root.path(), &format!("{case}_global_cap"))?;
+
+    configure_render(&project, root.path(), 17, 4, samples)?;
+    let high_budget = render_frame(&project, root.path(), &format!("{case}_high_budget"))?;
+
+    let active_scene = read_scene(&project)?["active_scene"]
+        .as_str()
+        .ok_or("active scene is missing")?
+        .to_owned();
+    let mut cap_setting = serde_json::Map::new();
+    cap_setting.insert(setting.to_owned(), json!(0));
+    let applied = apply_operations(
+        &project,
+        root.path(),
+        json!([{
+            "op": "render.update",
+            "target": {"id": active_scene},
+            "set": cap_setting
+        }]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+    let per_type_cap = render_frame(&project, root.path(), &format!("{case}_cap"))?;
+
+    let mut high_budget_difference: f64 = 0.0;
+    let mut global_total = 0.0;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let global = sample_pixel(&global_cap, [x, y]);
+            let per_type = sample_pixel(&per_type_cap, [x, y]);
+            global_total += global[0] + global[1] + global[2];
+
+            let high = sample_pixel(&high_budget, [x, y]);
+            for channel in 0..4 {
+                high_budget_difference =
+                    high_budget_difference.max((high[channel] - global[channel]).abs());
+            }
+            assert_eq!(
+                global, per_type,
+                "{setting}=0 differs from max_bounces=0 at pixel ({x}, {y})"
+            );
+        }
+    }
+    assert!(
+        global_total > 1.0e-3,
+        "the {case} floor should receive direct light; global render total {global_total}"
+    );
+
+    assert!(
+        high_budget_difference > 1.0e-3,
+        "the {case} secondary receiver added no indirect contribution: max difference {high_budget_difference}"
     );
     Ok(())
 }
