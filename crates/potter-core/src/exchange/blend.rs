@@ -15490,61 +15490,6 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 }
             }
         }
-        let eevee_engine = matches!(native_engine, Some("BLENDER_EEVEE" | "BLENDER_EEVEE_NEXT"));
-        let eevee_shadow_effective = eevee_engine
-            && scene
-                .get("camera")
-                .and_then(Value::as_str)
-                .is_some_and(|name| !name.is_empty())
-            && scene_objects.iter().any(|object| {
-                object.get("type").and_then(Value::as_str) == Some("LIGHT")
-                    && raw
-                        .get("lights")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .any(|light| {
-                            light.get("name").and_then(Value::as_str)
-                                == object.get("data_name").and_then(Value::as_str)
-                                && light.get("use_shadow").and_then(Value::as_bool) != Some(false)
-                        })
-            });
-        if eevee_shadow_effective {
-            for object in &scene_objects {
-                if !matches!(
-                    object.get("type").and_then(Value::as_str),
-                    Some("MESH" | "CURVE" | "SURFACE" | "FONT" | "META" | "CURVES")
-                ) {
-                    continue;
-                }
-                let normal_offset = object
-                    .get("shadow_terminator_normal_offset")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
-                let object_id = object
-                    .get("potter_id")
-                    .and_then(Value::as_str)
-                    .or_else(|| object.get("name").and_then(Value::as_str));
-                if normal_offset > 0.0 {
-                    losses.push(loss(
-                        "blender.object.shadow_terminator_normal_offset",
-                        object_id,
-                        "EEVEE uses the Object shadow terminator normal offset for shadow-ray origins; Potter's realtime renderer does not apply this Blender setting",
-                    ));
-                    if object
-                        .get("shadow_terminator_geometry_offset")
-                        .and_then(Value::as_f64)
-                        .is_some_and(|value| (value - 0.1).abs() > 1.0e-6)
-                    {
-                        losses.push(loss(
-                            "blender.object.shadow_terminator_geometry_offset",
-                            object_id,
-                            "EEVEE uses the Object shadow terminator geometry offset only with a nonzero normal offset; Potter's realtime renderer does not apply this Blender setting",
-                        ));
-                    }
-                }
-            }
-        }
         if simplify_on {
             let effective = render.and_then(|settings| settings.get("simplify_effective"));
             let settings = render
