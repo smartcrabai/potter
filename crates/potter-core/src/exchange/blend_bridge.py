@@ -2923,6 +2923,7 @@ def object_dump(obj):
             "delta_scale": plain(obj.delta_scale), "matrix_basis": matrix_rows(obj.matrix_basis),
             "matrix_local": matrix_rows(obj.matrix_local), "matrix_world": matrix_rows(obj.matrix_world),
             "is_holdout": bool(obj.is_holdout),
+            "is_shadow_catcher": bool(obj.is_shadow_catcher),
             "shadow_terminator_normal_offset": float(
                 obj.shadow_terminator_normal_offset),
             "shadow_terminator_geometry_offset": float(
