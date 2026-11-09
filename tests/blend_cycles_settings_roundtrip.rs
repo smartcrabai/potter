@@ -249,14 +249,13 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
         .ok_or("import losses are missing")?;
     assert_eq!(
         import_losses.len(),
-        4,
+        3,
         "unexpected import losses: {imported}"
     );
     for feature in [
         "blender.world.cycles.is_caustics_light",
         "blender.light.cycles.is_caustics_light",
         "blender.scene.cycles.use_fast_gi",
-        "blender.object.shadow_terminator_normal_offset",
     ] {
         assert!(
             import_losses
@@ -285,7 +284,6 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
         "blender.material.cycles.volume_step_rate",
         "blender.scene.cycles.caustics_reflective",
         "blender.scene.cycles.caustics_refractive",
-        "blender.object.shadow_terminator_geometry_offset",
         "blender.object.shadow_terminator_shading_offset",
         "blender.cycles.world.settings",
         "blender.cycles.material.settings",
@@ -544,12 +542,11 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
     let export_losses = report["result"]["losses"]
         .as_array()
         .ok_or("export losses are missing")?;
-    assert_eq!(export_losses.len(), 4, "unexpected export losses: {report}");
+    assert_eq!(export_losses.len(), 3, "unexpected export losses: {report}");
     for feature in [
         "blender.world.cycles.is_caustics_light",
         "blender.light.cycles.is_caustics_light",
         "blender.scene.cycles.use_fast_gi",
-        "blender.object.shadow_terminator_normal_offset",
     ] {
         assert!(
             export_losses

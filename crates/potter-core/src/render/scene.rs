@@ -120,6 +120,9 @@ pub(super) struct ObjectRecord {
     pub shadow_terminator_normal_offset: f64,
     #[serde(skip)]
     pub shadow_terminator_geometry_offset: f64,
+    /// EEVEE's f32 offsets after applying the object scale, cached once per object.
+    #[serde(skip)]
+    terminator_offsets: ShadowTerminatorOffsets,
     #[serde(skip)]
     pub shadow_terminator_shading_offset: f64,
     #[serde(skip)]
@@ -920,6 +923,11 @@ fn update_hair_member_object_record(
     object.is_holdout = is_holdout;
     object.shadow_terminator_normal_offset = shadow_terminator_normal_offset;
     object.shadow_terminator_geometry_offset = shadow_terminator_geometry_offset;
+    object.terminator_offsets = eevee_shadow_terminator_offsets(
+        shadow_terminator_normal_offset,
+        shadow_terminator_geometry_offset,
+        object_to_world,
+    );
     object.shadow_terminator_shading_offset = shadow_terminator_shading_offset;
     if let Some(material) = materials.get(material_index) {
         object.material_colors.insert(
@@ -1796,6 +1804,11 @@ pub(super) fn extract_geometry_with_semantics(
             is_holdout: node.is_holdout,
             shadow_terminator_normal_offset: node.shadow_terminator_normal_offset,
             shadow_terminator_geometry_offset: node.shadow_terminator_geometry_offset,
+            terminator_offsets: eevee_shadow_terminator_offsets(
+                node.shadow_terminator_normal_offset,
+                node.shadow_terminator_geometry_offset,
+                matrix,
+            ),
             shadow_terminator_shading_offset: node.shadow_terminator_shading_offset,
             view_layer_use_solid,
             view_layer_use_volumes,
@@ -2132,6 +2145,7 @@ pub(super) fn extract_geometry_with_semantics(
                                     shadow_point: center,
                                     geometric: normal,
                                     view: normal,
+                                    terminator_offsets: ShadowTerminatorOffsets::default(),
                                 },
                                 normal,
                                 closures: &closures,
@@ -5184,6 +5198,9 @@ impl SceneShaderCore<'_> {
                 shadow_point: hit.shadow_point,
                 geometric: hit.geometric,
                 view: hit.view,
+                terminator_offsets: object.map_or(ShadowTerminatorOffsets::default(), |object| {
+                    object.terminator_offsets
+                }),
             },
             normal: shading_normal,
             closures,
@@ -5221,6 +5238,9 @@ impl SceneShaderCore<'_> {
                 world,
                 world_sun,
                 triangle.object_index,
+                object.map_or(ShadowTerminatorOffsets::default(), |object| {
+                    object.terminator_offsets
+                }),
                 camera_matrices,
                 material.map_or(Some(false), |material| material.use_raytrace_refraction),
             )?
@@ -7437,7 +7457,6 @@ fn shade(context: &SurfaceShadeContext<'_>) -> Result<[f64; 4]> {
     let object_thickness = context.object_thickness;
     let world = context.world;
     let point = surface_receiver.point;
-    let shadow_point = surface_receiver.shadow_point;
     let geometric = surface_receiver.geometric;
     let opaque = opaque_share(closures);
     if !matches!(mode, Mode::Beauty) {
@@ -7593,10 +7612,8 @@ fn shade(context: &SurfaceShadeContext<'_>) -> Result<[f64; 4]> {
                         light_contribution(
                             light,
                             matrix,
-                            point,
-                            shadow_point,
+                            receiver,
                             normal,
-                            geometric,
                             &lobe,
                             &shading,
                             shadow,
@@ -7632,7 +7649,7 @@ fn shade(context: &SurfaceShadeContext<'_>) -> Result<[f64; 4]> {
             }
             if let Some(sun) = context.world_sun {
                 lobes += world_sun_light_contribution(
-                    sun, receiver, normal, geometric, &lobe, &shading, shadow, thickness,
+                    sun, receiver, normal, &lobe, &shading, shadow, thickness,
                 );
             }
             if let Some(glass) = &glass {
@@ -7729,6 +7746,7 @@ fn eevee_subsurface_sample(
     world: Option<&WorldProbe>,
     world_sun: Option<&EeveeWorldSunLight>,
     object_index: u32,
+    terminator_offsets: ShadowTerminatorOffsets,
     camera_matrices: Option<(&DMat4, &DMat4)>,
     material_refraction: Option<bool>,
 ) -> Result<Option<EeveeSubsurfaceSample>> {
@@ -7809,6 +7827,7 @@ fn eevee_subsurface_sample(
         shadow_point,
         geometric,
         view,
+        terminator_offsets,
     };
     let direct_front = eevee_diffuse_direct(
         doc,
@@ -7987,10 +8006,8 @@ fn prefiltered_world(
 fn light_contribution(
     light: &crate::model::LightData,
     matrix: DMat4,
-    point: DVec3,
-    shadow_point: DVec3,
+    receiver: Receiver,
     normal: DVec3,
-    geometric: DVec3,
     params: &BsdfParams,
     shading: &Layers,
     shadow: ShadowContext<'_>,
@@ -7999,6 +8016,8 @@ fn light_contribution(
     thickness: Thickness,
     sun_shadow_radius: Option<f64>,
 ) -> DVec3 {
+    let point = receiver.point;
+    let geometric = receiver.geometric;
     let color = DVec3::from_array(light.color).max(DVec3::ZERO);
     let energy = light.energy.max(0.0);
     let position = matrix.transform_point3(DVec3::ZERO);
@@ -8014,8 +8033,7 @@ fn light_contribution(
                 &light_params,
                 shading,
                 shadow,
-                shadow_point,
-                geometric,
+                receiver,
                 toward_light,
                 color,
                 light,
@@ -8038,8 +8056,10 @@ fn light_contribution(
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
-                shadow_point,
+                receiver,
                 geometric,
+                shading.normal,
+                toward_light,
                 toward_light,
                 distance_squared.sqrt(),
                 0.0,
@@ -8064,8 +8084,10 @@ fn light_contribution(
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
-                shadow_point,
+                receiver,
                 geometric,
+                shading.normal,
+                toward_light,
                 toward_light,
                 distance_squared.sqrt(),
                 0.0,
@@ -8083,24 +8105,22 @@ fn light_contribution(
             let front = area_side_weight(
                 shadow,
                 point_shadow,
-                shadow_point,
+                receiver,
                 geometric,
                 &shape,
                 position,
                 light_direction,
-                point,
                 normal,
             ) * radiance;
             let back = if params.thin_wall && !sphere_thickness {
                 area_side_weight(
                     shadow,
                     point_shadow,
-                    shadow_point,
+                    receiver,
                     -geometric,
                     &shape,
                     position,
                     light_direction,
-                    point,
                     -normal,
                 ) * radiance
             } else {
@@ -8152,8 +8172,8 @@ fn light_contribution(
             return contribution;
         };
         let origin = transmission_origin(
-            point,
-            geometric,
+            receiver,
+            -normal,
             direct.direction,
             direct.shadow_distance,
             thickness,
@@ -8189,21 +8209,19 @@ fn light_contribution(
     contribution + sphere_translucent
 }
 
-/// The weight of an area light over the hemisphere on `side` of a receiver: the Lambert irradiance of the emitter's
-/// outline clipped to that hemisphere, per unit radiance, times the share of its outline samples that reach the receiver.
-/// `geometric` is the geometric normal on the same side, which offsets the shadow rays to it.
+/// The weight of an area light over the hemisphere on `side`: Lambert irradiance times the visible share of its outline.
 fn area_side_weight(
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
-    shadow_point: DVec3,
+    receiver: Receiver,
     geometric: DVec3,
     shape: &AreaShape,
     position: DVec3,
     light_direction: DVec3,
-    point: DVec3,
     side: DVec3,
 ) -> f64 {
-    let irradiance = area_irradiance_per_radiance(shape, position, light_direction, point, side);
+    let irradiance =
+        area_irradiance_per_radiance(shape, position, light_direction, receiver.point, side);
     if irradiance <= 0.0 {
         return 0.0;
     }
@@ -8211,30 +8229,29 @@ fn area_side_weight(
         * area_visible_fraction(
             shadow,
             point_shadow,
-            shadow_point,
+            receiver,
             geometric,
             shape,
             position,
             light_direction,
-            point,
             side,
         )
 }
 
-/// The share of an area light's outline samples that reach the receiver, over the hemisphere on `side`: the sample
-/// weights of `area_visibility_samples`, times their visibility, over their total weight.
+/// The share of an area light's outline samples that reach the receiver over the hemisphere on `side`.
 fn area_visible_fraction(
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
-    shadow_point: DVec3,
+    receiver: Receiver,
     geometric: DVec3,
     shape: &AreaShape,
     position: DVec3,
     light_direction: DVec3,
-    point: DVec3,
     side: DVec3,
 ) -> f64 {
-    let (samples, count) = area_visibility_samples(shape, position, light_direction, point, side);
+    let (samples, count) =
+        area_visibility_samples(shape, position, light_direction, receiver.point, side);
+    let offset_direction = (position - receiver.point).normalize_or_zero();
     let mut total_weight = 0.0;
     let mut visible_weight = 0.0;
     for sample in &samples[..count] {
@@ -8242,9 +8259,11 @@ fn area_visible_fraction(
         let visibility = visibility_for_light(
             shadow,
             point_shadow,
-            shadow_point,
+            receiver,
             geometric,
+            side,
             sample.direction,
+            offset_direction,
             sample.distance,
             0.0,
         );
@@ -8256,24 +8275,26 @@ fn area_visible_fraction(
     visible_weight / total_weight
 }
 
-/// The visibility of a light from `point`: its depth map for a point or spot light, else the scene's rays. `sun_radius` is a
-/// sun's disc radius (`sun_disc_radius`) and is read only at an infinite distance, where the light is a sun.
+/// The visibility of a light from `point`: its depth map for a point or spot light, else the scene's rays.
 fn visibility_for_light(
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
-    point: DVec3,
+    receiver: Receiver,
+    geometric: DVec3,
     normal: DVec3,
     direction: DVec3,
+    terminator_direction: DVec3,
     distance: f64,
     sun_radius: f64,
 ) -> f64 {
+    let point = shadow_terminator_point(receiver, normal, terminator_direction);
     let Some(shadow_map) = point_shadow else {
-        return shadow_visibility(shadow, point, normal, direction, distance, sun_radius);
+        return shadow_visibility(shadow, point, geometric, direction, distance, sun_radius);
     };
     let opaque = shadow_map.visibility(point);
     match shadow {
         Some(scene) if scene.occluders.is_some() && opaque > 0.0 => {
-            opaque * point_light_transparency(scene, point, normal, direction, distance)
+            opaque * point_light_transparency(scene, point, geometric, direction, distance)
         }
         _ => opaque,
     }
@@ -8420,13 +8441,67 @@ fn sun_disc_visibility(
     total / SUN_DISC_SAMPLES as f64
 }
 
-/// The receiver of direct light at a shading point: the point and its shadow origin, the geometric normal, and the view.
+/// The receiver of direct light at a shading point: the point and its shadow origin, the geometric normal, the view, and
+/// EEVEE's object shadow-terminator offsets.
 #[derive(Clone, Copy)]
 struct Receiver {
     point: DVec3,
     shadow_point: DVec3,
     geometric: DVec3,
     view: DVec3,
+    terminator_offsets: ShadowTerminatorOffsets,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ShadowTerminatorOffsets {
+    enabled: bool,
+    normal: f32,
+    geometry: f32,
+}
+
+/// `ObjectInfos` caches both source f32 values and scales the normal offset by the largest object axis.
+fn eevee_shadow_terminator_offsets(
+    normal_offset: f64,
+    geometry_offset: f64,
+    object_to_world: DMat4,
+) -> ShadowTerminatorOffsets {
+    let normal = normal_offset as f32;
+    if normal <= 0.0 {
+        return ShadowTerminatorOffsets::default();
+    }
+    let scale = |axis: glam::DVec4| Vec3::new(axis.x as f32, axis.y as f32, axis.z as f32).length();
+    let max_scale = scale(object_to_world.x_axis)
+        .max(scale(object_to_world.y_axis))
+        .max(scale(object_to_world.z_axis));
+    ShadowTerminatorOffsets {
+        enabled: true,
+        normal: normal * max_scale,
+        geometry: geometry_offset as f32,
+    }
+}
+
+/// EEVEE moves the shadow-map receiver along the shading normal only below the configured cosine cutoff.
+fn shadow_terminator_point(receiver: Receiver, normal: DVec3, direction: DVec3) -> DVec3 {
+    let offsets = receiver.terminator_offsets;
+    // Preserve the established smooth-shadow origin bit-for-bit when Blender disables the offset.
+    if !offsets.enabled {
+        return receiver.shadow_point;
+    }
+    if offsets.geometry == 0.0 {
+        return receiver.shadow_point;
+    }
+    let normal = Vec3::new(normal.x as f32, normal.y as f32, normal.z as f32);
+    let direction = Vec3::new(direction.x as f32, direction.y as f32, direction.z as f32);
+    let amount = (1.0 - normal.dot(direction) / offsets.geometry).clamp(0.0, 1.0) * offsets.normal;
+    if amount <= 0.0 {
+        return receiver.shadow_point;
+    }
+    receiver.shadow_point
+        + DVec3::new(
+            f64::from(normal.x * amount),
+            f64::from(normal.y * amount),
+            f64::from(normal.z * amount),
+        )
 }
 
 /// The smallest radius of a light's shape (`shape_parameters_set`: `max(0.001, radius)`).
@@ -8610,24 +8685,33 @@ fn facing_attenuation(
 /// faces away from its light is moved through the object by its thickness toward the light (at most up to a punctual
 /// light), and biased along `reflect(Ng, L)`. A receiver that faces the light is biased along `Ng`.
 fn transmission_origin(
-    point: DVec3,
-    geometric: DVec3,
+    receiver: Receiver,
+    shading_normal: DVec3,
     direction: DVec3,
     distance: f64,
     thickness: Thickness,
 ) -> DVec3 {
-    if geometric.dot(direction) > 0.0 {
-        return shadow_origin(point, geometric, direction);
-    }
-    let reach = if distance.is_finite() {
-        thickness.value().min(distance - 0.01)
+    let (point, bias_normal) = if receiver.geometric.dot(direction) > 0.0 {
+        (receiver.point, receiver.geometric)
     } else {
-        thickness.value()
+        let reach = if distance.is_finite() {
+            thickness.value().min(distance - 0.01)
+        } else {
+            thickness.value()
+        };
+        (
+            receiver.point + direction * reach.abs(),
+            eevee_transmission::reflect(receiver.geometric, direction),
+        )
     };
-    let moved = point + direction * reach.abs();
+    let receiver = Receiver {
+        point,
+        shadow_point: point,
+        ..receiver
+    };
     shadow_origin(
-        moved,
-        eevee_transmission::reflect(geometric, direction),
+        shadow_terminator_point(receiver, shading_normal, direction),
+        bias_normal,
         direction,
     )
 }
@@ -8728,19 +8812,20 @@ fn glass_direct_contribution(
             Some(shape) => area_visible_fraction(
                 shadow,
                 point_shadow,
-                receiver.shadow_point,
+                receiver,
                 receiver.geometric,
                 &shape,
                 direct.centre,
                 -direct.axis,
-                receiver.point,
                 glass.oriented_normal,
             ),
             None => visibility_for_light(
                 shadow,
                 point_shadow,
-                receiver.shadow_point,
+                receiver,
                 receiver.geometric,
+                glass.oriented_normal,
+                direct.direction,
                 direct.direction,
                 direct.shadow_distance,
                 direct.sun_radius,
@@ -8766,8 +8851,8 @@ fn glass_direct_contribution(
     );
     if facing > 0.0 {
         let origin = transmission_origin(
-            receiver.point,
-            receiver.geometric,
+            receiver,
+            glass.transmission_normal,
             direct.direction,
             direct.shadow_distance,
             thickness,
@@ -8852,7 +8937,6 @@ fn world_sun_light_contribution(
     sun: &EeveeWorldSunLight,
     receiver: Receiver,
     normal: DVec3,
-    geometric: DVec3,
     params: &BsdfParams,
     shading: &Layers,
     shadow: ShadowContext<'_>,
@@ -8861,10 +8945,8 @@ fn world_sun_light_contribution(
     light_contribution(
         &sun.light,
         sun.matrix,
-        receiver.point,
-        receiver.shadow_point,
+        receiver,
         normal,
-        geometric,
         params,
         shading,
         world_sun_shadow(sun, shadow),
@@ -8920,8 +9002,8 @@ fn transmission_direct_contribution(
         )
     };
     let origin = transmission_origin(
-        context.receiver.point,
-        context.receiver.geometric,
+        context.receiver,
+        lobe_normal,
         direct.direction,
         direct.shadow_distance,
         thickness,
@@ -9013,19 +9095,20 @@ fn ltc_direct_contribution(
         Some(shape) => area_visible_fraction(
             context.shadow,
             context.point_shadow,
-            context.receiver.shadow_point,
+            context.receiver,
             context.receiver.geometric,
             &shape,
             direct.centre,
             -direct.axis,
-            context.receiver.point,
             context.normal,
         ),
         None => visibility_for_light(
             context.shadow,
             context.point_shadow,
-            context.receiver.shadow_point,
+            context.receiver,
             context.receiver.geometric,
+            context.normal,
+            direct.direction,
             direct.direction,
             direct.shadow_distance,
             direct.sun_radius,
@@ -9049,8 +9132,7 @@ fn sun_lighting(
     params: &BsdfParams,
     shading: &Layers,
     shadow: ShadowContext<'_>,
-    shadow_point: DVec3,
-    geometric: DVec3,
+    receiver: Receiver,
     toward_light: DVec3,
     color: DVec3,
     light: &crate::model::LightData,
@@ -9069,6 +9151,7 @@ fn sun_lighting(
     let shape_radius = sun_disc_radius(light.sun_angle);
     let shadow_radius = sun_shadow_radius.unwrap_or(shape_radius);
     let weight = energy / SUN_DISC_SAMPLES as f64;
+    let shadow_point = shadow_terminator_point(receiver, shading.normal, toward_light);
     let mut mean_visibility = 0.0;
     let mut specular = DVec3::ZERO;
     let mut translucent = DVec3::ZERO;
@@ -9078,7 +9161,7 @@ fn sun_lighting(
         let visibility = match shadow {
             Some(shadow) => ray_transmittance(
                 shadow,
-                shadow_origin(shadow_point, geometric, shadow_sample),
+                shadow_origin(shadow_point, receiver.geometric, shadow_sample),
                 shadow_sample,
                 f64::INFINITY,
                 true,
@@ -10929,6 +11012,7 @@ mod shading_normal_tests {
             is_holdout: false,
             shadow_terminator_normal_offset: 0.0,
             shadow_terminator_geometry_offset: 0.1,
+            terminator_offsets: super::ShadowTerminatorOffsets::default(),
             shadow_terminator_shading_offset: 0.0,
             view_layer_use_solid: false,
             view_layer_use_volumes: true,
@@ -11712,6 +11796,7 @@ mod eevee_world_sun_tests {
             shadow_point: DVec3::ZERO,
             geometric: DVec3::Z,
             view: DVec3::Z,
+            terminator_offsets: super::ShadowTerminatorOffsets::default(),
         };
         let lit = shade(&SurfaceShadeContext {
             doc: &doc,
