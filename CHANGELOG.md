@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Cycles `.blend` import reports `blender.object.is_shadow_catcher` for effective catcher flags, including source meshes reached through nested collection instances and opaque-film scenes; flag-only light/camera collections are ignored.
 - Cycles 5.2.2 path NEE honors World sampling, shadow, visibility, bounce, and volume settings; Light portals and bounce limits; Material emission-sampling and volume settings; and `scene.cycles.light_sampling_threshold`. World `NONE` removes world NEE. World and Light `max_bounces` limit NEE only, not forward emitter or background hits.
 - Path transport follows Cycles bounce limits and light-tree-off expectation; Potter sums all lights deterministically, including clamp scaling by selection probabilities. Per-contribution clamping reports unsupported emissive-mesh sampling when either clamp is active, plus portal and manual world-map cases. `is_caustics_light` remains unsupported without MNEE.
 - Principled thin-film Fresnel keeps Cycles' f32 interface, Airy-sum, and lookup-table interpolation operations for high-thickness film parity.

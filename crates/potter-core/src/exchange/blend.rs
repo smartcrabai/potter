@@ -15265,6 +15265,72 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             })
             .collect::<Vec<_>>();
         if cycles_engine {
+            let objects = raw
+                .get("objects")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|object| Some((object.get("name")?.as_str()?, object)))
+                .collect::<BTreeMap<_, _>>();
+            let collections = raw
+                .get("collections")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|collection| Some((collection.get("bridge_id")?.as_str()?, collection)))
+                .collect::<BTreeMap<_, _>>();
+            let mut catcher_names = BTreeSet::new();
+            for object in &scene_objects {
+                if cycles_non_light_geometry(object)
+                    && object.get("is_shadow_catcher").and_then(Value::as_bool) == Some(true)
+                    && let Some(name) = object.get("name").and_then(Value::as_str)
+                {
+                    catcher_names.insert(name);
+                }
+                let Some(collection_id) = object
+                    .get("instance_collection")
+                    .and_then(Value::as_str)
+                    .filter(|bridge_id| !bridge_id.is_empty())
+                else {
+                    continue;
+                };
+                let collection_geometry =
+                    cycles_collection_geometry_names(collection_id, &objects, &collections);
+                if collection_geometry.is_empty() {
+                    continue;
+                }
+                if object.get("is_shadow_catcher").and_then(Value::as_bool) == Some(true)
+                    && let Some(name) = object.get("name").and_then(Value::as_str)
+                {
+                    catcher_names.insert(name);
+                }
+                for name in collection_geometry {
+                    if objects
+                        .get(name)
+                        .and_then(|member| member.get("is_shadow_catcher"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        catcher_names.insert(name);
+                    }
+                }
+            }
+            for name in catcher_names {
+                let Some(object) = objects.get(name) else {
+                    continue;
+                };
+                let object_id = object
+                    .get("potter_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| object.get("name").and_then(Value::as_str));
+                losses.push(loss(
+                    "blender.object.is_shadow_catcher",
+                    object_id,
+                    "Cycles shadow-catcher visibility and path splitting affect the render, but Potter does not implement them",
+                ));
+            }
+        }
+        if cycles_engine {
             if cycles
                 .and_then(|settings| settings.get("use_fast_gi"))
                 .and_then(Value::as_bool)
@@ -15752,6 +15818,67 @@ fn collection_object_names<'a>(
         );
     }
     objects
+}
+
+fn cycles_non_light_geometry(object: &Value) -> bool {
+    matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("MESH" | "CURVE" | "SURFACE" | "META" | "FONT" | "CURVES" | "POINTCLOUD" | "VOLUME")
+    ) && object.get("data_name").is_some_and(|data| !data.is_null())
+}
+
+fn cycles_collection_geometry_names<'a>(
+    root: &'a str,
+    objects: &BTreeMap<&'a str, &'a Value>,
+    collections: &BTreeMap<&'a str, &'a Value>,
+) -> BTreeSet<&'a str> {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    let mut geometry_names = BTreeSet::new();
+    while let Some(bridge_id) = pending.pop() {
+        if !visited.insert(bridge_id) {
+            continue;
+        }
+        let Some(collection) = collections.get(bridge_id) else {
+            continue;
+        };
+        if collection.get("hide_render").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        for name in collection
+            .get("objects")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let Some(object) = objects.get(name) else {
+                continue;
+            };
+            if object.get("hide_render").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            if cycles_non_light_geometry(object) {
+                geometry_names.insert(name);
+            }
+            if let Some(nested_collection) = object
+                .get("instance_collection")
+                .and_then(Value::as_str)
+                .filter(|bridge_id| !bridge_id.is_empty())
+            {
+                pending.push(nested_collection);
+            }
+        }
+        pending.extend(
+            collection
+                .get("children")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        );
+    }
+    geometry_names
 }
 
 /// Dynamic Paint brush objects selected by WEIGHT, PAINT, or other canvas surfaces in their scene.
@@ -28635,6 +28762,114 @@ print("UNSUPPORTED_POSE " + json.dumps({
             .filter_map(|loss| loss.data_id)
             .collect();
         assert_eq!(denoised, ["Denoised"]);
+    }
+    #[test]
+    fn cycles_shadow_catcher_loss_covers_instanced_collection_geometry() {
+        let scene = |name: &str, object_names: &[&str]| {
+            json!({
+                "name": name,
+                "render": {"engine_native": "CYCLES", "film_transparent": true},
+                "object_names": object_names,
+                "view_layers": [{"name": "ViewLayer", "object_names": object_names}]
+            })
+        };
+        let raw = json!({
+            "objects": [
+                {"name": "CollectionCatcher", "type": "EMPTY", "instance_collection": "collection-catcher", "is_shadow_catcher": true},
+                {"name": "InstanceMesh", "type": "MESH", "data_name": "Instance Mesh", "is_shadow_catcher": false},
+                {"name": "UnlinkedInstancer", "type": "EMPTY", "instance_collection": "collection-unlinked", "is_shadow_catcher": false},
+                {"name": "UnlinkedCatcherMesh", "type": "MESH", "data_name": "Unlinked Mesh", "potter_id": "potter-unlinked-mesh", "is_shadow_catcher": true},
+                {"name": "NestedInstancer", "type": "EMPTY", "instance_collection": "collection-nested-root", "is_shadow_catcher": false},
+                {"name": "NestedInstance", "type": "EMPTY", "instance_collection": "collection-nested-plain", "is_shadow_catcher": true},
+                {"name": "NestedPlainMesh", "type": "MESH", "data_name": "Nested Plain Mesh", "is_shadow_catcher": false},
+                {"name": "NestedGeometryInstance", "type": "EMPTY", "instance_collection": "collection-nested-catcher", "is_shadow_catcher": false},
+                {"name": "NestedCatcherMesh", "type": "MESH", "data_name": "Nested Mesh", "is_shadow_catcher": true},
+                {"name": "LightOnly", "type": "EMPTY", "instance_collection": "collection-lights", "is_shadow_catcher": true},
+                {"name": "CollectionLight", "type": "LIGHT", "data_name": "Collection Light", "is_shadow_catcher": true},
+                {"name": "CollectionCamera", "type": "CAMERA", "data_name": "Collection Camera", "is_shadow_catcher": true},
+                {"name": "HiddenChildInstancer", "type": "EMPTY", "instance_collection": "collection-hidden-root", "is_shadow_catcher": true},
+                {"name": "HiddenChildMesh", "type": "MESH", "data_name": "Hidden Child Mesh", "is_shadow_catcher": true}
+            ],
+            "collections": [
+                {"bridge_id": "collection-catcher", "objects": ["InstanceMesh"], "children": []},
+                {"bridge_id": "collection-unlinked", "objects": [], "children": ["collection-unlinked-visible"]},
+                {"bridge_id": "collection-unlinked-visible", "objects": ["UnlinkedCatcherMesh"], "children": []},
+                {"bridge_id": "collection-nested-root", "objects": ["NestedInstance", "NestedGeometryInstance"], "children": []},
+                {"bridge_id": "collection-nested-plain", "objects": ["NestedPlainMesh"], "children": []},
+                {"bridge_id": "collection-nested-catcher", "objects": ["NestedCatcherMesh"], "children": []},
+                {"bridge_id": "collection-lights", "objects": ["CollectionLight", "CollectionCamera"], "children": []},
+                {"bridge_id": "collection-hidden-root", "objects": [], "children": ["collection-hidden-child"]},
+                {"bridge_id": "collection-hidden-child", "objects": ["HiddenChildMesh"], "children": [], "hide_render": true}
+            ],
+            "scenes": [
+                scene("FlaggedInstancer", &["CollectionCatcher"]),
+                scene("UnlinkedMember", &["UnlinkedInstancer"]),
+                scene("NestedMember", &["NestedInstancer"]),
+                scene("LightsOnly", &["LightOnly"]),
+                scene("HiddenChild", &["HiddenChildInstancer"])
+            ]
+        });
+        let mut reported: Vec<_> = import_losses(&raw)
+            .into_iter()
+            .filter(|loss| loss.feature_id == "blender.object.is_shadow_catcher")
+            .map(|loss| loss.data_id)
+            .collect();
+        reported.sort();
+        assert_eq!(
+            reported,
+            [
+                Some("CollectionCatcher".to_owned()),
+                Some("NestedCatcherMesh".to_owned()),
+                Some("potter-unlinked-mesh".to_owned())
+            ]
+        );
+    }
+    #[test]
+    fn cycles_shadow_catcher_loss_requires_render_visible_cycles_catcher_geometry() {
+        let scene = |name: &str,
+                     engine: &str,
+                     film_transparent: bool,
+                     object_names: &[&str],
+                     layer_object_names: &[&str]| {
+            json!({
+                "name": name,
+                "render": {"engine_native": engine, "film_transparent": film_transparent},
+                "object_names": object_names,
+                "view_layers": [{"name": "ViewLayer", "object_names": layer_object_names}]
+            })
+        };
+        let raw = json!({
+            "objects": [
+                {"name": "Catcher", "type": "MESH", "data_name": "Catcher Mesh", "potter_id": "potter-catcher", "is_shadow_catcher": true},
+                {"name": "Disabled", "type": "MESH", "data_name": "Disabled Mesh", "is_shadow_catcher": false},
+                {"name": "EeveeCatcher", "type": "MESH", "data_name": "Eevee Mesh", "is_shadow_catcher": true},
+                {"name": "HiddenCatcher", "type": "MESH", "data_name": "Hidden Mesh", "is_shadow_catcher": true, "hide_render": true},
+                {"name": "LayerExcludedCatcher", "type": "MESH", "data_name": "Layer Mesh", "is_shadow_catcher": true},
+                {"name": "OpaqueFilmCatcher", "type": "MESH", "data_name": "Opaque Mesh", "is_shadow_catcher": true},
+                {"name": "LightOnly", "type": "LIGHT", "data_name": "Light Data", "is_shadow_catcher": true},
+                {"name": "CameraCatcher", "type": "CAMERA", "data_name": "Camera Data", "is_shadow_catcher": true}
+            ],
+            "scenes": [
+                scene("Effective", "CYCLES", true, &["Catcher", "Disabled", "CameraCatcher"], &["Catcher", "Disabled", "CameraCatcher"]),
+                scene("Eevee", "BLENDER_EEVEE", true, &["EeveeCatcher"], &["EeveeCatcher"]),
+                scene("Hidden", "CYCLES", true, &["HiddenCatcher"], &["HiddenCatcher"]),
+                scene("LayerExcluded", "CYCLES", true, &["LayerExcludedCatcher"], &[]),
+                scene("OpaqueFilm", "CYCLES", false, &["OpaqueFilmCatcher"], &["OpaqueFilmCatcher"]),
+                scene("LightOnly", "CYCLES", true, &["LightOnly"], &["LightOnly"])
+            ]
+        });
+        let reported: Vec<_> = import_losses(&raw)
+            .into_iter()
+            .filter(|loss| loss.feature_id == "blender.object.is_shadow_catcher")
+            .map(|loss| loss.data_id)
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                Some("potter-catcher".to_owned()),
+                Some("OpaqueFilmCatcher".to_owned())
+            ]
+        );
     }
     #[test]
     fn import_losses_report_hair_curves_custom_knots() {
