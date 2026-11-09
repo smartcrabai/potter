@@ -53,12 +53,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2]
+        shard: [0, 1, 2, 3]
     env:
       # Test artifacts stay optimized; DWARF is unnecessary for ~200 test executables.
       CARGO_PROFILE_TEST_DEBUG: "0"
       POTTER_REQUIRE_BLENDER: "1"
-    # The Blender realistic-scene target takes about 27 minutes; leave time for the test build and other targets.
+    # The Blender realistic-scene target takes 35-45 minutes alone on its shard; leave time for the test build.
     timeout-minutes: 60
     steps:
       - name: Checkout repository
