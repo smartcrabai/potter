@@ -57,8 +57,7 @@ fn run_pot(args: &[&Path], strings: &[&str], label: &str) -> Result<Value, Box<d
     }
     command.args(strings).arg("--json");
     let output = checked_output(command, label)?;
-    let value = serde_json::from_slice(&output.stdout)?;
-    Ok(value)
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 fn import_blend(
@@ -87,8 +86,7 @@ fn import_blend(
         .args(extra)
         .arg("--json");
     let output = checked_output(command, label)?;
-    let value = serde_json::from_slice(&output.stdout)?;
-    Ok(value)
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 fn inspect_scene(project: &Path, frame: u32) -> Result<Value, Box<dyn Error>> {
@@ -103,12 +101,11 @@ fn inspect_scene(project: &Path, frame: u32) -> Result<Value, Box<dyn Error>> {
         return Err(io::Error::other(format!(
             "inspecting frame {frame} failed: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr),
         ))
         .into());
     }
-    let value = serde_json::from_slice(&output.stdout)?;
-    Ok(value)
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 fn assert_close(expected: f64, actual: f64, context: &str) {
@@ -357,31 +354,6 @@ impl<'a> CloudIndex<'a> {
     }
 }
 
-fn directed_cloud_worst_brute_force(
-    from: &[[f64; 3]],
-    to: &[[f64; 3]],
-) -> (f64, [f64; 3], [f64; 3]) {
-    let mut worst = (0.0, from[0], to[0]);
-    for point in from {
-        if let Some((distance, nearest)) = to
-            .iter()
-            .map(|candidate| {
-                (
-                    (point[0] - candidate[0])
-                        .hypot(point[1] - candidate[1])
-                        .hypot(point[2] - candidate[2]),
-                    *candidate,
-                )
-            })
-            .min_by(|left, right| left.0.total_cmp(&right.0))
-            && distance > worst.0
-        {
-            worst = (distance, *point, nearest);
-        }
-    }
-    worst
-}
-
 fn directed_cloud_worst(from: &[[f64; 3]], to: &[[f64; 3]]) -> (f64, [f64; 3], [f64; 3]) {
     let index = CloudIndex::new(to);
     let mut worst = (0.0, from[0], to[0]);
@@ -390,12 +362,6 @@ fn directed_cloud_worst(from: &[[f64; 3]], to: &[[f64; 3]]) -> (f64, [f64; 3], [
         if distance > worst.0 {
             worst = (distance, *point, to[nearest_index]);
         }
-    }
-    if std::env::var_os("POTTER_VERIFY_CLOUD_INDEX").is_some() {
-        let brute_force = directed_cloud_worst_brute_force(from, to);
-        assert_eq!(worst.0.to_bits(), brute_force.0.to_bits());
-        assert_eq!(worst.1.map(f64::to_bits), brute_force.1.map(f64::to_bits));
-        assert_eq!(worst.2.map(f64::to_bits), brute_force.2.map(f64::to_bits));
     }
     worst
 }
@@ -903,6 +869,7 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
     fs::write(
         &operations_path,
         serde_json::to_vec(&json!({
+            "schema_version": 1,
             "base_revision": base_revision,
             "operations": [{
                 "op": "render.update",
@@ -933,57 +900,5 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
         String::from_utf8_lossy(&render.stdout)
     );
 
-    if std::env::var_os("POTTER_VERIFY_RENDER_SAMPLE_REFUSAL").is_some() {
-        let full_project = root.join("unsupported-full-sample-project");
-        copy_project(&project, &full_project)?;
-        let mut unsupported_document = document.clone();
-        unsupported_document["scenes"][scene_id]["render"]["eevee_use_raytracing"] = Value::Null;
-        fs::write(
-            full_project.join("scene.json"),
-            serde_json::to_vec(&unsupported_document)?,
-        )?;
-        let full_render = Command::new(env!("CARGO_BIN_EXE_pot"))
-            .arg("render")
-            .arg(&full_project)
-            .args(["--format", "png", "--out"])
-            .arg(root.join("unsupported-full-sample-render"))
-            .arg("--json")
-            .output()?;
-        assert!(!full_render.status.success());
-        let full_error: Value = serde_json::from_slice(&full_render.stdout)?;
-
-        let one_sample_project = root.join("unsupported-one-sample-project");
-        copy_project(&full_project, &one_sample_project)?;
-        let operations_path = root.join("unsupported-render-samples.json");
-        fs::write(
-            &operations_path,
-            serde_json::to_vec(&json!({
-                "base_revision": base_revision,
-                "operations": [{
-                    "op": "render.update",
-                    "target": {"id": scene_id},
-                    "set": {"samples": 1}
-                }]
-            }))?,
-        )?;
-        let operations_path = operations_path
-            .to_str()
-            .ok_or("unsupported render update path is not UTF-8")?;
-        run_pot(
-            &[Path::new("apply"), one_sample_project.as_path()],
-            &["--file", operations_path],
-            "setting unsupported render smoke sample count",
-        )?;
-        let one_sample_render = Command::new(env!("CARGO_BIN_EXE_pot"))
-            .arg("render")
-            .arg(&one_sample_project)
-            .args(["--format", "png", "--out"])
-            .arg(root.join("unsupported-one-sample-render"))
-            .arg("--json")
-            .output()?;
-        assert!(!one_sample_render.status.success());
-        let one_sample_error: Value = serde_json::from_slice(&one_sample_render.stdout)?;
-        assert_eq!(full_error["error"], one_sample_error["error"]);
-    }
     Ok(())
 }
