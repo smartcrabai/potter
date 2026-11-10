@@ -15,6 +15,28 @@ use tempfile::tempdir;
 const SCENE_BUILDER: &str = include_str!("fixtures/blend_realistic_scene.py");
 const SCENE_DUMPER: &str = include_str!("fixtures/blend_realistic_scene_dump.py");
 const FRAME_TOLERANCE: f64 = 1.0e-5;
+fn copy_project(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        // Render with a fresh evaluation cache, not the source project's cached state.
+        if name == ".potter" {
+            continue;
+        }
+        let source_path = entry.path();
+        let destination_path = destination.join(name);
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_project(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(source_path, destination_path)?;
+        }
+    }
+    fs::create_dir_all(destination.join(".potter/tmp"))?;
+    fs::create_dir_all(destination.join(".potter/cache"))
+}
+
 fn checked_output(mut command: Command, label: &str) -> Result<Output, Box<dyn Error>> {
     let output = command.output()?;
     if !output.status.success() {
@@ -35,7 +57,8 @@ fn run_pot(args: &[&Path], strings: &[&str], label: &str) -> Result<Value, Box<d
     }
     command.args(strings).arg("--json");
     let output = checked_output(command, label)?;
-    Ok(serde_json::from_slice(&output.stdout)?)
+    let value = serde_json::from_slice(&output.stdout)?;
+    Ok(value)
 }
 
 fn import_blend(
@@ -64,7 +87,8 @@ fn import_blend(
         .args(extra)
         .arg("--json");
     let output = checked_output(command, label)?;
-    Ok(serde_json::from_slice(&output.stdout)?)
+    let value = serde_json::from_slice(&output.stdout)?;
+    Ok(value)
 }
 
 fn inspect_scene(project: &Path, frame: u32) -> Result<Value, Box<dyn Error>> {
@@ -79,11 +103,12 @@ fn inspect_scene(project: &Path, frame: u32) -> Result<Value, Box<dyn Error>> {
         return Err(io::Error::other(format!(
             "inspecting frame {frame} failed: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stderr)
         ))
         .into());
     }
-    Ok(serde_json::from_slice(&output.stdout)?)
+    let value = serde_json::from_slice(&output.stdout)?;
+    Ok(value)
 }
 
 fn assert_close(expected: f64, actual: f64, context: &str) {
@@ -198,7 +223,144 @@ fn point_cloud(points: &Value) -> Result<Vec<[f64; 3]>, Box<dyn Error>> {
         .collect()
 }
 
-fn directed_cloud_worst(from: &[[f64; 3]], to: &[[f64; 3]]) -> (f64, [f64; 3], [f64; 3]) {
+const CLOUD_LEAF_SIZE: usize = 8;
+
+struct CloudNode {
+    min: [f64; 3],
+    max: [f64; 3],
+    left: usize,
+    right: usize,
+    start: usize,
+    end: usize,
+}
+
+struct CloudIndex<'a> {
+    points: &'a [[f64; 3]],
+    order: Vec<usize>,
+    nodes: Vec<CloudNode>,
+    root: usize,
+}
+
+impl<'a> CloudIndex<'a> {
+    fn new(points: &'a [[f64; 3]]) -> Self {
+        let leaves = points.len().div_ceil(CLOUD_LEAF_SIZE);
+        let mut index = Self {
+            points,
+            order: (0..points.len()).collect(),
+            nodes: Vec::with_capacity(leaves.saturating_mul(2)),
+            root: 0,
+        };
+        index.root = index.build(0, points.len());
+        index
+    }
+
+    fn build(&mut self, start: usize, end: usize) -> usize {
+        let first = self.points[self.order[start]];
+        let mut min = first;
+        let mut max = first;
+        for &point_index in &self.order[start + 1..end] {
+            let point = self.points[point_index];
+            for (axis, (minimum, maximum)) in min.iter_mut().zip(max.iter_mut()).enumerate() {
+                *minimum = (*minimum).min(point[axis]);
+                *maximum = (*maximum).max(point[axis]);
+            }
+        }
+        let node_index = self.nodes.len();
+        self.nodes.push(CloudNode {
+            min,
+            max,
+            left: 0,
+            right: 0,
+            start,
+            end,
+        });
+        if end - start <= CLOUD_LEAF_SIZE {
+            return node_index;
+        }
+        let spreads = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+        let axis = if spreads[0] >= spreads[1] && spreads[0] >= spreads[2] {
+            0
+        } else if spreads[1] >= spreads[2] {
+            1
+        } else {
+            2
+        };
+        let middle = start + (end - start) / 2;
+        let points = self.points;
+        self.order[start..end].select_nth_unstable_by(middle - start, |left, right| {
+            points[*left][axis].total_cmp(&points[*right][axis])
+        });
+        let left = self.build(start, middle);
+        let right = self.build(middle, end);
+        self.nodes[node_index].left = left;
+        self.nodes[node_index].right = right;
+        node_index
+    }
+
+    fn bounds_delta(point: [f64; 3], node: &CloudNode) -> [f64; 3] {
+        let mut delta = [0.0; 3];
+        for (axis, component) in delta.iter_mut().enumerate() {
+            if point[axis] < node.min[axis] {
+                *component = node.min[axis] - point[axis];
+            } else if point[axis] > node.max[axis] {
+                *component = point[axis] - node.max[axis];
+            }
+        }
+        delta
+    }
+
+    fn bounds_distance(point: [f64; 3], node: &CloudNode) -> f64 {
+        let delta = Self::bounds_delta(point, node);
+        delta[0].hypot(delta[1]).hypot(delta[2])
+    }
+
+    fn nearest(&self, point: [f64; 3]) -> (f64, usize) {
+        let mut best = (f64::INFINITY, usize::MAX);
+        self.search(self.root, point, &mut best);
+        best
+    }
+
+    fn search(&self, node_index: usize, point: [f64; 3], best: &mut (f64, usize)) {
+        let node = &self.nodes[node_index];
+        // Any axis bound beyond the best distance prunes; equality preserves ties.
+        if Self::bounds_delta(point, node)
+            .into_iter()
+            .any(|delta| delta > best.0)
+        {
+            return;
+        }
+        if node.end - node.start <= CLOUD_LEAF_SIZE {
+            for &candidate_index in &self.order[node.start..node.end] {
+                let candidate = self.points[candidate_index];
+                let distance = (point[0] - candidate[0])
+                    .hypot(point[1] - candidate[1])
+                    .hypot(point[2] - candidate[2]);
+                let ordering = distance.total_cmp(&best.0);
+                // min_by keeps the first equally close input point.
+                if ordering == std::cmp::Ordering::Less
+                    || (ordering == std::cmp::Ordering::Equal && candidate_index < best.1)
+                {
+                    *best = (distance, candidate_index);
+                }
+            }
+            return;
+        }
+        let left = &self.nodes[node.left];
+        let right = &self.nodes[node.right];
+        if Self::bounds_distance(point, left) <= Self::bounds_distance(point, right) {
+            self.search(node.left, point, best);
+            self.search(node.right, point, best);
+        } else {
+            self.search(node.right, point, best);
+            self.search(node.left, point, best);
+        }
+    }
+}
+
+fn directed_cloud_worst_brute_force(
+    from: &[[f64; 3]],
+    to: &[[f64; 3]],
+) -> (f64, [f64; 3], [f64; 3]) {
     let mut worst = (0.0, from[0], to[0]);
     for point in from {
         if let Some((distance, nearest)) = to
@@ -216,6 +378,24 @@ fn directed_cloud_worst(from: &[[f64; 3]], to: &[[f64; 3]]) -> (f64, [f64; 3], [
         {
             worst = (distance, *point, nearest);
         }
+    }
+    worst
+}
+
+fn directed_cloud_worst(from: &[[f64; 3]], to: &[[f64; 3]]) -> (f64, [f64; 3], [f64; 3]) {
+    let index = CloudIndex::new(to);
+    let mut worst = (0.0, from[0], to[0]);
+    for point in from {
+        let (distance, nearest_index) = index.nearest(*point);
+        if distance > worst.0 {
+            worst = (distance, *point, to[nearest_index]);
+        }
+    }
+    if std::env::var_os("POTTER_VERIFY_CLOUD_INDEX").is_some() {
+        let brute_force = directed_cloud_worst_brute_force(from, to);
+        assert_eq!(worst.0.to_bits(), brute_force.0.to_bits());
+        assert_eq!(worst.1.map(f64::to_bits), brute_force.1.map(f64::to_bits));
+        assert_eq!(worst.2.map(f64::to_bits), brute_force.2.map(f64::to_bits));
     }
     worst
 }
@@ -551,6 +731,9 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
     let imported = import_blend(&project, &source_path, &blender, &[], "committing import")?;
     assert_eq!(imported["result"]["committed"], true);
     assert_eq!(imported["result"]["losses"], json!([]));
+    let base_revision = imported["scene"]["revision"]
+        .as_u64()
+        .ok_or("imported scene revision is missing")?;
     let document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
     let scene_id = document["active_scene"]
         .as_str()
@@ -559,18 +742,6 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
     assert_eq!(imported_scene["render"]["use_sequencer"], true);
     assert_eq!(imported_scene["render"]["audio_codec"], "none");
     assert_eq!(imported_scene["sequencer"]["strips"], json!([]));
-    let render = Command::new(env!("CARGO_BIN_EXE_pot"))
-        .arg("render")
-        .arg(&project)
-        .args(["--format", "png", "--out"])
-        .arg(root.join("realistic-render"))
-        .arg("--json")
-        .output()?;
-    assert!(
-        render.status.success(),
-        "render refused the realistic stack: {}",
-        String::from_utf8_lossy(&render.stdout)
-    );
     assert_modifier_reference(
         &document,
         "Rigged_Cylinder_Skin",
@@ -725,6 +896,94 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
             }
         }
     }
+    // Preserve full-resolution coverage; reduce only samples in this render-only copy.
+    let render_project = root.join("render-project");
+    copy_project(&project, &render_project)?;
+    let operations_path = root.join("render-samples.json");
+    fs::write(
+        &operations_path,
+        serde_json::to_vec(&json!({
+            "base_revision": base_revision,
+            "operations": [{
+                "op": "render.update",
+                "target": {"id": scene_id},
+                "set": {"samples": 1}
+            }]
+        }))?,
+    )?;
+    let operations_path = operations_path
+        .to_str()
+        .ok_or("render update path is not UTF-8")?;
+    let sample_update = run_pot(
+        &[Path::new("apply"), render_project.as_path()],
+        &["--file", operations_path],
+        "setting render smoke sample count",
+    )?;
+    assert_eq!(sample_update["ok"], true, "render sample update failed");
+    let render = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("render")
+        .arg(&render_project)
+        .args(["--format", "png", "--out"])
+        .arg(root.join("realistic-render"))
+        .arg("--json")
+        .output()?;
+    assert!(
+        render.status.success(),
+        "render refused the realistic stack: {}",
+        String::from_utf8_lossy(&render.stdout)
+    );
 
+    if std::env::var_os("POTTER_VERIFY_RENDER_SAMPLE_REFUSAL").is_some() {
+        let full_project = root.join("unsupported-full-sample-project");
+        copy_project(&project, &full_project)?;
+        let mut unsupported_document = document.clone();
+        unsupported_document["scenes"][scene_id]["render"]["eevee_use_raytracing"] = Value::Null;
+        fs::write(
+            full_project.join("scene.json"),
+            serde_json::to_vec(&unsupported_document)?,
+        )?;
+        let full_render = Command::new(env!("CARGO_BIN_EXE_pot"))
+            .arg("render")
+            .arg(&full_project)
+            .args(["--format", "png", "--out"])
+            .arg(root.join("unsupported-full-sample-render"))
+            .arg("--json")
+            .output()?;
+        assert!(!full_render.status.success());
+        let full_error: Value = serde_json::from_slice(&full_render.stdout)?;
+
+        let one_sample_project = root.join("unsupported-one-sample-project");
+        copy_project(&full_project, &one_sample_project)?;
+        let operations_path = root.join("unsupported-render-samples.json");
+        fs::write(
+            &operations_path,
+            serde_json::to_vec(&json!({
+                "base_revision": base_revision,
+                "operations": [{
+                    "op": "render.update",
+                    "target": {"id": scene_id},
+                    "set": {"samples": 1}
+                }]
+            }))?,
+        )?;
+        let operations_path = operations_path
+            .to_str()
+            .ok_or("unsupported render update path is not UTF-8")?;
+        run_pot(
+            &[Path::new("apply"), one_sample_project.as_path()],
+            &["--file", operations_path],
+            "setting unsupported render smoke sample count",
+        )?;
+        let one_sample_render = Command::new(env!("CARGO_BIN_EXE_pot"))
+            .arg("render")
+            .arg(&one_sample_project)
+            .args(["--format", "png", "--out"])
+            .arg(root.join("unsupported-one-sample-render"))
+            .arg("--json")
+            .output()?;
+        assert!(!one_sample_render.status.success());
+        let one_sample_error: Value = serde_json::from_slice(&one_sample_render.stdout)?;
+        assert_eq!(full_error["error"], one_sample_error["error"]);
+    }
     Ok(())
 }
