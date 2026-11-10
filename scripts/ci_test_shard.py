@@ -15,7 +15,6 @@ DEFAULT_SECONDS = 4
 # Seconds per target from the slower of the two latest CI runs. Library unit and doc tests run as separate
 # Cargo commands on shard 0, so their entries include that command's compile time.
 TARGET_SECONDS = {
-    "blend_realistic_scene": 2670,
     ("potter_core", "lib-unit"): 413,
     "native_shader_bsdf_wave12": 408,
     ("potter_workflow", "lib-doc"): 287,
@@ -26,6 +25,7 @@ TARGET_SECONDS = {
     "blend_roundtrip_constraints": 167,
     "path_transmission_bounce_budget": 136,
     "blend_modifiers_constraints": 119,
+    "blend_realistic_scene": 103,
     "volume_spectral_extinction": 81,
     "native_principled_thin_wall_indirect": 76,
     "cov_nodes_math_extended": 69,
