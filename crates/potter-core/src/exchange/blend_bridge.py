@@ -328,8 +328,9 @@ def matrix_rows(matrix):
 def custom_props(block):
     try:
         return {str(key): plain(block[key]) for key in block.keys()
-                if key not in ("potter.object_solver_inverses_json", "potter.root_collection",
-                               "potter.color_active", "potter.color_render")}
+                if not str(key).startswith("_potter.")
+                and key not in ("potter.object_solver_inverses_json", "potter.root_collection",
+                                "potter.color_active", "potter.color_render")}
     except Exception:
         return {}
 
@@ -2976,19 +2977,6 @@ def _light_tree_strength(light):
         return tuple(float(value[index]) for index in range(3))
 
     identity = (1.0, 1.0, 1.0)
-    stored_scale = light.get("_potter.light_tree_strength_scale")
-    if stored_scale is not None:
-        try:
-            stored_scale = tuple(float(value) for value in stored_scale)
-        except (TypeError, ValueError):
-            stored_scale = ()
-        if len(stored_scale) == 3:
-            return {
-                "tree_strength_scale": list(stored_scale),
-                "tree_strength_supported": bool(
-                    light.get("_potter.light_tree_strength_supported", True)),
-            }
-
     if not getattr(light, "use_nodes", False):
         estimate, supported = identity, True
     else:
@@ -3074,11 +3062,16 @@ def _light_tree_strength(light):
         if getattr(light, "use_temperature", False)
         else identity
     )
-    exposure = 2.0 ** float(getattr(light, "exposure", 0.0))
+    try:
+        exposure = 2.0 ** float(getattr(light, "exposure", 0.0))
+    except OverflowError:
+        exposure = math.inf
+    strength_scale = [temperature[i] * exposure * estimate[i] for i in range(3)]
+    if not all(math.isfinite(value) for value in strength_scale):
+        strength_scale = list(identity)
+        supported = False
     return {
-        "tree_strength_scale": [
-            temperature[i] * exposure * estimate[i] for i in range(3)
-        ],
+        "tree_strength_scale": strength_scale,
         "tree_strength_supported": supported,
     }
 
@@ -11140,10 +11133,6 @@ def export_doc(doc, target, pack, scene_hash, context):
             light.volume_factor = float(raw.get("volume_factor", 1.0))
             set_id(light, data_id)
             set_props(light, source.get("custom_properties", {}))
-            light["_potter.light_tree_strength_scale"] = raw.get(
-                "tree_strength_scale", [1.0, 1.0, 1.0])
-            light["_potter.light_tree_strength_supported"] = bool(
-                raw.get("tree_strength_supported", True))
             if source.get("fake_user"):
                 light.use_fake_user = True
             light_map[data_id] = light

@@ -69,6 +69,8 @@ holder.is_holdout = True
 holder.shadow_terminator_normal_offset = 0.42
 holder.shadow_terminator_geometry_offset = 0.71
 holder.shadow_terminator_shading_offset = 0.53
+holder["_potter.internal"] = True
+holder["visible_prop"] = "kept"
 eevee_scene = bpy.data.scenes.new("EEVEE Terminator Scene")
 eevee_scene.render.engine = "BLENDER_EEVEE"
 terminator_mesh = bpy.data.meshes.new("EEVEE Terminator Mesh")
@@ -89,6 +91,8 @@ light = bpy.data.lights.new("Cycles Settings Area", type="AREA")
 light.cycles.is_portal = True
 light.cycles.max_bounces = 31
 light.cycles.is_caustics_light = True
+light["_potter.light_tree_strength_scale"] = [7.0, 8.0, 9.0]
+light["_potter.light_tree_strength_supported"] = False
 light_object = bpy.data.objects.new("Cycles Settings Area", light)
 scene.collection.objects.link(light_object)
 
@@ -142,6 +146,8 @@ assert holder is not None and holder.is_holdout is True
 assert abs(holder.shadow_terminator_normal_offset - 0.42) < 1e-6
 assert abs(holder.shadow_terminator_geometry_offset - 0.71) < 1e-6
 assert abs(holder.shadow_terminator_shading_offset - 0.53) < 1e-6
+assert holder["visible_prop"] == "kept"
+assert not any(key.startswith("_potter.") for key in holder.keys())
 eevee_object = bpy.data.objects.get("EEVEE Terminator")
 assert eevee_object is not None
 assert abs(eevee_object.shadow_terminator_normal_offset - 0.25) < 1e-6
@@ -158,6 +164,7 @@ assert light is not None and light.type == "AREA"
 assert light.cycles.is_portal is True
 assert light.cycles.max_bounces == 31
 assert light.cycles.is_caustics_light is True
+assert not any(key.startswith("_potter.") for key in light.keys())
 "#;
 
 fn entity_id<'a>(scene: &'a Value, registry: &str, name: &str) -> TestResult<&'a str> {
@@ -349,6 +356,15 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
             "Object.{field}"
         );
     }
+    let holder_properties = holder["properties"]
+        .as_object()
+        .ok_or("Object properties are missing")?;
+    assert_eq!(holder_properties["visible_prop"], json!("kept"));
+    assert!(
+        holder_properties
+            .keys()
+            .all(|key| !key.starts_with("_potter."))
+    );
     let eevee_scene_id = entity_id(&scene, "scenes", "EEVEE Terminator Scene")?;
     let eevee_node_id = node_id(&scene, "EEVEE Terminator")?;
     assert_eq!(
@@ -393,6 +409,15 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
     assert_eq!(light["is_portal"], true);
     assert_eq!(light["max_bounces"], 31);
     assert_eq!(light["is_caustics_light"], true);
+    assert!(
+        light["tree_strength_scale"].is_null()
+            || light["tree_strength_scale"] == json!([1.0, 1.0, 1.0])
+    );
+    assert!(
+        light["tree_strength_supported"]
+            .as_bool()
+            .is_none_or(|supported| supported)
+    );
 
     let inspected_world = inspect_id(&project, world_id)?;
     assert_eq!(inspected_world["type"], "world");

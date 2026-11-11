@@ -1536,7 +1536,57 @@ struct WorldImportanceSampler {
     width_usize: usize,
     cumulative_weights: Vec<f64>,
     total_weight: f64,
-    average_radiance: f64,
+}
+
+fn shaded_world_average_radiance(
+    doc: &SceneDoc,
+    world: &World,
+    images: &BTreeMap<String, ImageData>,
+    width: u32,
+    height: u32,
+) -> Result<f64> {
+    if world.node_tree.is_none() {
+        let radiance = DVec3::from_array(world.color) * world.strength;
+        return Ok(radiance.abs().element_sum() / 3.0);
+    }
+    if width == 0 || height == 0 {
+        let mut workspace = EvaluatorWorkspace::default();
+        let radiance = crate::shader::evaluate_world_with_workspace(
+            world,
+            &doc.node_groups,
+            images,
+            DVec3::Z,
+            true,
+            &mut workspace,
+        )?;
+        return Ok(radiance.abs().element_sum() / 3.0);
+    }
+    let width = width.max(1);
+    let height = height.max(1);
+    let mut workspace = EvaluatorWorkspace::default();
+    let mut radiance_weight = 0.0;
+    for row in 0..height {
+        let latitude = std::f64::consts::PI * (f64::from(row) + 0.5) / f64::from(height);
+        for column in 0..width {
+            let u = (f64::from(column) + 0.5) / f64::from(width);
+            let longitude = (0.5 - u) * std::f64::consts::TAU;
+            let direction = DVec3::new(
+                latitude.sin() * longitude.cos(),
+                latitude.sin() * longitude.sin(),
+                latitude.cos(),
+            );
+            let radiance = crate::shader::evaluate_world_with_workspace(
+                world,
+                &doc.node_groups,
+                images,
+                direction,
+                true,
+                &mut workspace,
+            )?;
+            radiance_weight += radiance.abs().element_sum() / 3.0 * latitude.sin();
+        }
+    }
+    Ok(radiance_weight * std::f64::consts::PI / (2.0 * f64::from(width) * f64::from(height)))
 }
 
 impl WorldImportanceSampler {
@@ -1544,10 +1594,16 @@ impl WorldImportanceSampler {
         doc: &SceneDoc,
         snapshot: &Snapshot,
         images: &BTreeMap<String, ImageData>,
-    ) -> Result<Option<Self>> {
-        let Some(image_id) = super::scene::selected_world_id(doc, snapshot)
-            .and_then(|id| doc.worlds.get(id))
-            .and_then(|world| world.node_tree.as_ref())
+        include_tree_energy: bool,
+    ) -> Result<(Option<Self>, f64)> {
+        let Some(world) =
+            super::scene::selected_world_id(doc, snapshot).and_then(|id| doc.worlds.get(id))
+        else {
+            return Ok((None, 0.0));
+        };
+        let image_id = world
+            .node_tree
+            .as_ref()
             .and_then(|graph_id| doc.node_groups.get(graph_id))
             .and_then(|group| {
                 group.nodes.values().find_map(|node| {
@@ -1560,12 +1616,30 @@ impl WorldImportanceSampler {
                         })
                         .flatten()
                 })
-            })
-        else {
-            return Ok(None);
+            });
+        let image = image_id.and_then(|id| images.get(id));
+        let average_radiance = if include_tree_energy {
+            let (average_width, average_height) =
+                if world.sampling_method == WorldSamplingMethod::Manual {
+                    let width = world.sample_map_resolution;
+                    if width > 1 {
+                        (width, width / 2)
+                    } else {
+                        (1024, 512)
+                    }
+                } else if let Some(image) = image {
+                    (image.width, image.height)
+                } else if world_shader_is_spatially_varying(doc, snapshot) {
+                    (1024, 512)
+                } else {
+                    (0, 0)
+                };
+            shaded_world_average_radiance(doc, world, images, average_width, average_height)?
+        } else {
+            0.0
         };
-        let Some(image) = images.get(image_id) else {
-            return Ok(None);
+        let Some(image) = image else {
+            return Ok((None, average_radiance));
         };
         let width_usize = usize::try_from(image.width).map_err(|_| {
             PotError::new(
@@ -1595,7 +1669,6 @@ impl WorldImportanceSampler {
                 )
             })?;
         let mut total_weight = 0.0;
-        let mut average_radiance_weight = 0.0;
         let environment_pixels = image.straight_pixels();
         for row in 0..height_usize {
             let latitude = std::f64::consts::PI
@@ -1619,22 +1692,18 @@ impl WorldImportanceSampler {
                     )
                 })?;
                 let average_radiance = (pixel[0].abs() + pixel[1].abs() + pixel[2].abs()) / 3.0;
-                average_radiance_weight += average_radiance * solid_angle_weight;
                 total_weight += average_radiance * solid_angle_weight;
                 cumulative_weights.push(total_weight);
             }
         }
-        Ok(
-            (total_weight.is_finite() && total_weight > 0.0).then_some(Self {
-                width: image.width,
-                height: image.height,
-                width_usize,
-                cumulative_weights,
-                total_weight,
-                average_radiance: average_radiance_weight * std::f64::consts::PI
-                    / (2.0 * pixel_count as f64),
-            }),
-        )
+        let sampler = (total_weight.is_finite() && total_weight > 0.0).then_some(Self {
+            width: image.width,
+            height: image.height,
+            width_usize,
+            cumulative_weights,
+            total_weight,
+        });
+        Ok((sampler, average_radiance))
     }
 
     fn sample(&self, rng: &mut Pcg32) -> (DVec3, f64) {
@@ -2142,10 +2211,10 @@ pub(super) fn render(
         .any(|light| light.kind == LightType::Area && light.is_portal);
     let world_active =
         cycles_world_light_active(doc, snapshot, world_spatially_varying, world_has_portal);
-    let world_importance = if world_active {
-        WorldImportanceSampler::build(doc, snapshot, images)?
+    let (world_importance, world_average_radiance) = if world_active {
+        WorldImportanceSampler::build(doc, snapshot, images, tree_settings.is_some())?
     } else {
-        None
+        (None, 0.0)
     };
 
     let emissive_mesh_triangle_area = cycles_emissive_triangle_area_exists(doc, geometry);
@@ -2157,7 +2226,7 @@ pub(super) fn render(
             tree_settings,
             path_world,
             world_active,
-            world_importance.as_ref(),
+            world_average_radiance,
         )
     });
 
@@ -5870,6 +5939,30 @@ struct LightTreeQuery {
     volume: bool,
     has_transmission: bool,
 }
+fn surface_tree_query(point: DVec3, normal: DVec3, closures: &Closures) -> LightTreeQuery {
+    LightTreeQuery {
+        point,
+        normal_or_direction: normal,
+        distance: 0.0,
+        volume: false,
+        has_transmission: closures.has_transmission(),
+    }
+}
+
+fn volume_tree_query(
+    origin: DVec3,
+    direction: DVec3,
+    span_start: f64,
+    span_length: f64,
+) -> LightTreeQuery {
+    LightTreeQuery {
+        point: origin + direction * span_start,
+        normal_or_direction: direction,
+        distance: span_length,
+        volume: true,
+        has_transmission: true,
+    }
+}
 
 impl LightSelectionPdfs<'_> {
     fn lamp_pdf(self, index: usize, query: LightTreeQuery) -> f64 {
@@ -7122,9 +7215,7 @@ struct ShadowRay {
 /// light, and the environment along the incoming direction.
 struct VolumeSite<'a> {
     point: DVec3,
-    origin: DVec3,
-    direction: DVec3,
-    distance: f64,
+    tree_query: LightTreeQuery,
     /// The scatter's camera footprint (Cycles' volume `sd->dP`), carried by its shadow rays.
     footprint: f64,
     incoming: DVec3,
@@ -7615,13 +7706,7 @@ fn trace_path_with_temperatures(
         };
         if let Some(method) = method.filter(|_| span_length.is_finite()) {
             let span_origin = origin + direction * span_start;
-            let tree_query = LightTreeQuery {
-                point: span_origin,
-                normal_or_direction: direction,
-                distance: span_length,
-                volume: true,
-                has_transmission: true,
-            };
+            let tree_query = volume_tree_query(origin, direction, span_start, span_length);
             light_selection.lamp_pdfs(tree_query, &mut light_tree_pdfs);
             for (index, (light, &(point, sampled))) in lights.iter().zip(&choices).enumerate() {
                 let selection_pdf = light_tree_pdfs
@@ -7753,21 +7838,14 @@ fn trace_path_with_temperatures(
                     segment_scatter_pdf(Some(grid), Some(&medium), distance, voxel.channel_pdf),
                 );
                 let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
-                let volume_tree_query = LightTreeQuery {
-                    point: origin,
-                    normal_or_direction: direction,
-                    distance: segment_limit,
-                    volume: true,
-                    has_transmission: true,
-                };
+                let volume_tree_query =
+                    volume_tree_query(origin, direction, span_start, span_length);
                 radiance += direct_volume_lighting(
                     scene,
                     &media,
                     &VolumeSite {
                         point: event.point,
-                        origin,
-                        direction,
-                        distance: segment_limit,
+                        tree_query: volume_tree_query,
                         footprint: event_footprint,
                         incoming: direction,
                         phase: &phase,
@@ -7850,21 +7928,14 @@ fn trace_path_with_temperatures(
                     ),
                 );
                 let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
-                let volume_tree_query = LightTreeQuery {
-                    point: origin,
-                    normal_or_direction: direction,
-                    distance: segment_limit,
-                    volume: true,
-                    has_transmission: true,
-                };
+                let volume_tree_query =
+                    volume_tree_query(origin, direction, span_start, span_length);
                 radiance += direct_volume_lighting(
                     scene,
                     &media,
                     &VolumeSite {
                         point: event.point,
-                        origin,
-                        direction,
-                        distance: segment_limit,
+                        tree_query: volume_tree_query,
                         footprint: event_footprint,
                         incoming: direction,
                         phase: &phase,
@@ -7956,21 +8027,14 @@ fn trace_path_with_temperatures(
                     segment_scatter_pdf(Some(grid), None, event_distance, segment.channel_pdf),
                 );
                 let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
-                let volume_tree_query = LightTreeQuery {
-                    point: origin,
-                    normal_or_direction: direction,
-                    distance: segment_limit,
-                    volume: true,
-                    has_transmission: true,
-                };
+                let volume_tree_query =
+                    volume_tree_query(origin, direction, span_start, span_length);
                 radiance += direct_volume_lighting(
                     scene,
                     &media,
                     &VolumeSite {
                         point: event.point,
-                        origin,
-                        direction,
-                        distance: segment_limit,
+                        tree_query: volume_tree_query,
                         footprint: event_footprint,
                         incoming: direction,
                         phase: &phase,
@@ -8044,21 +8108,14 @@ fn trace_path_with_temperatures(
                         segment_scatter_pdf(None, Some(&medium), distance, DVec3::splat(1.0 / 3.0)),
                     );
                     let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
-                    let volume_tree_query = LightTreeQuery {
-                        point: origin,
-                        normal_or_direction: direction,
-                        distance: segment_limit,
-                        volume: true,
-                        has_transmission: true,
-                    };
+                    let volume_tree_query =
+                        volume_tree_query(origin, direction, span_start, span_length);
                     radiance += direct_volume_lighting(
                         scene,
                         &media,
                         &VolumeSite {
                             point: event.point,
-                            origin,
-                            direction,
-                            distance: segment_limit,
+                            tree_query: volume_tree_query,
                             footprint: event_footprint,
                             incoming: direction,
                             phase: &phase,
@@ -8472,14 +8529,11 @@ fn trace_path_with_temperatures(
                         previous = Scatter::Surface(MisVertex {
                             bsdf_pdf: pdf,
                             point: surface.point,
-                            tree_query: LightTreeQuery {
-                                point: surface.point,
-                                normal_or_direction: surface.normal,
-                                distance: 0.0,
-                                volume: false,
-                                has_transmission: transmission_bounce > 0
-                                    || lobe == RayKind::Transmission,
-                            },
+                            tree_query: surface_tree_query(
+                                surface.point,
+                                surface.normal,
+                                &surface.closures,
+                            ),
                         });
                         ray = lobe;
                         (direction, weight)
@@ -10371,13 +10425,7 @@ fn direct_lighting(
     let footprint = surface.footprint;
     let primitive_id = surface.primitive_id;
     let closures = &mut surface.closures;
-    let tree_query = LightTreeQuery {
-        point,
-        normal_or_direction: normal,
-        distance: 0.0,
-        volume: false,
-        has_transmission: closures.has_transmission(),
-    };
+    let tree_query = surface_tree_query(point, normal, closures);
     light_selection.lamp_pdfs(tree_query, lamp_pdfs);
     let mut contribution = DVec3::ZERO;
     for (index, light) in lights.iter().enumerate() {
@@ -10554,13 +10602,7 @@ fn direct_volume_lighting(
         ..
     } = next_event;
     let mut contribution = DVec3::ZERO;
-    let tree_query = LightTreeQuery {
-        point: site.origin,
-        normal_or_direction: site.direction,
-        distance: site.distance,
-        volume: true,
-        has_transmission: true,
-    };
+    let tree_query = site.tree_query;
     light_selection.lamp_pdfs(tree_query, lamp_pdfs);
     for (index, light) in scene.lights.iter().enumerate() {
         let selection_pdf = lamp_pdfs
@@ -12149,6 +12191,18 @@ fn environment_light_pdf(direction: DVec3, importance: Option<&WorldImportanceSa
 #[cfg(test)]
 mod world_sampling_tests {
     use super::*;
+    use crate::eval::EvaluationContext;
+
+    fn set_active_world(doc: &mut SceneDoc, world_id: Id) -> crate::error::Result<()> {
+        let scene = doc.scenes.get_mut(&doc.active_scene).ok_or_else(|| {
+            crate::error::PotError::new(
+                crate::error::ErrorCode::InternalError,
+                "active scene is missing",
+            )
+        })?;
+        scene.world = Some(world_id);
+        Ok(())
+    }
 
     #[test]
     fn constant_world_pdf_is_uniform_over_the_sphere() {
@@ -12156,6 +12210,119 @@ mod world_sampling_tests {
         for direction in [DVec3::X, DVec3::Y, DVec3::Z, -DVec3::Z] {
             assert!((environment_light_pdf(direction, None) - expected).abs() < 1.0e-12);
         }
+    }
+
+    #[test]
+    fn portal_constant_world_average_includes_world_strength() -> crate::error::Result<()> {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000001".to_owned());
+        let world_id = Id::new("portal_world")?;
+        doc.worlds.insert(
+            world_id.clone(),
+            World {
+                color: [0.05; 3],
+                strength: 2.0,
+                ..World::default()
+            },
+        );
+        set_active_world(&mut doc, world_id)?;
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        assert!(cycles_world_light_active(&doc, &snapshot, false, true));
+
+        let (importance, average) =
+            WorldImportanceSampler::build(&doc, &snapshot, &BTreeMap::new(), true)?;
+        assert!(importance.is_none());
+        assert!((average - 0.1).abs() < 1.0e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn portal_procedural_world_average_shades_the_world_graph() -> crate::error::Result<()> {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000002".to_owned());
+        let world_id = Id::new("portal_world")?;
+        let graph_id = Id::new("procedural_world")?;
+        let texture_id = Id::new("texture")?;
+        let background_id = Id::new("background")?;
+        let output_id = Id::new("output")?;
+        let mut graph = crate::graph::NodeGroup::new("World", crate::graph::GraphKind::Shader);
+        let mut texture = crate::graph::GraphNode::new("ShaderNodeTexMagic");
+        texture
+            .inputs
+            .insert("Vector".to_owned(), serde_json::json!([0.2, 0.3, 0.4]));
+        graph.nodes.insert(texture_id.clone(), texture);
+        graph.nodes.insert(background_id.clone(), {
+            let mut background = crate::graph::GraphNode::new("ShaderNodeBackground");
+            background
+                .inputs
+                .insert("Strength".to_owned(), serde_json::json!(2.0));
+            background
+        });
+        let mut output = crate::graph::GraphNode::new("ShaderNodeOutputWorld");
+        output
+            .properties
+            .insert("is_active_output".to_owned(), serde_json::json!(true));
+        graph.nodes.insert(output_id.clone(), output);
+        graph.links.extend([
+            crate::graph::GraphLink {
+                from_node: texture_id,
+                from_socket: "Color".to_owned(),
+                to_node: background_id.clone(),
+                to_socket: "Color".to_owned(),
+            },
+            crate::graph::GraphLink {
+                from_node: background_id,
+                from_socket: "Background".to_owned(),
+                to_node: output_id,
+                to_socket: "Surface".to_owned(),
+            },
+        ]);
+        doc.node_groups.insert(graph_id.clone(), graph);
+        let world = World {
+            node_tree: Some(graph_id),
+            sampling_method: WorldSamplingMethod::Manual,
+            sample_map_resolution: 4,
+            ..World::default()
+        };
+        doc.worlds.insert(world_id.clone(), world.clone());
+        set_active_world(&mut doc, world_id)?;
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        assert!(cycles_world_light_active(&doc, &snapshot, true, true));
+
+        let (importance, average) =
+            WorldImportanceSampler::build(&doc, &snapshot, &BTreeMap::new(), true)?;
+        assert!(importance.is_none());
+        let shaded = crate::shader::evaluate_world(
+            &world,
+            &doc.node_groups,
+            &BTreeMap::new(),
+            DVec3::Z,
+            true,
+        )?;
+        let average_factor = std::f64::consts::PI / 2.0
+            * ((std::f64::consts::PI / 4.0).sin() + (3.0 * std::f64::consts::PI / 4.0).sin())
+            / 2.0;
+        assert!((average - shaded.abs().element_sum() / 3.0 * average_factor).abs() < 1.0e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn surface_forward_and_nee_queries_share_closure_transmission() {
+        let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        params.model = BsdfModel::Principled;
+        params.transmission = 0.5;
+        let closure = HitClosure::new(1.0, &params, DVec3::Z, DVec3::Z, false);
+        let closures = Closures::new(vec![closure], DVec3::Z, DVec3::Z, false);
+        let nee = surface_tree_query(DVec3::ZERO, DVec3::Z, &closures);
+        let forward = surface_tree_query(DVec3::ZERO, DVec3::Z, &closures);
+        assert!(nee.has_transmission);
+        assert_eq!(forward.has_transmission, nee.has_transmission);
+    }
+
+    #[test]
+    fn volume_tree_query_uses_the_grid_span_origin_and_length() {
+        let query = volume_tree_query(DVec3::ZERO, DVec3::Z, 5.0, 1.0);
+        assert_eq!(query.point, DVec3::Z * 5.0);
+        assert_eq!(query.distance, 1.0);
+        assert!(query.volume);
     }
 }
 
@@ -17530,7 +17697,7 @@ mod cycles_world_light_tests {
         cycles_world_light_active, cycles_world_light_sampling_survival_probability,
         direct_lighting, direct_volume_lighting, march_volumes,
         material_has_cycles_emission_sampling, nearest_light_hit, sample_light,
-        scene_has_world_volume, to_srgb_byte, trace_path, world_path_settings,
+        scene_has_world_volume, to_srgb_byte, trace_path, volume_tree_query, world_path_settings,
     };
     use crate::{
         eval::{EvaluationContext, Snapshot},
@@ -18113,9 +18280,7 @@ mod cycles_world_light_tests {
             &[],
             &VolumeSite {
                 point: DVec3::ZERO,
-                origin: DVec3::ZERO,
-                direction: DVec3::Z,
-                distance: f64::INFINITY,
+                tree_query: volume_tree_query(DVec3::ZERO, DVec3::Z, 0.0, f64::INFINITY),
                 footprint: 0.0,
                 incoming: DVec3::Z,
                 phase,
@@ -18319,7 +18484,6 @@ mod cycles_world_light_tests {
             width_usize: 1,
             cumulative_weights: vec![1.0, 1.0],
             total_weight: 1.0,
-            average_radiance: 1.0,
         };
         scene.importance = Some(&importance);
         let model_world = World {
@@ -18627,9 +18791,7 @@ mod cycles_world_light_tests {
         phase.push(1.0, 0.0);
         let site = VolumeSite {
             point: DVec3::ZERO,
-            origin: DVec3::ZERO,
-            direction: DVec3::Z,
-            distance: f64::INFINITY,
+            tree_query: volume_tree_query(DVec3::ZERO, DVec3::Z, 0.0, f64::INFINITY),
             footprint: 0.0,
             incoming: DVec3::Z,
             phase: &phase,

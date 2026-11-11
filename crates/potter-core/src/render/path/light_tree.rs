@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use crate::model::{EmissionSampling, LightType, Material, SceneDoc, World};
 
 use super::{
-    GraphEmissionState, PointLight, WorldImportanceSampler, graph_emission_uses_auto_conversion,
+    GraphEmissionState, PointLight, graph_emission_uses_auto_conversion,
     material_has_cycles_emission_sampling, shader_graph_emission_estimate,
 };
 use crate::render::scene::Geometry;
@@ -251,7 +251,7 @@ impl LightTree {
         light_tree_settings: &[LightTreeSettings],
         world: Option<&World>,
         world_active: bool,
-        world_importance: Option<&WorldImportanceSampler>,
+        world_average_radiance: f64,
     ) -> Self {
         let mut emitters = Vec::new();
         let mut lamp_emitters = vec![None; lights.len()];
@@ -277,7 +277,7 @@ impl LightTree {
         let world_emitter = if world_active {
             world.map(|world| {
                 let index = emitters.len();
-                emitters.push(world_emitter(doc, world, world_importance));
+                emitters.push(world_emitter(doc, world, world_average_radiance));
                 distant.push(index);
                 index
             })
@@ -610,11 +610,7 @@ fn light_area(light: &PointLight) -> Option<f64> {
     }
 }
 
-fn world_emitter(
-    doc: &SceneDoc,
-    world: &World,
-    world_importance: Option<&WorldImportanceSampler>,
-) -> Emitter {
+fn world_emitter(doc: &SceneDoc, world: &World, average_radiance: f64) -> Emitter {
     let estimate = if let Some(graph_id) = &world.node_tree {
         shader_graph_emission_estimate(
             doc,
@@ -637,10 +633,7 @@ fn world_emitter(
                 outer: PI,
                 emission: 0.0,
             },
-            energy: world_importance.map_or_else(
-                || average_abs(estimate),
-                |sampler| sampler.average_radiance * average_abs(estimate),
-            ) * PI,
+            energy: average_radiance * average_abs(estimate) * PI,
         },
     }
 }
@@ -1464,6 +1457,18 @@ mod tests {
         let sun_energy = light_emitter(&sun, 0, settings).map(|emitter| emitter.measure.energy);
         let expected_sun = 2.0 * PI * (sun.spot_size * 0.5).sin().powi(2);
         assert!(sun_energy.is_some_and(|energy| (energy - expected_sun).abs() < 1.0e-12));
+    }
+
+    #[test]
+    fn world_energy_uses_shaded_average_radiance_and_emission_estimate() {
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000001".to_owned());
+        let world = World {
+            color: [0.05; 3],
+            strength: 2.0,
+            ..World::default()
+        };
+        let emitter = world_emitter(&doc, &world, 0.1);
+        assert!((emitter.measure.energy - 0.01 * PI).abs() < 1.0e-12);
     }
 
     fn query(volume: bool) -> Query {
