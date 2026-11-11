@@ -1545,6 +1545,24 @@ fn shaded_world_average_radiance(
     width: u32,
     height: u32,
 ) -> Result<f64> {
+    shaded_world_average_radiance_with_workers(
+        doc,
+        world,
+        images,
+        width,
+        height,
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+    )
+}
+
+fn shaded_world_average_radiance_with_workers(
+    doc: &SceneDoc,
+    world: &World,
+    images: &BTreeMap<String, ImageData>,
+    width: u32,
+    height: u32,
+    worker_count: usize,
+) -> Result<f64> {
     if world.node_tree.is_none() {
         let radiance = DVec3::from_array(world.color) * world.strength;
         return Ok(radiance.abs().element_sum() / 3.0);
@@ -1561,31 +1579,84 @@ fn shaded_world_average_radiance(
         )?;
         return Ok(radiance.abs().element_sum() / 3.0);
     }
-    let width = width.max(1);
-    let height = height.max(1);
-    let mut workspace = EvaluatorWorkspace::default();
-    let mut radiance_weight = 0.0;
-    for row in 0..height {
-        let latitude = std::f64::consts::PI * (f64::from(row) + 0.5) / f64::from(height);
-        for column in 0..width {
-            let u = (f64::from(column) + 0.5) / f64::from(width);
-            let longitude = (0.5 - u) * std::f64::consts::TAU;
-            let direction = DVec3::new(
-                latitude.sin() * longitude.cos(),
-                latitude.sin() * longitude.sin(),
-                latitude.cos(),
+    let row_count = usize::try_from(height).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "World shading height is too large",
+        )
+    })?;
+    let mut row_weights = Vec::new();
+    row_weights.try_reserve_exact(row_count).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "World shading row weights exceed available memory",
+        )
+    })?;
+    row_weights.resize(row_count, 0.0);
+    std::thread::scope(|scope| {
+        let bands = band_rows(row_count, worker_count);
+        let mut workers = Vec::with_capacity(bands.len());
+        let mut row_weights_rest = row_weights.as_mut_slice();
+        for rows in bands {
+            let (band_weights, weights_tail) = row_weights_rest.split_at_mut(rows.len());
+            row_weights_rest = weights_tail;
+            workers.push(
+                std::thread::Builder::new()
+                    .stack_size(WORKER_STACK_BYTES)
+                    .spawn_scoped(scope, move || {
+                        let mut workspace = EvaluatorWorkspace::default();
+                        for (row, row_weight) in rows.zip(band_weights) {
+                            let latitude = std::f64::consts::PI
+                                * (f64::from(u32::try_from(row).unwrap_or(u32::MAX)) + 0.5)
+                                / f64::from(height);
+                            let mut weight = 0.0;
+                            for column in 0..width {
+                                let u = (f64::from(column) + 0.5) / f64::from(width);
+                                let longitude = (0.5 - u) * std::f64::consts::TAU;
+                                let direction = DVec3::new(
+                                    latitude.sin() * longitude.cos(),
+                                    latitude.sin() * longitude.sin(),
+                                    latitude.cos(),
+                                );
+                                let radiance = crate::shader::evaluate_world_with_workspace(
+                                    world,
+                                    &doc.node_groups,
+                                    images,
+                                    direction,
+                                    true,
+                                    &mut workspace,
+                                )?;
+                                weight += radiance.abs().element_sum() / 3.0 * latitude.sin();
+                            }
+                            *row_weight = weight;
+                        }
+                        Ok::<_, PotError>(())
+                    }),
             );
-            let radiance = crate::shader::evaluate_world_with_workspace(
-                world,
-                &doc.node_groups,
-                images,
-                direction,
-                true,
-                &mut workspace,
-            )?;
-            radiance_weight += radiance.abs().element_sum() / 3.0 * latitude.sin();
         }
-    }
+        let mut worker_error = None;
+        for worker in workers {
+            let result = match worker {
+                Ok(handle) => handle.join().unwrap_or_else(|_| {
+                    Err(PotError::new(
+                        ErrorCode::InternalError,
+                        "World shading worker panicked",
+                    ))
+                }),
+                Err(error) => Err(PotError::new(
+                    ErrorCode::InternalError,
+                    format!("cannot start a World shading worker: {error}"),
+                )),
+            };
+            if let Err(error) = result
+                && worker_error.is_none()
+            {
+                worker_error = Some(error);
+            }
+        }
+        worker_error.map_or(Ok(()), Err)
+    })?;
+    let radiance_weight = row_weights.into_iter().sum::<f64>();
     Ok(radiance_weight * std::f64::consts::PI / (2.0 * f64::from(width) * f64::from(height)))
 }
 
@@ -12244,10 +12315,8 @@ mod world_sampling_tests {
         let background_id = Id::new("background")?;
         let output_id = Id::new("output")?;
         let mut graph = crate::graph::NodeGroup::new("World", crate::graph::GraphKind::Shader);
-        let mut texture = crate::graph::GraphNode::new("ShaderNodeTexMagic");
-        texture
-            .inputs
-            .insert("Vector".to_owned(), serde_json::json!([0.2, 0.3, 0.4]));
+        let texture = crate::graph::GraphNode::new("ShaderNodeTexMagic");
+        // An unlinked Magic Vector uses the World direction.
         graph.nodes.insert(texture_id.clone(), texture);
         graph.nodes.insert(background_id.clone(), {
             let mut background = crate::graph::GraphNode::new("ShaderNodeBackground");
@@ -12287,20 +12356,42 @@ mod world_sampling_tests {
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         assert!(cycles_world_light_active(&doc, &snapshot, true, true));
 
-        let (importance, average) =
-            WorldImportanceSampler::build(&doc, &snapshot, &BTreeMap::new(), true)?;
+        let images = BTreeMap::new();
+        let (importance, average) = WorldImportanceSampler::build(&doc, &snapshot, &images, true)?;
         assert!(importance.is_none());
-        let shaded = crate::shader::evaluate_world(
-            &world,
-            &doc.node_groups,
-            &BTreeMap::new(),
-            DVec3::Z,
-            true,
-        )?;
-        let average_factor = std::f64::consts::PI / 2.0
-            * ((std::f64::consts::PI / 4.0).sin() + (3.0 * std::f64::consts::PI / 4.0).sin())
-            / 2.0;
-        assert!((average - shaded.abs().element_sum() / 3.0 * average_factor).abs() < 1.0e-12);
+        let width = world.sample_map_resolution;
+        let height = width / 2;
+        let mut workspace = EvaluatorWorkspace::default();
+        let mut serial_weight = 0.0;
+        for row in 0..height {
+            let latitude = std::f64::consts::PI * (f64::from(row) + 0.5) / f64::from(height);
+            let mut row_weight = 0.0;
+            for column in 0..width {
+                let u = (f64::from(column) + 0.5) / f64::from(width);
+                let longitude = (0.5 - u) * std::f64::consts::TAU;
+                let direction = DVec3::new(
+                    latitude.sin() * longitude.cos(),
+                    latitude.sin() * longitude.sin(),
+                    latitude.cos(),
+                );
+                let radiance = crate::shader::evaluate_world_with_workspace(
+                    &world,
+                    &doc.node_groups,
+                    &images,
+                    direction,
+                    true,
+                    &mut workspace,
+                )?;
+                row_weight += radiance.abs().element_sum() / 3.0 * latitude.sin();
+            }
+            serial_weight += row_weight;
+        }
+        let serial_average =
+            serial_weight * std::f64::consts::PI / (2.0 * f64::from(width) * f64::from(height));
+        let parallel =
+            shaded_world_average_radiance_with_workers(&doc, &world, &images, width, height, 2)?;
+        assert_eq!(serial_average.to_bits(), parallel.to_bits());
+        assert_eq!(average.to_bits(), parallel.to_bits());
         Ok(())
     }
 
