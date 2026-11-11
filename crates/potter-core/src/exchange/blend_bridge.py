@@ -2905,6 +2905,9 @@ def object_dump(obj):
         action_extrapolation = "HOLD"
         nla_tweak_mode = False
     cycles = getattr(obj, "cycles", None)
+    linking = getattr(obj, "light_linking", None)
+    receiver_collection = getattr(linking, "receiver_collection", None)
+    blocker_collection = getattr(linking, "blocker_collection", None)
     return {"name": obj.name_full, "potter_id": obj.get("potter.id"), "type": obj.type,
             "library": library_reference(obj), "override_library": _override_dump(obj),
             "data_name": data.name_full if data else None, "parent": obj.parent.name_full if obj.parent else None,
@@ -2922,6 +2925,10 @@ def object_dump(obj):
             "delta_rotation_euler": plain(obj.delta_rotation_euler), "delta_rotation_quaternion": plain(obj.delta_rotation_quaternion),
             "delta_scale": plain(obj.delta_scale), "matrix_basis": matrix_rows(obj.matrix_basis),
             "matrix_local": matrix_rows(obj.matrix_local), "matrix_world": matrix_rows(obj.matrix_world),
+            "light_linking": {
+                "receiver_collection": receiver_collection.name_full if receiver_collection else None,
+                "blocker_collection": blocker_collection.name_full if blocker_collection else None,
+            },
             "is_holdout": bool(obj.is_holdout),
             "is_shadow_catcher": bool(obj.is_shadow_catcher),
             "shadow_terminator_normal_offset": float(
@@ -2961,6 +2968,154 @@ def object_dump(obj):
                                                    "shadow_terminator_geometry_offset",
                                                    "shadow_terminator_shading_offset"))}
 
+
+def _light_tree_strength(light):
+    def vector(value):
+        if isinstance(value, (int, float)):
+            return (float(value),) * 3
+        return tuple(float(value[index]) for index in range(3))
+
+    identity = (1.0, 1.0, 1.0)
+    stored_scale = light.get("_potter.light_tree_strength_scale")
+    if stored_scale is not None:
+        try:
+            stored_scale = tuple(float(value) for value in stored_scale)
+        except (TypeError, ValueError):
+            stored_scale = ()
+        if len(stored_scale) == 3:
+            return {
+                "tree_strength_scale": list(stored_scale),
+                "tree_strength_supported": bool(
+                    light.get("_potter.light_tree_strength_supported", True)),
+            }
+
+    if not getattr(light, "use_nodes", False):
+        estimate, supported = identity, True
+    else:
+        tree = getattr(light, "node_tree", None)
+        outputs = [] if tree is None else [
+            node for node in tree.nodes
+            if node.bl_idname == "ShaderNodeOutputLight"
+            and getattr(node, "is_active_output", True)
+        ]
+        output = outputs[0] if outputs else None
+        surface = None if output is None else output.inputs.get("Surface")
+        if surface is None or not surface.is_linked:
+            estimate, supported = (0.0, 0.0, 0.0), True
+        else:
+            def input_estimate(node_input, active):
+                if node_input.is_linked:
+                    return estimate_output(node_input.links[0].from_socket, active)
+                return vector(node_input.default_value), True
+
+            def estimate_output(socket, active):
+                node = socket.node
+                key = (node.as_pointer(), socket.identifier)
+                if key in active:
+                    return identity, False
+                active.add(key)
+                try:
+                    kind = node.bl_idname
+                    if kind in ("ShaderNodeEmission", "ShaderNodeBackground",
+                                "ShaderNodeBsdfPrincipled"):
+                        principled = kind == "ShaderNodeBsdfPrincipled"
+                        color_input = node.inputs.get(
+                            "Emission Color" if principled else "Color")
+                        strength_input = node.inputs.get(
+                            "Emission Strength" if principled else "Strength")
+                        color, color_supported = input_estimate(color_input, active)
+                        strength, strength_supported = input_estimate(strength_input, active)
+                        return (tuple(color[i] * strength[i] for i in range(3)),
+                                color_supported and strength_supported)
+                    if kind in ("ShaderNodeLightFalloff", "ShaderNodeTexIES"):
+                        return input_estimate(node.inputs.get("Strength"), active)
+                    closures = [
+                        item for item in node.inputs if item.type == "SHADER"
+                    ]
+                    if kind == "ShaderNodeAddShader":
+                        values = [
+                            estimate_output(item.links[0].from_socket, active)
+                            if item.is_linked else ((0.0, 0.0, 0.0), True)
+                            for item in closures
+                        ]
+                        return (
+                            tuple(sum(value[0][i] for value in values) for i in range(3)),
+                            all(value[1] for value in values),
+                        )
+                    if kind == "ShaderNodeMixShader":
+                        values = [
+                            estimate_output(item.links[0].from_socket, active)
+                            if item.is_linked else ((0.0, 0.0, 0.0), True)
+                            for item in closures
+                        ]
+                        if node.inputs["Fac"].is_linked:
+                            return (
+                                tuple(sum(value[0][i] for value in values) for i in range(3)),
+                                all(value[1] for value in values),
+                            )
+                        factor = float(node.inputs["Fac"].default_value)
+                        first = values[0][0] if values else (0.0, 0.0, 0.0)
+                        second = values[1][0] if len(values) > 1 else (0.0, 0.0, 0.0)
+                        supported = all(value[1] for value in values)
+                        return (tuple((1.0 - factor) * first[i] + factor * second[i]
+                                      for i in range(3)), supported)
+                    if socket.type != "SHADER":
+                        return identity, True
+                    if kind.startswith("ShaderNodeBsdf") or kind == "ShaderNodeHoldout":
+                        return (0.0, 0.0, 0.0), True
+                    return identity, False
+                finally:
+                    active.remove(key)
+
+            estimate, supported = estimate_output(
+                surface.links[0].from_socket, set())
+    temperature = (
+        vector(light.temperature_color)
+        if getattr(light, "use_temperature", False)
+        else identity
+    )
+    exposure = 2.0 ** float(getattr(light, "exposure", 0.0))
+    return {
+        "tree_strength_scale": [
+            temperature[i] * exposure * estimate[i] for i in range(3)
+        ],
+        "tree_strength_supported": supported,
+    }
+
+
+def light_dump(light):
+    return {
+        "name": light.name_full, "potter_id": light.get("potter.id"),
+        **animation_assignment_dump(light),
+        "drivers": animation_drivers_dump(light, data_owner=True),
+        "library": library_reference(light), "type": light.type,
+        "normalize": bool(getattr(light, "normalize", True)),
+        **_light_tree_strength(light),
+        "color": plain(light.color), "energy": float(light.energy),
+        "shadow_soft_size": float(light.shadow_soft_size),
+        "use_shadow": getattr(light, "use_shadow", None),
+        "sun_angle": float(getattr(light, "angle", math.radians(0.526))),
+        "soft_falloff": bool(getattr(light, "use_soft_falloff", True)),
+        "use_multiple_importance_sampling": bool(
+            light.cycles.use_multiple_importance_sampling),
+        "max_bounces": int(light.cycles.max_bounces),
+        "is_portal": bool(light.cycles.is_portal),
+        "is_caustics_light": bool(light.cycles.is_caustics_light),
+        "spot_size": float(getattr(light, "spot_size", math.pi / 4)),
+        "spot_blend": float(getattr(light, "spot_blend", 0.15)),
+        "shape": getattr(light, "shape", None),
+        "custom_properties": custom_props(light),
+        "size": float(getattr(light, "size", 0.25)),
+        "size_y": float(getattr(light, "size_y", 0.25)),
+        "spread": float(getattr(light, "spread", math.pi)),
+        "use_custom_distance": bool(getattr(light, "use_custom_distance", False)),
+        "cutoff_distance": float(getattr(light, "cutoff_distance", 40.0)),
+        "diffuse_factor": float(getattr(light, "diffuse_factor", 1.0)),
+        "specular_factor": float(getattr(light, "specular_factor", 1.0)),
+        "transmission_factor": float(getattr(light, "transmission_factor", 1.0)),
+        "volume_factor": float(getattr(light, "volume_factor", 1.0)),
+        "fake_user": bool(light.use_fake_user), "users": int(light.users),
+    }
 
 def _action_slot_assigned_objects(action, slot):
     action_pointer = action.as_pointer()
@@ -3151,11 +3306,32 @@ def nla_strip_dump(strip):
 
 
 def collection_dump(collection):
+    nondefault_linking = any(
+        item.light_linking.link_state != "INCLUDE"
+        for item in collection.collection_objects
+    ) or any(
+        item.light_linking.link_state != "INCLUDE"
+        for item in collection.collection_children
+    )
+    if nondefault_linking:
+        nondefault_linking = any(
+            obj.type == "LIGHT"
+            and any(
+                linked is not None
+                and (linked == collection or collection in linked.children_recursive)
+                for linked in (
+                    getattr(getattr(obj, "light_linking", None), "receiver_collection", None),
+                    getattr(getattr(obj, "light_linking", None), "blocker_collection", None),
+                )
+            )
+            for obj in bpy.data.objects
+        )
     return {"bridge_id": _collection_bridge_id(collection),
             "name": collection.get("potter.name", collection.name_full),
             "potter_id": collection.get("potter.id"), "library": library_reference(collection),
             "children": [_collection_bridge_id(child) for child in collection.children],
             "objects": [obj.name_full for obj in collection.objects],
+            "has_nondefault_light_linking": nondefault_linking,
             "custom_properties": custom_props(collection), "hide_viewport": bool(collection.hide_viewport),
             "hide_render": bool(collection.hide_render), "fake_user": bool(collection.use_fake_user)}
 
@@ -4387,6 +4563,7 @@ def dump_scene(scene):
                 "sample_clamp_direct": float(getattr(getattr(scene, "cycles", None), "sample_clamp_direct", 0.0)),
                 "sample_clamp_indirect": float(getattr(getattr(scene, "cycles", None), "sample_clamp_indirect", 10.0)),
                 "light_sampling_threshold": float(getattr(getattr(scene, "cycles", None), "light_sampling_threshold", 0.01)),
+                "use_light_tree": bool(getattr(getattr(scene, "cycles", None), "use_light_tree", True)),
                 "volume_bounces": int(getattr(getattr(scene, "cycles", None), "volume_bounces", 0)),
                 "transparent_max_bounces": int(getattr(getattr(scene, "cycles", None), "transparent_max_bounces", 8)),
                 "pixel_filter_type": str(getattr(getattr(scene, "cycles", None), "pixel_filter_type", "BLACKMAN_HARRIS")),
@@ -4727,32 +4904,7 @@ def dump_all():
                          "latitude_max": float(x.latitude_max),
                          "fisheye_fov": float(x.fisheye_fov), "fisheye_lens": float(x.fisheye_lens),
                          "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.cameras],
-            "lights": [{"name": x.name_full, "potter_id": x.get("potter.id"),
-                        **animation_assignment_dump(x),
-                        "drivers": animation_drivers_dump(x, data_owner=True),
-                        "library": library_reference(x), "type": x.type,
-                        "color": plain(x.color), "energy": float(x.energy), "shadow_soft_size": float(x.shadow_soft_size),
-                        "use_shadow": getattr(x, "use_shadow", None),
-                        "sun_angle": float(getattr(x, "angle", math.radians(0.526))),
-                        "soft_falloff": bool(getattr(x, "use_soft_falloff", True)),
-                        "use_multiple_importance_sampling": bool(x.cycles.use_multiple_importance_sampling),
-                        "max_bounces": int(x.cycles.max_bounces),
-                        "is_portal": bool(x.cycles.is_portal),
-                        "is_caustics_light": bool(x.cycles.is_caustics_light),
-                        "spot_size": float(getattr(x, "spot_size", math.pi / 4)),
-                        "spot_blend": float(getattr(x, "spot_blend", 0.15)),
-                        "shape": getattr(x, "shape", None), "custom_properties": custom_props(x),
-                        "size": float(getattr(x, "size", 0.25)),
-                        "size_y": float(getattr(x, "size_y", 0.25)),
-                        "spread": float(getattr(x, "spread", math.pi)),
-                        "sun_angle": float(getattr(x, "angle", math.radians(0.526))),
-                        "use_custom_distance": bool(getattr(x, "use_custom_distance", False)),
-                        "cutoff_distance": float(getattr(x, "cutoff_distance", 40.0)),
-                        "diffuse_factor": float(getattr(x, "diffuse_factor", 1.0)),
-                        "specular_factor": float(getattr(x, "specular_factor", 1.0)),
-                        "transmission_factor": float(getattr(x, "transmission_factor", 1.0)),
-                        "volume_factor": float(getattr(x, "volume_factor", 1.0)),
-                        "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.lights],
+            "lights": [light_dump(x) for x in bpy.data.lights],
             "actions": [action_dump(x, data_action_owners.get(x.as_pointer()))
                         for x in bpy.data.actions],
             "texts": [{"name": x.name_full, "potter_id": x.get("potter.id"),
@@ -10531,6 +10683,8 @@ def export_doc(doc, target, pack, scene_hash, context):
                 scene.cycles.sample_clamp_indirect = float(render["sample_clamp_indirect"])
             if "light_sampling_threshold" in render:
                 scene.cycles.light_sampling_threshold = float(render["light_sampling_threshold"])
+            if "use_light_tree" in render:
+                scene.cycles.use_light_tree = bool(render["use_light_tree"])
             scene.cycles.volume_bounces = int(render.get("volume_bounces", 0))
             if "transparent_max_bounces" in render:
                 scene.cycles.transparent_max_bounces = int(render["transparent_max_bounces"])
@@ -10953,6 +11107,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             source = compatibility_block(doc, "lights", "Light", data_id)
             light = bpy.data.lights.new(compatibility_name(doc, "Light", data_id, data_id),
                                         raw.get("light_type", "point").upper())
+            light.normalize = bool(raw.get("normalize", True))
             light.color = raw.get("color", [1.0, 1.0, 1.0])
             light.energy = raw.get("energy", 1000.0)
             light.shadow_soft_size = raw.get("radius", 0.1)
@@ -10985,6 +11140,10 @@ def export_doc(doc, target, pack, scene_hash, context):
             light.volume_factor = float(raw.get("volume_factor", 1.0))
             set_id(light, data_id)
             set_props(light, source.get("custom_properties", {}))
+            light["_potter.light_tree_strength_scale"] = raw.get(
+                "tree_strength_scale", [1.0, 1.0, 1.0])
+            light["_potter.light_tree_strength_supported"] = bool(
+                raw.get("tree_strength_supported", True))
             if source.get("fake_user"):
                 light.use_fake_user = True
             light_map[data_id] = light

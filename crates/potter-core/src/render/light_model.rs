@@ -241,6 +241,9 @@ impl Spread {
     pub(crate) fn is_zero(self) -> bool {
         self.half == 0.0
     }
+    pub(crate) fn half(self) -> f64 {
+        self.half
+    }
 }
 
 /// Cycles' `area_light_spread_attenuation`: the factor on the emitter radiance towards `to_receiver`,

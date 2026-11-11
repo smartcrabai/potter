@@ -454,6 +454,11 @@ fn complete_scene_schema(root: &mut Value) {
     scene["properties"]["simulation_frame_end"] = json!({"type":"integer"});
     defs["light"]["properties"]["sun_angle"] =
         json!({"type":"number","minimum":0,"maximum":std::f64::consts::PI});
+    defs["light"]["properties"]["normalize"] = json!({"type":"boolean","default":true});
+    defs["light"]["properties"]["tree_strength_scale"] =
+        json!({"$ref":"#/$defs/vec3","readOnly":true});
+    defs["light"]["properties"]["tree_strength_supported"] =
+        json!({"type":"boolean","readOnly":true,"default":true});
     defs["light"]["properties"]["use_custom_distance"] = json!({"type":"boolean"});
     defs["light"]["properties"]["cutoff_distance"] = json!({"type":"number","minimum":0});
     for factor in [
@@ -630,6 +635,7 @@ fn complete_scene_schema(root: &mut Value) {
         json!({"type":"number","minimum":0,"maximum":100_000_000.0,"default":10.0});
     render["properties"]["light_sampling_threshold"] =
         json!({"type":"number","minimum":0.0,"maximum":1.0,"default":0.01});
+    render["properties"]["use_light_tree"] = json!({"type":"boolean","default":true});
     render["properties"]["caustics_reflective"] = json!({"type":"boolean","default":true});
     render["properties"]["caustics_refractive"] = json!({"type":"boolean","default":true});
     render["properties"]["film_exposure"] =
@@ -3444,6 +3450,7 @@ fn set_schema(operation: &str) -> Value {
             "sample_clamp_direct":{"type":"number","minimum":0,"maximum":100_000_000.0},
             "sample_clamp_indirect":{"type":"number","minimum":0,"maximum":100_000_000.0},
             "light_sampling_threshold":{"type":"number","minimum":0,"maximum":1},
+            "use_light_tree":{"type":"boolean"},
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "pixel_filter_type":{"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"]},
             "filter_width":{"type":"number","minimum":crate::model::FILTER_WIDTH_MIN,"maximum":crate::model::FILTER_WIDTH_MAX},
@@ -4092,6 +4099,7 @@ mod tests {
             ("sample_clamp_direct", serde_json::json!(0.0)),
             ("sample_clamp_indirect", serde_json::json!(10.0)),
             ("light_sampling_threshold", serde_json::json!(0.01)),
+            ("use_light_tree", serde_json::json!(true)),
         ] {
             assert_eq!(render[field]["default"], default);
         }
@@ -4099,9 +4107,9 @@ mod tests {
             !scene["$defs"]["render_settings"]["required"]
                 .as_array()
                 .is_some_and(|required| {
-                    required
-                        .iter()
-                        .any(|field| field == "light_sampling_threshold")
+                    required.iter().any(|field| {
+                        field == "light_sampling_threshold" || field == "use_light_tree"
+                    })
                 })
         );
 
@@ -4117,6 +4125,7 @@ mod tests {
             assert_eq!(set[field]["minimum"], 0);
             assert_eq!(set[field]["maximum"], 1024);
         }
+        assert_eq!(set["use_light_tree"]["type"], "boolean");
         for field in ["sample_clamp_direct", "sample_clamp_indirect"] {
             assert_eq!(set[field]["minimum"], 0);
             assert_eq!(set[field]["maximum"], 100_000_000.0);

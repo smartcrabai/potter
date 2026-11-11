@@ -3488,6 +3488,43 @@ fn validate_intermediate(raw: &Value) -> Result<()> {
                         "`{collection}` contains a non-object item"
                     )));
                 }
+                if collection == "collections"
+                    && item
+                        .get("has_nondefault_light_linking")
+                        .is_some_and(|value| !value.is_boolean())
+                {
+                    return Err(invalid_intermediate(
+                        "Collection.has_nondefault_light_linking must be a boolean",
+                    ));
+                }
+                if collection == "lights" {
+                    for field in ["normalize", "tree_strength_supported"] {
+                        if item.get(field).is_some_and(|value| !value.is_boolean()) {
+                            return Err(invalid_intermediate(&format!(
+                                "Light.{field} must be a boolean"
+                            )));
+                        }
+                    }
+                }
+                if collection == "objects"
+                    && let Some(linking) = item.get("light_linking")
+                {
+                    if !linking.is_object() {
+                        return Err(invalid_intermediate(
+                            "Object.light_linking must be an object",
+                        ));
+                    }
+                    for field in ["receiver_collection", "blocker_collection"] {
+                        if linking
+                            .get(field)
+                            .is_some_and(|value| !value.is_null() && !value.is_string())
+                        {
+                            return Err(invalid_intermediate(&format!(
+                                "Object.light_linking.{field} must be a name or null"
+                            )));
+                        }
+                    }
+                }
                 if collection == "scenes" {
                     parse_optional_eevee_bool(
                         item.get("eevee_has_local_volume_probe_grids"),
@@ -3689,6 +3726,7 @@ fn validate_intermediate(raw: &Value) -> Result<()> {
                         "caustics_refractive",
                         "film_transparent_glass",
                         "motion_blur",
+                        "use_light_tree",
                     ] {
                         if render.get(field).is_some_and(|value| !value.is_boolean()) {
                             return Err(invalid_intermediate(&format!(
@@ -4592,6 +4630,10 @@ fn build_imported_graph(
             sample_clamp_direct: number_field(&render, "sample_clamp_direct", 0.0),
             sample_clamp_indirect: number_field(&render, "sample_clamp_indirect", 10.0),
             light_sampling_threshold: number_field(&render, "light_sampling_threshold", 0.01),
+            use_light_tree: render
+                .get("use_light_tree")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
             volume_bounces: u32::try_from(integer_field(&render, "volume_bounces", 0))
                 .map_err(|_| invalid_intermediate("render volume_bounces is out of range"))?,
             transparent_max_bounces: u32::try_from(integer_field(
@@ -5138,6 +5180,16 @@ fn build_imported_graph(
                     use_shadow: item.get("use_shadow").and_then(Value::as_bool),
                     color: vec3_field(item, "color", [1.0; 3]),
                     energy: number_field(item, "energy", 1000.0),
+                    normalize: item
+                        .get("normalize")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    tree_strength_scale: vec3_field(item, "tree_strength_scale", [1.0; 3]),
+                    tree_strength_supported: item
+                        .get("tree_strength_supported")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+
                     radius: number_field(item, "shadow_soft_size", 0.1),
                     sun_angle: number_field(item, "sun_angle", 0.526_f64.to_radians()),
                     soft_falloff: item
@@ -13940,6 +13992,136 @@ fn material_shader_graph_import_losses(raw: &Value, material: &Value, losses: &m
 
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
+    for object in raw
+        .get("objects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let identity = object
+            .get("potter_id")
+            .and_then(Value::as_str)
+            .or_else(|| object.get("name").and_then(Value::as_str));
+        let linking = object.get("light_linking");
+        if linking.is_some_and(|linking| {
+            ["receiver_collection", "blocker_collection"]
+                .iter()
+                .any(|field| linking.get(field).and_then(Value::as_str).is_some())
+        }) {
+            losses.push(loss(
+                "blender.object.light_linking",
+                identity,
+                "Cycles light or shadow linking is preserved in the source .blend but is not represented by Potter",
+            ));
+        }
+    }
+    for collection in raw
+        .get("collections")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if collection
+            .get("has_nondefault_light_linking")
+            .and_then(Value::as_bool)
+            .is_some_and(|enabled| enabled)
+        {
+            let identity = collection
+                .get("potter_id")
+                .and_then(Value::as_str)
+                .or_else(|| collection.get("name").and_then(Value::as_str));
+            losses.push(loss(
+                "blender.collection.light_linking",
+                identity,
+                "Cycles collection light or shadow linking is preserved in the source .blend but is not represented by Potter",
+            ));
+        }
+    }
+    let active_scene = raw.get("active_scene").and_then(Value::as_str);
+    let active_scene_record = raw
+        .get("scenes")
+        .and_then(Value::as_array)
+        .and_then(|scenes| {
+            active_scene.and_then(|active_scene| {
+                scenes
+                    .iter()
+                    .find(|scene| scene.get("name").and_then(Value::as_str) == Some(active_scene))
+            })
+        });
+    let light_tree_enabled = active_scene_record
+        .and_then(|scene| scene.get("render"))
+        .and_then(|render| render.get("use_light_tree"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let active_light_data_names = active_scene_record.map(|scene| {
+        let object_names: BTreeSet<String> = scene
+            .get("object_names")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        raw.get("objects")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|object| {
+                object.get("type").and_then(Value::as_str) == Some("LIGHT")
+                    && object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| object_names.contains(name))
+                    && object.get("hide_render").and_then(Value::as_bool) != Some(true)
+            })
+            .filter_map(|object| object.get("data_name").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+    });
+    for light in raw
+        .get("lights")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let identity = light
+            .get("potter_id")
+            .and_then(Value::as_str)
+            .or_else(|| light.get("name").and_then(Value::as_str));
+        if light_tree_enabled
+            && active_light_data_names.as_ref().is_none_or(|names| {
+                light
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| names.contains(name))
+            })
+            && light
+                .get("energy")
+                .and_then(Value::as_f64)
+                .unwrap_or(1000.0)
+                > 0.0
+            && light
+                .get("color")
+                .and_then(Value::as_array)
+                .is_none_or(|color| {
+                    color
+                        .iter()
+                        .filter_map(Value::as_f64)
+                        .any(|channel| channel > 0.0)
+                })
+            && light.get("is_portal").and_then(Value::as_bool) != Some(true)
+            && light
+                .get("tree_strength_supported")
+                .and_then(Value::as_bool)
+                == Some(false)
+        {
+            losses.push(loss(
+                "blender.light.shader_nodes",
+                identity,
+                "Cycles' Light Tree emission estimate uses a Light shader output that Potter cannot estimate",
+            ));
+        }
+    }
     // Blender's USD CacheFiles are not read: their Mesh Cache and Mesh Sequence Cache modifiers would fail at
     // evaluation, so the import reports each one (gated by --allow-lossy) instead of packing it as Alembic.
     for cache in raw
@@ -21351,6 +21533,7 @@ mod tests {
         scene.render.sample_clamp_direct = 2.5;
         scene.render.sample_clamp_indirect = 24.0;
         scene.render.light_sampling_threshold = 0.25;
+        scene.render.use_light_tree = false;
         let output = directory.path().join("cycles-path-state.blend");
         let context = crate::eval::EvaluationContext::default();
         let options = ExportOptions {
@@ -21370,6 +21553,7 @@ mod tests {
         assert_eq!(render.sample_clamp_direct, 2.5);
         assert_eq!(render.sample_clamp_indirect, 24.0);
         assert_eq!(render.light_sampling_threshold, 0.25);
+        assert!(!render.use_light_tree);
         Ok(())
     }
 
@@ -28417,6 +28601,75 @@ print("UNSUPPORTED_POSE " + json.dumps({
             ]
         );
     }
+
+    #[test]
+    fn import_losses_report_light_linking_and_unestimable_tree_shader() {
+        let raw = json!({
+            "active_scene": "Active",
+            "scenes": [{
+                "name": "Active",
+                "object_names": ["Key", "UnsupportedObject"],
+                "render": {"use_light_tree": true}
+            }],
+            "objects": [{
+                "name": "Key",
+                "type": "LIGHT",
+                "light_linking": {
+                    "receiver_collection": "Link Set",
+                    "blocker_collection": null
+                }
+            }, {
+                "name": "UnsupportedObject",
+                "type": "LIGHT",
+                "data_name": "Unsupported"
+            }],
+            "collections": [{
+                "name": "Link Set",
+                "has_nondefault_light_linking": true
+            }],
+            "lights": [{
+                "name": "Unsupported",
+                "normalize": false,
+                "tree_strength_supported": false
+            }]
+        });
+        let losses = import_losses(&raw);
+        for feature in [
+            "blender.object.light_linking",
+            "blender.collection.light_linking",
+            "blender.light.shader_nodes",
+        ] {
+            assert!(
+                losses.iter().any(|loss| loss.feature_id == feature),
+                "{feature}: {losses:?}"
+            );
+        }
+        assert!(
+            !losses
+                .iter()
+                .any(|loss| loss.feature_id == "blender.light.normalize")
+        );
+        let disabled = json!({
+            "active_scene": "Active",
+            "scenes": [{
+                "name": "Active",
+                "object_names": ["UnsupportedObject"],
+                "render": {"use_light_tree": false}
+            }],
+            "objects": [{
+                "name": "UnsupportedObject",
+                "type": "LIGHT",
+                "data_name": "Unsupported"
+            }],
+            "lights": [{"name": "Unsupported", "tree_strength_supported": false}]
+        });
+        assert!(
+            !import_losses(&disabled)
+                .iter()
+                .any(|loss| loss.feature_id == "blender.light.shader_nodes")
+        );
+    }
+
     #[test]
     fn cycles_settings_import_defaults_validation_and_losses() -> Result<()> {
         let world = json!({});
