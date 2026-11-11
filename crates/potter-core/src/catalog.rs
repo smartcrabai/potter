@@ -546,22 +546,6 @@ pub fn feature_catalog() -> Value {
             "A reachable OutputWorld.Volume is preserved but Potter does not evaluate World Volume closures. EEVEE derives `World.has_volume_absorption` from this input to decide whether the extracted WorldSun is enabled; the exact absorption state is not represented, so realtime rendering refuses the connected World.Volume.",
         ),
         unsupported(
-            "render.path.world_volume",
-            "Cycles path World Volume closure",
-            "OutputWorld.Volume",
-            &[
-                "world.create",
-                "world.update",
-                "scene.update",
-                "view_layer.update",
-                "render.update",
-                "graph.create",
-                "graph.node_add",
-                "graph.link",
-            ],
-            "When a Cycles path view layer selects a World whose OutputWorld.Volume is reachable, the import reports this loss and path rendering refuses the graph because Potter does not implement the World Volume closure.",
-        ),
-        unsupported(
             "render.eevee.world_probe.local_volume_grids",
             "EEVEE surface lighting with local volume-probe SH",
             "Scene view-layer VOLUME LightProbe",
@@ -3240,6 +3224,13 @@ pub fn feature_catalog() -> Value {
             "Render",
             &[],
             [false, false, true, true, true, false, false],
+        ),
+        unsupported(
+            "render.path.world_volume_heterogeneous",
+            "Heterogeneous Cycles World Volume",
+            "OutputWorld.Volume",
+            &[],
+            "Cycles path rendering supports homogeneous World Output.Volume closures and refuses spatially varying volume graphs.",
         ),
         supported(
             "render.motion_blur",

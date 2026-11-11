@@ -14219,66 +14219,6 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 ));
             }
         }
-        if engine == Some("path") {
-            let scene_world = scene.get("world").filter(|world| !world.is_null());
-            let scene_world_name = scene_world
-                .and_then(|world| world.get("name"))
-                .and_then(Value::as_str);
-            let mut selected_world_names = BTreeSet::new();
-            if let Some(layers) = scene
-                .get("view_layers")
-                .and_then(Value::as_array)
-                .filter(|layers| !layers.is_empty())
-            {
-                for layer in layers {
-                    let world_name = layer
-                        .get("world_override")
-                        .and_then(Value::as_str)
-                        .filter(|name| !name.is_empty())
-                        .or(scene_world_name);
-                    if let Some(world_name) = world_name {
-                        selected_world_names.insert(world_name.to_owned());
-                    }
-                }
-            } else if let Some(world_name) = scene_world_name {
-                selected_world_names.insert(world_name.to_owned());
-            }
-            let worlds = raw.get("worlds").and_then(Value::as_array);
-            let mut volume_world_names = Vec::new();
-            for world_name in selected_world_names {
-                let world = worlds
-                    .into_iter()
-                    .flatten()
-                    .find(|world| {
-                        world.get("name").and_then(Value::as_str) == Some(world_name.as_str())
-                    })
-                    .or_else(|| {
-                        scene_world.filter(|world| {
-                            world.get("name").and_then(Value::as_str) == Some(world_name.as_str())
-                        })
-                    });
-                let volume_reachable = world
-                    .and_then(|world| world.get("nodes"))
-                    .map(|tree| {
-                        shader_graph_nodes_reaching_output_socket(
-                            tree,
-                            "ShaderNodeOutputWorld",
-                            Some("Volume"),
-                        )
-                    })
-                    .unwrap_or_default();
-                if !volume_reachable.is_empty() {
-                    volume_world_names.push(world_name);
-                }
-            }
-            if !volume_world_names.is_empty() {
-                let reason = format!(
-                    "Cycles path rendering refuses reachable OutputWorld.Volume on effective World(s) `{}` because Potter does not implement Cycles World Volume closures",
-                    volume_world_names.join("`, `"),
-                );
-                losses.push(loss("render.path.world_volume", scene_name, &reason));
-            }
-        }
         if scene
             .get("eevee_has_local_volume_probe_grids")
             .and_then(Value::as_bool)
@@ -28867,72 +28807,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
         assert!(import_losses(&raw).iter().all(|loss| {
             loss.feature_id != "render.world.volume_absorption"
                 && loss.feature_id != "render.eevee.world_probe.local_volume_grids"
-        }));
-    }
-    #[test]
-    fn cycles_world_volume_loss_uses_effective_view_layer_world() {
-        let volume_world = json!({
-            "nodes": [
-                {
-                    "name": "World Output",
-                    "type": "ShaderNodeOutputWorld",
-                    "properties": {"is_active_output": true}
-                },
-                {"name": "Absorption", "type": "ShaderNodeVolumeAbsorption"}
-            ],
-            "links": [{
-                "from_node": "Absorption",
-                "from_socket": "Volume",
-                "to_node": "World Output",
-                "to_socket": "Volume"
-            }]
-        });
-        let surface_world = json!({
-            "nodes": [{
-                "name": "World Output",
-                "type": "ShaderNodeOutputWorld",
-                "properties": {"is_active_output": true}
-            }],
-            "links": []
-        });
-        let raw = json!({
-            "worlds": [
-                {"name": "Surface", "nodes": surface_world.clone()},
-                {"name": "Volume", "nodes": volume_world.clone()},
-                {"name": "Volume Base", "nodes": volume_world.clone()},
-                {"name": "Surface Override", "nodes": surface_world.clone()}
-            ],
-            "scenes": [
-                {
-                    "name": "OverrideVolume",
-                    "render": {"engine": "path"},
-                    "world": {"name": "Surface", "nodes": surface_world.clone()},
-                    "view_layers": [{"name": "Layer", "world_override": "Volume", "use_volumes": false}]
-                },
-                {
-                    "name": "SceneWorldFallback",
-                    "render": {"engine": "path"},
-                    "world": {"name": "Volume Base", "nodes": volume_world.clone()},
-                    "view_layers": [{"name": "Layer", "world_override": null, "use_volumes": false}]
-                },
-                {
-                    "name": "OverrideSurface",
-                    "render": {"engine": "path"},
-                    "world": {"name": "Volume Base", "nodes": volume_world},
-                    "view_layers": [{"name": "Layer", "world_override": "Surface Override", "use_volumes": false}]
-                }
-            ]
-        });
-        let losses = import_losses(&raw);
-        for scene_name in ["OverrideVolume", "SceneWorldFallback"] {
-            assert!(losses.iter().any(|loss| {
-                loss.feature_id == "render.path.world_volume"
-                    && loss.data_id.as_deref() == Some(scene_name)
-            }));
-        }
-        assert!(losses.iter().all(|loss| {
-            loss.feature_id != "render.path.world_volume"
-                || loss.data_id.as_deref() != Some("OverrideSurface")
+                && loss.feature_id != "render.path.world_volume"
         }));
     }
     #[test]

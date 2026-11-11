@@ -1558,6 +1558,81 @@ pub(crate) fn evaluate_surface_with_workspace_into_semantics(
     workspace.reset();
     result
 }
+/// Evaluates the linked World.Volume shader closures at a path-traced volume point.
+pub(crate) fn evaluate_volume_output_with_workspace(
+    material: &Material,
+    prepared: &PreparedMaterial,
+    hit_ctx: &HitContext<'_>,
+    workspace: &mut EvaluatorWorkspace,
+    volume: &mut Vec<ShaderClosure>,
+    math_semantics: crate::node_kernels::MathSemantics,
+) -> Result<()> {
+    workspace.reset();
+    volume.clear();
+    let result = evaluate_volume_output_inner(
+        material,
+        prepared,
+        hit_ctx,
+        workspace,
+        volume,
+        math_semantics,
+    );
+    workspace.reset();
+    result
+}
+
+fn evaluate_volume_output_inner(
+    material: &Material,
+    prepared: &PreparedMaterial,
+    hit_ctx: &HitContext<'_>,
+    workspace: &mut EvaluatorWorkspace,
+    volume: &mut Vec<ShaderClosure>,
+    math_semantics: crate::node_kernels::MathSemantics,
+) -> Result<()> {
+    let Some(graph_id) = &material.node_tree else {
+        return Ok(());
+    };
+    let group = hit_ctx.node_groups.get(graph_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::TargetNotFound,
+            format!("shader graph `{graph_id}` was not found"),
+            json!({"graph_id":graph_id}),
+        )
+    })?;
+    if group.kind != GraphKind::Shader {
+        return Err(PotError::new(
+            ErrorCode::InvalidOperation,
+            format!("shader graph `{graph_id}` is not a shader graph"),
+        ));
+    }
+    let output = PreparedMaterial::active_output(group).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "shader graph has no active shader output node",
+        )
+    })?;
+    let (_, has_volume, _) = prepared.output_feeds(graph_id, group, output);
+    if !has_volume {
+        return Ok(());
+    }
+    let mut evaluator = Evaluator {
+        group,
+        material,
+        hit_ctx: *hit_ctx,
+        workspace,
+        alpha_linked_images: &prepared.alpha_linked_images,
+        links: prepared.fold_index(graph_id, group),
+        group_input_binding: None,
+        group_depth: 0,
+        math_semantics,
+        texture_mapping_unsupported: &prepared.texture_mapping_unsupported,
+    };
+    let Value::Shader(output) = evaluator.input(output, "Volume", ValueKind::Shader)? else {
+        return Err(eval_error("shader volume output is not a volume shader"));
+    };
+    volume.extend_from_slice(evaluator.workspace.closures_of(output));
+    Ok(())
+}
 
 fn evaluate_surface_inner_into(
     material: &Material,
@@ -2664,13 +2739,16 @@ impl PreparedMaterial {
         Ok(self.eevee_closure_flags)
     }
 
-    /// The output node a surface evaluates from: the active one, else the first `OutputMaterial`.
+    /// The active material or world output, else the first shader output.
     fn active_output(group: &NodeGroup) -> Option<&Id> {
         let mut fallback = None;
         for (id, node) in &group.nodes {
             if matches!(
                 node.node_type.as_str(),
-                "OutputMaterial" | "ShaderNodeOutputMaterial"
+                "OutputMaterial"
+                    | "ShaderNodeOutputMaterial"
+                    | "OutputWorld"
+                    | "ShaderNodeOutputWorld"
             ) {
                 if node
                     .properties

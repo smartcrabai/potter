@@ -18,8 +18,8 @@ pub(crate) use evaluator::{
     HairParametrization, HairScatteringModel, MetallicFresnel, MetallicParameters,
     MicrofacetDistribution, PrincipledHairParameters, SheenDistribution, ToonComponent,
     ToonParameters, dielectric_f0, evaluate_surface_with_workspace_into_semantics,
-    evaluate_surface_with_workspace_semantics, heaviest, make_orthonormals,
-    shader_node_type_supported,
+    evaluate_surface_with_workspace_semantics, evaluate_volume_output_with_workspace, heaviest,
+    make_orthonormals, shader_node_type_supported,
 };
 
 pub(crate) use evaluator::evaluate_displacement_with_workspace_semantics;
