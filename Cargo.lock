@@ -696,6 +696,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fancy-regex"
+version = "0.20.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a2e16b9a584b602f1e0e5e22c30ca0906786088c27500653e432d086def8b53"
+dependencies = [
+ "bit-set 0.8.0",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1300,7 +1311,7 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 [[package]]
 name = "jcode-applet-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "serde",
  "serde_json",
@@ -1309,7 +1320,7 @@ dependencies = [
 [[package]]
 name = "jcode-core"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "chrono",
  "libc",
@@ -1322,7 +1333,7 @@ dependencies = [
 [[package]]
 name = "jcode-harness-api"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "jcode-applet-types",
  "jcode-session-types",
@@ -1336,7 +1347,7 @@ dependencies = [
 [[package]]
 name = "jcode-logging"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "chrono",
  "jcode-core",
@@ -1348,7 +1359,7 @@ dependencies = [
 [[package]]
 name = "jcode-message-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "chrono",
  "serde",
@@ -1358,7 +1369,7 @@ dependencies = [
 [[package]]
 name = "jcode-provider-metadata"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "url",
 ]
@@ -1366,7 +1377,7 @@ dependencies = [
 [[package]]
 name = "jcode-sdk"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "anyhow",
  "jcode-applet-types",
@@ -1387,7 +1398,7 @@ dependencies = [
 [[package]]
 name = "jcode-session-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "chrono",
  "jcode-message-types",
@@ -1398,7 +1409,7 @@ dependencies = [
 [[package]]
 name = "jcode-side-panel-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "serde",
 ]
@@ -1406,7 +1417,7 @@ dependencies = [
 [[package]]
 name = "jcode-storage"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1420,7 +1431,7 @@ dependencies = [
 [[package]]
 name = "jcode-task-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "chrono",
  "serde",
@@ -1430,7 +1441,7 @@ dependencies = [
 [[package]]
 name = "jcode-todo-policy"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "chrono",
  "jcode-logging",
@@ -1443,7 +1454,7 @@ dependencies = [
 [[package]]
 name = "jcode-transport"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "hex",
  "sha2 0.10.9",
@@ -1454,7 +1465,7 @@ dependencies = [
 [[package]]
 name = "jcode-usage-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e#8e11eb23ea33c7b09d43aa9a3b52fa3f0728f39e"
+source = "git+https://github.com/1jehuang/jcode?rev=446302f1b6dc57120a1ee3ebacb6cb6b933545eb#446302f1b6dc57120a1ee3ebacb6cb6b933545eb"
 dependencies = [
  "serde",
  "serde_json",
@@ -1540,7 +1551,7 @@ dependencies = [
  "bytecount",
  "data-encoding",
  "email_address",
- "fancy-regex",
+ "fancy-regex 0.19.2",
  "fraction 0.15.4",
  "getrandom 0.3.4",
  "idna",
@@ -1561,25 +1572,25 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.60.2"
+version = "0.61.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a42a11b47492e6a2cc76e9c7bcc8077776cb31dac444e0795d7f61bcc6441c08"
+checksum = "e1324c9bebe052584e96e7c80d2f9cf2d86e1a6d83d621a46932c5636996be18"
 dependencies = [
  "ahash",
  "bytecount",
  "data-encoding",
  "email_address",
- "fancy-regex",
+ "fancy-regex 0.20.2",
  "fraction 0.17.0",
  "getrandom 0.3.4",
  "idna",
  "itoa",
- "jsonschema-regex 0.60.2",
- "jsonschema-value 0.60.2",
+ "jsonschema-regex 0.61.1",
+ "jsonschema-value 0.61.1",
  "num-cmp",
  "num-traits",
  "percent-encoding",
- "referencing 0.60.2",
+ "referencing 0.61.1",
  "regex",
  "reqwest",
  "rustls",
@@ -1601,9 +1612,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.60.2"
+version = "0.61.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "107aeb6ff14b8deb5610096a8ce5c554ec89806b521147eaeb3cae05b07edb7a"
+checksum = "84cdf272371326ec8db8ce2608a52635d8edeeaf0189604e2ad627327b79e6db"
 dependencies = [
  "regex-syntax",
 ]
@@ -1624,9 +1635,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-value"
-version = "0.60.2"
+version = "0.61.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e281d6b177bb4834f2ffd6f92aa0443cffe29c996b251c8d94eb6f456186feba"
+checksum = "e5e4a7f3b3c19c9cd2aa37937e1704229a0bcb1b446308a148574d56ace0c6ba"
 dependencies = [
  "ahash",
  "bytecount",
@@ -1983,7 +1994,7 @@ dependencies = [
  "glam 0.34.3",
  "hex",
  "image",
- "jsonschema 0.60.2",
+ "jsonschema 0.61.0",
  "num-traits",
  "png",
  "potter-core",
@@ -2037,7 +2048,7 @@ dependencies = [
  "clap",
  "image",
  "jcode-sdk",
- "jsonschema 0.60.2",
+ "jsonschema 0.61.0",
  "potter-core",
  "serde",
  "serde_json",
@@ -2281,9 +2292,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.60.2"
+version = "0.61.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f42818036d3b37cda6bd4c494543158a36e431cb717015ef7c93acc6ba214d3b"
+checksum = "eba9bfd41f0d7d8fbf9c7ed23b788a3f97e9f5d9419be812ff7e08b8dc6b14ec"
 dependencies = [
  "ahash",
  "fluent-uri",
