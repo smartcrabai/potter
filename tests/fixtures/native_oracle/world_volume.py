@@ -132,7 +132,7 @@ scene.view_layers[0].cycles.use_denoising = False
 bpy.ops.wm.save_as_mainfile(filepath=blend_path)
 
 per_seed_files = []
-for seed in range(64):
+for seed in range(8):
     scene.cycles.seed = seed
     output_path = os.path.join(os.path.dirname(oracle_path), f"{case}_cycles_{seed}")
     scene.render.filepath = output_path

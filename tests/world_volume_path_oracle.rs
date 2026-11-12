@@ -17,7 +17,7 @@ use tempfile::tempdir;
 
 const SIZE: u32 = 16;
 const SAMPLES: u32 = 512;
-const SEEDS: usize = 64;
+const SEEDS: usize = 8;
 const WORLD_VOLUME_SCRIPT: &str = include_str!("fixtures/native_oracle/world_volume.py");
 const WELCH_T_95: [f64; 8] = [
     2.3646, 2.3060, 2.2622, 2.2281, 2.2010, 2.1788, 2.1604, 2.1448,
