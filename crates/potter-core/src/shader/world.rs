@@ -180,34 +180,12 @@ fn evaluate_world_graph(
     direction: DVec3,
     path_traced: bool,
 ) -> Result<DVec3> {
-    let output = group
-        .nodes
-        .iter()
-        .find(|(_, node)| {
-            matches!(
-                node.node_type.as_str(),
-                "ShaderNodeOutputWorld" | "OutputWorld"
-            ) && node
-                .properties
-                .get("is_active_output")
-                .and_then(JsonValue::as_bool)
-                == Some(true)
-        })
-        .or_else(|| {
-            group.nodes.iter().find(|(_, node)| {
-                matches!(
-                    node.node_type.as_str(),
-                    "ShaderNodeOutputWorld" | "OutputWorld"
-                )
-            })
-        })
-        .map(|(id, _)| id)
-        .ok_or_else(|| {
-            PotError::new(
-                ErrorCode::EvaluationFailed,
-                "world graph has no OutputWorld node",
-            )
-        })?;
+    let output = super::select_world_output(group, path_traced).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "world graph has no OutputWorld node",
+        )
+    })?;
     let mut evaluator = WorldEvaluator {
         group,
         fold_index,
@@ -1565,6 +1543,113 @@ mod tests {
             DVec3::Z,
             true,
         )
+    }
+
+    #[test]
+    fn cycles_world_surface_and_volume_share_the_target_selected_output() -> Result<()> {
+        let mut group = NodeGroup::new("World targets", GraphKind::Shader);
+        for (id, target, active, color, absorption_color) in [
+            (
+                "a_all",
+                "ALL",
+                true,
+                [1.0, 0.0, 0.0, 1.0],
+                [0.1, 0.2, 0.3, 1.0],
+            ),
+            (
+                "m_eevee",
+                "EEVEE",
+                true,
+                [0.0, 0.0, 1.0, 1.0],
+                [0.9, 0.8, 0.7, 1.0],
+            ),
+            (
+                "z_cycles",
+                "CYCLES",
+                false,
+                [0.2, 0.4, 0.6, 1.0],
+                [0.2, 0.4, 0.6, 1.0],
+            ),
+        ] {
+            let output_id = Id::new(id)?;
+            let background_id = Id::new(format!("{id}_background"))?;
+            let volume_id = Id::new(format!("{id}_volume"))?;
+            let mut output = GraphNode::new("ShaderNodeOutputWorld");
+            output
+                .properties
+                .insert("target".to_owned(), json!(target));
+            output
+                .properties
+                .insert("is_active_output".to_owned(), json!(active));
+            group.nodes.insert(output_id.clone(), output);
+            let mut background = GraphNode::new("ShaderNodeBackground");
+            background
+                .inputs
+                .insert("Color".to_owned(), json!(color));
+            background
+                .inputs
+                .insert("Strength".to_owned(), json!(1.0));
+            group.nodes.insert(background_id.clone(), background);
+            let mut volume = GraphNode::new("ShaderNodeVolumeAbsorption");
+            volume
+                .inputs
+                .insert("Color".to_owned(), json!(absorption_color));
+            volume
+                .inputs
+                .insert("Density".to_owned(), json!(1.0));
+            group.nodes.insert(volume_id.clone(), volume);
+            group.links.extend([
+                GraphLink {
+                    from_node: background_id,
+                    from_socket: "Background".to_owned(),
+                    to_node: output_id.clone(),
+                    to_socket: "Surface".to_owned(),
+                },
+                GraphLink {
+                    from_node: volume_id,
+                    from_socket: "Volume".to_owned(),
+                    to_node: output_id,
+                    to_socket: "Volume".to_owned(),
+                },
+            ]);
+        }
+        let world_id = Id::new("world_targets")?;
+        let mut groups = Registry::new();
+        groups.insert(world_id.clone(), group);
+        let world = World {
+            node_tree: Some(world_id.clone()),
+            ..World::default()
+        };
+        assert_eq!(
+            evaluate_world(
+                &world,
+                &groups,
+                &std::collections::BTreeMap::new(),
+                DVec3::Z,
+                true
+            )?,
+            DVec3::new(0.2, 0.4, 0.6)
+        );
+
+        let material = crate::model::Material {
+            node_tree: Some(world_id),
+            ..crate::model::Material::default()
+        };
+        let prepared = crate::shader::PreparedMaterial::new(&material, &groups);
+        let context = crate::shader::HitContext::new(&groups).with_path_traced(true);
+        let mut workspace = EvaluatorWorkspace::default();
+        let mut volume = Vec::new();
+        crate::shader::evaluate_volume_output_with_workspace(
+            &material,
+            &prepared,
+            &context,
+            &mut workspace,
+            &mut volume,
+            crate::node_kernels::MathSemantics::Cycles,
+        )?;
+        assert_eq!(volume.len(), 1);
+        assert_eq!(volume[0].params.volume_absorption, [0.8, 0.6, 0.4]);
+        Ok(())
     }
 
     #[test]

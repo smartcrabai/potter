@@ -231,6 +231,8 @@ pub struct BsdfParams {
     pub metallic: f64,
     pub roughness: f64,
     pub emission_color: [f64; 3],
+    /// Whether this closure came from a standalone Emission node.
+    pub(crate) standalone_emission: bool,
     pub emission_strength: f64,
     pub transmission: f64,
     pub ior: f64,
@@ -896,6 +898,7 @@ impl BsdfParams {
             metallic: material.metallic,
             roughness: material.roughness,
             emission_color: material.emission_color,
+            standalone_emission: false,
             emission_strength: material.emission_strength,
             transmission: material.transmission,
             ior: material.ior,
@@ -1605,12 +1608,19 @@ fn evaluate_volume_output_inner(
             format!("shader graph `{graph_id}` is not a shader graph"),
         ));
     }
-    let output = PreparedMaterial::active_output(group).ok_or_else(|| {
-        PotError::new(
-            ErrorCode::EvaluationFailed,
-            "shader graph has no active shader output node",
-        )
-    })?;
+    let output = if has_world_output(group) {
+        let Some(output) = select_world_output(group, true) else {
+            return Ok(());
+        };
+        output
+    } else {
+        PreparedMaterial::active_output(group).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "shader graph has no active shader output node",
+            )
+        })?
+    };
     let (_, has_volume, _) = prepared.output_feeds(graph_id, group, output);
     if !has_volume {
         return Ok(());
@@ -1630,7 +1640,14 @@ fn evaluate_volume_output_inner(
     let Value::Shader(output) = evaluator.input(output, "Volume", ValueKind::Shader)? else {
         return Err(eval_error("shader volume output is not a volume shader"));
     };
-    volume.extend_from_slice(evaluator.workspace.closures_of(output));
+    for mut closure in evaluator.workspace.closures_of(output).iter().copied() {
+        if closure.params.standalone_emission {
+            closure.params.volume_emission = closure.params.emission_color.map(|channel| {
+                channel * closure.params.emission_strength
+            });
+        }
+        volume.push(closure);
+    }
     Ok(())
 }
 
@@ -2612,7 +2629,11 @@ impl PreparedMaterial {
                 ..Self::default()
             };
         };
-        let output = Self::active_output(group);
+        let output = if has_world_output(group) {
+            select_world_output(group, true)
+        } else {
+            Self::active_output(group)
+        };
         let links = LinkIndex::new(graph_id, group, output, node_groups);
         let source_fold_failure = RefCell::new(None);
         let eevee_closure_flags = graph_eevee_closure_flags(
@@ -2739,16 +2760,13 @@ impl PreparedMaterial {
         Ok(self.eevee_closure_flags)
     }
 
-    /// The active material or world output, else the first shader output.
+    /// The active material output, else the first material output.
     fn active_output(group: &NodeGroup) -> Option<&Id> {
         let mut fallback = None;
         for (id, node) in &group.nodes {
             if matches!(
                 node.node_type.as_str(),
-                "OutputMaterial"
-                    | "ShaderNodeOutputMaterial"
-                    | "OutputWorld"
-                    | "ShaderNodeOutputWorld"
+                "OutputMaterial" | "ShaderNodeOutputMaterial"
             ) {
                 if node
                     .properties
@@ -2763,6 +2781,62 @@ impl PreparedMaterial {
         }
         fallback
     }
+}
+
+fn is_world_output(node: &GraphNode) -> bool {
+    matches!(
+        node.node_type.as_str(),
+        "OutputWorld" | "ShaderNodeOutputWorld"
+    )
+}
+
+fn has_world_output(group: &NodeGroup) -> bool {
+    group.nodes.values().any(is_world_output)
+}
+
+/// Selects the World output using Blender's Cycles target priority, or EEVEE's active-first behavior.
+pub(crate) fn select_world_output(group: &NodeGroup, path_traced: bool) -> Option<&Id> {
+    let is_active = |node: &GraphNode| {
+        node.properties
+            .get("is_active_output")
+            .and_then(JsonValue::as_bool)
+            == Some(true)
+    };
+    if !path_traced {
+        let mut fallback = None;
+        for (id, node) in &group.nodes {
+            if is_world_output(node) {
+                if is_active(node) {
+                    return Some(id);
+                }
+                fallback.get_or_insert(id);
+            }
+        }
+        return fallback;
+    }
+
+    let mut all_output: Option<(&Id, bool)> = None;
+    let mut cycles_output: Option<(&Id, bool)> = None;
+    for (id, node) in &group.nodes {
+        if !is_world_output(node) {
+            continue;
+        }
+        let active = is_active(node);
+        let selected = match node
+            .properties
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("ALL")
+        {
+            "CYCLES" => &mut cycles_output,
+            "ALL" => &mut all_output,
+            _ => continue,
+        };
+        if selected.is_none_or(|(_, selected_active)| active && !selected_active) {
+            *selected = Some((id, active));
+        }
+    }
+    cycles_output.or(all_output).map(|(id, _)| id)
 }
 
 #[derive(Clone, Copy)]
@@ -4088,6 +4162,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         params.base_color = color;
         params.emission_color = [color[0], color[1], color[2]];
         params.emission_strength = self.scalar_input(id, &["Strength"], 1.0)?;
+        params.standalone_emission = true;
         // An emission closure alone adds radiance and no reflection: Cycles'
         // `EmissionNode::compile` (intern/cycles/scene/shader_nodes.cpp:3071-3098) emits only
         // `NODE_CLOSURE_EMISSION`.
@@ -12237,6 +12312,174 @@ mod tests {
             }
         }
         total
+    }
+
+    fn evaluate_world_volume_graph(graph: NodeGroup) -> SurfaceShading {
+        let graph_id = Id::new("world_volume_graph").unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        let prepared = PreparedMaterial::new(&material, &groups);
+        let context = HitContext::new(&groups).with_path_traced(true);
+        let mut workspace = EvaluatorWorkspace::default();
+        let mut volume = Vec::new();
+        super::evaluate_volume_output_with_workspace(
+            &material,
+            &prepared,
+            &context,
+            &mut workspace,
+            &mut volume,
+            crate::node_kernels::MathSemantics::Cycles,
+        )
+        .unwrap();
+        SurfaceShading {
+            volume,
+            ..SurfaceShading::default()
+        }
+    }
+
+    #[test]
+    fn cycles_world_output_prefers_target_then_active_and_ignores_eevee() {
+        let mut graph = NodeGroup::new("World outputs", GraphKind::Shader);
+        for (id, target, active) in [
+            ("a_all", "ALL", true),
+            ("b_cycles", "CYCLES", false),
+            ("m_eevee", "EEVEE", true),
+            ("z_cycles", "CYCLES", true),
+        ] {
+            insert_node(&mut graph, id, "ShaderNodeOutputWorld", json!({}));
+            set_properties(
+                &mut graph,
+                id,
+                json!({"target":target,"is_active_output":active}),
+            );
+        }
+        let active_cycles_id = Id::new("z_cycles").unwrap();
+        assert_eq!(
+            super::select_world_output(&graph, true),
+            Some(&active_cycles_id)
+        );
+
+        set_properties(
+            &mut graph,
+            "z_cycles",
+            json!({"target":"CYCLES","is_active_output":false}),
+        );
+        let inactive_cycles_id = Id::new("b_cycles").unwrap();
+        assert_eq!(
+            super::select_world_output(&graph, true),
+            Some(&inactive_cycles_id)
+        );
+    }
+
+
+    #[test]
+    fn cycles_world_volume_ignores_eevee_only_output_and_eevee_keeps_active_output() {
+        let mut graph = NodeGroup::new("EEVEE World output", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputWorld", json!({}));
+        set_properties(
+            &mut graph,
+            "output",
+            json!({"target":"EEVEE","is_active_output":true}),
+        );
+        insert_node(
+            &mut graph,
+            "absorption",
+            "ShaderNodeVolumeAbsorption",
+            json!({"Color":[0.2,0.5,0.8,1.0],"Density":1.0}),
+        );
+        link(&mut graph, "absorption", "Volume", "output", "Volume");
+        let output_id = Id::new("output").unwrap();
+        assert_eq!(super::select_world_output(&graph, true), None);
+        assert_eq!(
+            super::select_world_output(&graph, false),
+            Some(&output_id)
+        );
+        assert!(evaluate_world_volume_graph(graph).volume.is_empty());
+    }
+
+    fn emission_and_absorption_world_volume(combiner: &str, inputs: Value) -> SurfaceShading {
+        let mut graph = NodeGroup::new("World emission volume", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputWorld", json!({}));
+        set_properties(
+            &mut graph,
+            "output",
+            json!({"target":"CYCLES","is_active_output":true}),
+        );
+        insert_node(
+            &mut graph,
+            "emission",
+            "ShaderNodeEmission",
+            json!({"Color":[0.2,0.4,0.6,1.0],"Strength":2.0}),
+        );
+        insert_node(
+            &mut graph,
+            "absorption",
+            "ShaderNodeVolumeAbsorption",
+            json!({"Color":[0.2,0.5,0.8,1.0],"Density":1.0}),
+        );
+        insert_node(&mut graph, "combine", combiner, inputs);
+        link(&mut graph, "emission", "Emission", "combine", "Shader");
+        link(&mut graph, "absorption", "Volume", "combine", "Shader_001");
+        link(&mut graph, "combine", "Shader", "output", "Volume");
+        evaluate_world_volume_graph(graph)
+    }
+
+    #[test]
+    fn world_volume_emission_and_absorption_keep_mix_and_add_weights() {
+        let added = emission_and_absorption_world_volume("ShaderNodeAddShader", json!({}));
+        assert_eq!(added.volume.len(), 2);
+        assert!(channels_close(
+            weighted_volume(&added, |params| params.volume_emission),
+            [0.4, 0.8, 1.2]
+        ));
+        assert!(channels_close(
+            weighted_volume(&added, |params| params.volume_absorption),
+            [0.8, 0.5, 0.2]
+        ));
+
+        let mixed =
+            emission_and_absorption_world_volume("ShaderNodeMixShader", json!({"Fac":0.25}));
+        assert_eq!(
+            mixed.volume.iter().map(|closure| closure.weight).collect::<Vec<_>>(),
+            [0.75, 0.25]
+        );
+        assert!(channels_close(
+            weighted_volume(&mixed, |params| params.volume_emission),
+            [0.3, 0.6, 0.9]
+        ));
+        assert!(channels_close(
+            weighted_volume(&mixed, |params| params.volume_absorption),
+            [0.2, 0.125, 0.05]
+        ));
+    }
+
+    #[test]
+    fn standalone_emission_volume_conversion_does_not_change_surface_radiance() {
+        let mut graph = NodeGroup::new("Emission surface", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "emission",
+            "ShaderNodeEmission",
+            json!({"Color":[0.2,0.4,0.6,1.0],"Strength":2.0}),
+        );
+        link(&mut graph, "emission", "Emission", "output", "Surface");
+        let graph_id = Id::new("emission_surface_graph").unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        let shading = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
+        let params = &shading.closures[0].params;
+        assert_eq!(params.emission_color, [0.2, 0.4, 0.6]);
+        assert_eq!(params.emission_strength, 2.0);
+        assert_eq!(params.volume_emission, [0.0; 3]);
     }
 
     /// Two Volume Absorption closures (σa = (1 - Color) · Density: (0.8, 0.5, 0.2) and (0.25, 0.25, 0.25))

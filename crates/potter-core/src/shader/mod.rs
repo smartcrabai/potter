@@ -23,6 +23,7 @@ pub(crate) use evaluator::{
 };
 
 pub(crate) use evaluator::evaluate_displacement_with_workspace_semantics;
+pub(crate) use evaluator::select_world_output;
 pub use evaluator::{
     BsdfParams, EeveeGBufferBin, EeveeGBufferCandidate, EeveeGBufferFeatures, EeveeGBufferLayout,
     EeveeGBufferLayoutError, EeveeGBufferLobe, EeveeGBufferMode, EvaluatorWorkspace, HitContext,
