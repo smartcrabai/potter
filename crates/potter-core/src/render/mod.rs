@@ -17,6 +17,7 @@ mod hair_bsdf;
 mod hair_geometry;
 mod hair_intersect;
 mod light_model;
+mod volume_guiding;
 mod path;
 mod pick;
 mod pixel_filter;
