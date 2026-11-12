@@ -17,7 +17,6 @@ mod hair_bsdf;
 mod hair_geometry;
 mod hair_intersect;
 mod light_model;
-mod volume_guiding;
 mod path;
 mod pick;
 mod pixel_filter;
@@ -33,6 +32,7 @@ mod studio;
 mod subsurface;
 mod subsurface_walk;
 mod text_strip;
+mod volume_guiding;
 mod wireframe;
 mod world_probe;
 
