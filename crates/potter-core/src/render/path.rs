@@ -16079,7 +16079,7 @@ mod world_volume_majorant_tests {
         let mut rng = Pcg32::for_sample(7, 0, 0, 0);
         assert!(sample_majorant_distance(0.0, &mut rng).is_none());
         let correction = majorant_event_correction(0.5, 1.5, 0.75);
-        let expected = (-1.0_f64 * 0.75).exp() / 0.5;
+        let expected = (-0.75_f64).exp() / 0.5;
         assert!((correction - expected).abs() < 1.0e-12);
         assert_eq!(majorant_event_correction(1.5, 1.0, 0.75), 1.0 / 1.5);
     }
@@ -17009,8 +17009,11 @@ fn heterogeneous_event_weights(
                 0.0
             };
             match method {
-                Some(VolumeSampling::Equiangular) if sampled => 0.0,
-                Some(VolumeSampling::MultipleImportance) if sampled => 0.0,
+                Some(VolumeSampling::Equiangular | VolumeSampling::MultipleImportance)
+                    if sampled =>
+                {
+                    0.0
+                }
                 Some(VolumeSampling::MultipleImportance) => {
                     2.0 * power_heuristic(scatter_pdf, equiangular_pdf)
                 }
@@ -21509,14 +21512,14 @@ mod cycles_world_light_tests {
             let mut rng = Pcg32::for_sample(37, sample, 0, 0);
             let (radiance, _) = trace(&mut rng, false)?;
             let survived = radiance != DVec3::ZERO;
-            if !survived {
-                terminated += 1;
-            } else {
+            if survived {
                 surviving += 1;
                 assert!(
                     (radiance - DVec3::splat(0.25)).abs().max_element() < 1.0e-12,
                     "surviving path radiance {radiance:?} differs from undivided throughput"
                 );
+            } else {
+                terminated += 1;
             }
             mean += radiance / f64::from(count);
 

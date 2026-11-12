@@ -523,13 +523,12 @@ mod tests {
     }
 
     #[test]
-    fn cell_extrema_use_all_sixteen_padded_sobol_samples() {
+    fn cell_extrema_use_all_sixteen_padded_sobol_samples() -> crate::error::Result<()> {
         let mut count = 0;
         let ((minimum, maximum), _) = cell_extrema_with_capacity(0, &mut |position| {
             count += 1;
             Ok((position.x as f32, 0))
-        })
-        .unwrap();
+        })?;
         assert_eq!(count, 16);
 
         let pad = 0.2_f32 * super::VOXEL_SIZE;
@@ -545,6 +544,7 @@ mod tests {
             (minimum.to_bits(), maximum.to_bits()),
             (expected.0.to_bits(), expected.1.to_bits())
         );
+        Ok(())
     }
 
     #[test]

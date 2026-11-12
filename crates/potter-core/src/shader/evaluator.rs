@@ -1145,7 +1145,7 @@ pub struct HitContext<'a> {
     pub light_falloff_distance: Option<f64>,
     /// Whether this hit is evaluated by Cycles semantics rather than the realtime shader path.
     pub path_traced: bool,
-    /// Ray class and path depths seen by ShaderNodeLightPath.
+    /// Ray class and path depths seen by `ShaderNodeLightPath`.
     pub ray_kind: RayKind,
     pub is_reflection_ray: bool,
     pub is_singular_ray: bool,
@@ -1250,7 +1250,7 @@ impl<'a> HitContext<'a> {
         }
     }
 
-    /// Set the path state exposed by ShaderNodeLightPath.
+    /// Set the path state exposed by `ShaderNodeLightPath`.
     #[must_use]
     pub const fn with_ray_context(
         mut self,
