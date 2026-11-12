@@ -25,6 +25,7 @@ const SET_FIELDS: &[&str] = &[
     "sample_clamp_direct",
     "sample_clamp_indirect",
     "light_sampling_threshold",
+    "use_light_tree",
     "volume_bounces",
     "transparent_max_bounces",
     "pixel_filter_type",
@@ -180,6 +181,18 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
     let sample_clamp_direct = optional_f64(engine, set, "sample_clamp_direct", 0.0, 1e8)?;
     let sample_clamp_indirect = optional_f64(engine, set, "sample_clamp_indirect", 0.0, 1e8)?;
     let light_sampling_threshold = optional_f64(engine, set, "light_sampling_threshold", 0.0, 1.0)?;
+    let use_light_tree = set
+        .get("use_light_tree")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "use_light_tree must be a boolean",
+                    &operation_pointer(engine.operation_index, "set/use_light_tree"),
+                )
+            })
+        })
+        .transpose()?;
     let pixel_filter_type = set
         .get("pixel_filter_type")
         .map(|value| {
@@ -677,6 +690,9 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         if let Some(value) = light_sampling_threshold {
             scene.render.light_sampling_threshold = value;
         }
+        if let Some(value) = use_light_tree {
+            scene.render.use_light_tree = value;
+        }
         if let Some(value) = pixel_filter_type {
             scene.render.pixel_filter_type = value;
         }
@@ -1075,7 +1091,8 @@ mod tests {
                         "min_transparent_bounces": 1,
                         "sample_clamp_direct": 2.5,
                         "sample_clamp_indirect": 24.0,
-                        "light_sampling_threshold": 0.25
+                        "light_sampling_threshold": 0.25,
+                        "use_light_tree": false
                     }
                 }]
             }),
@@ -1089,6 +1106,7 @@ mod tests {
         assert_eq!(render.sample_clamp_direct, 2.5);
         assert_eq!(render.sample_clamp_indirect, 24.0);
         assert_eq!(render.light_sampling_threshold, 0.25);
+        assert!(!render.use_light_tree);
 
         for set in [
             json!({"diffuse_bounces": 1025}),
@@ -1101,6 +1119,7 @@ mod tests {
             json!({"sample_clamp_indirect": 100_000_001.0}),
             json!({"light_sampling_threshold": -0.01}),
             json!({"light_sampling_threshold": 1.01}),
+            json!({"use_light_tree": "yes"}),
         ] {
             let batch = json!({
                 "schema_version": 1,

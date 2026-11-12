@@ -923,8 +923,24 @@ fn world_use_shadows_controls_nee_through_a_camera_invisible_occluder() -> Resul
             "unshadowed"
         };
         let scene = directory.path().join(label);
-        let operations = vec![
-            json!({"op":"world.create","id":"world_main","color":[1.0,1.0,1.0],"strength":1.0}),
+        let mut operations = vec![json!({
+            "op":"image.create",
+            "id":"environment",
+            "width":2,
+            "height":1,
+            "colorspace":"linear",
+            "generator":"checker",
+            "checker_colors":[[1.0,1.0,1.0,1.0],[0.75,0.75,0.75,1.0]],
+            "checker_size":1
+        })];
+        append_world_texture_graph(
+            &mut operations,
+            "environment_graph",
+            "ShaderNodeTexEnvironment",
+            &json!({}),
+            &json!({"image":"environment","interpolation":"closest"}),
+        );
+        operations.extend([
             json!({"op":"node.create","id":"receiver","kind":"plane","params":{"size":2.0},"transform":{"translation":[0.0,0.0,-1.5]}}),
             json!({"op":"node.create","id":"occluder","kind":"sphere","params":{"radius":2.0,"segments":24,"ring_count":12}}),
             json!({"op":"node.update","target":{"id":"occluder"},"set":{"ray_visibility":{"camera":false}}}),
@@ -932,7 +948,7 @@ fn world_use_shadows_controls_nee_through_a_camera_invisible_occluder() -> Resul
             json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
             json!({"op":"world.update","target":{"id":"world_main"},"set":{"use_shadows":use_shadows}}),
             json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":16,"resolution_y":16,"samples":16,"seed":31,"max_bounces":0,"pixel_filter_type":"BOX","filter_width":1.0}}),
-        ];
+        ]);
         make_scene(&scene, &operations)?;
         let (width, height, pixels) =
             render_png(&scene, &directory.path().join(label), Some("path"))?;

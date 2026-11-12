@@ -2459,6 +2459,9 @@ pub struct RenderSettings {
         skip_serializing_if = "is_default_light_sampling_threshold"
     )]
     pub light_sampling_threshold: f64,
+    /// Blender Cycles `scene.cycles.use_light_tree`; omitted at the default of true.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub use_light_tree: bool,
     /// Cycles' `volume_bounces`: a volume path takes `volume_bounces + 1` scatter vertices with direct light, and each
     /// later segment only attenuates (`max_volume_bounce`, `intern/cycles/scene/integrator.cpp`). Omitted when equal to
     /// Blender's default of 0.
@@ -2786,6 +2789,7 @@ impl Default for RenderSettings {
             sample_clamp_direct: 0.0,
             sample_clamp_indirect: 10.0,
             light_sampling_threshold: default_light_sampling_threshold(),
+            use_light_tree: default_true(),
             volume_bounces: 0,
             transparent_max_bounces: 8,
             filter_glossy: 1.0,
@@ -3067,6 +3071,17 @@ pub struct LightData {
     #[serde(default = "white_rgb")]
     pub color: [f64; 3],
     pub energy: f64,
+    /// Blender's Cycles `Light.normalize`; controls the light-tree emitter strength measure.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub normalize: bool,
+    /// Per-channel Cycles light-tree strength multiplier from light temperature, exposure and the
+    /// shader's emission estimate; it does not alter the path tracer's light radiance.
+    #[serde(default = "white_rgb", skip_serializing_if = "is_white_rgb")]
+    pub tree_strength_scale: [f64; 3],
+    /// Whether Potter could reproduce Cycles' node-based light-tree strength estimate.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub tree_strength_supported: bool,
+
     pub radius: f64,
     /// Blender's `use_soft_falloff` (Cycles `is_sphere = !soft_falloff`). When `true`, a point or
     /// spot light with a radius is a disk oriented to the receiver; when `false`, a sphere.
@@ -3152,6 +3167,9 @@ impl Default for LightData {
             use_shadow: Some(true),
             color: white_rgb(),
             energy: 1000.0,
+            normalize: true,
+            tree_strength_scale: white_rgb(),
+            tree_strength_supported: true,
             radius: 0.1,
             soft_falloff: true,
             spot_size: std::f64::consts::FRAC_PI_4,
@@ -3177,6 +3195,12 @@ impl Default for LightData {
 
 fn white_rgb() -> [f64; 3] {
     [1.0, 1.0, 1.0]
+}
+fn is_white_rgb(value: &[f64; 3]) -> bool {
+    value
+        .iter()
+        .zip(white_rgb())
+        .all(|(actual, expected)| actual.partial_cmp(&expected) == Some(std::cmp::Ordering::Equal))
 }
 
 /// Blender's sun angle default, `DNA_light_types.h`: `DEG2RADF(0.526f)`.
@@ -4494,10 +4518,10 @@ fn is_default_light_sampling_threshold(value: &f64) -> bool {
 fn default_light_sampling_threshold() -> f64 {
     0.01
 }
-
 fn default_filter_glossy() -> f64 {
     1.0
 }
+
 fn default_action_influence() -> f64 {
     1.0
 }
@@ -5812,6 +5836,7 @@ mod tests {
         assert_eq!(render.sample_clamp_direct, 0.0);
         assert_eq!(render.sample_clamp_indirect, 10.0);
         assert_eq!(render.light_sampling_threshold, 0.01);
+        assert!(render.use_light_tree);
         assert!(render.caustics_reflective);
         assert!(render.caustics_refractive);
         assert_eq!(render.film_exposure, 1.0);
@@ -5842,6 +5867,7 @@ mod tests {
             "sample_clamp_direct",
             "sample_clamp_indirect",
             "light_sampling_threshold",
+            "use_light_tree",
         ] {
             assert!(serialized.get(field).is_none(), "{field} should be omitted");
         }
@@ -5855,6 +5881,7 @@ mod tests {
             sample_clamp_direct: 1.5,
             sample_clamp_indirect: 24.0,
             light_sampling_threshold: 0.25,
+            use_light_tree: false,
             ..super::RenderSettings::default()
         };
         assert!(render.validate().is_ok());
