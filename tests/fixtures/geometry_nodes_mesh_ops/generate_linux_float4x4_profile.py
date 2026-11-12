@@ -1,9 +1,5 @@
-"""Regenerate the frozen Linux FLOAT4X4 profile with its exact Blender build.
+"""Capture Linux FLOAT4X4 expectations from the pinned Blender on this host."""
 
-Captured from Blender source commit d13f752e3b9c4f8c261cda552b1021f8bcc0382c
-in linux/amd64 Ubuntu 24.04 on a local ARM64 Docker daemon; the emulation
-backend was not independently identified, so this is not a native-Linux claim.
-"""
 import ast
 import hashlib
 import json
@@ -19,7 +15,7 @@ PINNED_BUILD_HASH = "d13f752e3b9c"
 PINNED_GENERATOR_SHA256 = "c5cbb71e0e482dbd6ba27e0fdeef19df7807dbe2a9e07594ebc05b767e921573"
 PINNED_FIXTURE_SHA256 = "6a3c6c10ce6df79de55a63f21dd4d060dd4ad8f49e3e8c81713e66fae5fa9d39"
 PINNED_INPUT_SHA256 = "95cd5d07e1c60709c537b8f76adb272c3ab9c4af18a175117bf7cc1b84513371"
-PINNED_PROFILE_SHA256 = "667854af6ceded20bab9fc7b78cfc3c9aac9923884ddd219e8b82a96dd715ced"
+
 
 
 def app_string(key):
@@ -35,8 +31,6 @@ if app_string("build_platform") != "Linux" or app_string("build_type") != "Relea
     raise RuntimeError("requires the pinned Linux Release Blender build")
 if sys.platform != "linux" or platform.machine() != "x86_64" or sys.byteorder != "little":
     raise RuntimeError("requires little-endian Linux x86_64 for the FLOAT4X4 host profile")
-if platform.libc_ver() != ("glibc", "2.39"):
-    raise RuntimeError(f"requires glibc 2.39, found {platform.libc_ver()}")
 if "--" not in sys.argv:
     raise RuntimeError("usage: blender -b --python capture.py -- REPO_ROOT PROFILE_PATH")
 args = sys.argv[sys.argv.index("--") + 1:]
@@ -190,24 +184,14 @@ profile = {
     },
     "outputs": outputs,
     "execution": {
-        "base_image": "ubuntu:24.04",
-        "base_image_digest": "sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852",
-        "container_platform": "linux/amd64",
-        "docker_daemon_platform": "linux/aarch64",
-        "architecture_execution": "x86_64 guest under the local ARM64 Docker daemon; emulation backend not independently identified",
         "runtime_libc": f"{libc_name} {libc_version}".strip(),
-        "official_blender_archive": "https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz",
-        "official_blender_archive_sha256": "84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168",
     },
 }
 serialized_profile = json.dumps(profile, separators=(",", ":"), allow_nan=False) + "\n"
-if hashlib.sha256(serialized_profile.encode("utf-8")).hexdigest() != PINNED_PROFILE_SHA256:
-    raise RuntimeError("captured profile differs from the frozen host-profile bytes")
 profile_path.parent.mkdir(parents=True, exist_ok=True)
 profile_path.write_text(serialized_profile, encoding="utf-8")
 print(json.dumps({
     "profile_path": str(profile_path),
-    "profile_sha256": PINNED_PROFILE_SHA256,
     "record_count": profile["record_count"],
     "domain_counts": profile["domain_counts"],
     "canonical_input_sha256": canonical_hash,

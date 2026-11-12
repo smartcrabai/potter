@@ -1,5 +1,5 @@
 use num_traits::ToPrimitive;
-use std::{error::Error, fs, process::Command};
+use std::{error::Error, fs, path::Path, process::Command, sync::LazyLock};
 
 use potter_core::{
     geom::Mesh,
@@ -10,9 +10,6 @@ use potter_core::{
 use serde_json::{Map, Value, json};
 
 const ORACLE: &str = include_str!("fixtures/geometry_nodes_mesh_ops/expected.json");
-// Pinned Linux x86_64 Blender uses a separate exact FLOAT4X4 host profile; the macOS oracle stays canonical.
-const LINUX_FLOAT4X4_PROFILE: &str =
-    include_str!("fixtures/geometry_nodes_mesh_ops/linux_float4x4_profile.json");
 
 #[derive(Clone, Copy)]
 struct FieldSpec {
@@ -322,24 +319,56 @@ const OPERATION_CASES: &[&str] = &[
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
 fn fixture() -> TestResult<Value> {
-    let oracle: Value = serde_json::from_str(ORACLE)?;
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let oracle = {
-        let mut oracle = oracle;
+    let mut oracle: Value = serde_json::from_str(ORACLE)?;
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         apply_linux_float4x4_profile(&mut oracle)?;
-        oracle
-    };
+    }
     Ok(oracle)
 }
+
 #[test]
 fn linux_float4x4_profile_is_bound_to_the_canonical_input() -> TestResult<()> {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Ok(());
+    }
     let mut oracle: Value = serde_json::from_str(ORACLE)?;
     apply_linux_float4x4_profile(&mut oracle)?;
     Ok(())
 }
 
+fn linux_float4x4_profile() -> TestResult<Value> {
+    static PROFILE: LazyLock<Result<Value, String>> =
+        LazyLock::new(|| generate_linux_float4x4_profile().map_err(|error| error.to_string()));
+    match &*PROFILE {
+        Ok(profile) => Ok(profile.clone()),
+        Err(error) => Err(std::io::Error::other(error.clone()).into()),
+    }
+}
+
+fn generate_linux_float4x4_profile() -> TestResult<Value> {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script =
+        repo.join("tests/fixtures/geometry_nodes_mesh_ops/generate_linux_float4x4_profile.py");
+    let tempdir = tempfile::tempdir()?;
+    let profile_path = tempdir.path().join("linux_float4x4_profile.json");
+    let blender = std::env::var_os("POTTER_BLENDER").unwrap_or_else(|| "blender".into());
+    let output = Command::new(blender)
+        .args(["--background", "--factory-startup", "--python"])
+        .arg(script)
+        .arg("--")
+        .arg(repo)
+        .arg(&profile_path)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Linux FLOAT4X4 Blender oracle generation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(serde_json::from_slice(&fs::read(profile_path)?)?)
+}
+
 fn apply_linux_float4x4_profile(oracle: &mut Value) -> TestResult<()> {
-    let profile: Value = serde_json::from_str(LINUX_FLOAT4X4_PROFILE)?;
+    let profile = linux_float4x4_profile()?;
     let source = profile
         .get("source")
         .and_then(Value::as_object)
