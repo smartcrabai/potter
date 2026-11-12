@@ -171,13 +171,7 @@ fn assert_case_matches(blender: &Path, root: &Path, script: &Path, case: &str) -
         .ok_or("active scene is missing")?;
     let mut potter_samples = Vec::with_capacity(SEEDS);
     for seed in 0..SEEDS {
-        potter_samples.push(potter_sample(
-            &project,
-            root,
-            scene_id,
-            case,
-            seed as u32,
-        )?);
+        potter_samples.push(potter_sample(&project, root, scene_id, case, seed as u32)?);
     }
     assert_welch_compatible(case, &blender_samples, &potter_samples);
     Ok(())

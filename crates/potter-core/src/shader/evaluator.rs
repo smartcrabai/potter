@@ -10272,13 +10272,7 @@ mod tests {
                 4.0,
             );
             assert_eq!(
-                light_path_scalar(
-                    &groups,
-                    &graph_id,
-                    &node_id,
-                    "Transparent Depth",
-                    &context,
-                ),
+                light_path_scalar(&groups, &graph_id, &node_id, "Transparent Depth", &context,),
                 2.0,
             );
         }

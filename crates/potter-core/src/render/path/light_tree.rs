@@ -1633,6 +1633,7 @@ mod tests {
             distance: 0.0,
             volume: false,
             has_transmission: false,
+            clip_to_light: false,
         };
         assert_eq!(selection.lamp_pdf(7, query), 0.25);
         assert_eq!(selection.world_pdf(query), 0.125);

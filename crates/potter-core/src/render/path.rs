@@ -3089,6 +3089,7 @@ pub(super) fn render(
             volumes: &volumes,
             world_volume: &world_volume,
             world_heterogeneous: world_heterogeneous.as_ref(),
+            volume_temperatures: &volume_temperatures,
             images,
             importance: world_importance.as_ref(),
             pixel_filter,
@@ -6330,6 +6331,8 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
                                             shading: DVec3::ZERO,
                                             direction: sample.direction,
                                             distance: sample.distance,
+                                            ray_depth: 0,
+                                            transparent_depth: 0,
                                             target: sample.distance.is_finite().then_some(
                                                 point + sample.direction * sample.distance,
                                             ),
@@ -6664,6 +6667,7 @@ impl WorldPathSettings {
 #[derive(Clone, Copy)]
 struct NextEventSettings<'tree> {
     bounce: u32,
+    transparent_depth: u32,
     light_selection: LightSelectionPdfs<'tree>,
     light_sampling_threshold: f64,
     world: WorldPathSettings,
@@ -6683,6 +6687,7 @@ struct LightTreeQuery {
     distance: f64,
     volume: bool,
     has_transmission: bool,
+    clip_to_light: bool,
 }
 fn surface_tree_query(point: DVec3, normal: DVec3, closures: &Closures) -> LightTreeQuery {
     LightTreeQuery {
@@ -6691,6 +6696,7 @@ fn surface_tree_query(point: DVec3, normal: DVec3, closures: &Closures) -> Light
         distance: 0.0,
         volume: false,
         has_transmission: closures.has_transmission(),
+        clip_to_light: false,
     }
 }
 
@@ -6706,6 +6712,19 @@ fn volume_tree_query(
         distance: span_length,
         volume: true,
         has_transmission: true,
+        clip_to_light: false,
+    }
+}
+
+fn heterogeneous_volume_tree_query(
+    origin: DVec3,
+    direction: DVec3,
+    span_start: f64,
+    span_length: f64,
+) -> LightTreeQuery {
+    LightTreeQuery {
+        clip_to_light: true,
+        ..volume_tree_query(origin, direction, span_start, span_length)
     }
 }
 
@@ -7217,9 +7236,9 @@ fn shader_graph_group_input_is_spatially_varying(
 }
 
 fn world_volume_has_light_path(doc: &SceneDoc, snapshot: &Snapshot) -> bool {
-    let Some(graph_id) =
-        super::scene::selected_world_id(doc, snapshot).and_then(|world| doc.worlds.get(world))
-            .and_then(|world| world.node_tree.as_ref())
+    let Some(graph_id) = super::scene::selected_world_id(doc, snapshot)
+        .and_then(|world| doc.worlds.get(world))
+        .and_then(|world| world.node_tree.as_ref())
     else {
         return false;
     };
@@ -7326,7 +7345,13 @@ fn shader_graph_link_contains_node_type(
             )
         })
     } else if node.node_type == "NodeGroupInput" {
-        shader_graph_group_input_contains_node_type(doc, group, &link.from_socket, target_node_type, state)
+        shader_graph_group_input_contains_node_type(
+            doc,
+            group,
+            &link.from_socket,
+            target_node_type,
+            state,
+        )
     } else if node.node_type == "ShaderNodeGroup" {
         node.properties
             .get("node_tree")
@@ -8259,6 +8284,9 @@ struct ShadowRay {
     shading: DVec3,
     direction: DVec3,
     distance: f64,
+    /// The path state copied into Cycles' shadow path before it traces transparent hits.
+    ray_depth: u32,
+    transparent_depth: u32,
     /// A finite emitter point, used to recompute the shadow direction from the offset origin.
     target: Option<DVec3>,
     /// The camera footprint at the ray's origin (Cycles' `sd->dP`, which a shadow ray carries unchanged).
@@ -8661,8 +8689,7 @@ fn trace_path_with_guiding(
         media.insert(0, *medium);
     }
     let mut active_media = Vec::with_capacity(media.len());
-    let world_closure_capacity =
-        world_heterogeneous.map_or(0, |world| world.max_closures);
+    let world_closure_capacity = world_heterogeneous.map_or(0, |world| world.max_closures);
     let mut world_closures = Vec::with_capacity(world_closure_capacity);
     let mut world_event_media = Vec::with_capacity(media.len() + world_closure_capacity);
     loop {
@@ -8856,13 +8883,33 @@ fn trace_path_with_guiding(
         };
         if let Some(method) = method {
             let span_origin = origin + direction * span_start;
-            let tree_query = volume_tree_query(origin, direction, span_start, span_length);
-            light_selection.lamp_pdfs(tree_query, &mut light_tree_pdfs);
+            let tree_query = if heterogeneous_world.is_some() {
+                heterogeneous_volume_tree_query(origin, direction, span_start, span_length)
+            } else {
+                volume_tree_query(origin, direction, span_start, span_length)
+            };
+            if tree_query.clip_to_light {
+                light_tree_pdfs.clear();
+            } else {
+                light_selection.lamp_pdfs(tree_query, &mut light_tree_pdfs);
+            }
             for (index, (light, &(point, sampled))) in lights.iter().zip(&choices).enumerate() {
-                let selection_pdf = light_tree_pdfs
-                    .get(index)
-                    .copied()
-                    .unwrap_or(light_selection.lamps);
+                let source_query = if tree_query.clip_to_light {
+                    let Some(query) = volume_light_tree_query(light, tree_query) else {
+                        continue;
+                    };
+                    query
+                } else {
+                    tree_query
+                };
+                let selection_pdf = if tree_query.clip_to_light {
+                    light_selection.lamp_pdf(index, source_query)
+                } else {
+                    light_tree_pdfs
+                        .get(index)
+                        .copied()
+                        .unwrap_or(light_selection.lamps)
+                };
                 if selection_pdf <= 0.0 {
                     continue;
                 }
@@ -8934,13 +8981,15 @@ fn trace_path_with_guiding(
                     let Some(point) = point.filter(|_| sampled) else {
                         continue;
                     };
-                    let Some((sample_start, sample_end)) =
-                        volume_light_segment_range(light, origin, direction, segment_limit)
-                    else {
-                        continue;
+                    let (sample_start, sample_origin, sample_length) = if tree_query.clip_to_light {
+                        (
+                            (source_query.point - origin).dot(direction),
+                            source_query.point,
+                            source_query.distance,
+                        )
+                    } else {
+                        (span_start, span_origin, span_length)
                     };
-                    let sample_origin = origin + direction * sample_start;
-                    let sample_length = sample_end - sample_start;
                     let Some((offset, pdf)) = equiangular_sample(
                         point,
                         sample_origin,
@@ -9082,6 +9131,8 @@ fn trace_path_with_guiding(
                     light_sample,
                     sample_point,
                     ray_dp + distance * ray_dd,
+                    bounce,
+                    transparent_bounce,
                     budget,
                     rng,
                     evaluator_workspace,
@@ -9142,19 +9193,21 @@ fn trace_path_with_guiding(
                     let Some(anisotropy) = phase.pick(rng) else {
                         break;
                     };
-                    let weights = event_weights(
+                    let weights = heterogeneous_event_weights(
+                        lights,
                         &choices,
                         method,
                         origin,
                         direction,
-                        segment_limit,
+                        span_start,
+                        span_length,
                         distance,
                         tracked.scatter_pdf,
-                        false,
                     );
                     let point = origin + direction * distance;
                     let event_footprint = ray_dp + distance * ray_dd;
-                    let tree_query = volume_tree_query(origin, direction, span_start, span_length);
+                    let tree_query =
+                        heterogeneous_volume_tree_query(origin, direction, span_start, span_length);
                     radiance += direct_volume_lighting(
                         scene,
                         &media,
@@ -9178,6 +9231,7 @@ fn trace_path_with_guiding(
                         throughput * roulette_weight,
                         NextEventSettings {
                             bounce,
+                            transparent_depth: transparent_bounce,
                             light_selection,
                             light_sampling_threshold,
                             world: world_settings,
@@ -9209,8 +9263,7 @@ fn trace_path_with_guiding(
                     continue;
                 }
             }
-        } else
-        if let Some((grid, medium)) = mixed {
+        } else if let Some((grid, medium)) = mixed {
             // The voxel hero-channel flight and mesh analog collision are sampled independently; the nearer event receives
             // the other medium's per-channel survival correction, and their densities form the distance MIS partner.
             let voxel = trace_volume_segment(Some(grid), origin, direction, throughput, rng, true);
@@ -9277,6 +9330,7 @@ fn trace_path_with_guiding(
                     throughput * roulette_weight,
                     NextEventSettings {
                         bounce,
+                        transparent_depth: transparent_bounce,
                         light_selection,
                         light_sampling_threshold,
                         world: world_settings,
@@ -9375,6 +9429,7 @@ fn trace_path_with_guiding(
                     throughput * roulette_weight,
                     NextEventSettings {
                         bounce,
+                        transparent_depth: transparent_bounce,
                         light_selection,
                         light_sampling_threshold,
                         world: world_settings,
@@ -9482,6 +9537,7 @@ fn trace_path_with_guiding(
                     throughput * roulette_weight,
                     NextEventSettings {
                         bounce,
+                        transparent_depth: transparent_bounce,
                         light_selection,
                         light_sampling_threshold,
                         world: world_settings,
@@ -9574,6 +9630,7 @@ fn trace_path_with_guiding(
                         throughput * roulette_weight,
                         NextEventSettings {
                             bounce,
+                            transparent_depth: transparent_bounce,
                             light_selection,
                             light_sampling_threshold,
                             world: world_settings,
@@ -9627,6 +9684,7 @@ fn trace_path_with_guiding(
                 light.pdf,
                 light_selection,
                 light.light_index,
+                lights,
             );
             if light.visible {
                 let contribution = film_clamp.apply(
@@ -9828,6 +9886,7 @@ fn trace_path_with_guiding(
                 throughput,
                 NextEventSettings {
                     bounce,
+                    transparent_depth: transparent_bounce,
                     light_selection,
                     light_sampling_threshold,
                     world: world_settings,
@@ -11891,6 +11950,7 @@ fn direct_lighting(
     } = scene;
     let NextEventSettings {
         bounce,
+        transparent_depth,
         light_selection,
         light_sampling_threshold,
         world: world_settings,
@@ -11954,6 +12014,8 @@ fn direct_lighting(
                         shading: closures.smooth,
                         direction: sample.direction,
                         distance: sample.distance,
+                        ray_depth: bounce,
+                        transparent_depth,
                         target: sample
                             .distance
                             .is_finite()
@@ -12036,6 +12098,8 @@ fn direct_lighting(
                                 shading: closures.smooth,
                                 direction,
                                 distance: f64::INFINITY,
+                                ray_depth: bounce,
+                                transparent_depth,
                                 target: None,
                                 self_primitive: Some(primitive_id),
                                 footprint,
@@ -12078,6 +12142,7 @@ fn direct_volume_lighting(
 ) -> Result<DVec3> {
     let NextEventSettings {
         bounce,
+        transparent_depth,
         light_selection,
         light_sampling_threshold,
         world: world_settings,
@@ -12085,12 +12150,23 @@ fn direct_volume_lighting(
     } = next_event;
     let mut contribution = DVec3::ZERO;
     let tree_query = site.tree_query;
-    light_selection.lamp_pdfs(tree_query, lamp_pdfs);
+    if tree_query.clip_to_light {
+        lamp_pdfs.clear();
+    } else {
+        light_selection.lamp_pdfs(tree_query, lamp_pdfs);
+    }
     for (index, light) in scene.lights.iter().enumerate() {
-        let selection_pdf = lamp_pdfs
-            .get(index)
-            .copied()
-            .unwrap_or(light_selection.lamps);
+        let selection_pdf = if tree_query.clip_to_light {
+            let Some(query) = volume_light_tree_query(light, tree_query) else {
+                continue;
+            };
+            light_selection.lamp_pdf(index, query)
+        } else {
+            lamp_pdfs
+                .get(index)
+                .copied()
+                .unwrap_or(light_selection.lamps)
+        };
         if selection_pdf <= 0.0 {
             continue;
         }
@@ -12130,6 +12206,8 @@ fn direct_volume_lighting(
             sample,
             site.point,
             site.footprint,
+            bounce,
+            transparent_depth,
             transparent_budget,
             rng,
             evaluator_workspace,
@@ -12181,6 +12259,8 @@ fn direct_volume_lighting(
                             shading: DVec3::ZERO,
                             direction,
                             distance: f64::INFINITY,
+                            ray_depth: bounce,
+                            transparent_depth,
                             target: None,
                             footprint: site.footprint,
                             self_primitive: None,
@@ -12220,6 +12300,7 @@ fn forward_light_hit_mis_weight(
     light_pdf: f64,
     light_selection: LightSelectionPdfs<'_>,
     light_index: usize,
+    lights: &[PointLight],
 ) -> f64 {
     match previous {
         Scatter::Surface(vertex) => power_heuristic(
@@ -12230,10 +12311,17 @@ fn forward_light_hit_mis_weight(
             phase_pdf,
             tree_query,
             ..
-        } => power_heuristic(
-            phase_pdf,
-            light_pdf * light_selection.lamp_pdf(light_index, tree_query),
-        ),
+        } => {
+            let selection_pdf = if tree_query.clip_to_light {
+                lights
+                    .get(light_index)
+                    .and_then(|light| volume_light_tree_query(light, tree_query))
+                    .map_or(0.0, |query| light_selection.lamp_pdf(light_index, query))
+            } else {
+                light_selection.lamp_pdf(light_index, tree_query)
+            };
+            power_heuristic(phase_pdf, light_pdf * selection_pdf)
+        }
         Scatter::Camera | Scatter::Delta(_) => 1.0,
     }
 }
@@ -12422,6 +12510,127 @@ fn volume_light_segment_range(
     (start < end).then_some((start, end))
 }
 
+fn heterogeneous_volume_light_segment_range(
+    light: &PointLight,
+    origin: DVec3,
+    direction: DVec3,
+    segment_limit: f64,
+) -> Option<(f64, f64)> {
+    let (mut start, mut end) = volume_light_segment_range(light, origin, direction, segment_limit)?;
+    if light.kind != LightType::Spot {
+        return Some((start, end));
+    }
+    let spot_half_angle = light.spot_size.clamp(0.0, std::f64::consts::PI) * 0.5;
+    let cos_half = spot_half_angle.cos();
+    let cos_half_squared = cos_half * cos_half;
+    let world_transform = light.world_transform;
+    let inverse = world_transform.inverse();
+    let tan_half = spot_half_angle.tan();
+    let minimum_scale_squared = world_transform
+        .x_axis
+        .truncate()
+        .length_squared()
+        .min(world_transform.y_axis.truncate().length_squared());
+    let radius = light.radius.max(0.0);
+    let ray_segment_dp = if radius > 0.0 && tan_half != 0.0 {
+        radius
+            * (1.0
+                + world_transform.z_axis.truncate().length_squared()
+                    / (tan_half * tan_half * minimum_scale_squared))
+                .sqrt()
+    } else {
+        0.0
+    };
+    let local_origin = inverse.transform_point3(origin + light.direction * ray_segment_dp);
+    let local_direction = inverse.transform_vector3(direction);
+    if !local_origin.is_finite()
+        || !local_direction.is_finite()
+        || local_direction.length_squared() <= 0.0
+    {
+        return None;
+    }
+    let axis = -DVec3::Z;
+    let axis_origin = axis.dot(local_origin);
+    let axis_direction = axis.dot(local_direction);
+    if axis_direction > 0.0 {
+        start = start.max(-axis_origin / axis_direction);
+    } else if axis_direction < 0.0 {
+        end = end.min(-axis_origin / axis_direction);
+    } else if axis_origin <= 0.0 {
+        return None;
+    }
+    if start >= end {
+        return None;
+    }
+
+    if cos_half_squared < 1.0e-4 {
+        return Some((start, end));
+    }
+    let a = axis_direction * axis_direction - cos_half_squared * local_direction.length_squared();
+    let b =
+        2.0 * (axis_direction * axis_origin - cos_half_squared * local_direction.dot(local_origin));
+    let c = axis_origin * axis_origin - cos_half_squared * local_origin.length_squared();
+    if a == 0.0 {
+        if b > 0.0 {
+            start = start.max(-c / b);
+        } else if b < 0.0 {
+            end = end.min(-c / b);
+        } else if c < 0.0 {
+            return None;
+        }
+        return (start < end).then_some((start, end));
+    }
+    let discriminant = b * b - 4.0 * a * c;
+    if discriminant < 0.0 {
+        return (a > 0.0).then_some((start, end));
+    }
+    if discriminant == 0.0 {
+        return (a > 0.0).then_some((start, end));
+    }
+    let root = discriminant.sqrt();
+    let denominator = 2.0 * a;
+    let mut first = (-b - root) / denominator;
+    let mut second = (-b + root) / denominator;
+    if first > second {
+        std::mem::swap(&mut first, &mut second);
+    }
+    if a < 0.0 {
+        start = start.max(first);
+        end = end.min(second);
+        return (start < end).then_some((start, end));
+    }
+    let left_end = end.min(first);
+    if start < left_end && {
+        let middle = start + (left_end - start) * 0.5;
+        a * middle * middle + b * middle + c >= 0.0
+    } {
+        return Some((start, left_end));
+    }
+    let right_start = start.max(second);
+    if right_start < end && {
+        let middle = right_start + (end - right_start) * 0.5;
+        a * middle * middle + b * middle + c >= 0.0
+    } {
+        return Some((right_start, end));
+    }
+    None
+}
+
+fn volume_light_tree_query(light: &PointLight, query: LightTreeQuery) -> Option<LightTreeQuery> {
+    let (start, end) = heterogeneous_volume_light_segment_range(
+        light,
+        query.point,
+        query.normal_or_direction,
+        query.distance,
+    )?;
+    Some(volume_tree_query(
+        query.point,
+        query.normal_or_direction,
+        start,
+        end - start,
+    ))
+}
+
 /// Cycles' direct channel proposal uses integrated albedo, then weights it by throughput again.
 fn volume_direct_channel_pdf(medium: &BsdfParams, throughput: DVec3, segment_length: f64) -> DVec3 {
     let scatter = DVec3::from_array(medium.volume_scatter);
@@ -12509,6 +12718,8 @@ fn volume_light_nee(
     sample: LightSample,
     point: DVec3,
     footprint: f64,
+    ray_depth: u32,
+    transparent_depth: u32,
     transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
@@ -12524,6 +12735,8 @@ fn volume_light_nee(
                     shading: DVec3::ZERO,
                     direction: sample.direction,
                     distance: sample.distance,
+                    ray_depth,
+                    transparent_depth,
                     target: sample
                         .distance
                         .is_finite()
@@ -12586,6 +12799,8 @@ fn shadow_transmittance_with_volumetric_shadows(
         shading,
         direction,
         distance,
+        ray_depth,
+        transparent_depth,
         target,
         footprint,
         self_primitive,
@@ -12598,8 +12813,9 @@ fn shadow_transmittance_with_volumetric_shadows(
     } else {
         Vec::new()
     };
-    let world_closure_capacity =
-        scene.world_heterogeneous.map_or(0, |world| world.max_closures);
+    let world_closure_capacity = scene
+        .world_heterogeneous
+        .map_or(0, |world| world.max_closures);
     let mut world_closures = Vec::with_capacity(world_closure_capacity);
     let mut world_media = Vec::with_capacity(shadow_media.len() + world_closure_capacity);
     let mut transmittance = DVec3::ONE;
@@ -12716,8 +12932,8 @@ fn shadow_transmittance_with_volumetric_shadows(
                     RayKind::Shadow,
                     false,
                     false,
-                    0,
-                    transparent_hits,
+                    ray_depth,
+                    transparent_depth.saturating_add(transparent_hits),
                     rng,
                     evaluator_workspace,
                     &mut world_closures,
@@ -12797,8 +13013,8 @@ fn shadow_transmittance_with_volumetric_shadows(
                 RayKind::Shadow,
                 false,
                 false,
-                0,
-                transparent_hits,
+                ray_depth,
+                transparent_depth.saturating_add(transparent_hits),
                 rng,
                 evaluator_workspace,
                 &mut world_closures,
@@ -14277,36 +14493,47 @@ fn collect_world_volume_media(
         return Ok((Vec::new(), None));
     }
     if world_volume_shader_is_spatially_varying(doc, snapshot) {
-        let mut workspace = EvaluatorWorkspace::default();
-        let mut closures = Vec::new();
-        let octree = WorldVolumeOctree::build(|position| {
-            evaluate_world_volume_closures(
-                &material,
-                &prepared,
-                &doc.node_groups,
-                images,
-                position,
-                RayKind::Camera,
-                false,
-                false,
-                0,
-                0,
-                world.volume_sampling,
-                world.volume_interpolation,
-                &mut workspace,
-                &mut closures,
-            )?;
-            let extinction = DVec3::from_array(weighted_volume_channels(&closures, |params| {
-                std::array::from_fn(|channel| {
-                    params.volume_scatter[channel] + params.volume_absorption[channel]
-                })
-            }));
-            let emission = DVec3::from_array(weighted_volume_channels(&closures, |params| {
-                params.volume_emission
-            }));
-            Ok(extinction.max_element().max(emission.max_element()) as f32)
+        let worker_count =
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let material_ref = &material;
+        let prepared_ref = &prepared;
+        let node_groups = &doc.node_groups;
+        let volume_sampling = world.volume_sampling;
+        let volume_interpolation = world.volume_interpolation;
+        let (octree, max_closures) = WorldVolumeOctree::build_with_workers(worker_count, || {
+            let mut workspace = EvaluatorWorkspace::default();
+            let mut closures = Vec::new();
+            move |position| {
+                evaluate_world_volume_closures(
+                    material_ref,
+                    prepared_ref,
+                    node_groups,
+                    images,
+                    position,
+                    RayKind::Camera,
+                    false,
+                    false,
+                    0,
+                    0,
+                    volume_sampling,
+                    volume_interpolation,
+                    &mut workspace,
+                    &mut closures,
+                )?;
+                let extinction = DVec3::from_array(weighted_volume_channels(&closures, |params| {
+                    std::array::from_fn(|channel| {
+                        params.volume_scatter[channel] + params.volume_absorption[channel]
+                    })
+                }));
+                let emission = DVec3::from_array(weighted_volume_channels(&closures, |params| {
+                    params.volume_emission
+                }));
+                Ok((
+                    extinction.max_element().max(emission.max_element()) as f32,
+                    closures.capacity(),
+                ))
+            }
         })?;
-        let max_closures = closures.capacity();
         let has_light_path = world_volume_has_light_path(doc, snapshot);
         return Ok((
             Vec::new(),
@@ -14425,15 +14652,9 @@ fn evaluate_world_volume_stack(
     media.reserve(closures.len() + static_media.len());
     for (closure_index, closure) in closures.iter().enumerate() {
         let mut params = closure.params;
-        params.volume_scatter = params
-            .volume_scatter
-            .map(|value| closure.weight * value);
-        params.volume_absorption = params
-            .volume_absorption
-            .map(|value| closure.weight * value);
-        params.volume_emission = params
-            .volume_emission
-            .map(|value| closure.weight * value);
+        params.volume_scatter = params.volume_scatter.map(|value| closure.weight * value);
+        params.volume_absorption = params.volume_absorption.map(|value| closure.weight * value);
+        params.volume_emission = params.volume_emission.map(|value| closure.weight * value);
         if params.has_medium() || params.volume_emission.iter().any(|value| *value != 0.0) {
             media.push(MeshMedium {
                 object_index: WORLD_VOLUME_OBJECT_INDEX,
@@ -15838,9 +16059,7 @@ fn static_volume_majorant(media: &[MeshMedium]) -> f64 {
 }
 
 fn sample_majorant_distance(majorant: f64, rng: &mut Pcg32) -> Option<f64> {
-    (majorant > 0.0).then(|| {
-        -rng.next_f64().max(f64::MIN_POSITIVE).ln() / majorant
-    })
+    (majorant > 0.0).then(|| -rng.next_f64().max(f64::MIN_POSITIVE).ln() / majorant)
 }
 
 fn majorant_event_correction(sampled_majorant: f64, actual_majorant: f64, distance: f64) -> f64 {
@@ -15866,11 +16085,7 @@ mod world_volume_majorant_tests {
     }
 }
 
-
-fn grid_volume_coefficients(
-    grid: Option<&VoxelGrid>,
-    distance: f64,
-) -> (DVec3, DVec3, DVec3, f64) {
+fn grid_volume_coefficients(grid: Option<&VoxelGrid>, distance: f64) -> (DVec3, DVec3, DVec3, f64) {
     let Some(grid) = grid else {
         return (DVec3::ZERO, DVec3::ZERO, DVec3::ZERO, 0.0);
     };
@@ -15917,7 +16132,9 @@ fn world_interval_extrema(
     closures: &mut Vec<ShaderClosure>,
     media: &mut Vec<MeshMedium>,
 ) -> Result<(f32, f32)> {
-    let interval = world.octree.interval(origin, direction, start, interval_end);
+    let interval = world
+        .octree
+        .interval(origin, direction, start, interval_end);
     if !world.has_light_path || ray_kind == RayKind::Camera {
         return Ok((interval.sigma_min, interval.sigma_max));
     }
@@ -15989,9 +16206,7 @@ fn trace_world_volume_segment(
                 scatter_pdf: 0.0,
             });
         }
-        let world_interval = world
-            .octree
-            .interval(origin, direction, position, limit);
+        let world_interval = world.octree.interval(origin, direction, position, limit);
         let end = world_interval
             .end
             .min(grid_step_boundary(grid, position, limit))
@@ -16004,7 +16219,7 @@ fn trace_world_volume_segment(
                 scatter_pdf: 0.0,
             });
         }
-        let (world_min, world_max) = world_interval_extrema(
+        let (_, world_max) = world_interval_extrema(
             scene,
             world,
             origin,
@@ -16022,8 +16237,7 @@ fn trace_world_volume_segment(
             candidate_media,
         )?;
         let (_, _, _, grid_majorant) = grid_volume_coefficients(grid, position);
-        let distance_majorant =
-            f64::from(world_max) + static_majorant + grid_majorant;
+        let distance_majorant = f64::from(world_max) + static_majorant + grid_majorant;
         if distance_majorant <= 0.0 {
             position = end;
             continue;
@@ -16059,16 +16273,18 @@ fn trace_world_volume_segment(
         )?;
         let (grid_extinction, grid_scatter, grid_emission, _) =
             grid_volume_coefficients(grid, event_distance);
-        let medium_scatter =
-            medium.map_or(DVec3::ZERO, |medium| DVec3::from_array(medium.volume_scatter));
-        let medium_absorption =
-            medium.map_or(DVec3::ZERO, |medium| DVec3::from_array(medium.volume_absorption));
+        let medium_scatter = medium.map_or(DVec3::ZERO, |medium| {
+            DVec3::from_array(medium.volume_scatter)
+        });
+        let medium_absorption = medium.map_or(DVec3::ZERO, |medium| {
+            DVec3::from_array(medium.volume_absorption)
+        });
         let scatter = medium_scatter + grid_scatter;
         let absorption = medium_absorption + (grid_extinction - grid_scatter).max(DVec3::ZERO);
         let extinction = scatter + absorption;
-        let emission = medium
-            .map_or(DVec3::ZERO, |medium| DVec3::from_array(medium.volume_emission))
-            + grid_emission;
+        let emission = medium.map_or(DVec3::ZERO, |medium| {
+            DVec3::from_array(medium.volume_emission)
+        }) + grid_emission;
         let majorant = distance_majorant.max(extinction.max_element());
         let correction = majorant_event_correction(distance_majorant, majorant, distance);
         emitted += *throughput * transmittance * emission * correction;
@@ -16160,9 +16376,7 @@ fn world_volume_transmittance(
         let mut sigma_min = f32::MAX;
         let mut sigma_max = -f32::MAX;
         loop {
-            let interval = world
-                .octree
-                .interval(origin, direction, segment_end, limit);
+            let interval = world.octree.interval(origin, direction, segment_end, limit);
             let end = interval
                 .end
                 .min(grid_step_boundary(grid, segment_end, limit))
@@ -16229,8 +16443,8 @@ fn world_volume_transmittance(
         if independent_estimators == 1 {
             let mut optical_depth = DVec3::ZERO;
             for index in 0..samples_per_estimator {
-                let distance = (segment_start + (shade_offset + index as f64) * step_size)
-                    .min(segment_end);
+                let distance =
+                    (segment_start + (shade_offset + index as f64) * step_size).min(segment_end);
                 optical_depth += world_volume_extinction_at(
                     scene,
                     world,
@@ -16288,10 +16502,8 @@ fn world_volume_transmittance(
                 transmittance_k += (-tau_k).exp();
             }
             transmittance_k /= independent_estimators as f64;
-            let transmittance_j =
-                0.5 * ((-tau_j[0]).exp() + (-tau_j[1]).exp());
-            transmittance *=
-                transmittance_k + ((-tau_j1).exp() - transmittance_j) / pmf;
+            let transmittance_j = 0.5 * ((-tau_j[0]).exp() + (-tau_j[1]).exp());
+            transmittance *= transmittance_k + ((-tau_j1).exp() - transmittance_j) / pmf;
         }
         position = segment_end;
         steps += 1;
@@ -16428,9 +16640,7 @@ fn world_volume_distance_pdf_at(
         if position >= distance {
             break;
         }
-        let interval = world
-            .octree
-            .interval(origin, direction, position, distance);
+        let interval = world.octree.interval(origin, direction, position, distance);
         let end = interval
             .end
             .min(grid_step_boundary(grid, position, distance))
@@ -16438,7 +16648,7 @@ fn world_volume_distance_pdf_at(
         if end <= position {
             return Ok(0.0);
         }
-        let (world_min, world_max) = world_interval_extrema(
+        let (_, world_max) = world_interval_extrema(
             scene,
             world,
             origin,
@@ -16456,8 +16666,7 @@ fn world_volume_distance_pdf_at(
             media,
         )?;
         let (_, _, _, grid_majorant) = grid_volume_coefficients(grid, position);
-        let distance_majorant =
-            f64::from(world_max) + static_majorant + grid_majorant;
+        let distance_majorant = f64::from(world_max) + static_majorant + grid_majorant;
         if distance_majorant <= 0.0 {
             position = end;
             continue;
@@ -16497,8 +16706,8 @@ fn world_volume_distance_pdf_at(
         let scatter = medium.map_or(DVec3::ZERO, |medium| {
             DVec3::from_array(medium.volume_scatter)
         }) + grid_scatter;
-        let extinction = medium.map_or(DVec3::ZERO, |medium| medium_extinction(&medium))
-            + grid_extinction;
+        let extinction =
+            medium.map_or(DVec3::ZERO, |medium| medium_extinction(&medium)) + grid_extinction;
         let majorant = distance_majorant.max(extinction.max_element());
         let null = DVec3::splat(majorant) - extinction;
         let albedo = DVec3::from_array(std::array::from_fn(|channel| {
@@ -16513,8 +16722,7 @@ fn world_volume_distance_pdf_at(
         if null_probability <= 0.0 {
             return Ok(0.0);
         }
-        let correction =
-            majorant_event_correction(distance_majorant, majorant, candidate_distance);
+        let correction = majorant_event_correction(distance_majorant, majorant, candidate_distance);
         path_throughput *= null * (correction / null_probability);
         survival *= null_probability;
         position = candidate;
@@ -16542,8 +16750,7 @@ fn world_volume_distance_pdf_at(
         media,
     )?;
     let (_, _, _, grid_majorant) = grid_volume_coefficients(grid, distance);
-    let distance_majorant =
-        f64::from(world_max) + static_majorant + grid_majorant;
+    let distance_majorant = f64::from(world_max) + static_majorant + grid_majorant;
     if distance_majorant <= 0.0 {
         return Ok(0.0);
     }
@@ -16569,8 +16776,8 @@ fn world_volume_distance_pdf_at(
     let scatter = medium.map_or(DVec3::ZERO, |medium| {
         DVec3::from_array(medium.volume_scatter)
     }) + grid_scatter;
-    let extinction = medium.map_or(DVec3::ZERO, |medium| medium_extinction(&medium))
-        + grid_extinction;
+    let extinction =
+        medium.map_or(DVec3::ZERO, |medium| medium_extinction(&medium)) + grid_extinction;
     let majorant = distance_majorant.max(extinction.max_element());
     let albedo = DVec3::from_array(std::array::from_fn(|channel| {
         if extinction[channel] > 0.0 {
@@ -16757,6 +16964,57 @@ fn event_weights(
                     }
                     _ => 1.0,
                 }
+            }
+        })
+        .collect()
+}
+
+fn heterogeneous_event_weights(
+    lights: &[PointLight],
+    choices: &[(Option<DVec3>, bool)],
+    method: Option<crate::model::VolumeSampling>,
+    origin: DVec3,
+    direction: DVec3,
+    span_start: f64,
+    span_length: f64,
+    distance: f64,
+    scatter_pdf: f64,
+) -> Vec<f64> {
+    use crate::model::VolumeSampling;
+    choices
+        .iter()
+        .zip(lights)
+        .map(|(&(point, sampled), light)| {
+            let Some(point) = point else {
+                return 1.0;
+            };
+            let Some((clip_start, clip_end)) = heterogeneous_volume_light_segment_range(
+                light,
+                origin + direction * span_start,
+                direction,
+                span_length,
+            ) else {
+                return 1.0;
+            };
+            let event_distance = distance - span_start;
+            let equiangular_pdf = if event_distance >= clip_start && event_distance <= clip_end {
+                equiangular_pdf(
+                    point,
+                    origin + direction * (span_start + clip_start),
+                    direction,
+                    clip_end - clip_start,
+                    event_distance - clip_start,
+                )
+            } else {
+                0.0
+            };
+            match method {
+                Some(VolumeSampling::Equiangular) if sampled => 0.0,
+                Some(VolumeSampling::MultipleImportance) if sampled => 0.0,
+                Some(VolumeSampling::MultipleImportance) => {
+                    2.0 * power_heuristic(scatter_pdf, equiangular_pdf)
+                }
+                _ => 1.0,
             }
         })
         .collect()
@@ -19474,6 +19732,8 @@ mod cycles_hair_path_tests {
                 shading: DVec3::ZERO,
                 direction,
                 distance: f64::INFINITY,
+                ray_depth: 0,
+                transparent_depth: 0,
                 footprint: 0.0,
                 target: None,
                 self_primitive: Some(primitive_id),
@@ -21585,8 +21845,13 @@ mod cycles_world_light_tests {
             point: query.point,
             tree_query: query,
         };
-        let forward =
-            super::forward_light_hit_mis_weight(volume, conditional_light_pdf, light_selection, 0);
+        let forward = super::forward_light_hit_mis_weight(
+            volume,
+            conditional_light_pdf,
+            light_selection,
+            0,
+            &lights,
+        );
         let nee = super::power_heuristic(conditional_light_pdf * selection_pdf, phase_pdf);
         assert_eq!(
             forward,
@@ -21612,6 +21877,30 @@ mod cycles_world_light_tests {
         assert_eq!(
             pdf,
             super::equiangular_pdf(light, origin, direction, distance, sample)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn heterogeneous_spot_volume_span_stops_at_cone_edge() -> crate::error::Result<()> {
+        let mut light = test_area_volume_light(DVec3::ZERO, -DVec3::Z, DVec3::Y);
+        light.kind = LightType::Spot;
+        light.area = None;
+        light.spot_size = 1.0;
+        let origin = DVec3::new(0.1, 0.0, -2.0);
+        let (start, end) =
+            super::heterogeneous_volume_light_segment_range(&light, origin, DVec3::Z, 4.0)
+                .ok_or_else(|| {
+                    crate::error::PotError::new(
+                        crate::error::ErrorCode::InternalError,
+                        "ray did not enter the spotlight cone",
+                    )
+                })?;
+        let expected_end = 2.0 - 0.1 / 0.5_f64.tan();
+        assert_eq!(start, 0.0);
+        assert!(
+            (end - expected_end).abs() < 1.0e-12,
+            "spotlight segment ends at {end}, expected {expected_end}"
         );
         Ok(())
     }
@@ -22065,6 +22354,7 @@ mod cycles_world_light_tests {
             DVec3::ONE,
             NextEventSettings {
                 bounce,
+                transparent_depth: 0,
                 light_selection: LightSelectionPdfs {
                     lamps: 0.0,
                     world: 1.0,
@@ -22105,6 +22395,7 @@ mod cycles_world_light_tests {
             DVec3::ONE,
             NextEventSettings {
                 bounce: 0,
+                transparent_depth: 0,
                 light_selection: LightSelectionPdfs {
                     lamps: 0.0,
                     world: 1.0,
@@ -22146,6 +22437,7 @@ mod cycles_world_light_tests {
             DVec3::ONE,
             NextEventSettings {
                 bounce: 0,
+                transparent_depth: 0,
                 light_selection: LightSelectionPdfs {
                     lamps: 0.0,
                     world: 1.0,
@@ -22211,6 +22503,7 @@ mod cycles_world_light_tests {
             DVec3::ONE,
             NextEventSettings {
                 bounce,
+                transparent_depth: 0,
                 light_selection,
                 light_sampling_threshold: 0.0,
                 world: WorldPathSettings {
@@ -22674,6 +22967,7 @@ mod cycles_world_light_tests {
             DVec3::ONE,
             NextEventSettings {
                 bounce: 0,
+                transparent_depth: 0,
                 light_selection,
                 light_sampling_threshold: 1.0,
                 world: WorldPathSettings {

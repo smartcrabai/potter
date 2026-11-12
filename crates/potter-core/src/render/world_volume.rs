@@ -47,20 +47,70 @@ pub(crate) struct WorldVolumeInterval {
 }
 
 impl WorldVolumeOctree {
-    pub(crate) fn build(mut eval_sigma: impl FnMut(DVec3) -> Result<f32>) -> Result<Self> {
+    pub(crate) fn build_with_workers<E>(
+        worker_count: usize,
+        mut make_evaluator: impl FnMut() -> E,
+    ) -> Result<(Self, usize)>
+    where
+        E: FnMut(DVec3) -> Result<(f32, usize)> + Send,
+    {
         let mut cells = vec![(f32::MAX, -f32::MAX); DENSITY_CELL_COUNT];
-        for z in 0..DENSITY_RESOLUTION {
-            for y in 0..DENSITY_RESOLUTION {
-                for x in 0..DENSITY_RESOLUTION {
-                    let offset = x + DENSITY_RESOLUTION * (y + z * DENSITY_RESOLUTION);
-                    cells[offset] = cell_extrema(offset, &mut eval_sigma)?;
+        let worker_count = worker_count.clamp(1, DENSITY_CELL_COUNT);
+        let chunk_size = DENSITY_CELL_COUNT.div_ceil(worker_count);
+        let max_closures = std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(worker_count);
+            for (chunk_index, chunk) in cells.chunks_mut(chunk_size).enumerate() {
+                let offset = chunk_index * chunk_size;
+                let mut evaluate = make_evaluator();
+                workers.push(
+                    std::thread::Builder::new()
+                        .stack_size(super::path::WORKER_STACK_BYTES)
+                        .spawn_scoped(scope, move || {
+                            let mut max_closures = 0;
+                            for (index, cell) in chunk.iter_mut().enumerate() {
+                                let (extrema, capacity) =
+                                    cell_extrema_with_capacity(offset + index, &mut evaluate)?;
+                                *cell = extrema;
+                                max_closures = max_closures.max(capacity);
+                            }
+                            Ok::<_, crate::error::PotError>(max_closures)
+                        }),
+                );
+            }
+
+            let mut max_closures = 0;
+            let mut worker_error = None;
+            for worker in workers {
+                let worker_result = match worker {
+                    Ok(worker) => worker.join().unwrap_or_else(|_| {
+                        Err(crate::error::PotError::new(
+                            crate::error::ErrorCode::InternalError,
+                            "World volume density worker panicked",
+                        ))
+                    }),
+                    Err(error) => Err(crate::error::PotError::new(
+                        crate::error::ErrorCode::InternalError,
+                        format!("cannot start a World volume density worker: {error}"),
+                    )),
+                };
+                match worker_result {
+                    Ok(capacity) => max_closures = max_closures.max(capacity),
+                    Err(error) => {
+                        if worker_error.is_none() {
+                            worker_error = Some(error);
+                        }
+                    }
                 }
             }
-        }
+            match worker_error {
+                Some(error) => Err(error),
+                None => Ok(max_closures),
+            }
+        })?;
 
         let mut nodes = vec![OctreeNode::EMPTY];
         build_node(&mut nodes, 0, &cells, 0, [0; 3], DENSITY_RESOLUTION);
-        Ok(Self { nodes })
+        Ok((Self { nodes }, max_closures))
     }
 
     pub(crate) fn interval(
@@ -134,14 +184,12 @@ impl WorldVolumeOctree {
             for axis in 0..3 {
                 let boundary = (cell_min[axis] + half) as f64;
                 let upper = if direction[axis] > 0.0 {
-                    let crossing = (f64::from(ROOT_MIN)
-                        + boundary * f64::from(VOXEL_SIZE)
+                    let crossing = (f64::from(ROOT_MIN) + boundary * f64::from(VOXEL_SIZE)
                         - origin[axis])
                         / direction[axis];
                     start >= crossing
                 } else if direction[axis] < 0.0 {
-                    let crossing = (f64::from(ROOT_MIN)
-                        + boundary * f64::from(VOXEL_SIZE)
+                    let crossing = (f64::from(ROOT_MIN) + boundary * f64::from(VOXEL_SIZE)
                         - origin[axis])
                         / direction[axis];
                     start < crossing
@@ -165,8 +213,7 @@ impl WorldVolumeOctree {
                     + (cell_min[axis] + cell_span) as f64 * f64::from(VOXEL_SIZE);
                 end = end.min((boundary - origin[axis]) / d);
             } else if d < 0.0 {
-                let boundary = f64::from(ROOT_MIN)
-                    + cell_min[axis] as f64 * f64::from(VOXEL_SIZE);
+                let boundary = f64::from(ROOT_MIN) + cell_min[axis] as f64 * f64::from(VOXEL_SIZE);
                 end = end.min((boundary - origin[axis]) / d);
             }
         }
@@ -180,10 +227,10 @@ impl WorldVolumeOctree {
     }
 }
 
-fn cell_extrema(
+fn cell_extrema_with_capacity(
     offset: usize,
-    eval_sigma: &mut impl FnMut(DVec3) -> Result<f32>,
-) -> Result<(f32, f32)> {
+    eval_sigma: &mut impl FnMut(DVec3) -> Result<(f32, usize)>,
+) -> Result<((f32, f32), usize)> {
     let x = offset % DENSITY_RESOLUTION;
     let y = (offset / DENSITY_RESOLUTION) % DENSITY_RESOLUTION;
     let z = offset / (DENSITY_RESOLUTION * DENSITY_RESOLUTION);
@@ -192,6 +239,7 @@ fn cell_extrema(
     let cell_min = [x, y, z].map(|index| ROOT_MIN + index as f32 * VOXEL_SIZE - pad);
     let mut sigma_min = f32::MAX;
     let mut sigma_max = -f32::MAX;
+    let mut max_closures = 0;
 
     for sample in 0..DENSITY_SAMPLES_PER_CELL {
         let sample_index = sample + offset as u32 * DENSITY_SAMPLES_PER_CELL;
@@ -201,11 +249,12 @@ fn cell_extrema(
             f64::from(cell_min[1] + sample_position[1] * padded_size),
             f64::from(cell_min[2] + sample_position[2] * padded_size),
         ))?;
-        sigma_min = sigma_min.min(sigma);
-        sigma_max = sigma_max.max(sigma);
+        sigma_min = sigma_min.min(sigma.0);
+        sigma_max = sigma_max.max(sigma.0);
+        max_closures = max_closures.max(sigma.1);
     }
 
-    Ok((sigma_min, sigma_max))
+    Ok(((sigma_min, sigma_max), max_closures))
 }
 
 fn build_node(
@@ -232,8 +281,7 @@ fn build_node(
 
     let edge = VOXEL_SIZE * cell_span as f32;
     let bbox_length = (edge * edge + edge * edge + edge * edge).sqrt();
-    if depth == VOLUME_OCTREE_MAX_DEPTH
-        || (sigma_max - sigma_min) * bbox_length <= SPLIT_THRESHOLD
+    if depth == VOLUME_OCTREE_MAX_DEPTH || (sigma_max - sigma_min) * bbox_length <= SPLIT_THRESHOLD
     {
         return;
     }
@@ -287,7 +335,8 @@ fn sobol_burley(mut rev_bit_index: u32, dimension: usize, scramble_seed: u32) ->
         result
     };
     result = reversed_bit_owen(result, scramble_seed).reverse_bits();
-    result as f32 * (1.0_f32 / 4_294_967_808.0_f32)
+    // Match Cycles' uint_to_float_excl rounding with a single f32 conversion.
+    (f64::from(result) / 4_294_967_808.0) as f32
 }
 
 #[inline]
@@ -312,36 +361,140 @@ fn hash_hp_uint(mut i: u32) -> u32 {
 
 const SOBOL_BURLEY_TABLE: [[u32; 32]; 4] = [
     [
-        0x0000_0001, 0x0000_0002, 0x0000_0004, 0x0000_0008, 0x0000_0010, 0x0000_0020,
-        0x0000_0040, 0x0000_0080, 0x0000_0100, 0x0000_0200, 0x0000_0400, 0x0000_0800,
-        0x0000_1000, 0x0000_2000, 0x0000_4000, 0x0000_8000, 0x0001_0000, 0x0002_0000,
-        0x0004_0000, 0x0008_0000, 0x0010_0000, 0x0020_0000, 0x0040_0000, 0x0080_0000,
-        0x0100_0000, 0x0200_0000, 0x0400_0000, 0x0800_0000, 0x1000_0000, 0x2000_0000,
-        0x4000_0000, 0x8000_0000,
+        0x0000_0001,
+        0x0000_0002,
+        0x0000_0004,
+        0x0000_0008,
+        0x0000_0010,
+        0x0000_0020,
+        0x0000_0040,
+        0x0000_0080,
+        0x0000_0100,
+        0x0000_0200,
+        0x0000_0400,
+        0x0000_0800,
+        0x0000_1000,
+        0x0000_2000,
+        0x0000_4000,
+        0x0000_8000,
+        0x0001_0000,
+        0x0002_0000,
+        0x0004_0000,
+        0x0008_0000,
+        0x0010_0000,
+        0x0020_0000,
+        0x0040_0000,
+        0x0080_0000,
+        0x0100_0000,
+        0x0200_0000,
+        0x0400_0000,
+        0x0800_0000,
+        0x1000_0000,
+        0x2000_0000,
+        0x4000_0000,
+        0x8000_0000,
     ],
     [
-        0x0000_0001, 0x0000_0003, 0x0000_0005, 0x0000_000f, 0x0000_0011, 0x0000_0033,
-        0x0000_0055, 0x0000_00ff, 0x0000_0101, 0x0000_0303, 0x0000_0505, 0x0000_0f0f,
-        0x0000_1111, 0x0000_3333, 0x0000_5555, 0x0000_ffff, 0x0001_0001, 0x0003_0003,
-        0x0005_0005, 0x000f_000f, 0x0011_0011, 0x0033_0033, 0x0055_0055, 0x00ff_00ff,
-        0x0101_0101, 0x0303_0303, 0x0505_0505, 0x0f0f_0f0f, 0x1111_1111, 0x3333_3333,
-        0x5555_5555, 0xffff_ffff,
+        0x0000_0001,
+        0x0000_0003,
+        0x0000_0005,
+        0x0000_000f,
+        0x0000_0011,
+        0x0000_0033,
+        0x0000_0055,
+        0x0000_00ff,
+        0x0000_0101,
+        0x0000_0303,
+        0x0000_0505,
+        0x0000_0f0f,
+        0x0000_1111,
+        0x0000_3333,
+        0x0000_5555,
+        0x0000_ffff,
+        0x0001_0001,
+        0x0003_0003,
+        0x0005_0005,
+        0x000f_000f,
+        0x0011_0011,
+        0x0033_0033,
+        0x0055_0055,
+        0x00ff_00ff,
+        0x0101_0101,
+        0x0303_0303,
+        0x0505_0505,
+        0x0f0f_0f0f,
+        0x1111_1111,
+        0x3333_3333,
+        0x5555_5555,
+        0xffff_ffff,
     ],
     [
-        0x0000_0001, 0x0000_0003, 0x0000_0006, 0x0000_0009, 0x0000_0017, 0x0000_003a,
-        0x0000_0071, 0x0000_00a3, 0x0000_0116, 0x0000_0339, 0x0000_0677, 0x0000_09aa,
-        0x0000_1601, 0x0000_3903, 0x0000_7706, 0x0000_aa09, 0x0001_0117, 0x0003_033a,
-        0x0006_0671, 0x0009_09a3, 0x0017_1616, 0x003a_3939, 0x0071_7777, 0x00a3_aaaa,
-        0x0117_0001, 0x033a_0003, 0x0671_0006, 0x09a3_0009, 0x1616_0017, 0x3939_003a,
-        0x7777_0071, 0xaaaa_00a3,
+        0x0000_0001,
+        0x0000_0003,
+        0x0000_0006,
+        0x0000_0009,
+        0x0000_0017,
+        0x0000_003a,
+        0x0000_0071,
+        0x0000_00a3,
+        0x0000_0116,
+        0x0000_0339,
+        0x0000_0677,
+        0x0000_09aa,
+        0x0000_1601,
+        0x0000_3903,
+        0x0000_7706,
+        0x0000_aa09,
+        0x0001_0117,
+        0x0003_033a,
+        0x0006_0671,
+        0x0009_09a3,
+        0x0017_1616,
+        0x003a_3939,
+        0x0071_7777,
+        0x00a3_aaaa,
+        0x0117_0001,
+        0x033a_0003,
+        0x0671_0006,
+        0x09a3_0009,
+        0x1616_0017,
+        0x3939_003a,
+        0x7777_0071,
+        0xaaaa_00a3,
     ],
     [
-        0x0000_0001, 0x0000_0003, 0x0000_0004, 0x0000_000a, 0x0000_001f, 0x0000_002e,
-        0x0000_0045, 0x0000_00c9, 0x0000_011b, 0x0000_02a4, 0x0000_079a, 0x0000_0b67,
-        0x0000_101e, 0x0000_302d, 0x0000_4041, 0x0000_a0c3, 0x0001_f104, 0x0002_e28a,
-        0x0004_57df, 0x000c_9bae, 0x0011_a105, 0x002a_7289, 0x0079_e7db, 0x00b6_dba4,
-        0x0100_011a, 0x0300_02a7, 0x0400_079e, 0x0a00_0b6d, 0x1f00_1001, 0x2e00_3003,
-        0x4500_4004, 0xc900_a00a,
+        0x0000_0001,
+        0x0000_0003,
+        0x0000_0004,
+        0x0000_000a,
+        0x0000_001f,
+        0x0000_002e,
+        0x0000_0045,
+        0x0000_00c9,
+        0x0000_011b,
+        0x0000_02a4,
+        0x0000_079a,
+        0x0000_0b67,
+        0x0000_101e,
+        0x0000_302d,
+        0x0000_4041,
+        0x0000_a0c3,
+        0x0001_f104,
+        0x0002_e28a,
+        0x0004_57df,
+        0x000c_9bae,
+        0x0011_a105,
+        0x002a_7289,
+        0x0079_e7db,
+        0x00b6_dba4,
+        0x0100_011a,
+        0x0300_02a7,
+        0x0400_079e,
+        0x0a00_0b6d,
+        0x1f00_1001,
+        0x2e00_3003,
+        0x4500_4004,
+        0xc900_a00a,
     ],
 ];
 
@@ -349,7 +502,7 @@ const SOBOL_BURLEY_TABLE: [[u32; 32]; 4] = [
 mod tests {
     use super::{
         DENSITY_CELL_COUNT, DENSITY_RESOLUTION, OctreeNode, WorldVolumeOctree, build_node,
-        cell_extrema,
+        cell_extrema_with_capacity,
     };
     use glam::DVec3;
 
@@ -372,9 +525,9 @@ mod tests {
     #[test]
     fn cell_extrema_use_all_sixteen_padded_sobol_samples() {
         let mut count = 0;
-        let (minimum, maximum) = cell_extrema(0, &mut |position| {
+        let ((minimum, maximum), _) = cell_extrema_with_capacity(0, &mut |position| {
             count += 1;
-            Ok(position.x as f32)
+            Ok((position.x as f32, 0))
         })
         .unwrap();
         assert_eq!(count, 16);
@@ -383,13 +536,15 @@ mod tests {
         let padded_size = super::VOXEL_SIZE + 2.0 * pad;
         let expected = (0..16)
             .map(|sample| {
-                super::ROOT_MIN - pad
-                    + super::sobol_burley_sample_3d(sample)[0] * padded_size
+                super::ROOT_MIN - pad + super::sobol_burley_sample_3d(sample)[0] * padded_size
             })
             .fold((f32::MAX, -f32::MAX), |(minimum, maximum), value| {
                 (minimum.min(value), maximum.max(value))
             });
-        assert_eq!((minimum.to_bits(), maximum.to_bits()), (expected.0.to_bits(), expected.1.to_bits()));
+        assert_eq!(
+            (minimum.to_bits(), maximum.to_bits()),
+            (expected.0.to_bits(), expected.1.to_bits())
+        );
     }
 
     #[test]
@@ -397,8 +552,8 @@ mod tests {
         let mut cells = vec![(0.0, 0.0); DENSITY_CELL_COUNT];
         let hot_offset = 96 + DENSITY_RESOLUTION * (64 + 64 * DENSITY_RESOLUTION);
         cells[hot_offset] = (1.0, 1.0);
-        let mut nodes = Vec::new();
-        build_node(&mut nodes, &cells, 0, [0; 3], DENSITY_RESOLUTION);
+        let mut nodes = vec![OctreeNode::EMPTY];
+        build_node(&mut nodes, 0, &cells, 0, [0; 3], DENSITY_RESOLUTION);
         let octree = WorldVolumeOctree { nodes };
         let origin = DVec3::new(
             -10_000.0,
