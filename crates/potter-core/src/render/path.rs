@@ -23,13 +23,15 @@ use crate::{
     },
     shader::{
         BsdfModel, BsdfParams, EvaluatorWorkspace, HairComponent, HairScatteringModel, HitContext,
-        HitFootprint, HitUvLayers, PreparedMaterial, ShaderClosure, SubsurfaceMethod,
-        SurfaceShading, equirectangular_uv, evaluate_displacement_with_workspace_semantics,
-        evaluate_surface_with_workspace, evaluate_surface_with_workspace_into_semantics,
-        evaluate_surface_with_workspace_semantics, heaviest, height_gradient, make_orthonormals,
+        HitFootprint, HitUvLayers, PreparedMaterial, ShaderClosure, SourceMixInputPruner,
+        SubsurfaceMethod, SurfaceShading, equirectangular_uv,
+        evaluate_displacement_with_workspace_semantics, evaluate_surface_with_workspace,
+        evaluate_surface_with_workspace_into_semantics, evaluate_surface_with_workspace_semantics,
+        heaviest, height_gradient, make_orthonormals,
     },
 };
 
+use super::adaptive_sampling::{AdaptivePixel, AdaptiveSampling};
 use super::hair_bsdf::{
     HairHitData, HairSample, hair_eval, hair_is_transparent, hair_pdf, hair_sample,
     hair_sample_weight,
@@ -50,6 +52,11 @@ use super::subsurface_walk::{
     WalkEntry, WalkMethod, entry_direction, skin_entry_direction, walk, walk_anisotropy,
     walk_radius, walk_uses_van_de_hulst,
 };
+use super::volume_guiding::{
+    VolumeGuidingAccumulator, VolumeGuidingFilm, VolumeGuidingRead, VolumeGuidingSample,
+    next_batch_end,
+};
+use super::volume_tiles::{VolumeTile, VolumeTiles};
 use super::world_probe::volume_ambient_l0;
 use super::{
     bvh::{Bvh, BvhHit, WalkRay},
@@ -77,6 +84,24 @@ use super::{
         object_space,
     },
 };
+
+#[cfg(test)]
+struct VolumeTileRenderReport {
+    tile: VolumeTile,
+    sample_counts: Vec<[u32; 2]>,
+    guide_checkpoints: Vec<u32>,
+    adaptive_active: Vec<(u32, [usize; 2])>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static VOLUME_TILE_RENDER_REPORTS: RefCell<Vec<VolumeTileRenderReport>> = RefCell::new(Vec::new());
+}
+
+#[cfg(test)]
+fn take_volume_tile_render_reports() -> Vec<VolumeTileRenderReport> {
+    VOLUME_TILE_RENDER_REPORTS.with(|reports| std::mem::take(&mut *reports.borrow_mut()))
+}
 
 const RAY_EPSILON: f64 = 1.0e-5;
 /// Blender `curve_thickness` normalizes its local radius vector by `sqrt(3)` before transforming it.
@@ -2052,6 +2077,118 @@ impl<'a> Deref for TraceGeometry<'a> {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct EyeSampleAccumulation {
+    radiance: DVec3,
+    alpha: f64,
+    sample_count: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SampleAccumulation {
+    eyes: [EyeSampleAccumulation; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VolumeGuideClass {
+    Scatter,
+    Transmit,
+    None,
+}
+
+struct VolumeGuidePath<'a> {
+    read: VolumeGuidingRead,
+    accumulator: &'a mut VolumeGuidingAccumulator,
+    adaptive: Option<&'a mut AdaptivePixel>,
+    sample_index: u32,
+    primary_transmit: bool,
+    volume_visible: bool,
+    optical_depth: f32,
+    sample_optical_depth: f32,
+}
+
+impl VolumeGuidePath<'_> {
+    fn class(&self) -> VolumeGuideClass {
+        if self.primary_transmit {
+            VolumeGuideClass::Transmit
+        } else if self.volume_visible {
+            VolumeGuideClass::Scatter
+        } else {
+            VolumeGuideClass::None
+        }
+    }
+
+    fn add(&mut self, contribution: DVec3) {
+        let class = self.class();
+        self.add_with_class(contribution, class);
+    }
+
+    fn add_with_class(&mut self, contribution: DVec3, class: VolumeGuideClass) {
+        if let Some(adaptive) = self.adaptive.as_deref_mut() {
+            adaptive.add_contribution(self.sample_index, contribution.as_vec3());
+        }
+        match class {
+            VolumeGuideClass::Scatter => self.accumulator.add_scatter(contribution.as_vec3()),
+            VolumeGuideClass::Transmit => self.accumulator.add_transmit(contribution.as_vec3()),
+            VolumeGuideClass::None => {}
+        }
+    }
+
+    fn volume_scatter(&mut self, bounce: u32) {
+        if bounce == 0 {
+            self.primary_transmit = false;
+        }
+        self.volume_visible = true;
+    }
+
+    fn sample(&self) -> VolumeGuidingSample {
+        VolumeGuidingSample {
+            optical_depth: self.sample_optical_depth,
+            primary_transmit: self.primary_transmit,
+        }
+    }
+}
+
+type VolumeGuideTarget<'a, 'path> = Option<(&'a mut VolumeGuidePath<'path>, VolumeGuideClass)>;
+
+fn volume_guide_target<'a, 'path>(
+    guide: &'a mut Option<VolumeGuidePath<'path>>,
+    override_class: Option<VolumeGuideClass>,
+) -> VolumeGuideTarget<'a, 'path> {
+    guide.as_mut().map(|path| {
+        let class = override_class.unwrap_or_else(|| path.class());
+        (path, class)
+    })
+}
+
+fn add_volume_guide_contribution(target: &mut VolumeGuideTarget<'_, '_>, contribution: DVec3) {
+    if let Some((path, class)) = target {
+        path.add_with_class(contribution, *class);
+    }
+}
+
+fn volume_guide_path<'a>(
+    reads: Option<&[VolumeGuidingRead]>,
+    accumulators: Option<&'a mut [VolumeGuidingAccumulator]>,
+    adaptive_pixels: Option<&'a mut [AdaptivePixel]>,
+    sample_index: u32,
+
+    index: usize,
+) -> Option<VolumeGuidePath<'a>> {
+    let accumulator = accumulators?.get_mut(index)?;
+    Some(VolumeGuidePath {
+        read: *reads?.get(index)?,
+        optical_depth: accumulator.mean_optical_depth(),
+        accumulator,
+        adaptive: adaptive_pixels.and_then(|pixels| pixels.get_mut(index)),
+        sample_index,
+
+        primary_transmit: false,
+        volume_visible: false,
+        sample_optical_depth: 0.0,
+    })
+}
+
 /// What the workers of one render share. Every field is read-only, so the job is shared by reference.
 struct RenderJob<'a> {
     doc: &'a SceneDoc,
@@ -2070,8 +2207,11 @@ struct RenderJob<'a> {
     anaglyph: bool,
     width: u32,
     height: u32,
-    width_usize: usize,
+    tile: VolumeTile,
     samples: u32,
+    sample_start: u32,
+    sample_end: u32,
+    adaptive: Option<AdaptiveSampling>,
     seed: u32,
     bounces: Bounces<'a>,
     film_transparent: bool,
@@ -2086,6 +2226,10 @@ fn render_rows(
     rows: Range<usize>,
     linear: &mut [[f32; 4]],
     rgba: &mut [u8],
+    mut sample_sums: Option<&mut [SampleAccumulation]>,
+    guide_reads: [Option<&[VolumeGuidingRead]>; 2],
+    mut guide_accumulators: [Option<&mut [VolumeGuidingAccumulator]>; 2],
+    mut adaptive_pixels: [Option<&mut [AdaptivePixel]>; 2],
     warnings: &RefCell<Vec<serde_json::Value>>,
 ) -> Result<()> {
     let geometry = TraceGeometry {
@@ -2120,7 +2264,7 @@ fn render_rows(
     } else {
         None
     };
-    let bounces = job.bounces;
+
     let mut evaluator_workspace = EvaluatorWorkspace::default();
     for (row_index, row) in rows.enumerate() {
         let y = u32::try_from(row).map_err(|_| {
@@ -2129,212 +2273,529 @@ fn render_rows(
                 "image height exceeds platform limits",
             )
         })?;
-        for x in 0..job.width {
-            let column = usize::try_from(x).map_err(|_| {
+        let y = job.tile.buffer_y + y;
+        for local_x in 0..job.tile.buffer_width {
+            let column = usize::try_from(local_x).map_err(|_| {
                 PotError::new(
                     ErrorCode::LimitExceeded,
                     "image width exceeds platform limits",
                 )
             })?;
-            let index = row_index * job.width_usize + column;
+            let x = job.tile.buffer_x + local_x;
+            let index = row_index * job.tile.buffer_width as usize + column;
+            let mut accumulated = sample_sums
+                .as_deref()
+                .map_or_else(SampleAccumulation::default, |sums| sums[index]);
             let mut sum = DVec3::ZERO;
             let mut alpha_sum = 0.0;
-            for sample_index in 0..job.samples {
-                let mut rng = Pcg32::for_sample(job.seed, x, y, sample_index);
-                let filter_u = rng.next_f64();
-                let filter_v = rng.next_f64();
-                let (sample_x, sample_y) =
-                    job.pixel_filter.sample(sample_index, filter_u, filter_v);
-                let (radiance, alpha) = if job.anaglyph {
-                    let (left_camera, left_frame) = &job.eyes[0];
-                    let (right_camera, right_frame) = &job.eyes[1];
-                    let left_ray = ray_for_sample_in_frame(
-                        left_frame,
-                        left_camera,
-                        job.width,
-                        job.height,
-                        x,
-                        y,
-                        sample_x,
-                        sample_y,
-                    )?;
-                    let right_ray = ray_for_sample_in_frame(
-                        right_frame,
-                        right_camera,
-                        job.width,
-                        job.height,
-                        x,
-                        y,
-                        sample_x,
-                        sample_y,
-                    )?;
-                    let mut left_rng = rng.clone();
-                    let mut right_rng = rng.clone();
-                    let right_camera_matrices = second_camera_matrices.as_ref();
-                    // A sample with no ray (outside a fisheye's circle, or past its field of view) is opaque black: Blender's
-                    // film writes a pixel with no ray as black with alpha 1 under either film (`probe_transparent_film_fisheye.py`).
-                    let (left, left_alpha) = match left_ray {
-                        Some((left_origin, left_direction)) => trace_path_with_temperatures(
-                            scene.with_camera_matrices(first_camera_matrices.as_ref()),
-                            job.volume_temperatures,
-                            bounces,
-                            cycles_camera_ray_origin(
-                                left_camera,
-                                left_frame,
-                                left_origin,
-                                left_direction,
-                                sample_x,
-                                sample_y,
-                            ),
-                            left_direction,
-                            camera_footprint(
-                                left_frame,
-                                left_camera,
-                                job.width,
-                                job.height,
-                                x,
-                                y,
-                                sample_x,
-                                sample_y,
-                                (
-                                    cycles_camera_ray_origin(
-                                        left_camera,
-                                        left_frame,
-                                        left_origin,
-                                        left_direction,
-                                        sample_x,
-                                        sample_y,
-                                    ),
-                                    left_direction,
-                                ),
-                                true,
-                            )?,
-                            job.environment,
-                            job.film_transparent,
-                            &mut left_rng,
-                            &mut evaluator_workspace,
-                        )?,
-                        None => (DVec3::ZERO, 1.0),
+            for scheduled_sample in job.sample_start..job.sample_end {
+                let eye_count = if job.anaglyph { 2 } else { 1 };
+                let mut eye_radiance = [DVec3::ZERO; 2];
+                let mut eye_alpha = [1.0; 2];
+                for eye in 0..eye_count {
+                    let sample_index = if sample_sums.is_some() {
+                        accumulated.eyes[eye].sample_count
+                    } else {
+                        scheduled_sample
                     };
-                    let (right, right_alpha) = match right_ray {
-                        Some((right_origin, right_direction)) => trace_path_with_temperatures(
-                            scene.with_camera_matrices(right_camera_matrices),
-                            job.volume_temperatures,
-                            bounces,
-                            cycles_camera_ray_origin(
-                                right_camera,
-                                right_frame,
-                                right_origin,
-                                right_direction,
-                                sample_x,
-                                sample_y,
-                            ),
-                            right_direction,
-                            camera_footprint(
-                                right_frame,
-                                right_camera,
-                                job.width,
-                                job.height,
-                                x,
-                                y,
-                                sample_x,
-                                sample_y,
-                                (
-                                    cycles_camera_ray_origin(
-                                        right_camera,
-                                        right_frame,
-                                        right_origin,
-                                        right_direction,
-                                        sample_x,
-                                        sample_y,
-                                    ),
-                                    right_direction,
-                                ),
-                                true,
-                            )?,
-                            job.environment,
-                            job.film_transparent,
-                            &mut right_rng,
-                            &mut evaluator_workspace,
-                        )?,
-                        None => (DVec3::ZERO, 1.0),
-                    };
-                    (
-                        DVec3::new(left.x, right.y, right.z),
-                        f64::midpoint(left_alpha, right_alpha),
-                    )
-                } else {
-                    let (camera, frame) = &job.eyes[0];
-                    let camera_matrices =
-                        if camera.stereo_mode == StereoMode::SideBySide && x >= job.width / 2 {
-                            second_camera_matrices.as_ref()
-                        } else {
-                            first_camera_matrices.as_ref()
-                        };
-                    match ray_for_sample_in_frame(
-                        frame, camera, job.width, job.height, x, y, sample_x, sample_y,
-                    )? {
-                        Some((origin, direction)) => trace_path_with_temperatures(
-                            scene.with_camera_matrices(camera_matrices),
-                            job.volume_temperatures,
-                            bounces,
-                            cycles_camera_ray_origin(
-                                camera, frame, origin, direction, sample_x, sample_y,
-                            ),
-                            direction,
-                            camera_footprint(
-                                frame,
-                                camera,
-                                job.width,
-                                job.height,
-                                x,
-                                y,
-                                sample_x,
-                                sample_y,
-                                (
-                                    cycles_camera_ray_origin(
-                                        camera, frame, origin, direction, sample_x, sample_y,
-                                    ),
-                                    direction,
-                                ),
-                                true,
-                            )?,
-                            job.environment,
-                            job.film_transparent,
-                            &mut rng,
-                            &mut evaluator_workspace,
-                        )?,
-                        None => (DVec3::ZERO, 1.0),
+                    let needs_sample = sample_sums.is_none()
+                        || job.adaptive.is_none()
+                        || adaptive_pixels[eye]
+                            .as_deref()
+                            .is_none_or(|pixels| pixels[index].needs_sample());
+                    if !needs_sample {
+                        continue;
                     }
-                };
-                sum += radiance;
-                alpha_sum += alpha;
+                    let (camera, frame) = &job.eyes[eye];
+                    let mut rng = Pcg32::for_sample(job.seed, x, y, sample_index);
+                    let filter_u = rng.next_f64();
+                    let filter_v = rng.next_f64();
+                    let (sample_x, sample_y) =
+                        job.pixel_filter.sample(sample_index, filter_u, filter_v);
+                    let camera_matrices = if job.anaglyph {
+                        if eye == 0 {
+                            first_camera_matrices.as_ref()
+                        } else {
+                            second_camera_matrices.as_ref()
+                        }
+                    } else if camera.stereo_mode == StereoMode::SideBySide && x >= job.width / 2 {
+                        second_camera_matrices.as_ref()
+                    } else {
+                        first_camera_matrices.as_ref()
+                    };
+                    let (radiance, alpha, guide_sample) = trace_eye_sample(
+                        scene.with_camera_matrices(camera_matrices),
+                        job,
+                        camera,
+                        frame,
+                        x,
+                        y,
+                        sample_x,
+                        sample_y,
+                        &mut rng,
+                        volume_guide_path(
+                            guide_reads[eye],
+                            guide_accumulators[eye].as_deref_mut(),
+                            adaptive_pixels[eye].as_deref_mut(),
+                            sample_index,
+                            index,
+                        ),
+                        &mut evaluator_workspace,
+                    )?;
+                    eye_radiance[eye] = radiance;
+                    eye_alpha[eye] = alpha;
+                    accumulated.eyes[eye].radiance += radiance;
+                    accumulated.eyes[eye].alpha += alpha;
+                    accumulated.eyes[eye].sample_count += 1;
+                    if let Some(accumulators) = guide_accumulators[eye].as_deref_mut() {
+                        accumulators[index].record(guide_sample.unwrap_or_default());
+                    }
+                }
+                if sample_sums.is_none() {
+                    if job.anaglyph {
+                        sum += DVec3::new(eye_radiance[0].x, eye_radiance[1].y, eye_radiance[1].z);
+                        alpha_sum += f64::midpoint(eye_alpha[0], eye_alpha[1]);
+                    } else {
+                        sum += eye_radiance[0];
+                        alpha_sum += eye_alpha[0];
+                    }
+                }
             }
-            let sample_scale = 1.0 / f64::from(job.samples);
-            let alpha = if job.film_transparent {
-                alpha_sum * sample_scale
-            } else {
-                1.0
-            };
-            let (color, alpha) = apply_film_exposure(sum * sample_scale, alpha, job.film_exposure);
-            linear[index] = [
-                finite_f32(color.x),
-                finite_f32(color.y),
-                finite_f32(color.z),
-                finite_f32(alpha),
-            ];
-            let display_rgb = display_rgb_from_associated([color.x, color.y, color.z], alpha);
-            rgba[index * 4..index * 4 + 4].copy_from_slice(&[
-                to_srgb_byte(display_rgb[0]),
-                to_srgb_byte(display_rgb[1]),
-                to_srgb_byte(display_rgb[2]),
-                (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
-            ]);
+            if let Some(sums) = sample_sums.as_deref_mut() {
+                sums[index] = accumulated;
+            } else if job.sample_end == job.samples {
+                let sample_scale = 1.0 / f64::from(job.samples);
+                let alpha = if job.film_transparent {
+                    alpha_sum * sample_scale
+                } else {
+                    1.0
+                };
+                let (color, alpha) =
+                    apply_film_exposure(sum * sample_scale, alpha, job.film_exposure);
+                linear[index] = [
+                    finite_f32(color.x),
+                    finite_f32(color.y),
+                    finite_f32(color.z),
+                    finite_f32(alpha),
+                ];
+                let display_rgb = display_rgb_from_associated([color.x, color.y, color.z], alpha);
+                rgba[index * 4..index * 4 + 4].copy_from_slice(&[
+                    to_srgb_byte(display_rgb[0]),
+                    to_srgb_byte(display_rgb[1]),
+                    to_srgb_byte(display_rgb[2]),
+                    (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+                ]);
+            }
         }
     }
     Ok(())
 }
 
+fn trace_eye_sample(
+    scene: SceneRefs<'_, '_>,
+    job: &RenderJob<'_>,
+    camera: &Camera,
+    frame: &CameraFrame,
+    x: u32,
+    y: u32,
+    sample_x: f64,
+    sample_y: f64,
+    rng: &mut Pcg32,
+    guide: Option<VolumeGuidePath<'_>>,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<(DVec3, f64, Option<VolumeGuidingSample>)> {
+    let Some((origin, direction)) = ray_for_sample_in_frame(
+        frame, camera, job.width, job.height, x, y, sample_x, sample_y,
+    )?
+    else {
+        return Ok((DVec3::ZERO, 1.0, None));
+    };
+    let origin = cycles_camera_ray_origin(camera, frame, origin, direction, sample_x, sample_y);
+    trace_path_with_guiding(
+        scene,
+        job.volume_temperatures,
+        job.bounces,
+        origin,
+        direction,
+        camera_footprint(
+            frame,
+            camera,
+            job.width,
+            job.height,
+            x,
+            y,
+            sample_x,
+            sample_y,
+            (origin, direction),
+            true,
+        )?,
+        job.environment,
+        job.film_transparent,
+        guide,
+        rng,
+        evaluator_workspace,
+    )
+}
+fn render_row_batch(
+    job: &RenderJob<'_>,
+    bands: &[Range<usize>],
+    linear: &mut [[f32; 4]],
+    rgba: &mut [u8],
+    mut sample_sums: Option<&mut [SampleAccumulation]>,
+    guide_reads: [Option<&[VolumeGuidingRead]>; 2],
+    guide_accumulators: [Option<&mut [VolumeGuidingAccumulator]>; 2],
+    adaptive_pixels: [Option<&mut [AdaptivePixel]>; 2],
+    shader_warnings: &RefCell<Vec<serde_json::Value>>,
+) -> Result<()> {
+    let outcomes = std::thread::scope(|scope| {
+        let job = &job;
+        let mut workers = Vec::with_capacity(bands.len());
+        let mut linear_rest = linear;
+        let mut rgba_rest = rgba;
+        let mut sample_sums_rest = sample_sums.as_deref_mut();
+        let mut guide_accumulators_rest = guide_accumulators;
+        let mut adaptive_pixels_rest = adaptive_pixels;
+        for rows in bands.iter().cloned() {
+            let band_len = rows.len() * job.tile.buffer_width as usize;
+            let (linear, linear_tail) = std::mem::take(&mut linear_rest).split_at_mut(band_len);
+            let (rgba, rgba_tail) = std::mem::take(&mut rgba_rest).split_at_mut(band_len * 4);
+            linear_rest = linear_tail;
+            rgba_rest = rgba_tail;
+            let worker_sample_sums = match sample_sums_rest.take() {
+                Some(rest) => {
+                    let (band, tail) = rest.split_at_mut(band_len);
+                    sample_sums_rest = Some(tail);
+                    Some(band)
+                }
+                None => None,
+            };
+            let worker_guide_reads = guide_reads;
+            let mut worker_guide_accumulators = [None, None];
+            for eye in 0..2 {
+                worker_guide_accumulators[eye] = match guide_accumulators_rest[eye].take() {
+                    Some(rest) => {
+                        let (band, tail) = rest.split_at_mut(band_len);
+                        guide_accumulators_rest[eye] = Some(tail);
+                        Some(band)
+                    }
+                    None => None,
+                };
+            }
+            let mut worker_adaptive_pixels = [None, None];
+            for eye in 0..2 {
+                worker_adaptive_pixels[eye] = match adaptive_pixels_rest[eye].take() {
+                    Some(rest) => {
+                        let (band, tail) = rest.split_at_mut(band_len);
+                        adaptive_pixels_rest[eye] = Some(tail);
+                        Some(band)
+                    }
+                    None => None,
+                };
+            }
+            workers.push(
+                std::thread::Builder::new()
+                    .stack_size(WORKER_STACK_BYTES)
+                    .spawn_scoped(scope, move || {
+                        let warnings = RefCell::new(Vec::new());
+                        let result = render_rows(
+                            job,
+                            rows,
+                            linear,
+                            rgba,
+                            worker_sample_sums,
+                            worker_guide_reads,
+                            worker_guide_accumulators,
+                            worker_adaptive_pixels,
+                            &warnings,
+                        );
+                        (result, warnings.into_inner())
+                    }),
+            );
+        }
+        workers
+            .into_iter()
+            .map(|worker| match worker {
+                Ok(handle) => handle.join().unwrap_or_else(|_| {
+                    (
+                        Err(PotError::new(
+                            ErrorCode::InternalError,
+                            "render worker panicked",
+                        )),
+                        Vec::new(),
+                    )
+                }),
+                Err(error) => (
+                    Err(PotError::new(
+                        ErrorCode::InternalError,
+                        format!("cannot start a render worker: {error}"),
+                    )),
+                    Vec::new(),
+                ),
+            })
+            .collect::<Vec<_>>()
+    });
+    for (result, warnings) in outcomes {
+        merge_shader_warnings(shader_warnings, warnings);
+        result?;
+    }
+    Ok(())
+}
+
+fn finalize_tile_samples(
+    job: &RenderJob<'_>,
+    samples: &[SampleAccumulation],
+    linear: &mut [[f32; 4]],
+    rgba: &mut [u8],
+) {
+    for (index, accumulation) in samples.iter().enumerate() {
+        let left = accumulation.eyes[0];
+        let left_count = f64::from(left.sample_count);
+        let (radiance, alpha) = if job.anaglyph {
+            let right = accumulation.eyes[1];
+            let right_count = f64::from(right.sample_count);
+            (
+                DVec3::new(
+                    left.radiance.x / left_count,
+                    right.radiance.y / right_count,
+                    right.radiance.z / right_count,
+                ),
+                if job.film_transparent {
+                    f64::midpoint(left.alpha / left_count, right.alpha / right_count)
+                } else {
+                    1.0
+                },
+            )
+        } else {
+            (
+                left.radiance / left_count,
+                if job.film_transparent {
+                    left.alpha / left_count
+                } else {
+                    1.0
+                },
+            )
+        };
+        let (color, alpha) = apply_film_exposure(radiance, alpha, job.film_exposure);
+        linear[index] = [
+            finite_f32(color.x),
+            finite_f32(color.y),
+            finite_f32(color.z),
+            finite_f32(alpha),
+        ];
+        let display_rgb = display_rgb_from_associated([color.x, color.y, color.z], alpha);
+        rgba[index * 4..index * 4 + 4].copy_from_slice(&[
+            to_srgb_byte(display_rgb[0]),
+            to_srgb_byte(display_rgb[1]),
+            to_srgb_byte(display_rgb[2]),
+            (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+        ]);
+    }
+}
+
+fn render_volume_tile(
+    job: &mut RenderJob<'_>,
+    tile: VolumeTile,
+    width_usize: usize,
+    output: &mut RasterOutput,
+    shader_warnings: &RefCell<Vec<serde_json::Value>>,
+) -> Result<()> {
+    let tile_width = usize::try_from(tile.buffer_width).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "tile width exceeds platform limits",
+        )
+    })?;
+    let tile_height = usize::try_from(tile.buffer_height).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "tile height exceeds platform limits",
+        )
+    })?;
+    let tile_pixels = tile_width.checked_mul(tile_height).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "tile dimensions exceed platform limits",
+        )
+    })?;
+    let tile_rgba_len = tile_pixels.checked_mul(4).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "tile dimensions exceed platform limits",
+        )
+    })?;
+    let guide_eye_count = if job.anaglyph { 2 } else { 1 };
+    let mut films = Vec::with_capacity(guide_eye_count);
+    let mut adaptive_pixels: [Option<Vec<AdaptivePixel>>; 2] = [None, None];
+    for eye in 0..guide_eye_count {
+        films.push(VolumeGuidingFilm::new(
+            tile.buffer_width,
+            tile.buffer_height,
+        )?);
+        if job.adaptive.is_some() {
+            adaptive_pixels[eye] = Some(allocate(
+                tile_pixels,
+                AdaptivePixel::default(),
+                "adaptive sampling pixels",
+            )?);
+        }
+    }
+    let mut sample_sums = allocate(
+        tile_pixels,
+        SampleAccumulation::default(),
+        "path sample sums",
+    )?;
+    let mut linear = allocate(tile_pixels, [0.0_f32; 4], "tile linear image")?;
+    let mut rgba = allocate(tile_rgba_len, 0_u8, "tile RGBA image")?;
+    let bands = band_rows(
+        tile_height,
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+    );
+    job.tile = tile;
+    let mut completed = 0;
+    #[cfg(test)]
+    let mut guide_checkpoints = Vec::new();
+    #[cfg(test)]
+    let mut adaptive_active = Vec::new();
+    let mut done = false;
+    while completed < job.samples && !done {
+        let proposed_end = next_batch_end(completed, job.samples);
+        let batch_end = job.adaptive.map_or(proposed_end, |adaptive| {
+            adaptive.align_batch_end(completed, proposed_end)
+        });
+        job.sample_start = completed;
+        job.sample_end = batch_end;
+        let mut guide_reads = [None, None];
+        let mut guide_accumulators: [Option<&mut [VolumeGuidingAccumulator]>; 2] = [None, None];
+        for (eye, film) in films.iter_mut().enumerate() {
+            let (reads, accumulators) = film.buffers();
+            guide_reads[eye] = Some(reads);
+            guide_accumulators[eye] = Some(accumulators);
+        }
+        let mut adaptive_slices = [None, None];
+        let (left_adaptive, right_adaptive) = adaptive_pixels.split_at_mut(1);
+        adaptive_slices[0] = left_adaptive[0].as_deref_mut();
+        adaptive_slices[1] = right_adaptive[0].as_deref_mut();
+        render_row_batch(
+            job,
+            &bands,
+            &mut linear,
+            &mut rgba,
+            Some(&mut sample_sums),
+            guide_reads,
+            guide_accumulators,
+            adaptive_slices,
+            shader_warnings,
+        )?;
+
+        if let Some(adaptive) = job.adaptive
+            && adaptive.needs_filter(batch_end)
+        {
+            done = true;
+            #[cfg(test)]
+            let mut adaptive_active_by_eye = [0; 2];
+            #[cfg(test)]
+            let mut eye = 0;
+            for (pixels, film) in adaptive_pixels
+                .iter_mut()
+                .zip(films.iter_mut())
+                .take(guide_eye_count)
+            {
+                let pixels = pixels.as_mut().ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "adaptive sampling has one pixel buffer per eye",
+                    )
+                })?;
+                let (_, counts) = film.buffers();
+                let active = adaptive.filter_pixels(
+                    pixels,
+                    tile.buffer_width,
+                    tile.buffer_height,
+                    job.film_exposure as f32,
+                    |index| counts[index].sample_count(),
+                )?;
+                #[cfg(test)]
+                {
+                    adaptive_active_by_eye[eye] = active;
+                    eye += 1;
+                }
+                done &= active == 0;
+            }
+            #[cfg(test)]
+            adaptive_active.push((batch_end, adaptive_active_by_eye));
+        }
+        if !done && batch_end < job.samples && batch_end.is_power_of_two() {
+            #[cfg(test)]
+            guide_checkpoints.push(batch_end);
+            for film in &mut films {
+                film.filter()?;
+            }
+        }
+        completed = batch_end;
+    }
+    #[cfg(test)]
+    VOLUME_TILE_RENDER_REPORTS.with(|reports| {
+        reports.borrow_mut().push(VolumeTileRenderReport {
+            tile,
+            sample_counts: sample_sums
+                .iter()
+                .map(|sample| [sample.eyes[0].sample_count, sample.eyes[1].sample_count])
+                .collect(),
+            guide_checkpoints,
+            adaptive_active,
+        });
+    });
+    finalize_tile_samples(job, &sample_sums, &mut linear, &mut rgba);
+
+    let source_x = usize::try_from(tile.window_x).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "tile window exceeds platform limits",
+        )
+    })?;
+    let source_y = usize::try_from(tile.window_y).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "tile window exceeds platform limits",
+        )
+    })?;
+    let crop_width = usize::try_from(tile.window_width).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "tile window exceeds platform limits",
+        )
+    })?;
+    let crop_height = usize::try_from(tile.window_height).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "tile window exceeds platform limits",
+        )
+    })?;
+    let destination_x = usize::try_from(tile.buffer_x + tile.window_x).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "tile origin exceeds platform limits",
+        )
+    })?;
+    let destination_y = usize::try_from(tile.buffer_y + tile.window_y).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "tile origin exceeds platform limits",
+        )
+    })?;
+    for row in 0..crop_height {
+        let source = (source_y + row) * tile_width + source_x;
+        let destination = (destination_y + row) * width_usize + destination_x;
+        output.linear_rgba[destination..destination + crop_width]
+            .copy_from_slice(&linear[source..source + crop_width]);
+        let source_rgba = source * 4;
+        let destination_rgba = destination * 4;
+        let rgba_count = crop_width * 4;
+        output.rgba[destination_rgba..destination_rgba + rgba_count]
+            .copy_from_slice(&rgba[source_rgba..source_rgba + rgba_count]);
+    }
+    Ok(())
+}
 /// The contiguous row bands that split `height` rows across at most `band_count` workers, in row order. Each band has
 /// `ceil(height / band_count)` rows except the last, and no band is empty.
 pub(super) fn band_rows(height: usize, band_count: usize) -> Vec<Range<usize>> {
@@ -2573,6 +3034,20 @@ pub(super) fn render(
         emission: allocate(pixel_count, [0.0_f32; 4], "emission pass")?,
         ambient_occlusion: allocate(pixel_count, 1.0_f32, "ambient occlusion pass")?,
     };
+    let anaglyph = camera.stereo_mode == StereoMode::Anaglyph;
+    let has_volume_media = !volumes.is_empty()
+        || !world_volume.is_empty()
+        || geometry
+            .prepared
+            .iter()
+            .any(PreparedMaterial::has_volume_output);
+    let adaptive = (has_volume_media && scene.render.use_adaptive_sampling).then(|| {
+        AdaptiveSampling::new(
+            samples,
+            scene.render.adaptive_threshold as f32,
+            scene.render.adaptive_min_samples,
+        )
+    });
     let width_usize = usize::try_from(width).map_err(|_| {
         PotError::new(
             ErrorCode::LimitExceeded,
@@ -2582,7 +3057,6 @@ pub(super) fn render(
     let environment = world.max(DVec3::ZERO);
 
     if pixel_count > 0 {
-        let anaglyph = camera.stereo_mode == StereoMode::Anaglyph;
         let eyes = if anaglyph {
             let left_camera = camera_eye(camera, -1.0);
             let right_camera = camera_eye(camera, 1.0);
@@ -2593,13 +3067,17 @@ pub(super) fn render(
         } else {
             vec![(*camera, camera_frame(camera, width, height)?)]
         };
-        let height_usize = usize::try_from(height).map_err(|_| {
-            PotError::new(
-                ErrorCode::LimitExceeded,
-                "image height exceeds platform limits",
-            )
-        })?;
-        let job = RenderJob {
+        let whole_image = VolumeTile {
+            buffer_x: 0,
+            buffer_y: 0,
+            buffer_width: width,
+            buffer_height: height,
+            window_x: 0,
+            window_y: 0,
+            window_width: width,
+            window_height: height,
+        };
+        let mut job = RenderJob {
             doc,
             snapshot,
             geometry: SharedGeometry::of(geometry),
@@ -2615,8 +3093,11 @@ pub(super) fn render(
             anaglyph,
             width,
             height,
-            width_usize,
+            tile: whole_image,
             samples,
+            sample_start: 0,
+            sample_end: samples,
+            adaptive,
             seed,
             bounces: Bounces {
                 surface: max_bounces,
@@ -2637,56 +3118,39 @@ pub(super) fn render(
             film_exposure: scene.render.film_exposure,
             environment,
         };
-        let bands = band_rows(
-            height_usize,
-            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-        );
-        let outcomes = std::thread::scope(|scope| {
-            let job = &job;
-            let mut workers = Vec::with_capacity(bands.len());
-            let mut linear_rest = output.linear_rgba.as_mut_slice();
-            let mut rgba_rest = output.rgba.as_mut_slice();
-            for rows in bands {
-                let band_len = rows.len() * width_usize;
-                let (linear, linear_tail) = std::mem::take(&mut linear_rest).split_at_mut(band_len);
-                let (rgba, rgba_tail) = std::mem::take(&mut rgba_rest).split_at_mut(band_len * 4);
-                linear_rest = linear_tail;
-                rgba_rest = rgba_tail;
-                workers.push(
-                    std::thread::Builder::new()
-                        .stack_size(WORKER_STACK_BYTES)
-                        .spawn_scoped(scope, move || {
-                            let warnings = RefCell::new(Vec::new());
-                            let result = render_rows(job, rows, linear, rgba, &warnings);
-                            (result, warnings.into_inner())
-                        }),
-                );
+        if has_volume_media {
+            for tile in VolumeTiles::new(width, height, scene.render.tile_size, adaptive.is_some())
+            {
+                render_volume_tile(
+                    &mut job,
+                    tile,
+                    width_usize,
+                    &mut output,
+                    &geometry.shader_warnings,
+                )?;
             }
-            workers
-                .into_iter()
-                .map(|worker| match worker {
-                    Ok(handle) => handle.join().unwrap_or_else(|_| {
-                        (
-                            Err(PotError::new(
-                                ErrorCode::InternalError,
-                                "render worker panicked",
-                            )),
-                            Vec::new(),
-                        )
-                    }),
-                    Err(error) => (
-                        Err(PotError::new(
-                            ErrorCode::InternalError,
-                            format!("cannot start a render worker: {error}"),
-                        )),
-                        Vec::new(),
-                    ),
-                })
-                .collect::<Vec<_>>()
-        });
-        for (result, warnings) in outcomes {
-            merge_shader_warnings(&geometry.shader_warnings, warnings);
-            result?;
+        } else {
+            let height_usize = usize::try_from(height).map_err(|_| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "image height exceeds platform limits",
+                )
+            })?;
+            let bands = band_rows(
+                height_usize,
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            );
+            render_row_batch(
+                &job,
+                &bands,
+                &mut output.linear_rgba,
+                &mut output.rgba,
+                None,
+                [None, None],
+                [None, None],
+                [None, None],
+                &geometry.shader_warnings,
+            )?;
         }
     }
 
@@ -6493,6 +6957,10 @@ struct WorldShaderVariabilityState {
     active_outputs: BTreeSet<(Id, Id, String)>,
     group_callsites: Vec<(Id, Id)>,
 }
+struct WorldShaderPrunerContext<'a, 'doc> {
+    pruner: &'a SourceMixInputPruner<'doc>,
+    parent: Option<&'a WorldShaderPrunerContext<'a, 'doc>>,
+}
 
 fn shader_graph_is_spatially_varying(
     doc: &SceneDoc,
@@ -6501,6 +6969,7 @@ fn shader_graph_is_spatially_varying(
     output_socket: &str,
     selected_output: Option<&Id>,
     state: &mut WorldShaderVariabilityState,
+    parent_context: Option<&WorldShaderPrunerContext<'_, '_>>,
 ) -> bool {
     if !state.active_groups.insert(group_id.clone()) {
         return false;
@@ -6528,11 +6997,18 @@ fn shader_graph_is_spatially_varying(
         let Some((output_id, _)) = output else {
             return false;
         };
+        let pruner = SourceMixInputPruner::new(group_id, group, &doc.node_groups);
+        let context = WorldShaderPrunerContext {
+            pruner: &pruner,
+            parent: parent_context,
+        };
         group
             .links
             .iter()
             .filter(|link| link.to_node == *output_id && link.to_socket == output_socket)
-            .any(|link| shader_graph_link_is_spatially_varying(doc, group_id, group, link, state))
+            .any(|link| {
+                shader_graph_link_is_spatially_varying(doc, group_id, group, link, state, &context)
+            })
     });
     state.active_groups.remove(group_id);
     varying
@@ -6544,6 +7020,7 @@ fn shader_graph_link_is_spatially_varying(
     group: &crate::graph::NodeGroup,
     link: &crate::graph::GraphLink,
     state: &mut WorldShaderVariabilityState,
+    context: &WorldShaderPrunerContext<'_, '_>,
 ) -> bool {
     let key = (
         group_id.clone(),
@@ -6581,12 +7058,12 @@ fn shader_graph_link_is_spatially_varying(
             })
         })
         .is_some_and(|input| {
-            shader_graph_link_is_spatially_varying(doc, group_id, group, input, state)
+            shader_graph_link_is_spatially_varying(doc, group_id, group, input, state, context)
         })
     } else if shader_node_is_spatially_varying(node) {
         true
     } else if node.node_type == "NodeGroupInput" {
-        shader_graph_group_input_is_spatially_varying(doc, group, &link.from_socket, state)
+        shader_graph_group_input_is_spatially_varying(doc, group, &link.from_socket, state, context)
     } else if node.node_type == "ShaderNodeGroup" {
         node.properties
             .get("node_tree")
@@ -6611,25 +7088,19 @@ fn shader_graph_link_is_spatially_varying(
                     &output_name,
                     None,
                     state,
+                    Some(context),
                 );
                 let _ = state.group_callsites.pop();
                 varying
             })
-    } else if node.node_type == "ShaderNodeMixShader"
-        && !group
-            .links
-            .iter()
-            .any(|input| input.to_node == link.from_node && input.to_socket == "Fac")
-    {
-        let factor = node
-            .inputs
-            .get("Fac")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.5);
-        let selected_input = if factor <= 0.0 {
-            Some("Shader")
-        } else if factor >= 1.0 {
+    } else if node.node_type == "ShaderNodeMixShader" {
+        let selected_input = if context.pruner.input_is_pruned(&link.from_node, "Shader") {
             Some("Shader_001")
+        } else if context
+            .pruner
+            .input_is_pruned(&link.from_node, "Shader_001")
+        {
+            Some("Shader")
         } else {
             None
         };
@@ -6640,13 +7111,17 @@ fn shader_graph_link_is_spatially_varying(
                 input.to_node == link.from_node
                     && selected_input.is_none_or(|socket| input.to_socket == socket)
             })
-            .any(|input| shader_graph_link_is_spatially_varying(doc, group_id, group, input, state))
+            .any(|input| {
+                shader_graph_link_is_spatially_varying(doc, group_id, group, input, state, context)
+            })
     } else {
         group
             .links
             .iter()
             .filter(|input| input.to_node == link.from_node)
-            .any(|input| shader_graph_link_is_spatially_varying(doc, group_id, group, input, state))
+            .any(|input| {
+                shader_graph_link_is_spatially_varying(doc, group_id, group, input, state, context)
+            })
     };
     state.active_outputs.remove(&key);
     varying
@@ -6657,6 +7132,7 @@ fn shader_graph_group_input_is_spatially_varying(
     group: &crate::graph::NodeGroup,
     output_socket: &str,
     state: &mut WorldShaderVariabilityState,
+    context: &WorldShaderPrunerContext<'_, '_>,
 ) -> bool {
     let Some(input_socket) = group
         .interface
@@ -6678,9 +7154,18 @@ fn shader_graph_group_input_is_spatially_varying(
     }) else {
         return false;
     };
+    let Some(parent_context) = context.parent else {
+        return false;
+    };
     let callsite = state.group_callsites.pop();
-    let varying =
-        shader_graph_link_is_spatially_varying(doc, &parent_group_id, parent_group, link, state);
+    let varying = shader_graph_link_is_spatially_varying(
+        doc,
+        &parent_group_id,
+        parent_group,
+        link,
+        state,
+        parent_context,
+    );
     if let Some(callsite) = callsite {
         state.group_callsites.push(callsite);
     }
@@ -6717,6 +7202,7 @@ fn selected_world_shader_is_spatially_varying(
         output_socket,
         Some(output_id),
         &mut WorldShaderVariabilityState::default(),
+        None,
     )
 }
 
@@ -7760,7 +8246,36 @@ fn trace_path(
     )
 }
 
+#[cfg(test)]
 fn trace_path_with_temperatures(
+    scene: SceneRefs<'_, '_>,
+    volume_temperatures: &[Option<VolumeTemperature>],
+    bounces: Bounces<'_>,
+    origin: DVec3,
+    direction: DVec3,
+    footprint: CameraFootprint,
+    environment: DVec3,
+    film_transparent: bool,
+    rng: &mut Pcg32,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<(DVec3, f64)> {
+    let (radiance, alpha, _) = trace_path_with_guiding(
+        scene,
+        volume_temperatures,
+        bounces,
+        origin,
+        direction,
+        footprint,
+        environment,
+        film_transparent,
+        None,
+        rng,
+        evaluator_workspace,
+    )?;
+    Ok((radiance, alpha))
+}
+
+fn trace_path_with_guiding(
     scene: SceneRefs<'_, '_>,
     volume_temperatures: &[Option<VolumeTemperature>],
     bounces: Bounces<'_>,
@@ -7769,9 +8284,10 @@ fn trace_path_with_temperatures(
     footprint: CameraFootprint,
     environment: DVec3,
     film_transparent: bool,
+    mut guide: Option<VolumeGuidePath<'_>>,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
-) -> Result<(DVec3, f64)> {
+) -> Result<(DVec3, f64, Option<VolumeGuidingSample>)> {
     let SceneRefs {
         doc,
         snapshot,
@@ -7994,6 +8510,13 @@ fn trace_path_with_temperatures(
             }
         }
         if grid.is_some() || stack.is_some() {
+            if bounce == 0
+                && let Some(guide) = guide.as_mut()
+            {
+                guide.primary_transmit = true;
+                guide.sample_optical_depth +=
+                    volume_optical_depth(grid.as_ref(), stack.as_ref(), segment_limit);
+            }
             let mut temperature_march = grid.as_ref().and_then(|grid| {
                 TemperatureEmissionMarch::new(
                     volumes,
@@ -8011,7 +8534,11 @@ fn trace_path_with_temperatures(
                 segment_limit,
                 temperature_march.as_mut(),
             )?;
-            radiance += film_clamp.apply(throughput * emission, bounce.saturating_sub(1));
+            let contribution = film_clamp.apply(throughput * emission, bounce.saturating_sub(1));
+            radiance += contribution;
+            if let Some(guide) = guide.as_mut() {
+                guide.add(contribution);
+            }
         }
         // A segment holding both a voxel grid and a mesh medium is mixed: its nearest free flight is sampled analogously.
         let mixed = match (grid.as_ref(), stack) {
@@ -8035,9 +8562,16 @@ fn trace_path_with_temperatures(
         };
         let budget = transparent_max_bounces.saturating_sub(transparent_bounce);
         let choices = equiangular_choices(lights, origin, method, rng);
-        let homogeneous_path_sample = if bounce > 0 && !terminal && grid.is_none() {
+        let homogeneous_path_sample = if !terminal && grid.is_none() {
             stack.as_ref().map(|medium| {
-                let scatter_probability = DVec3::ONE - medium_transmittance(medium, segment_limit);
+                let scatter_probability = homogeneous_path_scatter_probability(
+                    medium,
+                    segment_limit,
+                    bounce,
+                    guide
+                        .as_ref()
+                        .map(|guide| (&guide.read, guide.optical_depth)),
+                );
                 sample_homogeneous_path_segment(
                     medium,
                     segment_limit,
@@ -8051,9 +8585,13 @@ fn trace_path_with_temperatures(
         };
         // Homogeneous media take Cycles' dedicated direct-scatter sample instead of reusing the
         // indirect path event. The latter can be absorption/null/escape and has a different density.
-        let homogeneous_direct = if grid.is_none() { stack.as_ref() } else { None };
+        let homogeneous_direct = if grid.is_none() {
+            stack.as_ref().zip(homogeneous_path_sample.as_ref())
+        } else {
+            None
+        };
         let homogeneous_channel_pdf = homogeneous_direct
-            .map(|medium| volume_direct_channel_pdf(medium, throughput, segment_limit));
+            .map(|(medium, _)| volume_direct_channel_pdf(medium, throughput, segment_limit));
         // Next-event estimation of the segment's media, for each sampled light.
         let (span_start, span_length) = match (&grid, stack) {
             (Some(grid), None) => (grid.entry, grid_span(grid)),
@@ -8075,110 +8613,97 @@ fn trace_path_with_temperatures(
                 {
                     continue;
                 }
-                let Some((distance, pdf, distance_mis)) =
-                    (if let (Some(medium), Some(channel_pdf)) =
-                        (homogeneous_direct, homogeneous_channel_pdf)
-                    {
-                        let Some((range_start, range_end)) =
-                            volume_light_segment_range(light, origin, direction, segment_limit)
-                        else {
+                let direct_volume_sample = if let (Some((medium, path_sample)), Some(channel_pdf)) =
+                    (homogeneous_direct, homogeneous_channel_pdf)
+                {
+                    let Some((range_start, range_end)) =
+                        volume_light_segment_range(light, origin, direction, segment_limit)
+                    else {
+                        continue;
+                    };
+                    let eq_sample = point.filter(|_| sampled).and_then(|point| {
+                        equiangular_sample(
+                            point,
+                            origin + direction * range_start,
+                            direction,
+                            range_end - range_start,
+                            rng.next_f64(),
+                        )
+                    });
+                    if let Some((offset, pdf)) = eq_sample {
+                        let distance = range_start + offset;
+                        let distance_pdf = homogeneous_direct_distance_pdf(
+                            medium,
+                            channel_pdf,
+                            distance,
+                            range_start,
+                            range_end,
+                        );
+                        let mis = if method == VolumeSampling::MultipleImportance {
+                            2.0 * power_heuristic(pdf, distance_pdf)
+                        } else {
+                            1.0
+                        };
+                        Some((distance, pdf, mis))
+                    } else {
+                        let Some((distance, pdf)) = sample_homogeneous_direct_distance_with_samples(
+                            medium,
+                            channel_pdf,
+                            range_start,
+                            range_end,
+                            path_sample.direct_channel_sample,
+                            path_sample.direct_distance_sample,
+                        ) else {
                             continue;
                         };
-                        let eq_sample = point.filter(|_| sampled).and_then(|point| {
-                            equiangular_sample(
+                        let eq_pdf = point.map_or(0.0, |point| {
+                            equiangular_pdf(
                                 point,
                                 origin + direction * range_start,
                                 direction,
                                 range_end - range_start,
-                                rng.next_f64(),
+                                distance - range_start,
                             )
                         });
-                        if let Some((offset, pdf)) = eq_sample {
-                            let distance = range_start + offset;
-                            let distance_pdf = homogeneous_direct_distance_pdf(
-                                medium,
-                                channel_pdf,
-                                distance,
-                                range_start,
-                                range_end,
-                            );
-                            let mis = if method == VolumeSampling::MultipleImportance {
-                                2.0 * power_heuristic(pdf, distance_pdf)
-                            } else {
-                                1.0
-                            };
-                            Some((distance, pdf, mis))
+                        let mis = if method == VolumeSampling::MultipleImportance && point.is_some()
+                        {
+                            2.0 * power_heuristic(pdf, eq_pdf)
                         } else {
-                            let direct_sample = if let Some(path_sample) = homogeneous_path_sample {
-                                sample_homogeneous_direct_distance_with_samples(
-                                    medium,
-                                    channel_pdf,
-                                    range_start,
-                                    range_end,
-                                    path_sample.direct_channel_sample,
-                                    path_sample.direct_distance_sample,
-                                )
-                            } else {
-                                sample_homogeneous_direct_distance(
-                                    medium,
-                                    channel_pdf,
-                                    range_start,
-                                    range_end,
-                                    rng,
-                                )
-                            };
-                            let Some((distance, pdf)) = direct_sample else {
-                                continue;
-                            };
-                            let eq_pdf = point.map_or(0.0, |point| {
-                                equiangular_pdf(
-                                    point,
-                                    origin + direction * range_start,
-                                    direction,
-                                    range_end - range_start,
-                                    distance - range_start,
-                                )
-                            });
-                            let mis = if method == VolumeSampling::MultipleImportance
-                                && point.is_some()
-                            {
-                                2.0 * power_heuristic(pdf, eq_pdf)
-                            } else {
-                                1.0
-                            };
-                            Some((distance, pdf, mis))
-                        }
-                    } else {
-                        let Some(point) = point.filter(|_| sampled) else {
-                            continue;
-                        };
-                        let Some((offset, pdf)) = equiangular_sample(
-                            point,
-                            span_origin,
-                            direction,
-                            span_length,
-                            rng.next_f64(),
-                        ) else {
-                            continue;
-                        };
-                        let distance = span_start + offset;
-                        let mis = match method {
-                            VolumeSampling::Equiangular => 1.0,
-                            _ => {
-                                2.0 * power_heuristic(
-                                    pdf,
-                                    segment_scatter_pdf(
-                                        grid.as_ref(),
-                                        stack.as_ref(),
-                                        distance,
-                                        voxel_channel_pdf,
-                                    ),
-                                )
-                            }
+                            1.0
                         };
                         Some((distance, pdf, mis))
-                    })
-                else {
+                    }
+                } else {
+                    let Some(point) = point.filter(|_| sampled) else {
+                        continue;
+                    };
+                    let Some((offset, pdf)) = equiangular_sample(
+                        point,
+                        span_origin,
+                        direction,
+                        span_length,
+                        rng.next_f64(),
+                    ) else {
+                        continue;
+                    };
+                    let distance = span_start + offset;
+                    let mis = match method {
+                        VolumeSampling::Equiangular => 1.0,
+                        _ => {
+                            2.0 * power_heuristic(
+                                pdf,
+                                segment_scatter_pdf(
+                                    grid.as_ref(),
+                                    stack.as_ref(),
+                                    distance,
+                                    voxel_channel_pdf,
+                                ),
+                            )
+                        }
+                    };
+                    Some((distance, pdf, mis))
+                };
+                let Some((distance, pdf, distance_mis)) = direct_volume_sample else {
                     continue;
                 };
                 let sample_point = origin + direction * distance;
@@ -8204,7 +8729,9 @@ fn trace_path_with_temperatures(
                             transmittance,
                         )
                     },
-                    |medium| homogeneous_direct_scatter_phase(medium, phase_pdf, transmittance),
+                    |(medium, _)| {
+                        homogeneous_direct_scatter_phase(medium, phase_pdf, transmittance)
+                    },
                 );
                 let light_mis = if light_pdf > 0.0 {
                     power_heuristic(selection_pdf * light_pdf, phase_pdf)
@@ -8232,11 +8759,17 @@ fn trace_path_with_temperatures(
                     rng,
                     evaluator_workspace,
                 )?;
-                radiance += film_clamp.apply_selected(
+                let contribution = film_clamp.apply_selected(
                     throughput * roulette_weight * scatter * nee * (distance_mis * light_mis / pdf),
                     bounce,
                     selection_pdf * survival,
                 );
+                radiance += contribution;
+                let mut target = volume_guide_target(
+                    &mut guide,
+                    (bounce == 0).then_some(VolumeGuideClass::Scatter),
+                );
+                add_volume_guide_contribution(&mut target, contribution);
             }
         }
         if let Some((grid, medium)) = mixed {
@@ -8312,10 +8845,17 @@ fn trace_path_with_temperatures(
                     },
                     &mut light_tree_pdfs,
                     film_clamp,
+                    volume_guide_target(
+                        &mut guide,
+                        (bounce == 0).then_some(VolumeGuideClass::Scatter),
+                    ),
                     budget,
                     rng,
                     evaluator_workspace,
                 )?;
+                if let Some(guide) = guide.as_mut() {
+                    guide.volume_scatter(bounce);
+                }
                 throughput *= roulette_weight;
                 volume_scatters += 1;
                 terminal |= bounce >= max_bounces || volume_scatters >= volume_limit;
@@ -8403,10 +8943,17 @@ fn trace_path_with_temperatures(
                     },
                     &mut light_tree_pdfs,
                     film_clamp,
+                    volume_guide_target(
+                        &mut guide,
+                        (bounce == 0).then_some(VolumeGuideClass::Scatter),
+                    ),
                     budget,
                     rng,
                     evaluator_workspace,
                 )?;
+                if let Some(guide) = guide.as_mut() {
+                    guide.volume_scatter(bounce);
+                }
                 throughput *= roulette_weight;
                 volume_scatters += 1;
                 terminal |= bounce >= max_bounces || volume_scatters >= volume_limit;
@@ -8503,10 +9050,17 @@ fn trace_path_with_temperatures(
                     },
                     &mut light_tree_pdfs,
                     film_clamp,
+                    volume_guide_target(
+                        &mut guide,
+                        (bounce == 0).then_some(VolumeGuideClass::Scatter),
+                    ),
                     budget,
                     rng,
                     evaluator_workspace,
                 )?;
+                if let Some(guide) = guide.as_mut() {
+                    guide.volume_scatter(bounce);
+                }
                 throughput *= roulette_weight;
                 volume_scatters += 1;
                 terminal |= bounce >= max_bounces || volume_scatters >= volume_limit;
@@ -8528,20 +9082,12 @@ fn trace_path_with_temperatures(
                 continue;
             }
         } else if let Some(medium) = stack {
-            // Cycles uses analytic homogeneous sampling after the primary VSPG segment. Primary VSPG needs the
-            // render-buffer guide; until that film lifecycle is integrated, retain its existing path sampler there.
-            let path_sample = match homogeneous_path_sample {
-                Some(sample) => sample,
-                None => {
-                    let outcome = trace_mesh_medium(&medium, segment_limit, &mut throughput, rng);
-                    HomogeneousPathSample {
-                        outcome,
-                        throughput,
-                        direct_channel_sample: 0.5,
-                        direct_distance_sample: 0.5,
-                    }
-                }
-            };
+            let path_sample = homogeneous_path_sample.ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "active homogeneous segments must have an analytic path sample",
+                )
+            })?;
             throughput = path_sample.throughput;
             match path_sample.outcome {
                 MediumOutcome::Scatter(distance) => {
@@ -8596,10 +9142,17 @@ fn trace_path_with_temperatures(
                         },
                         &mut light_tree_pdfs,
                         film_clamp,
+                        volume_guide_target(
+                            &mut guide,
+                            (bounce == 0).then_some(VolumeGuideClass::Scatter),
+                        ),
                         budget,
                         rng,
                         evaluator_workspace,
                     )?;
+                    if let Some(guide) = guide.as_mut() {
+                        guide.volume_scatter(bounce);
+                    }
                     throughput *= roulette_weight;
                     volume_scatters += 1;
                     terminal |= bounce >= max_bounces || volume_scatters >= volume_limit;
@@ -8621,7 +9174,6 @@ fn trace_path_with_temperatures(
                     continue;
                 }
                 MediumOutcome::Survive => {}
-                MediumOutcome::Absorb => break,
             }
             if throughput.max_element() <= 1.0e-8 {
                 break;
@@ -8639,10 +9191,14 @@ fn trace_path_with_temperatures(
                 light.light_index,
             );
             if light.visible {
-                radiance += film_clamp.apply(
+                let contribution = film_clamp.apply(
                     throughput * light.radiance * weight,
                     bounce.saturating_sub(1),
                 );
+                radiance += contribution;
+                if let Some(guide) = guide.as_mut() {
+                    guide.add(contribution);
+                }
             }
             origin += direction * (light.distance + RAY_EPSILON);
             // The origin moves past the light, so the footprint grows by the distance skipped: `dP + t · dD` measured
@@ -8690,10 +9246,14 @@ fn trace_path_with_temperatures(
                 } else {
                     DVec3::ZERO
                 };
-                radiance += film_clamp.apply(
+                let contribution = film_clamp.apply(
                     throughput * environment * environment_weight,
                     bounce.saturating_sub(1),
                 );
+                radiance += contribution;
+                if let Some(guide) = guide.as_mut() {
+                    guide.add(contribution);
+                }
             }
             escaped = true;
             break;
@@ -8770,8 +9330,10 @@ fn trace_path_with_temperatures(
             surface.closures.apply_object_holdout();
         }
         if transparent_background {
-            holdout_transparency +=
+            let transparency =
                 holdout_film_transparency(throughput, surface.closures.holdout_transparency);
+            holdout_transparency += transparency;
+            record_primary_transparency_guide(guide.as_mut(), transparency);
             if surface.closures.holdout_transparency.max_element() <= 0.0 {
                 break;
             }
@@ -8800,10 +9362,14 @@ fn trace_path_with_temperatures(
             continue;
         }
         // Emission is the closures' radiance weighted by their coverage, so a path that ends here still shows it.
-        radiance += film_clamp.apply(
+        let contribution = film_clamp.apply(
             throughput * surface.closures.emission,
             bounce.saturating_sub(1),
         );
+        radiance += contribution;
+        if let Some(guide) = guide.as_mut() {
+            guide.add(contribution);
+        }
         if terminate_on_next_surface || roulette_terminated {
             // Cycles shades the surface for emission, then ends the path (`integrate_surface_terminate`).
             break;
@@ -8830,6 +9396,7 @@ fn trace_path_with_temperatures(
                 },
                 &mut light_tree_pdfs,
                 film_clamp,
+                volume_guide_target(&mut guide, None),
                 transparent_max_bounces.saturating_sub(transparent_bounce),
                 rng,
                 evaluator_workspace,
@@ -8903,6 +9470,9 @@ fn trace_path_with_temperatures(
                     ray_t_min = 0.0;
                     rng_offset = rng_offset.wrapping_add(CYCLES_PRNG_BOUNCE_NUM);
                     continue;
+                }
+                if let Some(guide) = guide.as_mut() {
+                    guide.volume_visible = false;
                 }
                 // A subsurface entry takes no bounce, so it is taken at the budget too (`subsurface_bounce`, which
                 // `path_state_next` does not count). The path leaves at the method's exit, keeping this vertex's count.
@@ -9062,6 +9632,9 @@ fn trace_path_with_temperatures(
     // Cycles writes film transparency only for a path that escapes to the background, as
     // `average(throughput)` (`intern/cycles/kernel/integrator/shade_background.h`). Every other
     // termination leaves the pixel covered.
+    if escaped && transparent_background && film_transparent {
+        record_primary_transparency_guide(guide.as_mut(), throughput.element_sum() / 3.0);
+    }
     let alpha = if film_transparent {
         transparent_film_alpha(
             escaped,
@@ -9072,10 +9645,20 @@ fn trace_path_with_temperatures(
     } else {
         1.0
     };
-    Ok((radiance, alpha.clamp(0.0, 1.0)))
+    let guide_sample = guide.as_ref().map(VolumeGuidePath::sample);
+    Ok((radiance, alpha.clamp(0.0, 1.0), guide_sample))
 }
 fn holdout_film_transparency(throughput: DVec3, holdout_transparency: DVec3) -> f64 {
     (throughput * (DVec3::ONE - holdout_transparency)).element_sum() / 3.0
+}
+fn record_primary_transparency_guide(guide: Option<&mut VolumeGuidePath<'_>>, transparency: f64) {
+    if let Some(guide) = guide
+        && guide.primary_transmit
+    {
+        guide
+            .accumulator
+            .add_transmit(DVec3::splat(transparency).as_vec3());
+    }
 }
 
 fn transparent_film_alpha(
@@ -10853,6 +11436,7 @@ fn direct_lighting(
     next_event: NextEventSettings<'_>,
     lamp_pdfs: &mut Vec<f64>,
     film_clamp: FilmClamp,
+    mut guide: VolumeGuideTarget<'_, '_>,
     transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
@@ -10949,11 +11533,13 @@ fn direct_lighting(
         if visibility.max_element() <= 0.0 {
             continue;
         }
-        contribution += film_clamp.apply_selected(
+        let light_contribution = film_clamp.apply_selected(
             throughput * direct * visibility,
             bounce,
             selection_pdf * survival,
         );
+        add_volume_guide_contribution(&mut guide, light_contribution);
+        contribution += light_contribution;
     }
     // The background is a sampled lamp here; forward background hits have no bounce cap.
     let world_selection_pdf = light_selection.world_pdf(tree_query);
@@ -11022,11 +11608,13 @@ fn direct_lighting(
                     } else {
                         DVec3::ONE
                     };
-                    contribution += film_clamp.apply_selected(
+                    let world_contribution = film_clamp.apply_selected(
                         throughput * direct * visibility,
                         bounce,
                         world_selection_pdf * survival,
                     );
+                    add_volume_guide_contribution(&mut guide, world_contribution);
+                    contribution += world_contribution;
                 }
             }
         }
@@ -11044,6 +11632,7 @@ fn direct_volume_lighting(
     next_event: NextEventSettings<'_>,
     lamp_pdfs: &mut Vec<f64>,
     film_clamp: FilmClamp,
+    mut guide: VolumeGuideTarget<'_, '_>,
     transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
@@ -11106,11 +11695,13 @@ fn direct_volume_lighting(
             rng,
             evaluator_workspace,
         )?;
-        contribution += film_clamp.apply_selected(
+        let light_contribution = film_clamp.apply_selected(
             throughput * radiance * (phase_pdf * weight * mis),
             bounce,
             selection_pdf * survival,
         );
+        add_volume_guide_contribution(&mut guide, light_contribution);
+        contribution += light_contribution;
     }
     let world_selection_pdf = light_selection.world_pdf(tree_query);
     if world_selection_pdf > 0.0
@@ -11162,11 +11753,13 @@ fn direct_volume_lighting(
                 } else {
                     DVec3::ONE
                 };
-                contribution += film_clamp.apply_selected(
+                let world_contribution = film_clamp.apply_selected(
                     throughput * direct * visibility,
                     bounce,
                     world_selection_pdf * survival,
                 );
+                add_volume_guide_contribution(&mut guide, world_contribution);
+                contribution += world_contribution;
             }
         }
     }
@@ -11441,23 +12034,6 @@ fn homogeneous_direct_distance_pdf(
         + channel_pdf.z * truncated_exponential_pdf(rates[2], distance, start, end)
 }
 
-fn sample_homogeneous_direct_distance(
-    medium: &BsdfParams,
-    channel_pdf: DVec3,
-    start: f64,
-    end: f64,
-    rng: &mut Pcg32,
-) -> Option<(f64, f64)> {
-    sample_homogeneous_direct_distance_with_samples(
-        medium,
-        channel_pdf,
-        start,
-        end,
-        rng.next_f64(),
-        rng.next_f64(),
-    )
-}
-
 fn sample_homogeneous_direct_distance_with_samples(
     medium: &BsdfParams,
     channel_pdf: DVec3,
@@ -11480,10 +12056,6 @@ fn sample_homogeneous_direct_distance_with_samples(
     (pdf > 0.0).then_some((distance, pdf))
 }
 
-/// The density per unit distance of the first real event of `trace_mesh_medium` being a scatter at `t`: the
-/// channel-mean scatter rate times the survival at the channel-mean extinction. Its weight in the MIS of
-/// `volume_direct_scatter_mis` needs only to be a positive function of `t`; the scatter's estimator is already
-/// weighted by the path, so the MIS stays unbiased for any such function.
 fn distance_scatter_pdf(medium: &BsdfParams, t: f64) -> f64 {
     let scatter = DVec3::from_array(medium.volume_scatter);
     let extinction = scatter + DVec3::from_array(medium.volume_absorption);
@@ -14086,8 +14658,6 @@ enum MediumOutcome {
     Scatter(f64),
     /// The path crosses the segment, its throughput carrying the transmittance.
     Survive,
-    /// The path is absorbed in the medium, or exhausts its tentative collisions.
-    Absorb,
 }
 
 #[derive(Clone, Copy)]
@@ -14206,137 +14776,382 @@ fn sample_homogeneous_path_segment(
     }
 }
 
-/// The tentative-collision budget of one medium segment. Exhausting it absorbs the path; the tail of the
-/// null-collision chain that this cuts off is negligible for the densities a rendered medium has.
-const MAX_MEDIUM_EVENTS: u32 = 4096;
-
-/// Spectral ratio tracking over a medium segment of length `distance`
-/// (`intern/cycles/kernel/integrator/shade_volume.h`, `volume_integrate_heterogeneous`). A medium with no
-/// scattering is attenuated deterministically, as Cycles does (`Absorption only`): each channel takes
-/// `exp(-σa·distance)` and no event is drawn. Otherwise tentative collisions come at the majorant `max_c σt_c`.
-/// Each tentative collision uses Cycles' throughput-weighted channel PDF and per-channel scatter/null weights.
-/// throughput takes each channel's own branch weight. Every channel's transmittance and single-scatter integral
-/// is then exact in expectation.
-fn trace_mesh_medium(
+fn homogeneous_path_scatter_probability(
     medium: &BsdfParams,
-    distance: f64,
-    throughput: &mut DVec3,
-    rng: &mut Pcg32,
-) -> MediumOutcome {
-    let scatter = DVec3::from_array(medium.volume_scatter);
-    let absorption = DVec3::from_array(medium.volume_absorption);
-    if scatter == DVec3::ZERO {
-        // A channel with no absorption stays at one, which keeps an infinite segment from giving 0 · ∞.
-        *throughput *= DVec3::from_array(absorption.to_array().map(|sigma| {
-            if sigma > 0.0 {
-                (-sigma * distance).exp()
-            } else {
-                1.0
-            }
-        }));
-        return MediumOutcome::Survive;
+    segment_length: f64,
+    bounce: u32,
+    guide: Option<(&VolumeGuidingRead, f32)>,
+) -> DVec3 {
+    let transmittance = medium_transmittance(medium, segment_length);
+    if bounce == 0 {
+        guide.map_or(DVec3::ONE - transmittance, |(read, optical_depth)| {
+            read.homogeneous_scatter_probability(
+                medium_extinction(medium),
+                segment_length,
+                optical_depth,
+            )
+        })
+    } else {
+        DVec3::ONE - transmittance
     }
-    let extinction = scatter + absorption;
-    let majorant = extinction.max_element();
-    if majorant <= 0.0 {
-        return MediumOutcome::Survive;
-    }
-    let null = DVec3::splat(majorant) - extinction;
-    let extinction_channels = extinction.to_array();
-    let scatter_channels = scatter.to_array();
-    let albedo = DVec3::from_array(std::array::from_fn(|channel| {
-        if extinction_channels[channel] > 0.0 {
-            scatter_channels[channel] / extinction_channels[channel]
-        } else {
-            1.0
-        }
-    }));
-    let channel_pdf = volume_channel_pdf(albedo, *throughput);
-    let scatter_probability = channel_pdf.dot(scatter / majorant);
-    let null_probability = channel_pdf.dot(null / majorant);
-    let mut position = 0.0;
-    for _ in 0..MAX_MEDIUM_EVENTS {
-        position += -rng.next_f64().max(f64::MIN_POSITIVE).ln() / majorant;
-        if position >= distance {
-            return MediumOutcome::Survive;
-        }
-        let choice = rng.next_f64();
-        if choice < scatter_probability {
-            *throughput *= scatter / (majorant * scatter_probability);
-            return MediumOutcome::Scatter(position);
-        }
-        if choice < scatter_probability + null_probability {
-            *throughput *= null / (majorant * null_probability);
-            continue;
-        }
-        *throughput = DVec3::ZERO;
-        return MediumOutcome::Absorb;
-    }
-    *throughput = DVec3::ZERO;
-    MediumOutcome::Absorb
 }
 
 #[cfg(test)]
-mod mesh_medium_survival_tests {
+mod volume_path_guiding_tests {
     use glam::DVec3;
 
-    use super::{BsdfParams, Material, MediumOutcome, Pcg32, trace_mesh_medium};
+    use super::{
+        BsdfParams, Material, MediumOutcome, Pcg32, VolumeGuideClass, VolumeGuidePath,
+        VolumeGuidingAccumulator, VolumeGuidingFilm, VolumeGuidingRead, VolumeGuidingSample,
+        holdout_film_transparency, homogeneous_path_scatter_probability,
+        record_primary_transparency_guide, sample_homogeneous_path_segment,
+        take_volume_tile_render_reports,
+    };
+
+    fn render_world_volume(
+        adaptive: bool,
+        anaglyph: bool,
+        plane_width: f64,
+        samples: u32,
+        threshold: f64,
+    ) -> super::RasterOutput {
+        use crate::{
+            eval::{EvaluationContext, EvaluationPurpose, Snapshot},
+            geom::{Mesh, PlaneParams},
+            graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
+            model::{DataBlock, Id, Node, SceneDoc, Transform, World},
+        };
+
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let world_graph_id = Id::new("world_graph").unwrap();
+        let output_id = Id::new("output").unwrap();
+        let background_id = Id::new("background").unwrap();
+        let absorption_id = Id::new("absorption").unwrap();
+        let mut world_graph = NodeGroup::new("World", GraphKind::Shader);
+        let mut output = GraphNode::new("ShaderNodeOutputWorld");
+        output
+            .properties
+            .insert("is_active_output".to_owned(), serde_json::json!(true));
+        let mut background = GraphNode::new("ShaderNodeBackground");
+        background
+            .inputs
+            .insert("Color".to_owned(), serde_json::json!([0.0, 0.0, 0.0, 1.0]));
+        background
+            .inputs
+            .insert("Strength".to_owned(), serde_json::json!(1.0));
+        let mut absorption = GraphNode::new("ShaderNodeVolumeAbsorption");
+        absorption
+            .inputs
+            .insert("Color".to_owned(), serde_json::json!([0.5, 0.5, 0.5, 1.0]));
+        absorption
+            .inputs
+            .insert("Density".to_owned(), serde_json::json!(0.1));
+        world_graph.nodes.insert(output_id.clone(), output);
+        world_graph.nodes.insert(background_id.clone(), background);
+        world_graph.nodes.insert(absorption_id.clone(), absorption);
+        world_graph.links.extend([
+            GraphLink {
+                from_node: background_id,
+                from_socket: "Background".to_owned(),
+                to_node: output_id.clone(),
+                to_socket: "Surface".to_owned(),
+            },
+            GraphLink {
+                from_node: absorption_id,
+                from_socket: "Volume".to_owned(),
+                to_node: output_id,
+                to_socket: "Volume".to_owned(),
+            },
+        ]);
+        doc.node_groups.insert(world_graph_id.clone(), world_graph);
+
+        let world_id = Id::new("world").unwrap();
+        doc.worlds.insert(
+            world_id.clone(),
+            World {
+                color: [0.0; 3],
+                node_tree: Some(world_graph_id),
+                strength: 1.0,
+                ..World::default()
+            },
+        );
+        let material_id = Id::new("emitter_material").unwrap();
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                emission_color: [1.0, 0.5, 0.25],
+                emission_strength: 1.0,
+                ..Material::default()
+            },
+        );
+        let mesh_id = Id::new("emitter_mesh").unwrap();
+        doc.data_blocks.insert(
+            mesh_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(Mesh::plane(PlaneParams { size: 2.0 }).unwrap()),
+                ..DataBlock::default()
+            },
+        );
+        let plane_id = Id::new("emitter_plane").unwrap();
+        doc.nodes.insert(
+            plane_id.clone(),
+            Node {
+                name: "Emitter Plane".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(mesh_id),
+                materials: vec![Some(material_id)],
+                transform: Transform {
+                    scale: [plane_width * 0.5, 2.0, 1.0],
+                    ..Transform::default()
+                },
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .unwrap()
+            .objects
+            .push(plane_id);
+
+        let scene_id = doc.active_scene.clone();
+        let scene = doc.scenes.get_mut(&scene_id).unwrap();
+        scene.world = Some(world_id);
+        scene.render.resolution_x = 32;
+        scene.render.resolution_y = 32;
+        scene.render.samples = samples;
+        scene.render.use_adaptive_sampling = adaptive;
+        scene.render.adaptive_threshold = threshold;
+        scene.render.adaptive_min_samples = 4;
+        scene.render.tile_size = 8;
+        scene.render.pixel_filter_type = crate::model::PixelFilterType::Box;
+        scene.render.filter_width = 1.0;
+
+        let snapshot = Snapshot::evaluate(
+            &doc,
+            &EvaluationContext {
+                purpose: EvaluationPurpose::Render,
+                ..EvaluationContext::default()
+            },
+        )
+        .unwrap();
+        let images = std::collections::BTreeMap::new();
+        let geometry = crate::render::scene::extract_geometry(
+            &doc,
+            &snapshot,
+            super::Mode::Beauty,
+            true,
+            &images,
+        )
+        .unwrap();
+        let camera = super::Camera {
+            position: glam::DVec3::new(0.0, 0.0, 3.0),
+            target: glam::DVec3::ZERO,
+            up: glam::DVec3::Y,
+            near: 0.1,
+            far: 100.0,
+            projection: super::Projection::Orthographic { height: 2.0 },
+            shift: [0.0; 2],
+            depth_of_field: None,
+            stereo_mode: if anaglyph {
+                super::StereoMode::Anaglyph
+            } else {
+                super::StereoMode::None
+            },
+            interocular_distance: if anaglyph { 1.5 } else { 0.0 },
+        };
+        let pixel_filter = super::PixelFilter::new(crate::model::PixelFilterType::Box, 1.0);
+        super::render(
+            &doc,
+            &snapshot,
+            &geometry,
+            &camera,
+            32,
+            32,
+            samples,
+            7,
+            0,
+            0,
+            0,
+            0,
+            0,
+            8,
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            &pixel_filter,
+            &images,
+        )
+        .unwrap()
+    }
 
     #[test]
-    fn null_chain_survival_estimates_rgb_transmittance_without_boundary_double_count() {
-        let mut medium = BsdfParams::from_material(&Material::default(), DVec3::Z);
-        medium.volume_scatter = [0.1, 0.4, 0.2];
-        medium.volume_absorption = [0.3, 0.2, 0.1];
-        let distance = 3.0;
-        let expected = DVec3::new(
-            (-0.4_f64 * distance).exp(),
-            (-0.6 * distance).exp(),
-            (-0.3 * distance).exp(),
-        );
-        let count = 40_000_u32;
-        let mut estimate = DVec3::ZERO;
-        for sample in 0..count {
-            let mut throughput = DVec3::ONE;
-            let mut rng = Pcg32::for_sample(37, sample, 0, 0);
-            if matches!(
-                trace_mesh_medium(&medium, distance, &mut throughput, &mut rng),
-                MediumOutcome::Survive
-            ) {
-                estimate += throughput;
+    fn transparent_alpha_guides_use_source_scalar_spectrum() {
+        let throughput = DVec3::new(1.0, 0.0, 0.0);
+        let transparencies = [
+            holdout_film_transparency(throughput, DVec3::ZERO),
+            throughput.element_sum() / 3.0,
+        ];
+        let probability_after_transparency = |transparency: Option<f64>| {
+            let mut film = VolumeGuidingFilm::new(1, 1).unwrap();
+            {
+                let (_, accumulators) = film.buffers();
+                let accumulator = &mut accumulators[0];
+                accumulator.add_scatter(glam::Vec3::ONE);
+                accumulator.record(VolumeGuidingSample {
+                    optical_depth: 1.0,
+                    primary_transmit: true,
+                });
+                if let Some(transparency) = transparency {
+                    let mut guide = VolumeGuidePath {
+                        read: VolumeGuidingRead::default(),
+                        accumulator,
+                        adaptive: None,
+                        sample_index: 0,
+                        primary_transmit: true,
+                        volume_visible: false,
+                        optical_depth: 1.0,
+                        sample_optical_depth: 0.0,
+                    };
+                    record_primary_transparency_guide(Some(&mut guide), transparency);
+                }
             }
+            film.filter().unwrap();
+            let (reads, accumulators) = film.buffers();
+            reads[0].homogeneous_scatter_probability(
+                DVec3::ONE,
+                1.0,
+                accumulators[0].mean_optical_depth(),
+            )
+        };
+        let no_alpha = probability_after_transparency(None);
+        for transparency in transparencies {
+            let probability = probability_after_transparency(Some(transparency));
+            assert!(probability.x < no_alpha.x);
+            assert_eq!(probability.x, probability.y);
+            assert_eq!(probability.y, probability.z);
         }
-        estimate /= f64::from(count);
-        assert!(
-            (estimate - expected).abs().max_element() < 0.015,
-            "estimated transmittance {estimate:?} differs from {expected:?}"
-        );
     }
+
     #[test]
-    fn null_chain_scatter_estimates_rgb_single_scatter_integral() {
-        let mut medium = BsdfParams::from_material(&Material::default(), DVec3::Z);
-        medium.volume_scatter = [0.1, 0.4, 0.2];
-        medium.volume_absorption = [0.3, 0.2, 0.1];
-        let distance = 3.0;
-        let scatter = DVec3::from_array(medium.volume_scatter);
-        let extinction = scatter + DVec3::from_array(medium.volume_absorption);
-        let expected = scatter / extinction * (DVec3::ONE - (-extinction * distance).exp());
-        let count = 100_000_u32;
-        let mut estimate = DVec3::ZERO;
-        for sample in 0..count {
-            let mut throughput = DVec3::ONE;
-            let mut rng = Pcg32::for_sample(53, sample, 0, 0);
-            if matches!(
-                trace_mesh_medium(&medium, distance, &mut throughput, &mut rng),
-                MediumOutcome::Scatter(_)
-            ) {
-                estimate += throughput;
+    fn adaptive_volume_tiles_stop_at_the_first_filter_and_crop_halos() {
+        let _ = take_volume_tile_render_reports();
+        let reference = render_world_volume(false, false, 4.0, 16, 1.0);
+        let reference_reports = take_volume_tile_render_reports();
+        assert_eq!(reference_reports.len(), 16);
+        assert!(
+            reference_reports
+                .iter()
+                .all(|report| { report.sample_counts.iter().all(|counts| *counts == [16, 0]) })
+        );
+
+        let actual = render_world_volume(true, false, 4.0, 32, 1.0);
+        let reports = take_volume_tile_render_reports();
+        assert_eq!(reports.len(), 16);
+        assert_eq!(actual.linear_rgba, reference.linear_rgba);
+        assert!(actual.linear_rgba.iter().all(|pixel| pixel[0] > 0.0));
+        assert!(reports.iter().any(|report| {
+            report.tile.window_x > 0
+                && report.tile.buffer_width > report.tile.window_width
+                && report.tile.window_y > 0
+                && report.tile.buffer_height > report.tile.window_height
+        }));
+        for report in &reports {
+            assert!(report.sample_counts.iter().all(|counts| *counts == [16, 0]));
+            assert_eq!(report.guide_checkpoints, vec![1, 2, 4, 8]);
+            assert_eq!(report.adaptive_active, vec![(16, [0, 0])]);
+        }
+    }
+
+    #[test]
+    fn anaglyph_volume_tiles_keep_eye_sample_states_independent() {
+        let _ = take_volume_tile_render_reports();
+        let output = render_world_volume(true, true, 1.4, 32, 0.01);
+        let reports = take_volume_tile_render_reports();
+        assert_eq!(reports.len(), 16);
+        assert!(output.linear_rgba.iter().any(|pixel| pixel[0] > 0.0));
+
+        let mut left_counts = vec![0; 32 * 32];
+        let mut right_counts = vec![0; 32 * 32];
+        for report in &reports {
+            let tile = report.tile;
+            for y in 0..tile.window_height {
+                for x in 0..tile.window_width {
+                    let buffer_index = usize::try_from(
+                        (tile.window_y + y) * tile.buffer_width + tile.window_x + x,
+                    )
+                    .unwrap();
+                    let image_index = usize::try_from(
+                        (tile.buffer_y + tile.window_y + y) * 32
+                            + tile.buffer_x
+                            + tile.window_x
+                            + x,
+                    )
+                    .unwrap();
+                    left_counts[image_index] = report.sample_counts[buffer_index][0];
+                    right_counts[image_index] = report.sample_counts[buffer_index][1];
+                }
             }
         }
-        estimate /= f64::from(count);
-        assert!(
-            (estimate - expected).abs().max_element() < 0.01,
-            "estimated single-scatter integral {estimate:?} differs from {expected:?}"
-        );
+        assert!(left_counts.iter().any(|count| *count == 32));
+        assert_ne!(left_counts, right_counts);
+    }
+
+    #[test]
+    fn primary_vspg_probability_controls_the_analytic_free_flight() {
+        let mut medium = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        medium.volume_scatter = [0.5; 3];
+        medium.volume_absorption = [0.5; 3];
+        let read = VolumeGuidingRead::default();
+        let guided = homogeneous_path_scatter_probability(&medium, 1.0, 0, Some((&read, f32::MAX)));
+        let baseline =
+            homogeneous_path_scatter_probability(&medium, 1.0, 1, Some((&read, f32::MAX)));
+        assert!(guided.x < baseline.x);
+
+        let seed = (0..10_000)
+            .find(|seed| {
+                let mut rng = Pcg32::for_sample(*seed, 0, 0, 0);
+                let sample = rng.next_f64();
+                guided.x < sample && sample < baseline.x
+            })
+            .expect("a deterministic RNG sample separates the source proposals");
+        let mut guided_rng = Pcg32::for_sample(seed, 0, 0, 0);
+        let guided_sample =
+            sample_homogeneous_path_segment(&medium, 1.0, DVec3::ONE, guided, &mut guided_rng);
+        let mut baseline_rng = Pcg32::for_sample(seed, 0, 0, 0);
+        let baseline_sample =
+            sample_homogeneous_path_segment(&medium, 1.0, DVec3::ONE, baseline, &mut baseline_rng);
+        assert!(matches!(guided_sample.outcome, MediumOutcome::Survive));
+        assert!(matches!(baseline_sample.outcome, MediumOutcome::Scatter(_)));
+    }
+
+    #[test]
+    fn primary_transmit_and_current_scatter_visibility_follow_path_state() {
+        let read = VolumeGuidingRead::default();
+        let mut accumulator = VolumeGuidingAccumulator::default();
+        let mut guide = VolumeGuidePath {
+            read,
+            accumulator: &mut accumulator,
+            adaptive: None,
+            sample_index: 0,
+            primary_transmit: true,
+            volume_visible: true,
+            optical_depth: f32::MAX,
+            sample_optical_depth: 0.0,
+        };
+        assert_eq!(guide.class(), VolumeGuideClass::Transmit);
+        guide.volume_scatter(1);
+        assert!(guide.primary_transmit);
+        assert_eq!(guide.class(), VolumeGuideClass::Transmit);
+        guide.volume_scatter(0);
+        assert!(!guide.primary_transmit);
+        assert!(guide.volume_visible);
+        assert_eq!(guide.class(), VolumeGuideClass::Scatter);
+        guide.volume_visible = false;
+        assert_eq!(guide.class(), VolumeGuideClass::None);
     }
 }
 
@@ -14850,6 +15665,45 @@ fn grid_depth(grid: &VoxelGrid, distance: f64) -> DVec3 {
         depth += *extinction * (covered * grid.meters_per_unit);
     }
     depth
+}
+
+fn volume_optical_depth(
+    grid: Option<&VoxelGrid>,
+    stack: Option<&BsdfParams>,
+    distance: f64,
+) -> f32 {
+    let stack_extinction = stack.map_or(DVec3::ZERO, medium_extinction).as_vec3();
+    let stack_majorant = source_max_rgb(stack_extinction);
+    let mut optical_depth = 0.0_f32;
+    let mut cursor = 0.0_f64;
+    if let Some(grid) = grid {
+        for (index, extinction) in grid.extinction.iter().enumerate() {
+            let start = grid.entry + index as f64 * grid.step;
+            if start >= distance {
+                break;
+            }
+            let end = (start + grid.step).min(distance);
+            let clipped_start = start.max(cursor).max(0.0);
+            if stack.is_some() && clipped_start > cursor {
+                optical_depth += stack_majorant * (clipped_start - cursor) as f32;
+            }
+            if end > clipped_start {
+                let total_extinction =
+                    extinction.as_vec3() * grid.meters_per_unit as f32 + stack_extinction;
+                optical_depth += source_max_rgb(total_extinction) * (end - clipped_start) as f32;
+                cursor = end;
+            }
+        }
+    }
+    if stack.is_some() && distance > cursor {
+        optical_depth += stack_majorant * (distance - cursor) as f32;
+    }
+    optical_depth
+}
+
+fn source_max_rgb(value: glam::Vec3) -> f32 {
+    let xy = if value.x > value.y { value.x } else { value.y };
+    if xy > value.z { xy } else { value.z }
 }
 
 /// The grid step containing `distance`, or `None` off the grid.
@@ -19230,8 +20084,7 @@ mod cycles_world_light_tests {
         Ok(())
     }
 
-    #[test]
-    fn constant_zero_mix_prunes_spatial_world_volume_arm() -> crate::error::Result<()> {
+    fn constant_zero_mix_world_media(factor_linked: bool) -> crate::error::Result<Vec<MeshMedium>> {
         let (mut doc, _, _, graph_id) = world_override_doc()?;
         let output_id = Id::new("world_output")?;
         let volume_id = Id::new("world_volume")?;
@@ -19239,6 +20092,7 @@ mod cycles_world_light_tests {
         let second_id = Id::new("varying_absorption")?;
         let mix_id = Id::new("volume_mix")?;
         let noise_id = Id::new("world_noise")?;
+        let factor_id = Id::new("mix_factor")?;
         let graph = doc.node_groups.get_mut(&graph_id).ok_or_else(|| {
             crate::error::PotError::new(
                 crate::error::ErrorCode::InternalError,
@@ -19291,14 +20145,32 @@ mod cycles_world_light_tests {
                 to_socket: "Density".to_owned(),
             },
             GraphLink {
-                from_node: mix_id,
+                from_node: mix_id.clone(),
                 from_socket: "Shader".to_owned(),
-                to_node: output_id,
+                to_node: output_id.clone(),
                 to_socket: "Volume".to_owned(),
             },
         ]);
+        if factor_linked {
+            let mut factor = GraphNode::new("ShaderNodeValue");
+            factor
+                .inputs
+                .insert("Value".to_owned(), serde_json::json!(0.0));
+            graph.nodes.insert(factor_id.clone(), factor);
+            graph.links.push(GraphLink {
+                from_node: factor_id,
+                from_socket: "Value".to_owned(),
+                to_node: mix_id,
+                to_socket: "Fac".to_owned(),
+            });
+        }
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
-        let media = collect_world_volume_media(&doc, &snapshot, &BTreeMap::new())?;
+        collect_world_volume_media(&doc, &snapshot, &BTreeMap::new())
+    }
+
+    #[test]
+    fn constant_zero_mix_prunes_spatial_world_volume_arm() -> crate::error::Result<()> {
+        let media = constant_zero_mix_world_media(false)?;
         assert_eq!(
             media.len(),
             1,
@@ -19313,6 +20185,19 @@ mod cycles_world_light_tests {
                 < 1.0e-12,
             "the selected homogeneous absorption did not produce exp(-1): {transmittance:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn linked_constant_zero_mix_factor_prunes_spatial_world_volume_arm() -> crate::error::Result<()>
+    {
+        let media = constant_zero_mix_world_media(true)?;
+        assert_eq!(
+            media.len(),
+            1,
+            "a source-folded linked zero Mix factor must prune its inactive noise arm"
+        );
+        assert_eq!(media[0].params.volume_absorption, [1.0; 3]);
         Ok(())
     }
     #[test]
@@ -19455,24 +20340,31 @@ mod cycles_world_light_tests {
                     (distance, pdf, mis)
                 })
             } else {
-                super::sample_homogeneous_direct_distance(medium, channel_pdf, start, end, &mut rng)
-                    .map(|(distance, pdf)| {
-                        let equiangular_pdf = anchor.map_or(0.0, |point| {
-                            super::equiangular_pdf(
-                                point,
-                                origin + direction * start,
-                                direction,
-                                end - start,
-                                distance - start,
-                            )
-                        });
-                        let mis = if multiple_importance && anchor.is_some() {
-                            2.0 * super::power_heuristic(pdf, equiangular_pdf)
-                        } else {
-                            1.0
-                        };
-                        (distance, pdf, mis)
-                    })
+                super::sample_homogeneous_direct_distance_with_samples(
+                    medium,
+                    channel_pdf,
+                    start,
+                    end,
+                    rng.next_f64(),
+                    rng.next_f64(),
+                )
+                .map(|(distance, pdf)| {
+                    let equiangular_pdf = anchor.map_or(0.0, |point| {
+                        super::equiangular_pdf(
+                            point,
+                            origin + direction * start,
+                            direction,
+                            end - start,
+                            distance - start,
+                        )
+                    });
+                    let mis = if multiple_importance && anchor.is_some() {
+                        2.0 * super::power_heuristic(pdf, equiangular_pdf)
+                    } else {
+                        1.0
+                    };
+                    (distance, pdf, mis)
+                })
             };
             let Some((distance, pdf, mis)) = direct_sample else {
                 continue;
@@ -19833,6 +20725,7 @@ mod cycles_world_light_tests {
             },
             &mut Vec::new(),
             FilmClamp::new(0.0, 0.0),
+            None,
             0,
             &mut rng,
             &mut workspace,
@@ -19875,6 +20768,7 @@ mod cycles_world_light_tests {
             },
             &mut Vec::new(),
             FilmClamp::new(0.1, 0.0),
+            None,
             0,
             &mut rng,
             &mut workspace,
@@ -19915,6 +20809,7 @@ mod cycles_world_light_tests {
             },
             &mut Vec::new(),
             FilmClamp::new(0.1, 0.0),
+            None,
             0,
             &mut rng,
             &mut workspace,
@@ -19975,6 +20870,7 @@ mod cycles_world_light_tests {
             },
             &mut Vec::new(),
             FilmClamp::new(0.0, 0.0),
+            None,
             0,
             &mut rng,
             &mut workspace,
@@ -20437,6 +21333,7 @@ mod cycles_world_light_tests {
             },
             &mut Vec::new(),
             FilmClamp::new(0.1, 0.0),
+            None,
             0,
             &mut rng,
             &mut workspace,

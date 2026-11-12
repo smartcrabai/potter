@@ -432,6 +432,52 @@ fn material_volume_output_transmits_according_to_beer_lambert() -> Result<(), Bo
     Ok(())
 }
 
+fn render_absorbing_volume_adaptive_case(
+    adaptive: bool,
+    samples: u32,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    let operations = vec![
+        json!({"op":"graph.create","id":"volume_graph","kind":"shader"}),
+        json!({"op":"graph.node_add","graph":"volume_graph","id":"volume_output","type":"ShaderNodeOutputMaterial"}),
+        json!({"op":"graph.node_add","graph":"volume_graph","id":"absorption","type":"ShaderNodeVolumeAbsorption","inputs":{"Color":[0.5,0.5,0.5,1.0],"Density":0.1}}),
+        json!({"op":"graph.link","graph":"volume_graph","from_node":"absorption","from_socket":"Volume","to_node":"volume_output","to_socket":"Volume"}),
+        json!({"op":"material.create","id":"fog","graph":"volume_graph"}),
+        json!({"op":"node.create","id":"fog_cube","kind":"box","params":{"size":8.0},"material":"fog"}),
+        json!({"op":"world.create","id":"world_main","color":[0.0,0.0,0.0],"strength":1.0}),
+        json!({"op":"material.create","id":"emitter","emission_color":[1.0,0.5,0.25],"emission_strength":1.0}),
+        json!({"op":"node.create","id":"emitter_plane","kind":"plane","params":{"size":4.0},"material":"emitter"}),
+        json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,3.0]},"projection":"orthographic","ortho_scale":2.0}),
+        json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{
+            "resolution_x":32,"resolution_y":32,"samples":samples,"seed":7,
+            "max_bounces":0,"volume_bounces":0,"use_adaptive_sampling":adaptive,
+            "adaptive_threshold":1.0,"adaptive_min_samples":4,"tile_size":8,
+            "pixel_filter_type":"BOX","filter_width":1.0
+        }}),
+    ];
+    make_scene(&scene, &operations)?;
+    let (width, height, pixels) =
+        render_png(&scene, &directory.path().join("render"), Some("path"))?;
+    assert_eq!((width, height), (32, 32));
+    Ok(pixels)
+}
+
+#[test]
+fn absorbing_volume_adaptive_tiles_crop_and_normalize_at_the_first_filter()
+-> Result<(), Box<dyn Error>> {
+    let reference = render_absorbing_volume_adaptive_case(false, 16)?;
+    let adaptive = render_absorbing_volume_adaptive_case(true, 32)?;
+    assert_eq!(adaptive, reference);
+    assert!(
+        adaptive
+            .chunks_exact(4)
+            .any(|pixel| pixel[..3].iter().any(|component| *component > 0))
+    );
+    Ok(())
+}
+
 #[test]
 fn true_displacement_subdivides_and_moves_the_rendered_silhouette() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;

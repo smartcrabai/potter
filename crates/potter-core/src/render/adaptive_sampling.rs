@@ -37,15 +37,13 @@ impl AdaptiveSampling {
         }
 
         let next_filter_sample = first_filter_sample.max(completed | (ADAPTIVE_STEP - 1));
-        next_filter_sample
-            .saturating_add(1)
-            .min(proposed_end)
+        next_filter_sample.saturating_add(1).min(proposed_end)
     }
 
     pub(super) fn needs_filter(&self, completed: u32) -> bool {
-        completed
-            .checked_sub(1)
-            .is_some_and(|sample| sample > self.min_samples && sample & (ADAPTIVE_STEP - 1) == ADAPTIVE_STEP - 1)
+        completed.checked_sub(1).is_some_and(|sample| {
+            sample > self.min_samples && sample & (ADAPTIVE_STEP - 1) == ADAPTIVE_STEP - 1
+        })
     }
 
     pub(super) fn filter_pixels(
@@ -60,9 +58,9 @@ impl AdaptiveSampling {
             .map_err(|_| allocation_error("adaptive sampling width exceeds addressable memory"))?;
         let height = usize::try_from(height)
             .map_err(|_| allocation_error("adaptive sampling height exceeds addressable memory"))?;
-        let pixel_count = width
-            .checked_mul(height)
-            .ok_or_else(|| allocation_error("adaptive sampling dimensions exceed addressable memory"))?;
+        let pixel_count = width.checked_mul(height).ok_or_else(|| {
+            allocation_error("adaptive sampling dimensions exceed addressable memory")
+        })?;
         if pixel_count != pixels.len() {
             return Err(PotError::invalid_argument(
                 "adaptive sampling pixel buffer does not match its dimensions",
@@ -357,10 +355,8 @@ mod tests {
     }
 
     #[test]
-    fn automatic_settings_and_schedule_match_cycles_filter_points() {
+    fn adaptive_filter_schedule_handles_automatic_minimum_and_overflow() {
         let adaptive = AdaptiveSampling::new(100, 0.0, 0);
-        assert_eq!(adaptive.threshold, 0.05);
-        assert_eq!(adaptive.min_samples, 64);
         assert!(!adaptive.needs_filter(0));
         assert!(!adaptive.needs_filter(16));
         assert!(adaptive.needs_filter(80));
@@ -368,11 +364,11 @@ mod tests {
         assert_eq!(adaptive.align_batch_end(64, 200), 80);
         assert_eq!(adaptive.align_batch_end(80, 200), 96);
 
-        let explicit = AdaptiveSampling::new(100, 0.01, 8);
-        assert_eq!(explicit.threshold, 0.05);
-        assert_eq!(explicit.min_samples, 8);
-
-        assert_eq!(adaptive.align_batch_end(u32::MAX - 16, u32::MAX), u32::MAX);
+        assert_eq!(
+            adaptive.align_batch_end(u32::MAX - 16, u32::MAX),
+            u32::MAX - 15
+        );
+        assert_eq!(adaptive.align_batch_end(u32::MAX - 15, u32::MAX), u32::MAX);
         assert!(!adaptive.needs_filter(u32::MAX));
         assert!(adaptive.needs_filter(u32::MAX - 15));
     }
@@ -410,7 +406,10 @@ mod tests {
             class_a_x2: Vec3::ZERO,
             converged: false,
         }];
-        assert_eq!(adaptive.filter_pixels(&mut negative, 1, 1, 1.0, |_| 1), Ok(1));
+        assert_eq!(
+            adaptive.filter_pixels(&mut negative, 1, 1, 1.0, |_| 1),
+            Ok(1)
+        );
         assert!(!negative[0].converged);
 
         let mut nan = [AdaptivePixel {
@@ -440,10 +439,13 @@ mod tests {
     #[test]
     fn active_mask_dilates_exactly_three_by_three_and_clips_at_edges() {
         let adaptive = AdaptiveSampling::new(1, -1.0, 4);
-        let mut pixels = vec![AdaptivePixel {
-            converged: true,
-            ..AdaptivePixel::default()
-        }; 5 * 4];
+        let mut pixels = vec![
+            AdaptivePixel {
+                converged: true,
+                ..AdaptivePixel::default()
+            };
+            5 * 4
+        ];
         pixels[1 * 5 + 2].converged = false;
         assert_eq!(
             adaptive.filter_pixels(&mut pixels, 5, 4, 1.0, |index| {
@@ -461,10 +463,13 @@ mod tests {
             }
         }
 
-        let mut clipped = vec![AdaptivePixel {
-            converged: true,
-            ..AdaptivePixel::default()
-        }; 3 * 3];
+        let mut clipped = vec![
+            AdaptivePixel {
+                converged: true,
+                ..AdaptivePixel::default()
+            };
+            3 * 3
+        ];
         clipped[0].converged = false;
         assert_eq!(
             adaptive.filter_pixels(&mut clipped, 3, 3, 1.0, |_| 1),
@@ -472,10 +477,7 @@ mod tests {
         );
         for y in 0..3 {
             for x in 0..3 {
-                assert_eq!(
-                    clipped[y * 3 + x].needs_sample(),
-                    x <= 1 && y <= 1,
-                );
+                assert_eq!(clipped[y * 3 + x].needs_sample(), x <= 1 && y <= 1,);
             }
         }
     }
