@@ -58,6 +58,7 @@ use super::volume_guiding::{
 };
 use super::volume_tiles::{VolumeTile, VolumeTiles};
 use super::world_probe::volume_ambient_l0;
+use super::world_volume::WorldVolumeOctree;
 use super::{
     bvh::{Bvh, BvhHit, WalkRay},
     eevee_volume_resolve::{
@@ -2198,6 +2199,7 @@ struct RenderJob<'a> {
     lights: &'a [PointLight],
     volumes: &'a [VolumeInstance<'a>],
     world_volume: &'a [MeshMedium],
+    world_heterogeneous: Option<&'a HeterogeneousWorldVolume>,
     volume_temperatures: &'a [Option<VolumeTemperature>],
     images: &'a BTreeMap<String, ImageData>,
     importance: Option<&'a WorldImportanceSampler>,
@@ -2244,6 +2246,7 @@ fn render_rows(
         lights: job.lights,
         volumes: job.volumes,
         world_volume: job.world_volume,
+        world_heterogeneous: job.world_heterogeneous,
         images: job.images,
         importance: job.importance,
         camera_matrices: None,
@@ -2936,7 +2939,7 @@ pub(super) fn render(
         &geometry.shader_warnings,
         crate::node_kernels::MathSemantics::Cycles,
     )?;
-    let world_volume = collect_world_volume_media(doc, snapshot, images)?;
+    let (world_volume, world_heterogeneous) = collect_world_volume_media(doc, snapshot, images)?;
     let path_world = scene_world(doc, snapshot);
     let mut world_settings = world_path_settings(path_world);
     let world_spatially_varying = world_shader_is_spatially_varying(doc, snapshot);
@@ -3085,7 +3088,7 @@ pub(super) fn render(
             lights: &lights,
             volumes: &volumes,
             world_volume: &world_volume,
-            volume_temperatures: &volume_temperatures,
+            world_heterogeneous: world_heterogeneous.as_ref(),
             images,
             importance: world_importance.as_ref(),
             pixel_filter,
@@ -4955,6 +4958,7 @@ impl RealtimeVolumeSample<'_, '_> {
             lights: &self.transport.lights,
             volumes: &self.transport.volumes,
             world_volume: &[],
+            world_heterogeneous: None,
             images: self.transport.images,
             importance: None,
             camera_matrices: self.camera_matrices.as_ref(),
@@ -5357,6 +5361,7 @@ impl RealtimeVolumeSample<'_, '_> {
                 lights: &self.transport.lights,
                 volumes: &self.transport.volumes,
                 world_volume: &[],
+                world_heterogeneous: None,
                 images: self.transport.images,
                 importance: None,
                 camera_matrices: self.camera_matrices.as_ref(),
@@ -6573,6 +6578,7 @@ struct SceneRefs<'a, 'v> {
     lights: &'a [PointLight],
     volumes: &'a [VolumeInstance<'v>],
     world_volume: &'a [MeshMedium],
+    world_heterogeneous: Option<&'a HeterogeneousWorldVolume>,
     images: &'a BTreeMap<String, ImageData>,
     importance: Option<&'a WorldImportanceSampler>,
     camera_matrices: Option<&'a (DMat4, DMat4)>,
@@ -6962,6 +6968,57 @@ struct WorldShaderPrunerContext<'a, 'doc> {
     parent: Option<&'a WorldShaderPrunerContext<'a, 'doc>>,
 }
 
+fn shader_graph_output_node_id<'a>(
+    group: &'a crate::graph::NodeGroup,
+    output_node_type: &str,
+) -> Option<&'a Id> {
+    if output_node_type != "ShaderNodeOutputWorld" {
+        return group
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                (node.node_type == output_node_type
+                    || (output_node_type == "ShaderNodeOutputMaterial"
+                        && node.node_type == "OutputMaterial"))
+                    && node
+                        .properties
+                        .get("is_active_output")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(false)
+            })
+            .map(|(id, _)| id);
+    }
+
+    let mut cycles = None;
+    let mut all = None;
+    let mut fallback = None;
+    for (id, node) in &group.nodes {
+        if !matches!(
+            node.node_type.as_str(),
+            "ShaderNodeOutputWorld" | "OutputWorld"
+        ) || node
+            .properties
+            .get("is_active_output")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        {
+            continue;
+        }
+        match node
+            .properties
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("ALL")
+        {
+            "CYCLES" => cycles = Some(id),
+            "ALL" => all = Some(id),
+            "EEVEE" => (),
+            _ => fallback = Some(id),
+        }
+    }
+    cycles.or(all).or(fallback)
+}
+
 fn shader_graph_is_spatially_varying(
     doc: &SceneDoc,
     group_id: &Id,
@@ -6978,23 +7035,10 @@ fn shader_graph_is_spatially_varying(
         if group.kind != crate::graph::GraphKind::Shader {
             return false;
         }
-        let output = selected_output
-            .and_then(|id| group.nodes.get_key_value(id))
-            .or_else(|| {
-                group.nodes.iter().find(|(_, node)| {
-                    (node.node_type == output_node_type
-                        || (output_node_type == "ShaderNodeOutputMaterial"
-                            && node.node_type == "OutputMaterial")
-                        || (output_node_type == "ShaderNodeOutputWorld"
-                            && node.node_type == "OutputWorld"))
-                        && node
-                            .properties
-                            .get("is_active_output")
-                            .and_then(serde_json::Value::as_bool)
-                            != Some(false)
-                })
-            });
-        let Some((output_id, _)) = output else {
+        let output_id = selected_output
+            .filter(|id| group.nodes.contains_key(*id))
+            .or_else(|| shader_graph_output_node_id(group, output_node_type));
+        let Some(output_id) = output_id else {
             return false;
         };
         let pruner = SourceMixInputPruner::new(group_id, group, &doc.node_groups);
@@ -7170,6 +7214,207 @@ fn shader_graph_group_input_is_spatially_varying(
         state.group_callsites.push(callsite);
     }
     varying
+}
+
+fn world_volume_has_light_path(doc: &SceneDoc, snapshot: &Snapshot) -> bool {
+    let Some(graph_id) =
+        super::scene::selected_world_id(doc, snapshot).and_then(|world| doc.worlds.get(world))
+            .and_then(|world| world.node_tree.as_ref())
+    else {
+        return false;
+    };
+    shader_graph_output_contains_node_type(
+        doc,
+        graph_id,
+        "ShaderNodeOutputWorld",
+        "Volume",
+        "ShaderNodeLightPath",
+        &mut WorldShaderVariabilityState::default(),
+    )
+}
+
+fn shader_graph_output_contains_node_type(
+    doc: &SceneDoc,
+    group_id: &Id,
+    output_node_type: &str,
+    output_socket: &str,
+    target_node_type: &str,
+    state: &mut WorldShaderVariabilityState,
+) -> bool {
+    if !state.active_groups.insert(group_id.clone()) {
+        return false;
+    }
+    let contains = doc.node_groups.get(group_id).is_some_and(|group| {
+        if group.kind != crate::graph::GraphKind::Shader {
+            return false;
+        }
+        let Some(output_id) = shader_graph_output_node_id(group, output_node_type) else {
+            return false;
+        };
+        group
+            .links
+            .iter()
+            .filter(|link| link.to_node == *output_id && link.to_socket == output_socket)
+            .any(|link| {
+                shader_graph_link_contains_node_type(
+                    doc,
+                    group_id,
+                    group,
+                    link,
+                    target_node_type,
+                    state,
+                )
+            })
+    });
+    state.active_groups.remove(group_id);
+    contains
+}
+
+fn shader_graph_link_contains_node_type(
+    doc: &SceneDoc,
+    group_id: &Id,
+    group: &crate::graph::NodeGroup,
+    link: &crate::graph::GraphLink,
+    target_node_type: &str,
+    state: &mut WorldShaderVariabilityState,
+) -> bool {
+    let key = (
+        group_id.clone(),
+        link.from_node.clone(),
+        link.from_socket.clone(),
+    );
+    if !state.active_outputs.insert(key.clone()) {
+        return false;
+    }
+    let Some(node) = group.nodes.get(&link.from_node) else {
+        state.active_outputs.remove(&key);
+        return false;
+    };
+    let contains = if node.node_type == target_node_type {
+        true
+    } else if node.node_type == "NodeReroute"
+        || node
+            .properties
+            .get("mute")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        crate::shader::inline_fold::source_passthrough_input_socket(
+            node,
+            &link.from_socket,
+            group,
+            &link.from_node,
+        )
+        .and_then(|input_socket| {
+            group.links.iter().find(|input| {
+                input.to_node == link.from_node
+                    && crate::shader::inline_fold::source_input_socket_matches(
+                        node,
+                        &input.to_socket,
+                        input_socket,
+                    )
+            })
+        })
+        .is_some_and(|input| {
+            shader_graph_link_contains_node_type(
+                doc,
+                group_id,
+                group,
+                input,
+                target_node_type,
+                state,
+            )
+        })
+    } else if node.node_type == "NodeGroupInput" {
+        shader_graph_group_input_contains_node_type(doc, group, &link.from_socket, target_node_type, state)
+    } else if node.node_type == "ShaderNodeGroup" {
+        node.properties
+            .get("node_tree")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|name| doc.node_groups.get_key_value(name))
+            .and_then(|(child_id, child_group)| {
+                child_group
+                    .interface
+                    .outputs
+                    .iter()
+                    .find(|socket| socket.id == link.from_socket || socket.name == link.from_socket)
+                    .map(|socket| (child_id, socket.name.clone()))
+            })
+            .is_some_and(|(child_id, output_name)| {
+                state
+                    .group_callsites
+                    .push((group_id.clone(), link.from_node.clone()));
+                let contains = shader_graph_output_contains_node_type(
+                    doc,
+                    child_id,
+                    "NodeGroupOutput",
+                    &output_name,
+                    target_node_type,
+                    state,
+                );
+                let _ = state.group_callsites.pop();
+                contains
+            })
+    } else {
+        group
+            .links
+            .iter()
+            .filter(|input| input.to_node == link.from_node)
+            .any(|input| {
+                shader_graph_link_contains_node_type(
+                    doc,
+                    group_id,
+                    group,
+                    input,
+                    target_node_type,
+                    state,
+                )
+            })
+    };
+    state.active_outputs.remove(&key);
+    contains
+}
+
+fn shader_graph_group_input_contains_node_type(
+    doc: &SceneDoc,
+    group: &crate::graph::NodeGroup,
+    output_socket: &str,
+    target_node_type: &str,
+    state: &mut WorldShaderVariabilityState,
+) -> bool {
+    let Some(input_socket) = group
+        .interface
+        .inputs
+        .iter()
+        .find(|socket| socket.id == output_socket || socket.name == output_socket)
+    else {
+        return false;
+    };
+    let Some((parent_group_id, parent_node_id)) = state.group_callsites.last().cloned() else {
+        return false;
+    };
+    let Some(parent_group) = doc.node_groups.get(&parent_group_id) else {
+        return false;
+    };
+    let Some(link) = parent_group.links.iter().find(|link| {
+        link.to_node == parent_node_id
+            && (link.to_socket == input_socket.id || link.to_socket == input_socket.name)
+    }) else {
+        return false;
+    };
+    let callsite = state.group_callsites.pop();
+    let contains = shader_graph_link_contains_node_type(
+        doc,
+        &parent_group_id,
+        parent_group,
+        link,
+        target_node_type,
+        state,
+    );
+    if let Some(callsite) = callsite {
+        state.group_callsites.push(callsite);
+    }
+    contains
 }
 
 fn world_shader_is_spatially_varying(doc: &SceneDoc, snapshot: &Snapshot) -> bool {
@@ -8296,6 +8541,7 @@ fn trace_path_with_guiding(
         lights,
         volumes,
         world_volume,
+        world_heterogeneous,
         images,
         importance,
         camera_matrices,
@@ -8415,6 +8661,10 @@ fn trace_path_with_guiding(
         media.insert(0, *medium);
     }
     let mut active_media = Vec::with_capacity(media.len());
+    let world_closure_capacity =
+        world_heterogeneous.map_or(0, |world| world.max_closures);
+    let mut world_closures = Vec::with_capacity(world_closure_capacity);
+    let mut world_event_media = Vec::with_capacity(media.len() + world_closure_capacity);
     loop {
         let hit = match exit_hit.take() {
             Some(exit) => {
@@ -8457,11 +8707,13 @@ fn trace_path_with_guiding(
         let light = receiver.and_then(|receiver| {
             nearest_light_hit(lights, origin, direction, receiver, surface_distance, ray)
         });
+        let heterogeneous_world = world_heterogeneous.filter(|_| exit_entry.is_none());
         // Keep physical miss/light distance markers separate from Cycles' finite FLT_MAX volume interval.
         let segment_limit = light
             .map_or(surface_distance, |light| light.distance)
             .min(f64::from(f32::MAX));
         // World volume coefficients remain active when background-surface visibility is disabled.
+        // World surface visibility filters path rays, never shadow rays.
         active_media.clear();
         active_media.extend(media.iter().copied());
         // The voxel volumes this segment can see: a volume whose object is hidden from the ray's kind passes the ray by
@@ -8487,7 +8739,7 @@ fn trace_path_with_guiding(
         let mut roulette_weight = 1.0;
         if roulette_applies(RouletteEvents {
             exit_probe: exit_entry.is_some(),
-            has_volume: grid.is_some() || stack.is_some(),
+            has_volume: grid.is_some() || stack.is_some() || heterogeneous_world.is_some(),
             has_surface: hit.is_some(),
             has_light: light.is_some(),
         }) {
@@ -8557,7 +8809,8 @@ fn trace_path_with_guiding(
                         active_media
                             .iter()
                             .map(|medium| medium.params.volume_sampling),
-                    ),
+                    )
+                    .chain(heterogeneous_world.map(|world| world.sampling)),
             )
         };
         let budget = transparent_max_bounces.saturating_sub(transparent_bounce);
@@ -8585,7 +8838,7 @@ fn trace_path_with_guiding(
         };
         // Homogeneous media take Cycles' dedicated direct-scatter sample instead of reusing the
         // indirect path event. The latter can be absorption/null/escape and has a different density.
-        let homogeneous_direct = if grid.is_none() {
+        let homogeneous_direct = if heterogeneous_world.is_none() && grid.is_none() {
             stack.as_ref().zip(homogeneous_path_sample.as_ref())
         } else {
             None
@@ -8593,9 +8846,13 @@ fn trace_path_with_guiding(
         let homogeneous_channel_pdf = homogeneous_direct
             .map(|(medium, _)| volume_direct_channel_pdf(medium, throughput, segment_limit));
         // Next-event estimation of the segment's media, for each sampled light.
-        let (span_start, span_length) = match (&grid, stack) {
-            (Some(grid), None) => (grid.entry, grid_span(grid)),
-            _ => (0.0, segment_limit),
+        let (span_start, span_length) = if heterogeneous_world.is_some() {
+            (0.0, segment_limit)
+        } else {
+            match (&grid, stack) {
+                (Some(grid), None) => (grid.entry, grid_span(grid)),
+                _ => (0.0, segment_limit),
+            }
         };
         if let Some(method) = method {
             let span_origin = origin + direction * span_start;
@@ -8673,6 +8930,54 @@ fn trace_path_with_guiding(
                         };
                         Some((distance, pdf, mis))
                     }
+                } else if let Some(world) = heterogeneous_world {
+                    let Some(point) = point.filter(|_| sampled) else {
+                        continue;
+                    };
+                    let Some((sample_start, sample_end)) =
+                        volume_light_segment_range(light, origin, direction, segment_limit)
+                    else {
+                        continue;
+                    };
+                    let sample_origin = origin + direction * sample_start;
+                    let sample_length = sample_end - sample_start;
+                    let Some((offset, pdf)) = equiangular_sample(
+                        point,
+                        sample_origin,
+                        direction,
+                        sample_length,
+                        rng.next_f64(),
+                    ) else {
+                        continue;
+                    };
+                    let distance = sample_start + offset;
+                    let mis = match method {
+                        VolumeSampling::Equiangular => 1.0,
+                        VolumeSampling::MultipleImportance => {
+                            let distance_pdf = world_volume_distance_pdf_at(
+                                scene,
+                                world,
+                                &active_media,
+                                grid.as_ref(),
+                                origin,
+                                direction,
+                                distance,
+                                throughput,
+                                ray,
+                                ray == RayKind::Glossy,
+                                matches!(previous, Scatter::Delta(_)),
+                                bounce,
+                                transparent_bounce,
+                                rng,
+                                evaluator_workspace,
+                                &mut world_closures,
+                                &mut world_event_media,
+                            )?;
+                            2.0 * power_heuristic(pdf, distance_pdf)
+                        }
+                        VolumeSampling::Distance => 1.0,
+                    };
+                    Some((distance, pdf, mis))
                 } else {
                     let Some(point) = point.filter(|_| sampled) else {
                         continue;
@@ -8715,24 +9020,46 @@ fn trace_path_with_guiding(
                 }
                 let light_direction = light_sample.direction;
                 let light_pdf = light_sample.pdf;
-                let transmittance = segment_transmittance(grid.as_ref(), stack.as_ref(), distance);
                 let phase_cosine = direction.dot(light_direction);
-                let phase_pdf =
-                    event_phase_density(&active_media, grid.as_ref(), distance, phase_cosine);
-                let scatter = homogeneous_direct.map_or_else(
-                    || {
-                        camera_scatter_phase(
-                            &active_media,
-                            grid.as_ref(),
-                            distance,
-                            phase_cosine,
-                            transmittance,
-                        )
-                    },
-                    |(medium, _)| {
-                        homogeneous_direct_scatter_phase(medium, phase_pdf, transmittance)
-                    },
-                );
+                let (scatter, phase_pdf) = if let Some(world) = heterogeneous_world {
+                    world_direct_scatter_at(
+                        scene,
+                        world,
+                        &active_media,
+                        grid.as_ref(),
+                        origin,
+                        direction,
+                        distance,
+                        phase_cosine,
+                        ray,
+                        ray == RayKind::Glossy,
+                        matches!(previous, Scatter::Delta(_)),
+                        bounce,
+                        transparent_bounce,
+                        rng,
+                        evaluator_workspace,
+                        &mut world_closures,
+                        &mut world_event_media,
+                    )?
+                } else {
+                    let phase_pdf =
+                        event_phase_density(&active_media, grid.as_ref(), distance, phase_cosine);
+                    let scatter = homogeneous_direct.map_or_else(
+                        || {
+                            camera_scatter_phase(
+                                &active_media,
+                                grid.as_ref(),
+                                distance,
+                                phase_cosine,
+                                transmittance,
+                            )
+                        },
+                        |(medium, _)| {
+                            homogeneous_direct_scatter_phase(medium, phase_pdf, transmittance)
+                        },
+                    );
+                    (scatter, phase_pdf)
+                };
                 let light_mis = if light_pdf > 0.0 {
                     power_heuristic(selection_pdf * light_pdf, phase_pdf)
                 } else {
@@ -8772,6 +9099,117 @@ fn trace_path_with_guiding(
                 add_volume_guide_contribution(&mut target, contribution);
             }
         }
+        if let Some(world) = heterogeneous_world {
+            let tracking_limit = if segment_limit.is_finite() {
+                segment_limit
+            } else {
+                f64::from(f32::MAX)
+            };
+            let tracked = trace_world_volume_segment(
+                scene,
+                world,
+                &active_media,
+                grid.as_ref(),
+                origin,
+                direction,
+                tracking_limit,
+                !terminal,
+                &mut throughput,
+                ray,
+                ray == RayKind::Glossy,
+                matches!(previous, Scatter::Delta(_)),
+                bounce,
+                transparent_bounce,
+                rng,
+                evaluator_workspace,
+                &mut world_closures,
+                &mut world_event_media,
+            )?;
+            radiance += film_clamp.apply(tracked.emission, bounce.saturating_sub(1));
+            match tracked.outcome {
+                MediumOutcome::Absorb => break,
+                MediumOutcome::Survive => {
+                    if terminal {
+                        throughput *= tracked.transmittance;
+                    }
+                    if throughput.max_element() <= 1.0e-8 {
+                        break;
+                    }
+                }
+                MediumOutcome::Scatter(distance) => {
+                    transparent_background = false;
+                    let phase = event_phase(&world_event_media, grid.as_ref(), distance);
+                    let Some(anisotropy) = phase.pick(rng) else {
+                        break;
+                    };
+                    let weights = event_weights(
+                        &choices,
+                        method,
+                        origin,
+                        direction,
+                        segment_limit,
+                        distance,
+                        tracked.scatter_pdf,
+                        false,
+                    );
+                    let point = origin + direction * distance;
+                    let event_footprint = ray_dp + distance * ray_dd;
+                    let tree_query = volume_tree_query(origin, direction, span_start, span_length);
+                    radiance += direct_volume_lighting(
+                        scene,
+                        &media,
+                        &VolumeSite {
+                            point,
+                            tree_query,
+                            footprint: event_footprint,
+                            incoming: direction,
+                            phase: &phase,
+                            light_weights: &weights,
+                            environment: world_radiance(
+                                doc,
+                                snapshot,
+                                images,
+                                direction,
+                                environment,
+                                true,
+                                evaluator_workspace,
+                            )?,
+                        },
+                        throughput * roulette_weight,
+                        NextEventSettings {
+                            bounce,
+                            light_selection,
+                            light_sampling_threshold,
+                            world: world_settings,
+                        },
+                        &mut light_tree_pdfs,
+                        film_clamp,
+                        budget,
+                        rng,
+                        evaluator_workspace,
+                    )?;
+                    throughput *= roulette_weight;
+                    volume_scatters += 1;
+                    terminal |= bounce >= max_bounces || volume_scatters >= volume_limit;
+                    let (next_direction, phase_pdf) =
+                        sample_volume_continuation(direction, anisotropy, &phase, rng);
+                    direction = next_direction;
+                    origin = point + direction * RAY_EPSILON;
+                    ray_dp = event_footprint;
+                    min_ray_pdf = min_ray_pdf.min(phase_pdf);
+                    previous = Scatter::Volume {
+                        phase_pdf,
+                        point,
+                        tree_query,
+                    };
+                    ray = RayKind::VolumeScatter;
+                    transparent_path = false;
+                    bounce += 1;
+                    rng_offset = rng_offset.wrapping_add(CYCLES_PRNG_BOUNCE_NUM);
+                    continue;
+                }
+            }
+        } else
         if let Some((grid, medium)) = mixed {
             // The voxel hero-channel flight and mesh analog collision are sampled independently; the nearer event receives
             // the other medium's per-channel survival correction, and their densities form the distance MIS partner.
@@ -10074,6 +10512,7 @@ mod overlay_tests {
             lights: &lights,
             volumes: &[],
             world_volume: &[],
+            world_heterogeneous: None,
             images: &images,
             importance: None,
             camera_matrices: None,
@@ -12159,6 +12598,10 @@ fn shadow_transmittance_with_volumetric_shadows(
     } else {
         Vec::new()
     };
+    let world_closure_capacity =
+        scene.world_heterogeneous.map_or(0, |world| world.max_closures);
+    let mut world_closures = Vec::with_capacity(world_closure_capacity);
+    let mut world_media = Vec::with_capacity(shadow_media.len() + world_closure_capacity);
     let mut transmittance = DVec3::ONE;
     let mut remaining = if distance.is_finite() {
         (distance - RAY_EPSILON).max(0.0)
@@ -12260,8 +12703,29 @@ fn shadow_transmittance_with_volumetric_shadows(
                 RayKind::Shadow,
             )?;
         }
-        if volumetric_shadows && let Some(stack) = stack_medium(&shadow_media) {
-            transmittance *= medium_transmittance(&stack, hit_distance);
+        if volumetric_shadows {
+            if let Some(world) = scene.world_heterogeneous {
+                transmittance *= world_volume_transmittance(
+                    scene,
+                    world,
+                    &shadow_media,
+                    None,
+                    origin,
+                    direction,
+                    hit_distance,
+                    RayKind::Shadow,
+                    false,
+                    false,
+                    0,
+                    transparent_hits,
+                    rng,
+                    evaluator_workspace,
+                    &mut world_closures,
+                    &mut world_media,
+                )?;
+            } else if let Some(stack) = stack_medium(&shadow_media) {
+                transmittance *= medium_transmittance(&stack, hit_distance);
+            }
         }
         if transmittance.max_element() <= 1.0e-5 {
             blocked = true;
@@ -12316,7 +12780,31 @@ fn shadow_transmittance_with_volumetric_shadows(
     }
     // The last segment, to the light or to infinity, lies in the stack's combined medium.
     let volume_transmittance = if volumetric_shadows {
-        if let Some(stack) = stack_medium(&shadow_media) {
+        if let Some(world) = scene.world_heterogeneous {
+            let world_limit = if remaining.is_finite() {
+                remaining
+            } else {
+                f64::from(f32::MAX)
+            };
+            transmittance *= world_volume_transmittance(
+                scene,
+                world,
+                &shadow_media,
+                None,
+                origin,
+                direction,
+                world_limit,
+                RayKind::Shadow,
+                false,
+                false,
+                0,
+                transparent_hits,
+                rng,
+                evaluator_workspace,
+                &mut world_closures,
+                &mut world_media,
+            )?;
+        } else if let Some(stack) = stack_medium(&shadow_media) {
             transmittance *= medium_transmittance(&stack, remaining);
         }
         march_volumes(
@@ -13753,19 +14241,19 @@ fn weighted_volume_channels(
     total
 }
 
-/// The selected World's homogeneous Volume closures.
+/// The selected World's homogeneous Volume closures or its sampled heterogeneous octree.
 fn collect_world_volume_media(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     images: &BTreeMap<String, ImageData>,
-) -> Result<Vec<MeshMedium>> {
+) -> Result<(Vec<MeshMedium>, Option<HeterogeneousWorldVolume>)> {
     let Some(world) =
         super::scene::selected_world_id(doc, snapshot).and_then(|id| doc.worlds.get(id))
     else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     let Some(graph_id) = world.node_tree.as_ref() else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     let Some(group) = doc.node_groups.get(graph_id) else {
         return Ok(Vec::new());
@@ -13785,11 +14273,52 @@ fn collect_world_volume_media(
         ..Material::default()
     };
     let prepared = PreparedMaterial::new(&material, &doc.node_groups);
+    if !prepared.has_volume_output() {
+        return Ok((Vec::new(), None));
+    }
     if world_volume_shader_is_spatially_varying(doc, snapshot) {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "heterogeneous Cycles World Volume is not supported",
-            serde_json::json!({"feature_id": "render.path.world_volume_heterogeneous"}),
+        let mut workspace = EvaluatorWorkspace::default();
+        let mut closures = Vec::new();
+        let octree = WorldVolumeOctree::build(|position| {
+            evaluate_world_volume_closures(
+                &material,
+                &prepared,
+                &doc.node_groups,
+                images,
+                position,
+                RayKind::Camera,
+                false,
+                false,
+                0,
+                0,
+                world.volume_sampling,
+                world.volume_interpolation,
+                &mut workspace,
+                &mut closures,
+            )?;
+            let extinction = DVec3::from_array(weighted_volume_channels(&closures, |params| {
+                std::array::from_fn(|channel| {
+                    params.volume_scatter[channel] + params.volume_absorption[channel]
+                })
+            }));
+            let emission = DVec3::from_array(weighted_volume_channels(&closures, |params| {
+                params.volume_emission
+            }));
+            Ok(extinction.max_element().max(emission.max_element()) as f32)
+        })?;
+        let max_closures = closures.capacity();
+        let has_light_path = world_volume_has_light_path(doc, snapshot);
+        return Ok((
+            Vec::new(),
+            Some(HeterogeneousWorldVolume {
+                material,
+                prepared,
+                sampling: world.volume_sampling,
+                interpolation: world.volume_interpolation,
+                octree,
+                has_light_path,
+                max_closures,
+            }),
         ));
     }
     let mut closures = Vec::new();
@@ -13799,6 +14328,11 @@ fn collect_world_volume_media(
         &doc.node_groups,
         images,
         DVec3::ZERO,
+        RayKind::Camera,
+        false,
+        false,
+        0,
+        0,
         world.volume_sampling,
         world.volume_interpolation,
         &mut EvaluatorWorkspace::default(),
@@ -13808,7 +14342,7 @@ fn collect_world_volume_media(
     for medium in &mut media {
         medium.is_world = true;
     }
-    Ok(media)
+    Ok((media, None))
 }
 
 fn evaluate_world_volume_closures(
@@ -13817,6 +14351,11 @@ fn evaluate_world_volume_closures(
     node_groups: &crate::model::Registry<crate::graph::NodeGroup>,
     images: &BTreeMap<String, ImageData>,
     position: DVec3,
+    ray_kind: RayKind,
+    is_reflection_ray: bool,
+    is_singular_ray: bool,
+    ray_depth: u32,
+    transparent_depth: u32,
     volume_sampling: crate::model::VolumeSampling,
     volume_interpolation: crate::model::VolumeInterpolation,
     workspace: &mut EvaluatorWorkspace,
@@ -13824,7 +14363,14 @@ fn evaluate_world_volume_closures(
 ) -> Result<()> {
     let mut context = HitContext::new(node_groups)
         .with_images(images)
-        .with_path_traced(true);
+        .with_path_traced(true)
+        .with_ray_context(
+            ray_kind,
+            is_reflection_ray,
+            is_singular_ray,
+            ray_depth,
+            transparent_depth,
+        );
     context.position = position;
     context.object = position;
     context.generated = position;
@@ -13842,6 +14388,63 @@ fn evaluate_world_volume_closures(
         closure.params.volume_interpolation = volume_interpolation;
     }
     Ok(())
+}
+
+fn evaluate_world_volume_stack(
+    doc: &SceneDoc,
+    world: &HeterogeneousWorldVolume,
+    images: &BTreeMap<String, ImageData>,
+    position: DVec3,
+    ray_kind: RayKind,
+    is_reflection_ray: bool,
+    is_singular_ray: bool,
+    ray_depth: u32,
+    transparent_depth: u32,
+    static_media: &[MeshMedium],
+    workspace: &mut EvaluatorWorkspace,
+    closures: &mut Vec<ShaderClosure>,
+    media: &mut Vec<MeshMedium>,
+) -> Result<Option<BsdfParams>> {
+    evaluate_world_volume_closures(
+        &world.material,
+        &world.prepared,
+        &doc.node_groups,
+        images,
+        position,
+        ray_kind,
+        is_reflection_ray,
+        is_singular_ray,
+        ray_depth,
+        transparent_depth,
+        world.sampling,
+        world.interpolation,
+        workspace,
+        closures,
+    )?;
+    media.clear();
+    media.reserve(closures.len() + static_media.len());
+    for (closure_index, closure) in closures.iter().enumerate() {
+        let mut params = closure.params;
+        params.volume_scatter = params
+            .volume_scatter
+            .map(|value| closure.weight * value);
+        params.volume_absorption = params
+            .volume_absorption
+            .map(|value| closure.weight * value);
+        params.volume_emission = params
+            .volume_emission
+            .map(|value| closure.weight * value);
+        if params.has_medium() || params.volume_emission.iter().any(|value| *value != 0.0) {
+            media.push(MeshMedium {
+                object_index: WORLD_VOLUME_OBJECT_INDEX,
+                closure: closure_index,
+                params,
+                is_world: true,
+            });
+        }
+    }
+    media.extend_from_slice(static_media);
+    Ok(stack_medium(media))
 }
 
 fn collect_volumes<'a>(
@@ -14643,6 +15246,16 @@ struct MeshMedium {
     is_world: bool,
 }
 
+struct HeterogeneousWorldVolume {
+    material: Material,
+    prepared: PreparedMaterial,
+    sampling: VolumeSampling,
+    max_closures: usize,
+    interpolation: crate::model::VolumeInterpolation,
+    octree: WorldVolumeOctree,
+    has_light_path: bool,
+}
+
 #[derive(Clone, Copy)]
 struct FroxelMeshMedium {
     object_index: u32,
@@ -15206,6 +15819,769 @@ fn stack_medium(media: &[MeshMedium]) -> Option<BsdfParams> {
     Some(combined)
 }
 
+struct WorldVolumePathSegment {
+    outcome: MediumOutcome,
+    emission: DVec3,
+    transmittance: DVec3,
+    scatter_pdf: f64,
+}
+
+fn static_volume_majorant(media: &[MeshMedium]) -> f64 {
+    media
+        .iter()
+        .map(|medium| {
+            medium_extinction(&medium.params)
+                .max_element()
+                .max(DVec3::from_array(medium.params.volume_emission).max_element())
+        })
+        .sum()
+}
+
+fn sample_majorant_distance(majorant: f64, rng: &mut Pcg32) -> Option<f64> {
+    (majorant > 0.0).then(|| {
+        -rng.next_f64().max(f64::MIN_POSITIVE).ln() / majorant
+    })
+}
+
+fn majorant_event_correction(sampled_majorant: f64, actual_majorant: f64, distance: f64) -> f64 {
+    if actual_majorant > sampled_majorant {
+        ((sampled_majorant - actual_majorant) * distance).exp() / sampled_majorant
+    } else {
+        1.0 / sampled_majorant
+    }
+}
+
+#[cfg(test)]
+mod world_volume_majorant_tests {
+    use super::{Pcg32, majorant_event_correction, sample_majorant_distance};
+
+    #[test]
+    fn zero_majorant_advances_without_sampling_and_underestimates_are_corrected() {
+        let mut rng = Pcg32::for_sample(7, 0, 0, 0);
+        assert!(sample_majorant_distance(0.0, &mut rng).is_none());
+        let correction = majorant_event_correction(0.5, 1.5, 0.75);
+        let expected = (-1.0_f64 * 0.75).exp() / 0.5;
+        assert!((correction - expected).abs() < 1.0e-12);
+        assert_eq!(majorant_event_correction(1.5, 1.0, 0.75), 1.0 / 1.5);
+    }
+}
+
+
+fn grid_volume_coefficients(
+    grid: Option<&VoxelGrid>,
+    distance: f64,
+) -> (DVec3, DVec3, DVec3, f64) {
+    let Some(grid) = grid else {
+        return (DVec3::ZERO, DVec3::ZERO, DVec3::ZERO, 0.0);
+    };
+    let Some(index) = grid_step_index(grid, distance) else {
+        return (DVec3::ZERO, DVec3::ZERO, DVec3::ZERO, 0.0);
+    };
+    let extinction = grid.extinction[index] * grid.meters_per_unit;
+    let scatter = grid.scatter[index] * grid.meters_per_unit;
+    let emission = grid.emission[index] * grid.meters_per_unit;
+    let majorant = extinction.max_element().max(emission.max_element());
+    (extinction, scatter, emission, majorant)
+}
+
+fn grid_step_boundary(grid: Option<&VoxelGrid>, distance: f64, limit: f64) -> f64 {
+    let Some(grid) = grid else {
+        return limit;
+    };
+    if distance < grid.entry {
+        return grid.entry.min(limit);
+    }
+    if let Some(index) = grid_step_index(grid, distance) {
+        (grid.entry + (index + 1) as f64 * grid.step).min(limit)
+    } else if distance < grid.exit {
+        grid.exit.min(limit)
+    } else {
+        limit
+    }
+}
+
+fn world_interval_extrema(
+    scene: SceneRefs<'_, '_>,
+    world: &HeterogeneousWorldVolume,
+    origin: DVec3,
+    direction: DVec3,
+    start: f64,
+    interval_end: f64,
+    ray_kind: RayKind,
+    is_reflection_ray: bool,
+    is_singular_ray: bool,
+    ray_depth: u32,
+    transparent_depth: u32,
+    rng: &mut Pcg32,
+    workspace: &mut EvaluatorWorkspace,
+    closures: &mut Vec<ShaderClosure>,
+    media: &mut Vec<MeshMedium>,
+) -> Result<(f32, f32)> {
+    let interval = world.octree.interval(origin, direction, start, interval_end);
+    if !world.has_light_path || ray_kind == RayKind::Camera {
+        return Ok((interval.sigma_min, interval.sigma_max));
+    }
+    let mut sigma_min = f32::MAX;
+    let mut sigma_max = -f32::MAX;
+    let samples = 4.0_f32;
+    let step = ((interval_end - start) as f32) / samples;
+    let shade_offset = rng.next_f64() as f32;
+    for index in 0..4 {
+        let sample_distance = start as f32 + (shade_offset + index as f32) * step;
+        let position = origin + direction * f64::from(sample_distance);
+        let coefficients = evaluate_world_volume_stack(
+            scene.doc,
+            world,
+            scene.images,
+            position,
+            ray_kind,
+            is_reflection_ray,
+            is_singular_ray,
+            ray_depth,
+            transparent_depth,
+            &[],
+            workspace,
+            closures,
+            media,
+        )?;
+        let sigma = coefficients.map_or(0.0, |params| {
+            medium_extinction(&params)
+                .max_element()
+                .max(DVec3::from_array(params.volume_emission).max_element()) as f32
+        });
+        sigma_min = sigma_min.min(sigma);
+        sigma_max = sigma_max.max(sigma);
+    }
+    Ok((sigma_min, 0.5_f32.max(sigma_max * 1.5)))
+}
+
+fn trace_world_volume_segment(
+    scene: SceneRefs<'_, '_>,
+    world: &HeterogeneousWorldVolume,
+    static_media: &[MeshMedium],
+    grid: Option<&VoxelGrid>,
+    origin: DVec3,
+    direction: DVec3,
+    limit: f64,
+    events: bool,
+    throughput: &mut DVec3,
+    ray_kind: RayKind,
+    is_reflection_ray: bool,
+    is_singular_ray: bool,
+    ray_depth: u32,
+    transparent_depth: u32,
+    rng: &mut Pcg32,
+    workspace: &mut EvaluatorWorkspace,
+    closures: &mut Vec<ShaderClosure>,
+    candidate_media: &mut Vec<MeshMedium>,
+) -> Result<WorldVolumePathSegment> {
+    let static_majorant = static_volume_majorant(static_media);
+    let mut position = 0.0;
+    let mut emitted = DVec3::ZERO;
+    let mut transmittance = DVec3::ONE;
+    let mut proposal_survival = 1.0;
+    for _ in 0..CYCLES_VOLUME_MAX_STEPS {
+        if position >= limit {
+            return Ok(WorldVolumePathSegment {
+                outcome: MediumOutcome::Survive,
+                emission: emitted,
+                transmittance,
+                scatter_pdf: 0.0,
+            });
+        }
+        let world_interval = world
+            .octree
+            .interval(origin, direction, position, limit);
+        let end = world_interval
+            .end
+            .min(grid_step_boundary(grid, position, limit))
+            .min(limit);
+        if end <= position {
+            return Ok(WorldVolumePathSegment {
+                outcome: MediumOutcome::Absorb,
+                emission: emitted,
+                transmittance,
+                scatter_pdf: 0.0,
+            });
+        }
+        let (world_min, world_max) = world_interval_extrema(
+            scene,
+            world,
+            origin,
+            direction,
+            position,
+            end,
+            ray_kind,
+            is_reflection_ray,
+            is_singular_ray,
+            ray_depth,
+            transparent_depth,
+            rng,
+            workspace,
+            closures,
+            candidate_media,
+        )?;
+        let (_, _, _, grid_majorant) = grid_volume_coefficients(grid, position);
+        let distance_majorant =
+            f64::from(world_max) + static_majorant + grid_majorant;
+        if distance_majorant <= 0.0 {
+            position = end;
+            continue;
+        }
+        let Some(distance) = sample_majorant_distance(distance_majorant, rng) else {
+            position = end;
+            continue;
+        };
+        let interval_length = end - position;
+        if distance >= interval_length {
+            proposal_survival *= (-distance_majorant * interval_length).exp();
+            position = end;
+            continue;
+        }
+
+        let event_distance = position + distance;
+        proposal_survival *= (-distance_majorant * distance).exp();
+        let point = origin + direction * event_distance;
+        let medium = evaluate_world_volume_stack(
+            scene.doc,
+            world,
+            scene.images,
+            point,
+            ray_kind,
+            is_reflection_ray,
+            is_singular_ray,
+            ray_depth,
+            transparent_depth,
+            static_media,
+            workspace,
+            closures,
+            candidate_media,
+        )?;
+        let (grid_extinction, grid_scatter, grid_emission, _) =
+            grid_volume_coefficients(grid, event_distance);
+        let medium_scatter =
+            medium.map_or(DVec3::ZERO, |medium| DVec3::from_array(medium.volume_scatter));
+        let medium_absorption =
+            medium.map_or(DVec3::ZERO, |medium| DVec3::from_array(medium.volume_absorption));
+        let scatter = medium_scatter + grid_scatter;
+        let absorption = medium_absorption + (grid_extinction - grid_scatter).max(DVec3::ZERO);
+        let extinction = scatter + absorption;
+        let emission = medium
+            .map_or(DVec3::ZERO, |medium| DVec3::from_array(medium.volume_emission))
+            + grid_emission;
+        let majorant = distance_majorant.max(extinction.max_element());
+        let correction = majorant_event_correction(distance_majorant, majorant, distance);
+        emitted += *throughput * transmittance * emission * correction;
+        if !events {
+            transmittance *= (DVec3::ONE - extinction / majorant).max(DVec3::ZERO);
+            position = event_distance;
+            continue;
+        }
+        let albedo = DVec3::from_array(std::array::from_fn(|channel| {
+            if extinction[channel] > 0.0 {
+                scatter[channel] / extinction[channel]
+            } else {
+                1.0
+            }
+        }));
+        let channel_pdf = volume_channel_pdf(albedo, *throughput);
+        let null = DVec3::splat(majorant) - extinction;
+        let scatter_probability = channel_pdf.dot(scatter / majorant);
+        let null_probability = channel_pdf.dot(null / majorant);
+        let choice = rng.next_f64();
+        if choice < scatter_probability {
+            let scatter_pdf = proposal_survival * distance_majorant * scatter_probability;
+            *throughput *= scatter * (correction / scatter_probability);
+            return Ok(WorldVolumePathSegment {
+                outcome: MediumOutcome::Scatter(event_distance),
+                emission: emitted,
+                transmittance,
+                scatter_pdf,
+            });
+        }
+        if choice < scatter_probability + null_probability && null_probability > 0.0 {
+            *throughput *= null * (correction / null_probability);
+            proposal_survival *= null_probability;
+            position = event_distance;
+            continue;
+        }
+        *throughput = DVec3::ZERO;
+        return Ok(WorldVolumePathSegment {
+            outcome: MediumOutcome::Absorb,
+            emission: emitted,
+            transmittance,
+            scatter_pdf: 0.0,
+        });
+    }
+    if events {
+        *throughput = DVec3::ZERO;
+        Ok(WorldVolumePathSegment {
+            outcome: MediumOutcome::Absorb,
+            emission: emitted,
+            transmittance,
+            scatter_pdf: 0.0,
+        })
+    } else {
+        Ok(WorldVolumePathSegment {
+            outcome: MediumOutcome::Survive,
+            emission: emitted,
+            transmittance,
+            scatter_pdf: 0.0,
+        })
+    }
+}
+
+fn world_volume_transmittance(
+    scene: SceneRefs<'_, '_>,
+    world: &HeterogeneousWorldVolume,
+    static_media: &[MeshMedium],
+    grid: Option<&VoxelGrid>,
+    origin: DVec3,
+    direction: DVec3,
+    limit: f64,
+    ray_kind: RayKind,
+    is_reflection_ray: bool,
+    is_singular_ray: bool,
+    ray_depth: u32,
+    transparent_depth: u32,
+    rng: &mut Pcg32,
+    workspace: &mut EvaluatorWorkspace,
+    closures: &mut Vec<ShaderClosure>,
+    candidate_media: &mut Vec<MeshMedium>,
+) -> Result<DVec3> {
+    let static_majorant = static_volume_majorant(static_media);
+    let mut transmittance = DVec3::ONE;
+    let mut position = 0.0;
+    let mut steps = 0;
+
+    while position < limit && steps < CYCLES_VOLUME_MAX_STEPS {
+        let segment_start = position;
+        let mut segment_end = position;
+        let mut sigma_min = f32::MAX;
+        let mut sigma_max = -f32::MAX;
+        loop {
+            let interval = world
+                .octree
+                .interval(origin, direction, segment_end, limit);
+            let end = interval
+                .end
+                .min(grid_step_boundary(grid, segment_end, limit))
+                .min(limit);
+            if end <= segment_end {
+                break;
+            }
+            let (world_min, world_max) = world_interval_extrema(
+                scene,
+                world,
+                origin,
+                direction,
+                segment_end,
+                end,
+                ray_kind,
+                is_reflection_ray,
+                is_singular_ray,
+                ray_depth,
+                transparent_depth,
+                rng,
+                workspace,
+                closures,
+                candidate_media,
+            )?;
+            let (_, _, _, grid_majorant) = grid_volume_coefficients(grid, segment_end);
+            let current_min = f64::from(world_min) + static_majorant + grid_majorant;
+            let current_max = f64::from(world_max) + static_majorant + grid_majorant;
+            sigma_min = sigma_min.min(current_min as f32);
+            sigma_max = sigma_max.max(current_max as f32);
+            segment_end = end;
+            if f64::from(sigma_max - sigma_min) * (segment_end - segment_start) >= 1.0
+                || segment_end >= limit
+            {
+                break;
+            }
+        }
+        if segment_end <= segment_start {
+            return Ok(DVec3::ZERO);
+        }
+
+        let length = segment_end - segment_start;
+        let sigma_range = (sigma_max - sigma_min).max(0.0);
+        let samples_per_estimator = (f64::from(sigma_range) * length)
+            .round()
+            .clamp(1.0, f64::from(CYCLES_VOLUME_MAX_STEPS as u32))
+            as usize;
+        let mut pmf = 1.0_f64;
+        let independent_estimators = if sigma_range == 0.0 {
+            1
+        } else {
+            let random = rng.next_f64().max(f64::MIN_POSITIVE);
+            let order = (random.ln() / 0.1_f64.ln()).floor().clamp(0.0, 4.0) as u32;
+            pmf = if order == 4 {
+                0.1_f64.powi(order as i32)
+            } else {
+                0.9 * 0.1_f64.powi(order as i32)
+            };
+            1_usize << order
+        };
+        let sample_count = independent_estimators * samples_per_estimator;
+        let shade_offset = rng.next_f64();
+        let step_size = length / sample_count as f64;
+
+        if independent_estimators == 1 {
+            let mut optical_depth = DVec3::ZERO;
+            for index in 0..samples_per_estimator {
+                let distance = (segment_start + (shade_offset + index as f64) * step_size)
+                    .min(segment_end);
+                optical_depth += world_volume_extinction_at(
+                    scene,
+                    world,
+                    static_media,
+                    grid,
+                    origin + direction * distance,
+                    distance,
+                    ray_kind,
+                    is_reflection_ray,
+                    is_singular_ray,
+                    ray_depth,
+                    transparent_depth,
+                    workspace,
+                    closures,
+                    candidate_media,
+                )?;
+            }
+            let tau = optical_depth * step_size;
+            transmittance *= if tau == DVec3::ZERO {
+                DVec3::ONE
+            } else {
+                (-tau).exp()
+            };
+        } else {
+            let mut tau_j = [DVec3::ZERO; 2];
+            let mut tau_j1 = DVec3::ZERO;
+            let mut transmittance_k = DVec3::ZERO;
+            for estimator in 0..independent_estimators {
+                let mut tau_k = DVec3::ZERO;
+                for index in 0..samples_per_estimator {
+                    let sample_index = index * independent_estimators + estimator;
+                    let distance = (segment_start
+                        + (shade_offset + sample_index as f64) * step_size)
+                        .min(segment_end);
+                    let tau = world_volume_extinction_at(
+                        scene,
+                        world,
+                        static_media,
+                        grid,
+                        origin + direction * distance,
+                        distance,
+                        ray_kind,
+                        is_reflection_ray,
+                        is_singular_ray,
+                        ray_depth,
+                        transparent_depth,
+                        workspace,
+                        closures,
+                        candidate_media,
+                    )? * step_size;
+                    tau_k += tau * independent_estimators as f64;
+                    tau_j[sample_index % 2] += tau * 2.0;
+                    tau_j1 += tau;
+                }
+                transmittance_k += (-tau_k).exp();
+            }
+            transmittance_k /= independent_estimators as f64;
+            let transmittance_j =
+                0.5 * ((-tau_j[0]).exp() + (-tau_j[1]).exp());
+            transmittance *=
+                transmittance_k + ((-tau_j1).exp() - transmittance_j) / pmf;
+        }
+        position = segment_end;
+        steps += 1;
+    }
+
+    Ok(transmittance)
+}
+
+fn world_volume_extinction_at(
+    scene: SceneRefs<'_, '_>,
+    world: &HeterogeneousWorldVolume,
+    static_media: &[MeshMedium],
+    grid: Option<&VoxelGrid>,
+    point: DVec3,
+    distance: f64,
+    ray_kind: RayKind,
+    is_reflection_ray: bool,
+    is_singular_ray: bool,
+    ray_depth: u32,
+    transparent_depth: u32,
+    workspace: &mut EvaluatorWorkspace,
+    closures: &mut Vec<ShaderClosure>,
+    candidate_media: &mut Vec<MeshMedium>,
+) -> Result<DVec3> {
+    let medium = evaluate_world_volume_stack(
+        scene.doc,
+        world,
+        scene.images,
+        point,
+        ray_kind,
+        is_reflection_ray,
+        is_singular_ray,
+        ray_depth,
+        transparent_depth,
+        static_media,
+        workspace,
+        closures,
+        candidate_media,
+    )?;
+    let grid = grid_volume_coefficients(grid, distance).0;
+    Ok(medium.map_or(DVec3::ZERO, |medium| medium_extinction(&medium)) + grid)
+}
+
+fn world_direct_scatter_at(
+    scene: SceneRefs<'_, '_>,
+    world: &HeterogeneousWorldVolume,
+    static_media: &[MeshMedium],
+    grid: Option<&VoxelGrid>,
+    origin: DVec3,
+    direction: DVec3,
+    distance: f64,
+    phase_cosine: f64,
+    ray_kind: RayKind,
+    is_reflection_ray: bool,
+    is_singular_ray: bool,
+    ray_depth: u32,
+    transparent_depth: u32,
+    rng: &mut Pcg32,
+    workspace: &mut EvaluatorWorkspace,
+    closures: &mut Vec<ShaderClosure>,
+    media: &mut Vec<MeshMedium>,
+) -> Result<(DVec3, f64)> {
+    let transmittance = world_volume_transmittance(
+        scene,
+        world,
+        static_media,
+        grid,
+        origin,
+        direction,
+        distance,
+        ray_kind,
+        is_reflection_ray,
+        is_singular_ray,
+        ray_depth,
+        transparent_depth,
+        rng,
+        workspace,
+        closures,
+        media,
+    )?;
+    let parameters = evaluate_world_volume_stack(
+        scene.doc,
+        world,
+        scene.images,
+        origin + direction * distance,
+        ray_kind,
+        is_reflection_ray,
+        is_singular_ray,
+        ray_depth,
+        transparent_depth,
+        static_media,
+        workspace,
+        closures,
+        media,
+    )?;
+    let scatter = parameters.map_or(DVec3::ZERO, |params| {
+        DVec3::from_array(params.volume_scatter)
+    }) + grid.map_or(DVec3::ZERO, |grid| {
+        grid_scatter_at(grid, &grid.scatter, distance) * grid.meters_per_unit
+    });
+    let phase = event_phase(media, grid, distance);
+    let phase_pdf = phase.density(phase_cosine);
+    Ok((scatter * (transmittance * phase_pdf), phase_pdf))
+}
+
+fn world_volume_distance_pdf_at(
+    scene: SceneRefs<'_, '_>,
+    world: &HeterogeneousWorldVolume,
+    static_media: &[MeshMedium],
+    grid: Option<&VoxelGrid>,
+    origin: DVec3,
+    direction: DVec3,
+    distance: f64,
+    throughput: DVec3,
+    ray_kind: RayKind,
+    is_reflection_ray: bool,
+    is_singular_ray: bool,
+    ray_depth: u32,
+    transparent_depth: u32,
+    rng: &mut Pcg32,
+    workspace: &mut EvaluatorWorkspace,
+    closures: &mut Vec<ShaderClosure>,
+    media: &mut Vec<MeshMedium>,
+) -> Result<f64> {
+    if distance <= 0.0 {
+        return Ok(0.0);
+    }
+    let static_majorant = static_volume_majorant(static_media);
+    let mut position = 0.0;
+    let mut path_throughput = throughput;
+    let mut survival = 1.0;
+
+    for _ in 0..CYCLES_VOLUME_MAX_STEPS {
+        if position >= distance {
+            break;
+        }
+        let interval = world
+            .octree
+            .interval(origin, direction, position, distance);
+        let end = interval
+            .end
+            .min(grid_step_boundary(grid, position, distance))
+            .min(distance);
+        if end <= position {
+            return Ok(0.0);
+        }
+        let (world_min, world_max) = world_interval_extrema(
+            scene,
+            world,
+            origin,
+            direction,
+            position,
+            end,
+            ray_kind,
+            is_reflection_ray,
+            is_singular_ray,
+            ray_depth,
+            transparent_depth,
+            rng,
+            workspace,
+            closures,
+            media,
+        )?;
+        let (_, _, _, grid_majorant) = grid_volume_coefficients(grid, position);
+        let distance_majorant =
+            f64::from(world_max) + static_majorant + grid_majorant;
+        if distance_majorant <= 0.0 {
+            position = end;
+            continue;
+        }
+        let length = end - position;
+        let Some(candidate_distance) = sample_majorant_distance(distance_majorant, rng) else {
+            position = end;
+            continue;
+        };
+        if candidate_distance >= length {
+            survival *= (-distance_majorant * length).exp();
+            position = end;
+            continue;
+        }
+
+        let candidate = position + candidate_distance;
+        survival *= (-distance_majorant * candidate_distance).exp();
+        let medium = evaluate_world_volume_stack(
+            scene.doc,
+            world,
+            scene.images,
+            origin + direction * candidate,
+            ray_kind,
+            is_reflection_ray,
+            is_singular_ray,
+            ray_depth,
+            transparent_depth,
+            static_media,
+            workspace,
+            closures,
+            media,
+        )?;
+        let grid_extinction = grid_volume_coefficients(grid, candidate).0;
+        let grid_scatter = grid.map_or(DVec3::ZERO, |grid| {
+            grid_scatter_at(grid, &grid.scatter, candidate) * grid.meters_per_unit
+        });
+        let scatter = medium.map_or(DVec3::ZERO, |medium| {
+            DVec3::from_array(medium.volume_scatter)
+        }) + grid_scatter;
+        let extinction = medium.map_or(DVec3::ZERO, |medium| medium_extinction(&medium))
+            + grid_extinction;
+        let majorant = distance_majorant.max(extinction.max_element());
+        let null = DVec3::splat(majorant) - extinction;
+        let albedo = DVec3::from_array(std::array::from_fn(|channel| {
+            if extinction[channel] > 0.0 {
+                scatter[channel] / extinction[channel]
+            } else {
+                1.0
+            }
+        }));
+        let channel_pdf = volume_channel_pdf(albedo, path_throughput);
+        let null_probability = channel_pdf.dot(null / majorant);
+        if null_probability <= 0.0 {
+            return Ok(0.0);
+        }
+        let correction =
+            majorant_event_correction(distance_majorant, majorant, candidate_distance);
+        path_throughput *= null * (correction / null_probability);
+        survival *= null_probability;
+        position = candidate;
+    }
+
+    let interval = world
+        .octree
+        .interval(origin, direction, distance, f64::from(f32::MAX));
+    let interval_end = interval.end.max(distance);
+    let (_, world_max) = world_interval_extrema(
+        scene,
+        world,
+        origin,
+        direction,
+        distance,
+        interval_end,
+        ray_kind,
+        is_reflection_ray,
+        is_singular_ray,
+        ray_depth,
+        transparent_depth,
+        rng,
+        workspace,
+        closures,
+        media,
+    )?;
+    let (_, _, _, grid_majorant) = grid_volume_coefficients(grid, distance);
+    let distance_majorant =
+        f64::from(world_max) + static_majorant + grid_majorant;
+    if distance_majorant <= 0.0 {
+        return Ok(0.0);
+    }
+    let medium = evaluate_world_volume_stack(
+        scene.doc,
+        world,
+        scene.images,
+        origin + direction * distance,
+        ray_kind,
+        is_reflection_ray,
+        is_singular_ray,
+        ray_depth,
+        transparent_depth,
+        static_media,
+        workspace,
+        closures,
+        media,
+    )?;
+    let grid_extinction = grid_volume_coefficients(grid, distance).0;
+    let grid_scatter = grid.map_or(DVec3::ZERO, |grid| {
+        grid_scatter_at(grid, &grid.scatter, distance) * grid.meters_per_unit
+    });
+    let scatter = medium.map_or(DVec3::ZERO, |medium| {
+        DVec3::from_array(medium.volume_scatter)
+    }) + grid_scatter;
+    let extinction = medium.map_or(DVec3::ZERO, |medium| medium_extinction(&medium))
+        + grid_extinction;
+    let majorant = distance_majorant.max(extinction.max_element());
+    let albedo = DVec3::from_array(std::array::from_fn(|channel| {
+        if extinction[channel] > 0.0 {
+            scatter[channel] / extinction[channel]
+        } else {
+            1.0
+        }
+    }));
+    let channel_pdf = volume_channel_pdf(albedo, path_throughput);
+    Ok(survival * distance_majorant * channel_pdf.dot(scatter / majorant))
+}
 /// The mesh media that contain `origin`, as Cycles' `volume_stack_init` seeds the stack. A ray from the origin toggles
 /// each medium it crosses, so a medium's object is in the stack when the ray crosses its surfaces an odd number of
 /// times, that is, when the origin is inside it. The probe direction is fixed and oblique, so it avoids axis-aligned edges.
@@ -15385,6 +16761,7 @@ fn event_weights(
         })
         .collect()
 }
+
 /// A segment's per-step RGB extinction and scatter, with static and temperature-grid emission sources.
 struct VoxelGrid {
     entry: f64,
@@ -18082,6 +19459,7 @@ mod cycles_hair_path_tests {
             lights: &[],
             volumes: &[],
             world_volume: &[],
+            world_heterogeneous: None,
             images: &images,
             importance: None,
             camera_matrices: None,
@@ -19620,6 +20998,7 @@ mod cycles_world_light_tests {
             lights,
             volumes: &[],
             world_volume: &[],
+            world_heterogeneous: None,
             images,
             importance: None,
             camera_matrices: None,
@@ -20033,8 +21412,9 @@ mod cycles_world_light_tests {
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         assert!(!scene_has_world_volume(&doc, &snapshot));
 
-        let media = collect_world_volume_media(&doc, &snapshot, &BTreeMap::new())?;
+        let (media, heterogeneous) = collect_world_volume_media(&doc, &snapshot, &BTreeMap::new())?;
         assert_eq!(media.len(), 1);
+        assert!(heterogeneous.is_none());
         assert!(media[0].is_world);
         assert!(media[0].params.volume_scatter[0] > 0.0);
 
@@ -20048,39 +21428,9 @@ mod cycles_world_light_tests {
             })?
             .links
             .retain(|link| link.to_socket != "Volume");
-        let media = collect_world_volume_media(&doc, &snapshot, &BTreeMap::new())?;
+        let (media, heterogeneous) = collect_world_volume_media(&doc, &snapshot, &BTreeMap::new())?;
         assert!(media.is_empty());
-        Ok(())
-    }
-    #[test]
-    fn spatially_varying_world_volume_is_refused_with_feature_id() -> crate::error::Result<()> {
-        let (mut doc, _, _, graph_id) = world_override_doc()?;
-        let texture_id = Id::new("world_noise")?;
-        let volume_id = Id::new("world_volume")?;
-        let graph = doc.node_groups.get_mut(&graph_id).ok_or_else(|| {
-            crate::error::PotError::new(
-                crate::error::ErrorCode::InternalError,
-                "world-volume graph is missing",
-            )
-        })?;
-        graph
-            .nodes
-            .insert(texture_id.clone(), GraphNode::new("ShaderNodeTexNoise"));
-        graph.links.push(GraphLink {
-            from_node: texture_id,
-            from_socket: "Fac".to_owned(),
-            to_node: volume_id,
-            to_socket: "Density".to_owned(),
-        });
-        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
-        let Err(error) = collect_world_volume_media(&doc, &snapshot, &BTreeMap::new()) else {
-            panic!("spatially varying World Volume should be refused");
-        };
-        assert_eq!(error.code, crate::error::ErrorCode::UnsupportedFeature);
-        assert_eq!(
-            error.details["feature_id"],
-            "render.path.world_volume_heterogeneous"
-        );
+        assert!(heterogeneous.is_none());
         Ok(())
     }
 

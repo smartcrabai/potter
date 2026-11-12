@@ -63,6 +63,40 @@ fog.inputs["Color"].default_value = (
     else (0.8, 0.7, 0.6, 1.0)
 )
 fog.inputs["Density"].default_value = 0.18
+spatial_kind = (
+    "gradient"
+    if case.startswith("gradient_") or case == "world_override_spatial"
+    else "noise"
+    if case.startswith("noise_")
+    else None
+)
+if spatial_kind is not None:
+    coordinates = volume_tree.nodes.new("ShaderNodeTexCoord")
+    texture = volume_tree.nodes.new(
+        "ShaderNodeTexGradient" if spatial_kind == "gradient" else "ShaderNodeTexNoise"
+    )
+    if spatial_kind == "gradient":
+        texture.gradient_type = "LINEAR"
+    else:
+        texture.inputs["Scale"].default_value = 3.0
+        texture.inputs["Detail"].default_value = 2.0
+    volume_tree.links.new(coordinates.outputs["Generated"], texture.inputs["Vector"])
+    density_scale = volume_tree.nodes.new("ShaderNodeMath")
+    density_scale.operation = "MULTIPLY"
+    density_scale.inputs[1].default_value = 0.36
+    volume_tree.links.new(texture.outputs["Fac"], density_scale.inputs[0])
+    volume_tree.links.new(density_scale.outputs["Value"], fog.inputs["Density"])
+if case == "spatial_volume_emission":
+    coordinates = volume_tree.nodes.new("ShaderNodeTexCoord")
+    emission_texture = volume_tree.nodes.new("ShaderNodeTexNoise")
+    emission_texture.inputs["Scale"].default_value = 4.0
+    volume_tree.links.new(coordinates.outputs["Generated"], emission_texture.inputs["Vector"])
+    emission_scale = volume_tree.nodes.new("ShaderNodeMath")
+    emission_scale.operation = "MULTIPLY"
+    emission_scale.inputs[1].default_value = 2.0
+    volume_tree.links.new(emission_texture.outputs["Fac"], emission_scale.inputs[0])
+    volume_tree.links.new(emission_scale.outputs["Value"], fog.inputs["Emission Strength"])
+    fog.inputs["Emission Color"].default_value = (0.8, 0.2, 0.05, 1.0)
 fog.inputs["Anisotropy"].default_value = 0.2
 fog.inputs["Absorption Color"].default_value = (0.15, 0.25, 0.35, 1.0)
 if case == "scene_world_scattering_only":
@@ -70,20 +104,25 @@ if case == "scene_world_scattering_only":
 volume_tree.links.new(background.outputs["Background"], volume_output.inputs["Surface"])
 if case != "scene_world_no_volume":
     volume_tree.links.new(fog.outputs["Volume"], volume_output.inputs["Volume"])
-volume_world.cycles.volume_sampling = (
-    "DISTANCE" if case == "scene_world_distance" else "MULTIPLE_IMPORTANCE"
-)
+volume_world.cycles.volume_sampling = {
+    "scene_world_distance": "DISTANCE",
+    "gradient_distance": "DISTANCE",
+    "noise_distance": "DISTANCE",
+    "gradient_equiangular": "EQUIANGULAR",
+    "noise_equiangular": "EQUIANGULAR",
+}.get(case, "MULTIPLE_IMPORTANCE")
 volume_world.cycles.volume_interpolation = "LINEAR"
 volume_world.cycles.volume_step_size = 0.125
 volume_world.cycles_visibility.scatter = True
 
-if case == "view_layer_override":
+if case in ("view_layer_override", "world_override_spatial"):
     surface_world = bpy.data.worlds.new("Surface World")
     surface_world.color = (0.01, 0.01, 0.01)
     scene.world = surface_world
     layer = scene.view_layers[0]
     layer.world_override = volume_world
-    layer.use_volumes = False
+    if case == "view_layer_override":
+        layer.use_volumes = False
 else:
     scene.world = volume_world
 
