@@ -3734,15 +3734,17 @@ fn validate_intermediate(raw: &Value) -> Result<()> {
                             )));
                         }
                     }
-                    if render.get("use_adaptive_sampling").is_some_and(|value| !value.is_boolean()) {
+                    if render
+                        .get("use_adaptive_sampling")
+                        .is_some_and(|value| !value.is_boolean())
+                    {
                         return Err(invalid_intermediate(
                             "render use_adaptive_sampling must be a boolean",
                         ));
                     }
-                    for (field, minimum, maximum) in [
-                        ("adaptive_min_samples", 0, 4096),
-                        ("tile_size", 8, 8192),
-                    ] {
+                    for (field, minimum, maximum) in
+                        [("adaptive_min_samples", 0, 4096), ("tile_size", 8, 8192)]
+                    {
                         if render.get(field).is_some_and(|value| {
                             value
                                 .as_u64()
@@ -4659,12 +4661,8 @@ fn build_imported_graph(
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             adaptive_threshold: number_field(&render, "adaptive_threshold", 0.01),
-            adaptive_min_samples: u32::try_from(integer_field(
-                &render,
-                "adaptive_min_samples",
-                0,
-            ))
-            .map_err(|_| invalid_intermediate("render adaptive_min_samples is out of range"))?,
+            adaptive_min_samples: u32::try_from(integer_field(&render, "adaptive_min_samples", 0))
+                .map_err(|_| invalid_intermediate("render adaptive_min_samples is out of range"))?,
             tile_size: u32::try_from(integer_field(&render, "tile_size", 2048))
                 .map_err(|_| invalid_intermediate("render tile_size is out of range"))?,
             volume_bounces: u32::try_from(integer_field(&render, "volume_bounces", 0))

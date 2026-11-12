@@ -328,7 +328,10 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
     assert_eq!(render["film_transparent_glass"], true);
     assert_eq!(render["use_adaptive_sampling"], false);
     assert!(
-        (render["adaptive_threshold"].as_f64().ok_or("adaptive threshold missing")? - 0.23)
+        (render["adaptive_threshold"]
+            .as_f64()
+            .ok_or("adaptive threshold missing")?
+            - 0.23)
             .abs()
             < 1e-6
     );

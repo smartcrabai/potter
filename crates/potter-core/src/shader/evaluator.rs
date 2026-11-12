@@ -1642,9 +1642,10 @@ fn evaluate_volume_output_inner(
     };
     for mut closure in evaluator.workspace.closures_of(output).iter().copied() {
         if closure.params.standalone_emission {
-            closure.params.volume_emission = closure.params.emission_color.map(|channel| {
-                channel * closure.params.emission_strength
-            });
+            closure.params.volume_emission = closure
+                .params
+                .emission_color
+                .map(|channel| channel * closure.params.emission_strength);
         }
         volume.push(closure);
     }
@@ -11619,11 +11620,13 @@ mod tests {
                         id,
                         json!({"potter_output_defaults":[{"identifier":"Value","default":value}]}),
                     );
-                    link(&mut graph, id, "Value", "math", if id == "first" {
-                        "Value"
-                    } else {
-                        "Value_001"
-                    });
+                    link(
+                        &mut graph,
+                        id,
+                        "Value",
+                        "math",
+                        if id == "first" { "Value" } else { "Value_001" },
+                    );
                 }
                 link(&mut graph, "math", "Value", "mix", "Fac");
             } else {
@@ -12474,7 +12477,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn cycles_world_volume_ignores_eevee_only_output_and_eevee_keeps_active_output() {
         let mut graph = NodeGroup::new("EEVEE World output", GraphKind::Shader);
@@ -12493,10 +12495,7 @@ mod tests {
         link(&mut graph, "absorption", "Volume", "output", "Volume");
         let output_id = Id::new("output").unwrap();
         assert_eq!(super::select_world_output(&graph, true), None);
-        assert_eq!(
-            super::select_world_output(&graph, false),
-            Some(&output_id)
-        );
+        assert_eq!(super::select_world_output(&graph, false), Some(&output_id));
         assert!(evaluate_world_volume_graph(graph).volume.is_empty());
     }
 
@@ -12543,7 +12542,11 @@ mod tests {
         let mixed =
             emission_and_absorption_world_volume("ShaderNodeMixShader", json!({"Fac":0.25}));
         assert_eq!(
-            mixed.volume.iter().map(|closure| closure.weight).collect::<Vec<_>>(),
+            mixed
+                .volume
+                .iter()
+                .map(|closure| closure.weight)
+                .collect::<Vec<_>>(),
             [0.75, 0.25]
         );
         assert!(channels_close(

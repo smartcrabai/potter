@@ -22,9 +22,9 @@ pub(crate) use evaluator::{
     make_orthonormals, shader_node_type_supported,
 };
 
+pub(crate) use evaluator::SourceMixInputPruner;
 pub(crate) use evaluator::evaluate_displacement_with_workspace_semantics;
 pub(crate) use evaluator::select_world_output;
-pub(crate) use evaluator::SourceMixInputPruner;
 pub use evaluator::{
     BsdfParams, EeveeGBufferBin, EeveeGBufferCandidate, EeveeGBufferFeatures, EeveeGBufferLayout,
     EeveeGBufferLayoutError, EeveeGBufferLobe, EeveeGBufferMode, EvaluatorWorkspace, HitContext,

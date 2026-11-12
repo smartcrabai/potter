@@ -1575,28 +1575,20 @@ mod tests {
             let background_id = Id::new(format!("{id}_background"))?;
             let volume_id = Id::new(format!("{id}_volume"))?;
             let mut output = GraphNode::new("ShaderNodeOutputWorld");
-            output
-                .properties
-                .insert("target".to_owned(), json!(target));
+            output.properties.insert("target".to_owned(), json!(target));
             output
                 .properties
                 .insert("is_active_output".to_owned(), json!(active));
             group.nodes.insert(output_id.clone(), output);
             let mut background = GraphNode::new("ShaderNodeBackground");
-            background
-                .inputs
-                .insert("Color".to_owned(), json!(color));
-            background
-                .inputs
-                .insert("Strength".to_owned(), json!(1.0));
+            background.inputs.insert("Color".to_owned(), json!(color));
+            background.inputs.insert("Strength".to_owned(), json!(1.0));
             group.nodes.insert(background_id.clone(), background);
             let mut volume = GraphNode::new("ShaderNodeVolumeAbsorption");
             volume
                 .inputs
                 .insert("Color".to_owned(), json!(absorption_color));
-            volume
-                .inputs
-                .insert("Density".to_owned(), json!(1.0));
+            volume.inputs.insert("Density".to_owned(), json!(1.0));
             group.nodes.insert(volume_id.clone(), volume);
             group.links.extend([
                 GraphLink {

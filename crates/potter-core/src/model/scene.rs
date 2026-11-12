@@ -2404,7 +2404,6 @@ fn is_default_tile_size(value: &u32) -> bool {
     *value == 2048
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CyclesCurveShape {
@@ -2448,7 +2447,10 @@ pub struct RenderSettings {
         skip_serializing_if = "is_default_adaptive_min_samples"
     )]
     pub adaptive_min_samples: u32,
-    #[serde(default = "default_tile_size", skip_serializing_if = "is_default_tile_size")]
+    #[serde(
+        default = "default_tile_size",
+        skip_serializing_if = "is_default_tile_size"
+    )]
     pub tile_size: u32,
     pub max_bounces: u32,
     /// Blender Cycles `scene.cycles.diffuse_bounces`; omitted at its Blender default of 4.
