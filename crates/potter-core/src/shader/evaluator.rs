@@ -14,7 +14,7 @@ use crate::{
     geom::{GeneratedCorners, TextureSpace, volume::VolumeData},
     graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
     image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
-    model::{Id, Material, Registry, TextureRef, ThicknessMode},
+    model::{Id, Material, RayKind, Registry, TextureRef, ThicknessMode},
 };
 
 /// Blender's Principled "Specular IOR Level" default: `SOCKET_IN_FLOAT(specular_ior_level,
@@ -1145,6 +1145,12 @@ pub struct HitContext<'a> {
     pub light_falloff_distance: Option<f64>,
     /// Whether this hit is evaluated by Cycles semantics rather than the realtime shader path.
     pub path_traced: bool,
+    /// Ray class and path depths seen by ShaderNodeLightPath.
+    pub ray_kind: RayKind,
+    pub is_reflection_ray: bool,
+    pub is_singular_ray: bool,
+    pub ray_depth: u32,
+    pub transparent_depth: u32,
     /// Whether this path hit came from a curve primitive without mesh UV or generic-attribute interpolation.
     pub(crate) hair_curve_hit: bool,
     /// The strand tangent supplied by the curve/particle hit.
@@ -1220,6 +1226,11 @@ impl<'a> HitContext<'a> {
             view_direction: DVec3::Z,
             light_falloff_distance: None,
             path_traced: false,
+            ray_kind: RayKind::Camera,
+            is_reflection_ray: false,
+            is_singular_ray: false,
+            ray_depth: 0,
+            transparent_depth: 0,
             hair_curve_hit: false,
             hair_tangent: None,
             hair_random: None,
@@ -1237,6 +1248,24 @@ impl<'a> HitContext<'a> {
             opacity_only: false,
             bump_height_shifted: false,
         }
+    }
+
+    /// Set the path state exposed by ShaderNodeLightPath.
+    #[must_use]
+    pub const fn with_ray_context(
+        mut self,
+        ray_kind: RayKind,
+        is_reflection_ray: bool,
+        is_singular_ray: bool,
+        ray_depth: u32,
+        transparent_depth: u32,
+    ) -> Self {
+        self.ray_kind = ray_kind;
+        self.is_reflection_ray = is_reflection_ray;
+        self.is_singular_ray = is_singular_ray;
+        self.ray_depth = ray_depth;
+        self.transparent_depth = transparent_depth;
+        self
     }
 
     /// Set the camera transforms and cache EEVEE's f32 world-to-camera matrix.
@@ -2215,6 +2244,7 @@ enum NodeKind {
     ObjectInfo,
     Geometry,
     CameraData,
+    LightPath,
     Group,
     GroupInput,
     SeparateXyz,
@@ -2306,6 +2336,7 @@ impl NodeKind {
             "ShaderNodeNormalMap" => Self::NormalMap,
             "ShaderNodeFresnel" => Self::Fresnel,
             "ShaderNodeLayerWeight" => Self::LayerWeight,
+            "ShaderNodeLightPath" => Self::LightPath,
             "ShaderNodeAttribute" => Self::Attribute,
             "ShaderNodeVertexColor" => Self::VertexColor,
             _ => return None,
@@ -3528,6 +3559,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             NodeKind::ObjectInfo => self.object_info(node_id, socket),
             NodeKind::Geometry => self.geometry(node_id, socket),
             NodeKind::CameraData => self.camera_data(node_id, socket),
+            NodeKind::LightPath => self.light_path(node_id, socket),
             NodeKind::OutputMaterial => Err(invalid("material output has no output sockets")),
             NodeKind::Principled => {
                 let params = self.principled(node_id)?;
@@ -6376,6 +6408,25 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             )),
             _ => Err(invalid(format!("unknown Geometry output `{socket}`"))),
         }
+    }
+
+    fn light_path(&self, id: &Id, socket: &str) -> Result<Value> {
+        let value = match socket {
+            "Is Camera Ray" => self.hit_ctx.ray_kind == RayKind::Camera,
+            "Is Shadow Ray" => self.hit_ctx.ray_kind == RayKind::Shadow,
+            "Is Diffuse Ray" => self.hit_ctx.ray_kind == RayKind::Diffuse,
+            "Is Glossy Ray" => self.hit_ctx.ray_kind == RayKind::Glossy,
+            "Is Singular Ray" => self.hit_ctx.is_singular_ray,
+            "Is Reflection Ray" => self.hit_ctx.is_reflection_ray,
+            "Is Transmission Ray" => self.hit_ctx.ray_kind == RayKind::Transmission,
+            "Is Volume Scatter Ray" => self.hit_ctx.ray_kind == RayKind::VolumeScatter,
+            "Ray Depth" => return Ok(Value::Scalar(f64::from(self.hit_ctx.ray_depth))),
+            "Transparent Depth" => {
+                return Ok(Value::Scalar(f64::from(self.hit_ctx.transparent_depth)));
+            }
+            _ => return Err(unsupported_node_id(id.as_str(), socket)),
+        };
+        Ok(Value::Scalar(if value { 1.0 } else { 0.0 }))
     }
 
     fn camera_data(&self, id: &Id, socket: &str) -> Result<Value> {
@@ -9947,7 +9998,7 @@ mod tests {
         geom::GeneratedCorners,
         graph::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup},
         image::{ImageData, ImageExtension, ImageInterpolation},
-        model::{Id, Material, Registry, TextureRef},
+        model::{Id, Material, RayKind, Registry, TextureRef},
     };
 
     use super::{
@@ -10155,6 +10206,121 @@ mod tests {
         let view = evaluate_camera_data_view_vector(DVec3::ZERO, camera_to_world.inverse());
         assert_eq!(view, DVec3::Z);
     }
+    fn light_path_test_graph() -> (Registry<NodeGroup>, Id, Id) {
+        let mut group = NodeGroup::new("Light Path", GraphKind::Shader);
+        insert_node(&mut group, "light_path", "ShaderNodeLightPath", json!({}));
+        let graph_id = Id::new("light_path_graph".to_owned()).unwrap();
+        let node_id = Id::new("light_path".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), group);
+        (groups, graph_id, node_id)
+    }
+
+    fn light_path_scalar(
+        groups: &Registry<NodeGroup>,
+        graph_id: &Id,
+        node_id: &Id,
+        output: &str,
+        context: &HitContext<'_>,
+    ) -> f64 {
+        let ShaderValue::Scalar(value) =
+            evaluate_input_node_output(groups, graph_id, node_id, output, context).unwrap()
+        else {
+            panic!("Light Path output `{output}` must be a scalar")
+        };
+        value
+    }
+
+    #[test]
+    fn light_path_outputs_follow_ray_kind_bounce_and_depth_context() {
+        let (groups, graph_id, node_id) = light_path_test_graph();
+        let outputs = [
+            "Is Camera Ray",
+            "Is Shadow Ray",
+            "Is Diffuse Ray",
+            "Is Glossy Ray",
+            "Is Singular Ray",
+            "Is Reflection Ray",
+            "Is Transmission Ray",
+            "Is Volume Scatter Ray",
+        ];
+        let cases = [
+            (RayKind::Camera, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            (RayKind::Shadow, [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            (RayKind::Diffuse, [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            (RayKind::Glossy, [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+            (
+                RayKind::Transmission,
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            ),
+            (
+                RayKind::VolumeScatter,
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            ),
+        ];
+        for (ray_kind, expected) in cases {
+            let context = HitContext::new(&groups).with_ray_context(ray_kind, false, false, 4, 2);
+            for (output, expected) in outputs.into_iter().zip(expected) {
+                assert_eq!(
+                    light_path_scalar(&groups, &graph_id, &node_id, output, &context),
+                    expected,
+                    "{ray_kind:?} output {output}",
+                );
+            }
+            assert_eq!(
+                light_path_scalar(&groups, &graph_id, &node_id, "Ray Depth", &context),
+                4.0,
+            );
+            assert_eq!(
+                light_path_scalar(
+                    &groups,
+                    &graph_id,
+                    &node_id,
+                    "Transparent Depth",
+                    &context,
+                ),
+                2.0,
+            );
+        }
+
+        let context = HitContext::new(&groups).with_ray_context(RayKind::Diffuse, true, true, 7, 3);
+        assert_eq!(
+            light_path_scalar(&groups, &graph_id, &node_id, "Is Reflection Ray", &context),
+            1.0,
+        );
+        assert_eq!(
+            light_path_scalar(&groups, &graph_id, &node_id, "Is Singular Ray", &context),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn light_path_default_context_is_camera_ray_at_depth_zero() {
+        let (groups, graph_id, node_id) = light_path_test_graph();
+        let context = HitContext::new(&groups);
+        assert_eq!(
+            light_path_scalar(&groups, &graph_id, &node_id, "Is Camera Ray", &context),
+            1.0,
+        );
+        for output in [
+            "Is Shadow Ray",
+            "Is Diffuse Ray",
+            "Is Glossy Ray",
+            "Is Singular Ray",
+            "Is Reflection Ray",
+            "Is Transmission Ray",
+            "Is Volume Scatter Ray",
+            "Ray Depth",
+            "Transparent Depth",
+        ] {
+            assert_eq!(
+                light_path_scalar(&groups, &graph_id, &node_id, output, &context),
+                0.0,
+                "{output}",
+            );
+        }
+    }
+
     #[test]
     fn normal_map_non_tangent_spaces_transform_world_normals() {
         let quarter_turn = std::f64::consts::FRAC_PI_2;

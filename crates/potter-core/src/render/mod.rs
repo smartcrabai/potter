@@ -37,6 +37,7 @@ mod volume_guiding;
 mod volume_tiles;
 mod wireframe;
 mod world_probe;
+pub(crate) mod world_volume;
 
 pub use pick::pick;
 pub use preview::{PreviewRequest, render_previews};
