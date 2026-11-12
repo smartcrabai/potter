@@ -4546,6 +4546,10 @@ def dump_scene(scene):
                 "resolution_y": int(scene.render.resolution_y),
                 "resolution_percentage": int(scene.render.resolution_percentage),
                 "samples": samples,
+                "use_adaptive_sampling": bool(getattr(cycles, "use_adaptive_sampling", True)),
+                "adaptive_threshold": float(getattr(cycles, "adaptive_threshold", 0.01)),
+                "adaptive_min_samples": int(getattr(cycles, "adaptive_min_samples", 0)),
+                "tile_size": int(getattr(cycles, "tile_size", 2048)),
                 "seed": seed,
                 "max_bounces": int(getattr(getattr(scene, "cycles", None), "max_bounces", 4)),
                 "diffuse_bounces": int(getattr(getattr(scene, "cycles", None), "diffuse_bounces", 4)),
@@ -10701,6 +10705,16 @@ def export_doc(doc, target, pack, scene_hash, context):
                 cycles_curves.subdivisions = curve_subdivisions
         if hasattr(scene, "cycles"):
             scene.cycles.blur_glossy = float(render.get("filter_glossy", 1.0))
+            scene.cycles.use_adaptive_sampling = bool(
+                render.get("use_adaptive_sampling", True)
+            )
+            scene.cycles.adaptive_threshold = float(
+                render.get("adaptive_threshold", 0.01)
+            )
+            scene.cycles.adaptive_min_samples = int(
+                render.get("adaptive_min_samples", 0)
+            )
+            scene.cycles.tile_size = int(render.get("tile_size", 2048))
             scene.cycles.dicing_rate = float(render.get("dicing_rate", 1.0))
             scene.cycles.preview_dicing_rate = float(render.get("preview_dicing_rate", 8.0))
             scene.cycles.max_subdivisions = int(render.get("max_subdivisions", 12))

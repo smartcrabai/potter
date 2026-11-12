@@ -41,6 +41,9 @@ impl VolumeGuidingAccumulator {
         self.transmit_sum += contribution;
     }
 
+    pub(super) fn sample_count(&self) -> u32 {
+        self.sample_count
+    }
     pub(super) fn record(&mut self, sample: VolumeGuidingSample) {
         self.sample_count = self.sample_count.wrapping_add(1);
         if sample.primary_transmit {
@@ -180,10 +183,15 @@ pub(super) fn next_batch_end(completed: u32, total: u32) -> u32 {
     if completed >= total {
         return total;
     }
-    if completed == 0 {
-        return total.min(1);
-    }
-    completed.saturating_mul(2).min(total)
+    let checkpoint = if completed == 0 {
+        1
+    } else {
+        completed
+            .saturating_add(1)
+            .checked_next_power_of_two()
+            .unwrap_or(u32::MAX)
+    };
+    checkpoint.min(total)
 }
 
 fn filter_x_parallel(
@@ -655,7 +663,7 @@ mod tests {
             primary_transmit: true,
         });
 
-        assert_eq!(accumulator.sample_count, 3);
+        assert_eq!(accumulator.sample_count(), 3);
         assert_eq!(accumulator.scatter_sum, Vec3::splat(1.0));
         assert_eq!(accumulator.transmit_sum, Vec3::splat(2.0));
         assert_eq!(accumulator.optical_depth_count, 2.0);
@@ -718,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn batches_end_at_power_of_two_checkpoints_without_overflow() {
+    fn batches_end_at_strict_power_of_two_checkpoints_without_overflow() {
         let mut completed = 0;
         let mut ends = Vec::new();
         while completed < 13 {
@@ -727,6 +735,11 @@ mod tests {
         }
         assert_eq!(ends, [1, 2, 4, 8, 13]);
         assert_eq!(next_batch_end(0, 0), 0);
+        assert_eq!(next_batch_end(3, 200), 4);
+        assert_eq!(next_batch_end(64, 200), 128);
+        assert_eq!(next_batch_end(80, 200), 128);
+        assert_eq!(next_batch_end(96, 200), 128);
+        assert_eq!(next_batch_end(80, 100), 100);
         assert_eq!(next_batch_end(u32::MAX - 1, u32::MAX), u32::MAX);
         assert_eq!(next_batch_end(u32::MAX, u32::MAX), u32::MAX);
     }

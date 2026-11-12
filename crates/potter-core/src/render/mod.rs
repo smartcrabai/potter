@@ -1,5 +1,6 @@
 pub mod raster;
 
+mod adaptive_sampling;
 mod bvh;
 mod eevee_advanced_bsdf;
 mod eevee_blue_noise;
@@ -33,6 +34,7 @@ mod subsurface;
 mod subsurface_walk;
 mod text_strip;
 mod volume_guiding;
+mod volume_tiles;
 mod wireframe;
 mod world_probe;
 
