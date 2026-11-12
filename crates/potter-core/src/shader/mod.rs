@@ -15,7 +15,7 @@ pub(crate) use evaluator::{
     EEVEE_CLOSURE_REFLECTION, EEVEE_CLOSURE_REFRACTION, EEVEE_CLOSURE_SHADER_TO_RGBA,
     EEVEE_CLOSURE_SUBSURFACE, EEVEE_CLOSURE_TRANSLUCENT, EEVEE_CLOSURE_TRANSPARENCY,
     GeometryAttribute, GeometryAttributeValues, GlassDistribution, HairComponent, HairParameters,
-    HairParametrization, HairScatteringModel, MetallicFresnel, MetallicParameters,
+    HairParametrization, HairScatteringModel, LightPathContext, MetallicFresnel, MetallicParameters,
     MicrofacetDistribution, PrincipledHairParameters, SheenDistribution, ToonComponent,
     ToonParameters, dielectric_f0, evaluate_surface_with_workspace_into_semantics,
     evaluate_surface_with_workspace_semantics, evaluate_volume_output_with_workspace, heaviest,

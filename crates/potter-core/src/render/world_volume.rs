@@ -3,6 +3,7 @@
 //
 // Adapted from Blender Cycles 5.2.2 (source commit d13f752e3b9c4f8c261cda552b1021f8bcc0382c):
 // intern/cycles/bvh/octree.cpp, intern/cycles/kernel/bake/bake.h,
+// intern/cycles/kernel/integrator/shade_volume.h,
 // intern/cycles/kernel/sample/sobol_burley.h, intern/cycles/kernel/sample/util.h,
 // intern/cycles/util/hash.h, and intern/cycles/kernel/tables.h.
 
@@ -11,6 +12,8 @@ use glam::DVec3;
 use crate::error::Result;
 
 const VOLUME_OCTREE_MAX_DEPTH: u32 = 7;
+const MANTISSA_BITS: u8 = 23;
+const OVERLAP_EXP: f32 = 5e-4;
 const DENSITY_RESOLUTION: usize = 1 << VOLUME_OCTREE_MAX_DEPTH;
 const DENSITY_CELL_COUNT: usize = DENSITY_RESOLUTION * DENSITY_RESOLUTION * DENSITY_RESOLUTION;
 const DENSITY_SAMPLES_PER_CELL: u32 = 16;
@@ -113,117 +116,155 @@ impl WorldVolumeOctree {
         Ok((Self { nodes }, max_closures))
     }
 
-    pub(crate) fn interval(
+    pub(crate) fn trace(
         &self,
         origin: DVec3,
         direction: DVec3,
         start: f64,
         limit: f64,
-    ) -> WorldVolumeInterval {
-        let root = self.nodes[0];
-        let mut root_near = f64::NEG_INFINITY;
-        let mut root_far = f64::INFINITY;
-        let mut intersects_root = true;
+    ) -> WorldVolumeTrace {
+        WorldVolumeTrace::new(self, origin, direction, start, limit)
+    }
+}
 
+/// Preserves Cycles' initial clamp while monotonically advancing this ray's leaf traversal.
+pub(crate) struct WorldVolumeTrace {
+    ray_p: [f32; 3],
+    ray_d: [f32; 3],
+    current_p: [u32; 3],
+    octant_mask: u8,
+    scale: u8,
+    next_scale: u8,
+    node_index: usize,
+    active_min: f32,
+    active_max: f32,
+    ray_max: f32,
+    root_mode: bool,
+}
+
+impl WorldVolumeTrace {
+    fn new(
+        octree: &WorldVolumeOctree,
+        origin: DVec3,
+        direction: DVec3,
+        start: f64,
+        limit: f64,
+    ) -> Self {
+        let origin = origin.to_array().map(|component| component as f32);
+        let direction = direction.to_array().map(|component| component as f32);
+        let start = start as f32;
+        let ray_max = (limit as f32).min(f32::MAX);
+        let scale = 1.0_f32 / (ROOT_MAX - ROOT_MIN);
+        let translation = -ROOT_MIN * scale + 1.0;
+        let mut ray_d = direction.map(|component| component * scale);
+        let mut local_p = std::array::from_fn(|axis| {
+            (origin[axis] + direction[axis] * start) * scale + translation
+        });
+        let mut octant_mask = 0_u8;
         for axis in 0..3 {
-            let o = origin[axis];
-            let d = direction[axis];
-            let min = f64::from(ROOT_MIN);
-            let max = f64::from(ROOT_MAX);
-            if d > 0.0 {
-                let near = (min - o) / d;
-                let far = (max - o) / d;
-                root_near = root_near.max(near);
-                root_far = root_far.min(far);
-            } else if d < 0.0 {
-                let near = (max - o) / d;
-                let far = (min - o) / d;
-                root_near = root_near.max(near);
-                root_far = root_far.min(far);
-            } else if o < min || o > max {
-                intersects_root = false;
+            if ray_d[axis] > 0.0 {
+                octant_mask |= 1 << axis;
+                local_p[axis] = 3.0 - local_p[axis];
             }
+            local_p[axis] = local_p[axis].min(1.999_999_9);
+            ray_d[axis] = -ray_d[axis].abs();
         }
 
-        let position = origin + direction * start;
-        let inside_root = intersects_root
-            && start >= root_near
-            && start < root_far
-            && position.x >= f64::from(ROOT_MIN)
-            && position.x <= f64::from(ROOT_MAX)
-            && position.y >= f64::from(ROOT_MIN)
-            && position.y <= f64::from(ROOT_MAX)
-            && position.z >= f64::from(ROOT_MIN)
-            && position.z <= f64::from(ROOT_MAX);
-        if !inside_root {
-            let entry = root_near.max(start);
-            let end = if intersects_root && root_far > entry && root_near > start {
-                entry.min(limit)
-            } else {
-                limit
-            };
-            return WorldVolumeInterval {
-                end,
-                sigma_min: root.sigma_min,
-                sigma_max: root.sigma_max,
-            };
+        let mut trace = Self {
+            ray_p: std::array::from_fn(|axis| local_p[axis] - ray_d[axis] * start),
+            ray_d,
+            current_p: local_p.map(f32::to_bits),
+            octant_mask,
+            scale: MANTISSA_BITS,
+            next_scale: 0,
+            node_index: 0,
+            active_min: start,
+            active_max: ray_max,
+            ray_max,
+            root_mode: !local_p.iter().all(|component| *component > 1.0),
+        };
+        if !trace.root_mode {
+            trace.locate_leaf(octree);
+            trace.active_max = trace.ray_voxel_intersect();
         }
+        trace
+    }
 
-        let grid_position = [
-            (position.x - f64::from(ROOT_MIN)) / f64::from(VOXEL_SIZE),
-            (position.y - f64::from(ROOT_MIN)) / f64::from(VOXEL_SIZE),
-            (position.z - f64::from(ROOT_MIN)) / f64::from(VOXEL_SIZE),
-        ];
-        let mut cell_min = [0_usize; 3];
-        let mut cell_span = DENSITY_RESOLUTION;
-        let mut node_index = 0;
-
-        while self.nodes[node_index].first_child != LEAF {
-            let half = cell_span / 2;
-            let mut child = 0_usize;
-            for axis in 0..3 {
-                let boundary = (cell_min[axis] + half) as f64;
-                let upper = if direction[axis] > 0.0 {
-                    let crossing = (f64::from(ROOT_MIN) + boundary * f64::from(VOXEL_SIZE)
-                        - origin[axis])
-                        / direction[axis];
-                    start >= crossing
-                } else if direction[axis] < 0.0 {
-                    let crossing = (f64::from(ROOT_MIN) + boundary * f64::from(VOXEL_SIZE)
-                        - origin[axis])
-                        / direction[axis];
-                    start < crossing
-                } else {
-                    grid_position[axis] >= boundary
-                };
-                if upper {
-                    child |= 1 << axis;
-                    cell_min[axis] += half;
+    /// Returns `None` at ray completion or when Cycles skips the overlapping root tail.
+    pub(crate) fn interval(
+        &mut self,
+        octree: &WorldVolumeOctree,
+        start: f64,
+        limit: f64,
+    ) -> Option<WorldVolumeInterval> {
+        let start = start as f32;
+        if start >= self.ray_max {
+            return None;
+        }
+        while !self.root_mode && self.active_max < self.ray_max && start >= self.active_max {
+            self.active_min = self.active_max;
+            if self.next_scale > MANTISSA_BITS {
+                // Match Cycles' overlap termination before extending traversal to the root.
+                if (self.active_max - self.ray_max).abs() <= OVERLAP_EXP {
+                    return None;
                 }
+                self.root_mode = true;
+                self.node_index = 0;
+                self.active_max = self.ray_max;
+                break;
             }
-            node_index = self.nodes[node_index].first_child + child;
-            cell_span = half;
+            self.locate_leaf(octree);
+            self.active_max = self.ray_voxel_intersect();
         }
-
-        let mut end = limit;
-        for axis in 0..3 {
-            let d = direction[axis];
-            if d > 0.0 {
-                let boundary = f64::from(ROOT_MIN)
-                    + (cell_min[axis] + cell_span) as f64 * f64::from(VOXEL_SIZE);
-                end = end.min((boundary - origin[axis]) / d);
-            } else if d < 0.0 {
-                let boundary = f64::from(ROOT_MIN) + cell_min[axis] as f64 * f64::from(VOXEL_SIZE);
-                end = end.min((boundary - origin[axis]) / d);
-            }
-        }
-
-        let node = self.nodes[node_index];
-        WorldVolumeInterval {
-            end,
+        let node = octree.nodes[if self.root_mode { 0 } else { self.node_index }];
+        Some(WorldVolumeInterval {
+            end: f64::from(self.active_max).min(limit),
             sigma_min: node.sigma_min,
             sigma_max: node.sigma_max,
+        })
+    }
+
+    fn locate_leaf(&mut self, octree: &WorldVolumeOctree) {
+        let mut node_index = 0;
+        let mut scale = MANTISSA_BITS;
+        while octree.nodes[node_index].first_child != LEAF {
+            scale -= 1;
+            let mut child = 0;
+            for axis in 0..3 {
+                child |= (((self.current_p[axis] >> scale) & 1) as usize) << axis;
+            }
+            node_index =
+                octree.nodes[node_index].first_child + (child ^ self.octant_mask as usize);
         }
+        self.node_index = node_index;
+        self.scale = scale;
+    }
+
+    fn ray_voxel_intersect(&mut self) -> f32 {
+        let mask = u32::MAX << self.scale;
+        let bbox_min = self.current_p.map(|coordinate| f32::from_bits(coordinate & mask));
+        let mut intersect_t = [f32::MAX; 3];
+        for axis in 0..3 {
+            let t = (bbox_min[axis] - self.ray_p[axis]) / self.ray_d[axis];
+            if t > self.active_min {
+                intersect_t[axis] = t;
+            }
+        }
+        let t_max = intersect_t.into_iter().fold(f32::MAX, f32::min);
+        let half_size = 1.0 / (2 << VOLUME_OCTREE_MAX_DEPTH) as f32;
+        let next_p = std::array::from_fn(|axis| {
+            if intersect_t[axis] == t_max {
+                bbox_min[axis] - half_size
+            } else {
+                self.ray_d[axis] * t_max + self.ray_p[axis]
+            }
+        });
+        let diff = (self.current_p[0] ^ next_p[0].to_bits())
+            | (self.current_p[1] ^ next_p[1].to_bits())
+            | (self.current_p[2] ^ next_p[2].to_bits());
+        self.current_p = next_p.map(f32::to_bits);
+        self.next_scale = (32 - diff.leading_zeros()) as u8;
+        t_max.min(self.ray_max)
     }
 }
 
@@ -335,8 +376,12 @@ fn sobol_burley(mut rev_bit_index: u32, dimension: usize, scramble_seed: u32) ->
         result
     };
     result = reversed_bit_owen(result, scramble_seed).reverse_bits();
-    // Match Cycles' uint_to_float_excl rounding with a single f32 conversion.
-    (f64::from(result) / 4_294_967_808.0) as f32
+    uint_to_float_excl(result)
+}
+
+#[inline]
+fn uint_to_float_excl(value: u32) -> f32 {
+    value as f32 * (1.0_f32 / 4_294_967_808.0_f32)
 }
 
 #[inline]
@@ -510,7 +555,7 @@ mod tests {
     fn sobol_burley_samples_match_cycles_table_and_hash() {
         assert_eq!(
             super::sobol_burley_sample_3d(0).map(f32::to_bits),
-            [0x3f50_5455, 0x3ebb_c2e6, 0x3f7d_e3ea]
+            [0x3f50_5454, 0x3ebb_c2e7, 0x3f7d_e3ea]
         );
         assert_eq!(
             super::sobol_burley_sample_3d(1).map(f32::to_bits),
@@ -519,6 +564,16 @@ mod tests {
         assert_eq!(
             super::sobol_burley_sample_3d(65_535).map(f32::to_bits),
             [0x3e60_4818, 0x3f03_982b, 0x3f0e_90d5]
+        );
+    }
+
+    #[test]
+    fn uint_to_float_excl_matches_cycles_at_f32_rounding_boundary() {
+        let value = 0xffff_da80;
+        assert_eq!(super::uint_to_float_excl(value).to_bits(), 0x3f7f_ffd8);
+        assert_ne!(
+            super::uint_to_float_excl(value).to_bits(),
+            ((f64::from(value) / 4_294_967_808.0) as f32).to_bits()
         );
     }
 
@@ -548,39 +603,150 @@ mod tests {
     }
 
     #[test]
-    fn split_nodes_agree_with_exact_ray_leaf_intervals() {
+    fn split_nodes_and_outside_root_match_cycles_octree_traversal() {
         let mut cells = vec![(0.0, 0.0); DENSITY_CELL_COUNT];
         let hot_offset = 96 + DENSITY_RESOLUTION * (64 + 64 * DENSITY_RESOLUTION);
         cells[hot_offset] = (1.0, 1.0);
         let mut nodes = vec![OctreeNode::EMPTY];
         build_node(&mut nodes, 0, &cells, 0, [0; 3], DENSITY_RESOLUTION);
         let octree = WorldVolumeOctree { nodes };
-        let origin = DVec3::new(
-            -10_000.0,
-            -10_000.0 + 64.5 * 156.25,
-            -10_000.0 + 64.5 * 156.25,
-        );
+        let y = -10_000.0 + 64.5 * 156.25;
+        let origin = DVec3::new(-10_000.0, y, y);
         let direction = DVec3::X;
+        let limit = f64::INFINITY;
+        let mut trace = octree.trace(origin, direction, 0.0, limit);
 
-        let first = octree.interval(origin, direction, 0.0, f64::INFINITY);
-        assert_eq!(first.end, 10_000.0);
+        let clipped = trace.interval(&octree, 0.0, 1.0).unwrap();
+        assert_eq!(clipped.end, 1.0);
+        assert_eq!((clipped.sigma_min, clipped.sigma_max), (0.0, 0.0));
+        let first = trace.interval(&octree, clipped.end, limit).unwrap();
+        assert_eq!(first.end, 9_999.998_046_875);
         assert_eq!((first.sigma_min, first.sigma_max), (0.0, 0.0));
-
-        let second = octree.interval(origin, direction, first.end, f64::INFINITY);
-        assert_eq!(second.end, 15_000.0);
+        let second = trace.interval(&octree, first.end, limit).unwrap();
+        assert_eq!(second.end, 14_999.998_046_875);
         assert_eq!((second.sigma_min, second.sigma_max), (0.0, 0.0));
 
-        let hot = octree.interval(origin, direction, second.end, f64::INFINITY);
-        assert_eq!(hot.end, 15_156.25);
+        let hot = trace.interval(&octree, second.end, limit).unwrap();
+        assert_eq!(hot.end, 15_156.248_046_875);
         assert_eq!((hot.sigma_min, hot.sigma_max), (1.0, 1.0));
 
-        let outside = octree.interval(
-            DVec3::new(-20_000.0, origin.y, origin.z),
+        let mut approaching = octree.trace(
+            DVec3::new(-20_000.0, y, y),
             direction,
             0.0,
-            f64::INFINITY,
+            limit,
         );
-        assert_eq!(outside.end, 10_000.0);
-        assert_eq!((outside.sigma_min, outside.sigma_max), (0.0, 1.0));
+        let approaching = approaching.interval(&octree, 0.0, limit).unwrap();
+        assert_eq!(approaching.end, 9_999.998_046_875);
+        assert_eq!((approaching.sigma_min, approaching.sigma_max), (0.0, 0.0));
+
+        let mut outgoing = octree.trace(
+            DVec3::new(20_000.0, y, y),
+            direction,
+            0.0,
+            40_000.0,
+        );
+        let outgoing = outgoing.interval(&octree, 0.0, 40_000.0).unwrap();
+        assert_eq!(outgoing.end, 40_000.0);
+        assert_eq!((outgoing.sigma_min, outgoing.sigma_max), (0.0, 1.0));
+
+        let mut corner = octree.trace(
+            DVec3::new(-20_000.0, -20_000.0, y),
+            DVec3::new(1.0, 1.0, 0.0),
+            0.0,
+            limit,
+        );
+        let corner = corner.interval(&octree, 0.0, limit).unwrap();
+        assert_eq!(corner.end, 9_999.998_046_875);
+        assert_eq!((corner.sigma_min, corner.sigma_max), (0.0, 0.0));
+
+        let mut stationary_above_root =
+            octree.trace(DVec3::new(20_000.0, y, y), DVec3::Y, 0.0, 1.0);
+        let stationary_above_root = stationary_above_root.interval(&octree, 0.0, 1.0).unwrap();
+        assert_eq!(stationary_above_root.end, 1.0);
+        assert_eq!(
+            (
+                stationary_above_root.sigma_min,
+                stationary_above_root.sigma_max
+            ),
+            (0.0, 0.0)
+        );
+
+        let mut parallel_outside = octree.trace(
+            DVec3::new(15_000.0, 0.0, 20_000.0),
+            DVec3::new(0.0, 0.0, -1.0),
+            0.0,
+            100.0,
+        );
+        let parallel_outside = parallel_outside.interval(&octree, 0.0, 100.0).unwrap();
+        assert_eq!(parallel_outside.end, 100.0);
+        assert_eq!(
+            (parallel_outside.sigma_min, parallel_outside.sigma_max),
+            (0.0, 0.0)
+        );
+
+        let mut stationary_below_root =
+            octree.trace(DVec3::new(-10_000.0, y, y), DVec3::Y, 0.0, 1.0);
+        let stationary_below_root = stationary_below_root.interval(&octree, 0.0, 1.0).unwrap();
+        assert_eq!(stationary_below_root.end, 1.0);
+        assert_eq!(
+            (
+                stationary_below_root.sigma_min,
+                stationary_below_root.sigma_max
+            ),
+            (0.0, 1.0)
+        );
+
+        let mut leaving_on_face =
+            octree.trace(DVec3::new(10_000.0, y, y), direction, 0.0, 100.0);
+        let leaving_on_face = leaving_on_face.interval(&octree, 0.0, 100.0).unwrap();
+        assert_eq!(leaving_on_face.end, 100.0);
+        assert_eq!(
+            (leaving_on_face.sigma_min, leaving_on_face.sigma_max),
+            (0.0, 1.0)
+        );
+        let mut nodes = vec![OctreeNode {
+            sigma_min: 0.0,
+            sigma_max: 1.0,
+            first_child: 1,
+        }];
+        nodes.extend([OctreeNode::EMPTY; 8]);
+        let octree = WorldVolumeOctree { nodes };
+        let mut leaving_root =
+            octree.trace(DVec3::new(1.0, y, y), direction, 0.0, 20_000.0);
+        let edge_leaf = leaving_root.interval(&octree, 0.0, 20_000.0).unwrap();
+        assert_eq!(edge_leaf.end, 9_999.000_976_562_5);
+        assert_eq!((edge_leaf.sigma_min, edge_leaf.sigma_max), (0.0, 0.0));
+        let root_extrema = leaving_root.interval(&octree, edge_leaf.end, 20_000.0).unwrap();
+        assert_eq!(root_extrema.end, 20_000.0);
+        assert_eq!((root_extrema.sigma_min, root_extrema.sigma_max), (0.0, 1.0));
+
+        let root_exit = f32::from_bits(0x4479_fff1);
+        let within_limit = f32::from_bits(0x4479_fff4);
+        let mut within_tolerance =
+            octree.trace(DVec3::new(9_000.0, y, y), direction, 0.0, f64::from(within_limit));
+        let edge = within_tolerance
+            .interval(&octree, 0.0, f64::from(within_limit))
+            .unwrap();
+        assert_eq!(edge.end, f64::from(root_exit));
+        assert!(
+            within_tolerance
+                .interval(&octree, edge.end, f64::from(within_limit))
+                .is_none()
+        );
+
+        let outside_limit = f32::from_bits(0x4479_fffa);
+        let mut outside_tolerance =
+            octree.trace(DVec3::new(9_000.0, y, y), direction, 0.0, f64::from(outside_limit));
+        let edge = outside_tolerance
+            .interval(&octree, 0.0, f64::from(outside_limit))
+            .unwrap();
+        assert_eq!(edge.end, f64::from(root_exit));
+        let root_extrema = outside_tolerance
+            .interval(&octree, edge.end, f64::from(outside_limit))
+            .unwrap();
+        assert_eq!(root_extrema.end, f64::from(outside_limit));
+        assert_eq!((root_extrema.sigma_min, root_extrema.sigma_max), (0.0, 1.0));
+
     }
 }

@@ -14,7 +14,7 @@ use crate::{
     geom::{GeneratedCorners, TextureSpace, volume::VolumeData},
     graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
     image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
-    model::{Id, Material, RayKind, Registry, TextureRef, ThicknessMode},
+    model::{Id, Material, Registry, TextureRef, ThicknessMode},
 };
 
 /// Blender's Principled "Specular IOR Level" default: `SOCKET_IN_FLOAT(specular_ior_level,
@@ -1089,6 +1089,25 @@ pub(crate) enum GeometryAttributeValues {
     Vector(Vec<[f64; 3]>),
     Unsupported,
 }
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LightPathContext {
+    pub(crate) is_camera_ray: bool,
+    pub(crate) is_shadow_ray: bool,
+    pub(crate) is_diffuse_ray: bool,
+    pub(crate) is_glossy_ray: bool,
+    pub(crate) is_transmission_ray: bool,
+    pub(crate) is_volume_scatter_ray: bool,
+    pub(crate) is_reflection_ray: bool,
+    pub(crate) is_singular_ray: bool,
+    pub(crate) is_emission: bool,
+    pub(crate) ray_depth: u32,
+    pub(crate) transparent_depth: u32,
+    pub(crate) diffuse_depth: u32,
+    pub(crate) glossy_depth: u32,
+    pub(crate) transmission_depth: u32,
+    pub(crate) portal_depth: u32,
+}
+
 /// Per-hit coordinates and graph context used by procedural shader nodes.
 #[derive(Clone, Copy, Debug)]
 pub struct HitContext<'a> {
@@ -1145,12 +1164,8 @@ pub struct HitContext<'a> {
     pub light_falloff_distance: Option<f64>,
     /// Whether this hit is evaluated by Cycles semantics rather than the realtime shader path.
     pub path_traced: bool,
-    /// Ray class and path depths seen by `ShaderNodeLightPath`.
-    pub ray_kind: RayKind,
-    pub is_reflection_ray: bool,
-    pub is_singular_ray: bool,
-    pub ray_depth: u32,
-    pub transparent_depth: u32,
+    /// Cycles path visibility, flags, and counters for `ShaderNodeLightPath`.
+    pub(crate) light_path_context: Option<LightPathContext>,
     /// Whether this path hit came from a curve primitive without mesh UV or generic-attribute interpolation.
     pub(crate) hair_curve_hit: bool,
     /// The strand tangent supplied by the curve/particle hit.
@@ -1226,11 +1241,7 @@ impl<'a> HitContext<'a> {
             view_direction: DVec3::Z,
             light_falloff_distance: None,
             path_traced: false,
-            ray_kind: RayKind::Camera,
-            is_reflection_ray: false,
-            is_singular_ray: false,
-            ray_depth: 0,
-            transparent_depth: 0,
+            light_path_context: None,
             hair_curve_hit: false,
             hair_tangent: None,
             hair_random: None,
@@ -1252,19 +1263,8 @@ impl<'a> HitContext<'a> {
 
     /// Set the path state exposed by `ShaderNodeLightPath`.
     #[must_use]
-    pub const fn with_ray_context(
-        mut self,
-        ray_kind: RayKind,
-        is_reflection_ray: bool,
-        is_singular_ray: bool,
-        ray_depth: u32,
-        transparent_depth: u32,
-    ) -> Self {
-        self.ray_kind = ray_kind;
-        self.is_reflection_ray = is_reflection_ray;
-        self.is_singular_ray = is_singular_ray;
-        self.ray_depth = ray_depth;
-        self.transparent_depth = transparent_depth;
+    pub(crate) const fn with_light_path_context(mut self, context: LightPathContext) -> Self {
+        self.light_path_context = Some(context);
         self
     }
 
@@ -6411,19 +6411,35 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     }
 
     fn light_path(&self, id: &Id, socket: &str) -> Result<Value> {
+        let context = self
+            .hit_ctx
+            .light_path_context
+            .ok_or_else(|| unsupported_node_id(id.as_str(), socket))?;
         let value = match socket {
-            "Is Camera Ray" => self.hit_ctx.ray_kind == RayKind::Camera,
-            "Is Shadow Ray" => self.hit_ctx.ray_kind == RayKind::Shadow,
-            "Is Diffuse Ray" => self.hit_ctx.ray_kind == RayKind::Diffuse,
-            "Is Glossy Ray" => self.hit_ctx.ray_kind == RayKind::Glossy,
-            "Is Singular Ray" => self.hit_ctx.is_singular_ray,
-            "Is Reflection Ray" => self.hit_ctx.is_reflection_ray,
-            "Is Transmission Ray" => self.hit_ctx.ray_kind == RayKind::Transmission,
-            "Is Volume Scatter Ray" => self.hit_ctx.ray_kind == RayKind::VolumeScatter,
-            "Ray Depth" => return Ok(Value::Scalar(f64::from(self.hit_ctx.ray_depth))),
-            "Transparent Depth" => {
-                return Ok(Value::Scalar(f64::from(self.hit_ctx.transparent_depth)));
+            "Is Camera Ray" => context.is_camera_ray,
+            "Is Shadow Ray" => context.is_shadow_ray,
+            "Is Diffuse Ray" => context.is_diffuse_ray,
+            "Is Glossy Ray" => context.is_glossy_ray,
+            "Is Singular Ray" => context.is_singular_ray,
+            "Is Reflection Ray" => context.is_reflection_ray,
+            "Is Transmission Ray" => context.is_transmission_ray,
+            "Is Volume Scatter Ray" => context.is_volume_scatter_ray,
+            "Ray Depth" => {
+                let depth = f64::from(context.ray_depth);
+                let shadow_or_emission = context.is_shadow_ray || context.is_emission;
+                return Ok(Value::Scalar(
+                    depth + if shadow_or_emission { 1.0 } else { 0.0 },
+                ));
             }
+            "Transparent Depth" => {
+                return Ok(Value::Scalar(f64::from(context.transparent_depth)));
+            }
+            "Diffuse Depth" => return Ok(Value::Scalar(f64::from(context.diffuse_depth))),
+            "Glossy Depth" => return Ok(Value::Scalar(f64::from(context.glossy_depth))),
+            "Transmission Depth" => {
+                return Ok(Value::Scalar(f64::from(context.transmission_depth)));
+            }
+            "Ray Portal Depth" => return Ok(Value::Scalar(f64::from(context.portal_depth))),
             _ => return Err(unsupported_node_id(id.as_str(), socket)),
         };
         Ok(Value::Scalar(if value { 1.0 } else { 0.0 }))
@@ -10005,6 +10021,7 @@ mod tests {
         BsdfModel, BsdfParams, EeveeGBufferCandidate, EeveeGBufferLobe, EeveeGBufferMode,
         Evaluator, EvaluatorWorkspace, GeometryAttribute, GeometryAttributeValues, HairComponent,
         HairParametrization, HairScatteringModel, HitContext, HitDifferentials, HitUvLayers,
+        LightPathContext,
         MetallicFresnel, MicrofacetDistribution, PreparedMaterial, PrincipledHairParameters,
         SheenDistribution, SubsurfaceMethod, SurfaceShading, ToonComponent, Value as ShaderValue,
         color_lerp, evaluate_displacement, evaluate_surface, layer_index, layer_uv,
@@ -10216,6 +10233,40 @@ mod tests {
         (groups, graph_id, node_id)
     }
 
+    fn light_path_context(
+        ray_kind: RayKind,
+        is_reflection_ray: bool,
+        is_singular_ray: bool,
+        is_emission: bool,
+        counters: [u32; 6],
+    ) -> LightPathContext {
+        let [
+            ray_depth,
+            transparent_depth,
+            diffuse_depth,
+            glossy_depth,
+            transmission_depth,
+            portal_depth,
+        ] = counters;
+        LightPathContext {
+            is_camera_ray: ray_kind == RayKind::Camera,
+            is_shadow_ray: ray_kind == RayKind::Shadow,
+            is_diffuse_ray: ray_kind == RayKind::Diffuse,
+            is_glossy_ray: ray_kind == RayKind::Glossy,
+            is_transmission_ray: ray_kind == RayKind::Transmission,
+            is_volume_scatter_ray: ray_kind == RayKind::VolumeScatter,
+            is_reflection_ray,
+            is_singular_ray,
+            is_emission,
+            ray_depth,
+            transparent_depth,
+            diffuse_depth,
+            glossy_depth,
+            transmission_depth,
+            portal_depth,
+        }
+    }
+
     fn light_path_scalar(
         groups: &Registry<NodeGroup>,
         graph_id: &Id,
@@ -10232,7 +10283,7 @@ mod tests {
     }
 
     #[test]
-    fn light_path_outputs_follow_ray_kind_bounce_and_depth_context() {
+    fn light_path_outputs_follow_ray_visibility_and_path_state() {
         let (groups, graph_id, node_id) = light_path_test_graph();
         let outputs = [
             "Is Camera Ray",
@@ -10259,7 +10310,14 @@ mod tests {
             ),
         ];
         for (ray_kind, expected) in cases {
-            let context = HitContext::new(&groups).with_ray_context(ray_kind, false, false, 4, 2);
+            let path_state = light_path_context(
+                ray_kind,
+                false,
+                false,
+                false,
+                [4, 2, 3, 4, 5, 6],
+            );
+            let context = HitContext::new(&groups).with_light_path_context(path_state);
             for (output, expected) in outputs.into_iter().zip(expected) {
                 assert_eq!(
                     light_path_scalar(&groups, &graph_id, &node_id, output, &context),
@@ -10269,15 +10327,65 @@ mod tests {
             }
             assert_eq!(
                 light_path_scalar(&groups, &graph_id, &node_id, "Ray Depth", &context),
-                4.0,
+                if ray_kind == RayKind::Shadow { 5.0 } else { 4.0 },
             );
-            assert_eq!(
-                light_path_scalar(&groups, &graph_id, &node_id, "Transparent Depth", &context,),
-                2.0,
-            );
+            for (output, expected) in [
+                ("Transparent Depth", 2.0),
+                ("Diffuse Depth", 3.0),
+                ("Glossy Depth", 4.0),
+                ("Transmission Depth", 5.0),
+                ("Ray Portal Depth", 6.0),
+            ] {
+                assert_eq!(
+                    light_path_scalar(&groups, &graph_id, &node_id, output, &context),
+                    expected,
+                );
+            }
         }
 
-        let context = HitContext::new(&groups).with_ray_context(RayKind::Diffuse, true, true, 7, 3);
+        let path_state =
+            light_path_context(RayKind::Shadow, false, false, false, [u32::MAX, 0, 0, 0, 0, 0]);
+        let context = HitContext::new(&groups).with_light_path_context(path_state);
+        assert_eq!(
+            light_path_scalar(&groups, &graph_id, &node_id, "Ray Depth", &context),
+            f64::from(u32::MAX) + 1.0,
+        );
+
+        let path_state = light_path_context(
+            RayKind::Shadow,
+            false,
+            false,
+            true,
+            [4, 0, 0, 0, 0, 0],
+        );
+        let context = HitContext::new(&groups).with_light_path_context(path_state);
+        assert_eq!(
+            light_path_scalar(&groups, &graph_id, &node_id, "Ray Depth", &context),
+            5.0,
+            "Shadow and emission add one only once",
+        );
+
+        let path_state = light_path_context(
+            RayKind::Camera,
+            false,
+            false,
+            true,
+            [4, 0, 0, 0, 0, 0],
+        );
+        let context = HitContext::new(&groups).with_light_path_context(path_state);
+        assert_eq!(
+            light_path_scalar(&groups, &graph_id, &node_id, "Ray Depth", &context),
+            5.0,
+        );
+
+        let path_state = light_path_context(
+            RayKind::Diffuse,
+            true,
+            true,
+            false,
+            [7, 3, 0, 0, 0, 0],
+        );
+        let context = HitContext::new(&groups).with_light_path_context(path_state);
         assert_eq!(
             light_path_scalar(&groups, &graph_id, &node_id, "Is Reflection Ray", &context),
             1.0,
@@ -10286,17 +10394,32 @@ mod tests {
             light_path_scalar(&groups, &graph_id, &node_id, "Is Singular Ray", &context),
             1.0,
         );
+
+        let mut path_state = light_path_context(
+            RayKind::Transmission,
+            false,
+            false,
+            false,
+            [1, 2, 3, 4, 5, 6],
+        );
+        path_state.is_diffuse_ray = true;
+        path_state.is_glossy_ray = true;
+        let context = HitContext::new(&groups).with_light_path_context(path_state);
+        for output in ["Is Diffuse Ray", "Is Glossy Ray", "Is Transmission Ray"] {
+            assert_eq!(
+                light_path_scalar(&groups, &graph_id, &node_id, output, &context),
+                1.0,
+                "{output}",
+            );
+        }
     }
 
     #[test]
-    fn light_path_default_context_is_camera_ray_at_depth_zero() {
+    fn light_path_without_ray_context_is_unsupported() {
         let (groups, graph_id, node_id) = light_path_test_graph();
         let context = HitContext::new(&groups);
-        assert_eq!(
-            light_path_scalar(&groups, &graph_id, &node_id, "Is Camera Ray", &context),
-            1.0,
-        );
         for output in [
+            "Is Camera Ray",
             "Is Shadow Ray",
             "Is Diffuse Ray",
             "Is Glossy Ray",
@@ -10306,11 +10429,53 @@ mod tests {
             "Is Volume Scatter Ray",
             "Ray Depth",
             "Transparent Depth",
+            "Diffuse Depth",
+            "Glossy Depth",
+            "Transmission Depth",
+            "Ray Portal Depth",
         ] {
+            let error =
+                evaluate_input_node_output(&groups, &graph_id, &node_id, output, &context)
+                    .unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedFeature, "{output}");
             assert_eq!(
-                light_path_scalar(&groups, &graph_id, &node_id, output, &context),
-                0.0,
+                error.details["feature_id"],
+                json!(format!("shader.node.light_path.{output}")),
                 "{output}",
+            );
+        }
+    }
+
+    #[test]
+    fn surface_material_light_path_requires_ray_context_in_both_engines() {
+        let mut group = NodeGroup::new("Surface", GraphKind::Shader);
+        insert_node(&mut group, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(&mut group, "light_path", "ShaderNodeLightPath", json!({}));
+        insert_node(&mut group, "emission", "ShaderNodeEmission", json!({}));
+        link(
+            &mut group,
+            "light_path",
+            "Is Camera Ray",
+            "emission",
+            "Strength",
+        );
+        link(&mut group, "emission", "Emission", "output", "Surface");
+
+        let graph_id = Id::new("surface_graph".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), group);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        for path_traced in [true, false] {
+            let mut context = HitContext::new(&groups);
+            context.path_traced = path_traced;
+            let error = evaluate_surface(&material, &context).unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+            assert_eq!(
+                error.details["feature_id"],
+                json!("shader.node.light_path.Is Camera Ray"),
             );
         }
     }

@@ -13909,13 +13909,22 @@ fn material_shader_graph_import_losses(raw: &Value, material: &Value, losses: &m
         let Some(node_type) = node.get("type").and_then(Value::as_str) else {
             continue;
         };
-        if !crate::shader::shader_node_type_supported(node_type) {
+        if node_type == "ShaderNodeLightPath"
+            || !crate::shader::shader_node_type_supported(node_type)
+        {
+            let reason = if node_type == "ShaderNodeLightPath" {
+                format!(
+                    "Shader node `{name}` of type `{node_type}` requires ray state unavailable to Potter's material shader evaluator; the node is preserved"
+                )
+            } else {
+                format!(
+                    "Shader node `{name}` of type `{node_type}` is unsupported by Potter's shader evaluator; the node is preserved"
+                )
+            };
             losses.push(loss(
                 "blender.material.shader_node.unsupported",
                 material_name,
-                &format!(
-                    "Shader node `{name}` of type `{node_type}` is unsupported by Potter's shader evaluator; the node is preserved"
-                ),
+                &reason,
             ));
         }
         let properties = node.get("properties").unwrap_or(&Value::Null);
@@ -30632,6 +30641,63 @@ fn shader_import_losses_only_report_unavailable_outputs() -> Result<()> {
         loss.feature_id == "shader.node.VectorTransform:WORLD_to_CAMERA:camera_matrices"
     }));
     Ok(())
+}
+#[test]
+fn material_shader_import_reports_light_path_context_loss() {
+    let material = json!({
+        "name": "Material",
+        "nodes": {
+            "nodes": [
+                {"name": "Output", "type": "ShaderNodeOutputMaterial", "properties": {"is_active_output": true}},
+                {"name": "Mix", "type": "ShaderNodeMixShader"},
+                {"name": "Light Path", "type": "ShaderNodeLightPath"},
+                {"name": "Emission A", "type": "ShaderNodeEmission"},
+                {"name": "Emission B", "type": "ShaderNodeEmission"}
+            ],
+            "links": [
+                {"from_node": "Light Path", "from_socket": "Is Camera Ray", "to_node": "Mix", "to_socket": "Fac"},
+                {"from_node": "Emission A", "from_socket": "Emission", "to_node": "Mix", "to_socket": "Shader1"},
+                {"from_node": "Emission B", "from_socket": "Emission", "to_node": "Mix", "to_socket": "Shader2"},
+                {"from_node": "Mix", "from_socket": "Shader", "to_node": "Output", "to_socket": "Surface"}
+            ]
+        }
+    });
+    let mut losses = Vec::new();
+    material_shader_graph_import_losses(&Value::Null, &material, &mut losses);
+    assert!(crate::shader::shader_node_type_supported("ShaderNodeLightPath"));
+    assert!(losses.iter().any(|loss| {
+        loss.feature_id == "blender.material.shader_node.unsupported"
+            && loss.data_id.as_deref() == Some("Material")
+            && loss.reason.contains("requires ray state")
+    }));
+}
+
+#[test]
+fn world_volume_light_path_is_not_a_material_node_import_loss() {
+    let raw = json!({
+        "scenes": [{
+            "name": "Scene",
+            "render": {"engine": "path"},
+            "world": {
+                "nodes": {
+                    "nodes": [
+                        {"name": "Output", "type": "ShaderNodeOutputWorld", "properties": {"is_active_output": true}},
+                        {"name": "Light Path", "type": "ShaderNodeLightPath"},
+                        {"name": "Volume", "type": "ShaderNodeVolumePrincipled"}
+                    ],
+                    "links": [
+                        {"from_node": "Light Path", "from_socket": "Is Camera Ray", "to_node": "Volume", "to_socket": "Density"},
+                        {"from_node": "Volume", "from_socket": "Volume", "to_node": "Output", "to_socket": "Volume"}
+                    ]
+                }
+            }
+        }]
+    });
+    assert!(
+        !import_losses(&raw).iter().any(|loss| {
+            loss.feature_id == "blender.material.shader_node.unsupported"
+        })
+    );
 }
 
 #[test]

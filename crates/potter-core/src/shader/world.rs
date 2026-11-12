@@ -1416,6 +1416,58 @@ mod tests {
             [0.0; 2]
         );
     }
+
+    #[test]
+    fn light_path_world_surface_remains_unsupported_in_both_engines() -> Result<()> {
+        let graph_id = Id::new("world_graph")?;
+        let output_id = Id::new("output")?;
+        let light_path_id = Id::new("light_path")?;
+        let background_id = Id::new("background")?;
+        let mut group = NodeGroup::new("World", GraphKind::Shader);
+        group.nodes.insert(
+            output_id.clone(),
+            GraphNode::new("ShaderNodeOutputWorld"),
+        );
+        group.nodes.insert(
+            light_path_id.clone(),
+            GraphNode::new("ShaderNodeLightPath"),
+        );
+        group.nodes.insert(
+            background_id.clone(),
+            GraphNode::new("ShaderNodeBackground"),
+        );
+        group.links.push(GraphLink {
+            from_node: light_path_id,
+            from_socket: "Is Camera Ray".to_owned(),
+            to_node: background_id.clone(),
+            to_socket: "Strength".to_owned(),
+        });
+        group.links.push(GraphLink {
+            from_node: background_id,
+            from_socket: "Background".to_owned(),
+            to_node: output_id,
+            to_socket: "Surface".to_owned(),
+        });
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), group);
+        let world = World {
+            node_tree: Some(graph_id),
+            ..World::default()
+        };
+        for path_traced in [true, false] {
+            let error = evaluate_world(
+                &world,
+                &groups,
+                &std::collections::BTreeMap::new(),
+                DVec3::Z,
+                path_traced,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        }
+        Ok(())
+    }
+
     #[test]
     fn mirror_ball_uses_eevee_safe_normalize_cutoff() -> Result<()> {
         let mut node = GraphNode::new("ShaderNodeTexEnvironment");
