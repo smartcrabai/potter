@@ -8817,6 +8817,49 @@ fn source_mix_factor(
     })
 }
 
+/// Source-folded mix-arm selection for consumers outside the shader evaluator.
+pub(crate) struct SourceMixInputPruner<'a> {
+    group: &'a NodeGroup,
+    node_groups: &'a Registry<NodeGroup>,
+    material: Material,
+    fold_index: super::inline_fold::FoldIndex,
+    failure: RefCell<Option<SourceFoldFailure>>,
+}
+
+impl<'a> SourceMixInputPruner<'a> {
+    #[must_use]
+    pub(crate) fn new(
+        graph_id: &Id,
+        group: &'a NodeGroup,
+        node_groups: &'a Registry<NodeGroup>,
+    ) -> Self {
+        Self {
+            group,
+            node_groups,
+            material: Material::default(),
+            fold_index: super::inline_fold::FoldIndex::new(graph_id, group, node_groups),
+            failure: RefCell::new(None),
+        }
+    }
+
+    /// Whether the linked input is discarded by a source-folded constant Mix factor.
+    /// Unknown or dynamic factors conservatively keep both arms.
+    pub(crate) fn input_is_pruned(&self, node_id: &Id, socket: &str) -> bool {
+        let Some(node) = self.group.nodes.get(node_id) else {
+            return false;
+        };
+        let source = SourceFoldResolver {
+            group: self.group,
+            node_groups: self.node_groups,
+            material: &self.material,
+            fold_index: &self.fold_index,
+            input_binding: None,
+            failure: &self.failure,
+        };
+        source_mix_input_is_pruned(&source, node_id, socket, node)
+    }
+}
+
 fn source_socket_default<'a>(node: &'a GraphNode, socket: &str) -> Option<&'a JsonValue> {
     node.inputs
         .get(socket)
@@ -11552,6 +11595,62 @@ mod tests {
         let flags = prepared_material(graph).eevee_closure_flags().unwrap();
         assert_ne!(flags & super::EEVEE_CLOSURE_DIFFUSE, 0);
         assert_eq!(flags & super::EEVEE_CLOSURE_TRANSPARENCY, 0);
+    }
+
+    #[test]
+    fn source_mix_input_pruner_folds_linked_value_and_math_factors() {
+        let pruned_inputs = |factor: f64, through_math: bool| {
+            let mut graph = NodeGroup::new("Folded Mix", GraphKind::Shader);
+            insert_node(&mut graph, "mix", "ShaderNodeMixShader", json!({}));
+            if through_math {
+                insert_node(&mut graph, "math", "ShaderNodeMath", json!({}));
+                set_properties(
+                    &mut graph,
+                    "math",
+                    json!({"operation":if factor == 0.0 {"MULTIPLY"} else {"ADD"}}),
+                );
+                for (id, value) in [
+                    ("first", if factor == 0.0 { 0.0 } else { 0.5 }),
+                    ("second", if factor == 0.0 { 1.0 } else { 0.5 }),
+                ] {
+                    insert_node(&mut graph, id, "ShaderNodeValue", json!({}));
+                    set_properties(
+                        &mut graph,
+                        id,
+                        json!({"potter_output_defaults":[{"identifier":"Value","default":value}]}),
+                    );
+                    link(&mut graph, id, "Value", "math", if id == "first" {
+                        "Value"
+                    } else {
+                        "Value_001"
+                    });
+                }
+                link(&mut graph, "math", "Value", "mix", "Fac");
+            } else {
+                insert_node(&mut graph, "factor", "ShaderNodeValue", json!({}));
+                set_properties(
+                    &mut graph,
+                    "factor",
+                    json!({"potter_output_defaults":[{"identifier":"Value","default":factor}]}),
+                );
+                link(&mut graph, "factor", "Value", "mix", "Fac");
+            }
+            let graph_id = Id::new("folded_mix_graph").unwrap();
+            let mut groups = Registry::new();
+            groups.insert(graph_id.clone(), graph);
+            let graph = groups.get(&graph_id).unwrap();
+            let pruner = super::SourceMixInputPruner::new(&graph_id, graph, &groups);
+            let mix_id = Id::new("mix").unwrap();
+            (
+                pruner.input_is_pruned(&mix_id, "Shader_001"),
+                pruner.input_is_pruned(&mix_id, "Shader"),
+            )
+        };
+
+        for through_math in [false, true] {
+            assert_eq!(pruned_inputs(0.0, through_math), (true, false));
+            assert_eq!(pruned_inputs(1.0, through_math), (false, true));
+        }
     }
 
     #[test]
