@@ -34,8 +34,8 @@ const RELATIVE_TOLERANCE: f64 = 0.1;
 const ABSOLUTE_TOLERANCE: f64 = 0.002;
 
 /// A black world, a diffuse floor at z = 0, and a point light at (-5, 0, 5). The orthographic camera sees
-/// x, y in [-0.4, 0.4]. The optional fog box spans x in [0.5, 1.5], so camera rays and the floor's shadow rays to the
-/// light never enter it; only the floor's diffuse bounce rays do.
+/// x, y in [-0.4, 0.4]. Both scenes contain the same fog box over x in [0.5, 1.5], so camera rays and the floor's
+/// shadow rays to the light never enter it; only the floor's diffuse bounce rays do.
 const FOG_SCENE_SCRIPT: &str = r#"
 import bpy
 import sys
@@ -77,22 +77,21 @@ camera.location = (0.0, 0.0, 10.0)
 camera.rotation_euler = (0.0, 0.0, 0.0)
 scene.camera = camera
 
-if with_fog:
-    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(1.0, 0.0, 1.0))
-    box = bpy.context.object
-    fog = bpy.data.materials.new("Fog")
-    fog.use_nodes = True
-    tree = fog.node_tree
-    output = next(node for node in tree.nodes if node.type == "OUTPUT_MATERIAL")
-    for node in list(tree.nodes):
-        if node.type == "BSDF_PRINCIPLED":
-            tree.nodes.remove(node)
-    volume = tree.nodes.new("ShaderNodeVolumePrincipled")
-    volume.inputs["Density"].default_value = 4.0
-    volume.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
-    volume.inputs["Anisotropy"].default_value = 0.0
-    tree.links.new(volume.outputs["Volume"], output.inputs["Volume"])
-    box.data.materials.append(fog)
+bpy.ops.mesh.primitive_cube_add(size=1.0, location=(1.0, 0.0, 1.0))
+box = bpy.context.object
+fog = bpy.data.materials.new("Fog")
+fog.use_nodes = True
+tree = fog.node_tree
+output = next(node for node in tree.nodes if node.type == "OUTPUT_MATERIAL")
+for node in list(tree.nodes):
+    if node.type == "BSDF_PRINCIPLED":
+        tree.nodes.remove(node)
+volume = tree.nodes.new("ShaderNodeVolumePrincipled")
+volume.inputs["Density"].default_value = 4.0 if with_fog else 0.0
+volume.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+volume.inputs["Anisotropy"].default_value = 0.0
+tree.links.new(volume.outputs["Volume"], output.inputs["Volume"])
+box.data.materials.append(fog)
 
 bpy.ops.wm.save_as_mainfile(filepath=out_path)
 "#;
@@ -246,9 +245,10 @@ fn transmission_events_follow_cycles_bounce_budget() -> TestResult {
     Ok(())
 }
 
-/// At `max_bounces = 0` the floor's bounce ray leaves its last allowed bounce as a terminal ray. It may cross the
-/// fog only as attenuation, so the render with the fog box equals the render without it (a black world gives no
-/// other contribution). The fog must not change any pixel that the floor's own direct light reaches.
+/// Both renders have the same volume box, keeping the Source volume sampler active for the zero-density control and
+/// fog. At `max_bounces = 0`, the floor's bounce ray leaves its last allowed bounce as a terminal ray. It may cross
+/// the fog only as attenuation, so the render with fog equals the zero-density control (a black world gives no other
+/// contribution). The fog must not change any pixel that the floor's own direct light reaches.
 #[test]
 fn terminal_bounce_ray_attenuates_through_fog_without_in_scatter() -> TestResult {
     let Some(blender) = blender_executable() else {
@@ -257,13 +257,13 @@ fn terminal_bounce_ray_attenuates_through_fog_without_in_scatter() -> TestResult
     };
     let root = tempdir()?;
     let script = write_script(root.path(), "fog_scene.py", FOG_SCENE_SCRIPT)?;
-    let plain_blend = root.path().join("plain.blend");
+    let control_blend = root.path().join("control.blend");
     let fog_blend = root.path().join("fog.blend");
     run_blender_arguments(
         &blender,
         &script,
         None,
-        &[plain_blend.as_path(), Path::new("plain")],
+        &[control_blend.as_path(), Path::new("control")],
     )?;
     run_blender_arguments(
         &blender,
@@ -271,29 +271,30 @@ fn terminal_bounce_ray_attenuates_through_fog_without_in_scatter() -> TestResult
         None,
         &[fog_blend.as_path(), Path::new("fog")],
     )?;
-    let (plain_project, _) = import_blend(&blender, root.path(), "plain_project", &plain_blend)?;
+    let (control_project, _) =
+        import_blend(&blender, root.path(), "control_project", &control_blend)?;
     let (fog_project, _) = import_blend(&blender, root.path(), "fog_project", &fog_blend)?;
 
-    configure_render(&plain_project, root.path(), 17, 0, 128)?;
+    configure_render(&control_project, root.path(), 17, 0, 128)?;
     configure_render(&fog_project, root.path(), 17, 0, 128)?;
-    let plain = render_frame(&plain_project, root.path(), "plain_mb0")?;
+    let control = render_frame(&control_project, root.path(), "control_mb0")?;
     let fog = render_frame(&fog_project, root.path(), "fog_mb0")?;
 
-    let mut plain_total = 0.0;
+    let mut control_total = 0.0;
     let mut largest_difference: f64 = 0.0;
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let a = sample_pixel(&plain, [x, y]);
+            let a = sample_pixel(&control, [x, y]);
             let b = sample_pixel(&fog, [x, y]);
-            plain_total += a[0] + a[1] + a[2];
+            control_total += a[0] + a[1] + a[2];
             for channel in 0..4 {
                 largest_difference = largest_difference.max((a[channel] - b[channel]).abs());
             }
         }
     }
     assert!(
-        plain_total > 1.0e-3,
-        "the floor's direct light should be visible; plain render total {plain_total}"
+        control_total > 1.0e-3,
+        "the floor's direct light should be visible; zero-density control render total {control_total}"
     );
     assert!(
         largest_difference <= 1.0e-6,

@@ -228,7 +228,10 @@ struct VolumeInstance<'a> {
     voxel_size: f64,
     meters_per_unit: f64,
     density_range: Option<(f64, f64)>,
+    /// Whether density or shader coefficients vary across the padded voxel bounds.
     source_heterogeneous: bool,
+    /// Uses Cycles' heterogeneous source transport rather than the native voxel marcher.
+    requires_source_transport: bool,
     source_octree: Option<Arc<VolumeOctree>>,
     albedo: DVec3,
     /// The phase lobes of the volume's Volume closures, one per closure (`scatter_lobes`).
@@ -1706,6 +1709,8 @@ struct LightSample {
     direction: DVec3,
     distance: f64,
     radiance: DVec3,
+    /// Cycles' projected sphere-surface point when source UVs are replayed.
+    sampled_point: Option<DVec3>,
     /// Solid-angle density of `direction` under light sampling. Only set for hittable lights.
     pdf: f64,
 }
@@ -2218,6 +2223,22 @@ enum VolumeGuideClass {
     None,
 }
 
+#[derive(Clone, Copy)]
+struct SourceLightSample {
+    uv: [f32; 2],
+    selection: f64,
+}
+
+#[derive(Clone, Copy)]
+enum VolumeGuideNeeSelection {
+    Legacy,
+    None,
+    Emitter {
+        emitter: light_tree::SampledEmitter,
+        probability: f64,
+    },
+}
+
 struct VolumeGuidePath<'a> {
     read: VolumeGuidingRead,
     accumulator: &'a mut VolumeGuidingAccumulator,
@@ -2246,9 +2267,17 @@ impl VolumeGuidePath<'_> {
     }
 
     fn add_with_class(&mut self, contribution: DVec3, class: VolumeGuideClass) {
+        self.add_adaptive(contribution);
+        self.add_guide_with_class(contribution, class);
+    }
+
+    fn add_adaptive(&mut self, contribution: DVec3) {
         if let Some(adaptive) = self.adaptive.as_deref_mut() {
             adaptive.add_contribution(self.sample_index, contribution.as_vec3());
         }
+    }
+
+    fn add_guide_with_class(&mut self, contribution: DVec3, class: VolumeGuideClass) {
         match class {
             VolumeGuideClass::Scatter => self.accumulator.add_scatter(contribution.as_vec3()),
             VolumeGuideClass::Transmit => self.accumulator.add_transmit(contribution.as_vec3()),
@@ -2283,9 +2312,46 @@ fn volume_guide_target<'a, 'path>(
     })
 }
 
-fn add_volume_guide_contribution(target: &mut VolumeGuideTarget<'_, '_>, contribution: DVec3) {
+fn volume_guide_nee_selection(
+    source_light_sample: Option<SourceLightSample>,
+    light_selection: LightSelectionPdfs<'_>,
+    query: LightTreeQuery,
+    lights: &[PointLight],
+) -> VolumeGuideNeeSelection {
+    let Some(source_light_sample) = source_light_sample else {
+        return VolumeGuideNeeSelection::Legacy;
+    };
+    light_selection
+        .sampled_emitter(source_light_sample.selection, query, lights)
+        .filter(|(_, probability)| *probability > 0.0)
+        .map_or(VolumeGuideNeeSelection::None, |(emitter, probability)| {
+            VolumeGuideNeeSelection::Emitter {
+                emitter,
+                probability,
+            }
+        })
+}
+
+fn add_volume_guide_nee_contribution(
+    target: &mut VolumeGuideTarget<'_, '_>,
+    selection: VolumeGuideNeeSelection,
+    emitter: light_tree::SampledEmitter,
+    contribution: DVec3,
+) {
     if let Some((path, class)) = target {
-        path.add_with_class(contribution, *class);
+        match selection {
+            VolumeGuideNeeSelection::Legacy => path.add_with_class(contribution, *class),
+            VolumeGuideNeeSelection::None => path.add_adaptive(contribution),
+            VolumeGuideNeeSelection::Emitter {
+                emitter: selected,
+                probability,
+            } => {
+                path.add_adaptive(contribution);
+                if selected == emitter && probability > 0.0 {
+                    path.add_guide_with_class(contribution / probability, *class);
+                }
+            }
+        }
     }
 }
 
@@ -2651,7 +2717,9 @@ fn render_row_batch(
                 }
                 None => None,
             };
-            let worker_guide_reads = guide_reads;
+            let start = rows.start * job.tile.buffer_width as usize;
+            let end = start + band_len;
+            let worker_guide_reads = guide_reads.map(|reads| reads.map(|reads| &reads[start..end]));
             let mut worker_guide_accumulators = [None, None];
             for eye in 0..2 {
                 worker_guide_accumulators[eye] = match guide_accumulators_rest[eye].take() {
@@ -3125,7 +3193,11 @@ pub(super) fn render(
     )?;
     let (world_volume, world_heterogeneous, world_homogeneous) =
         collect_world_volume_media(doc, snapshot, images)?;
-    if world_heterogeneous.is_some() || volumes.iter().any(|volume| volume.source_heterogeneous) {
+    if world_heterogeneous.is_some()
+        || volumes
+            .iter()
+            .any(|volume| volume.requires_source_transport)
+    {
         build_volume_source_octrees(&mut volumes, &volume_temperatures)?;
     }
     let path_world = scene_world(doc, snapshot);
@@ -6203,6 +6275,7 @@ fn eevee_volume_light_sample(light: &PointLight, point: DVec3) -> Option<LightSa
         distance,
         radiance,
         pdf: 0.0,
+        sampled_point: None,
     })
 }
 /// EEVEE stores each froxel's accumulated source in an `UFLOAT_11_11_10` image before integration.
@@ -6870,6 +6943,7 @@ struct NextEventSettings<'tree> {
     bounce: u32,
     transparent_depth: u32,
     source_rng_offset: u32,
+    source_light_sample: Option<SourceLightSample>,
     light_selection: LightSelectionPdfs<'tree>,
     light_sampling_threshold: f64,
     world: WorldPathSettings,
@@ -7053,6 +7127,49 @@ impl LightSelectionPdfs<'_> {
         })
     }
 
+    fn sampled_emitter(
+        self,
+        sample: f64,
+        query: LightTreeQuery,
+        lights: &[PointLight],
+    ) -> Option<(light_tree::SampledEmitter, f64)> {
+        if let Some(tree) = self.tree {
+            return tree.sample(
+                sample,
+                query.point,
+                query.normal_or_direction,
+                query.distance,
+                query.volume,
+                query.has_transmission,
+            );
+        }
+
+        let supported_probability = lights
+            .iter()
+            .filter(|light| cycles_light_selection_eligible(light))
+            .count() as f64
+            * self.lamps
+            + self.world;
+        let unsupported_probability = (1.0 - supported_probability).max(0.0);
+        if sample < unsupported_probability {
+            return None;
+        }
+        let mut remaining = sample - unsupported_probability;
+        for (index, light) in lights.iter().enumerate() {
+            if !cycles_light_selection_eligible(light) || self.lamps <= 0.0 {
+                continue;
+            }
+            if remaining < self.lamps {
+                return Some((light_tree::SampledEmitter::Lamp(index), self.lamps));
+            }
+            remaining -= self.lamps;
+        }
+        if self.world > 0.0 && remaining < self.world {
+            return Some((light_tree::SampledEmitter::World, self.world));
+        }
+        None
+    }
+
     fn lamp_pdfs(self, query: LightTreeQuery, output: &mut Vec<f64>) {
         if let Some(tree) = self.tree {
             tree.lamp_pdfs(
@@ -7080,6 +7197,16 @@ fn world_path_settings(world: Option<&World>) -> WorldPathSettings {
 
 /// Flat Cycles light selection (`scene/light.cpp:729-744`): uniform over contributing lights and the sampled world,
 /// halved when an eligible emissive-triangle area exists. `sampling_method == NONE` excludes the world from this count.
+fn cycles_light_selection_eligible(light: &PointLight) -> bool {
+    !(light.kind == LightType::Area && light.is_portal)
+        && light.energy > 0.0
+        && light.color.max_element() > 0.0
+        && (light.kind != LightType::Area
+            || light.area.is_some_and(|area| {
+                area.area > 0.0 && area.axis_u != DVec3::ZERO && area.axis_v != DVec3::ZERO
+            }))
+}
+
 fn cycles_light_selection_pdfs(
     lights: &[PointLight],
     world_active: bool,
@@ -7087,15 +7214,7 @@ fn cycles_light_selection_pdfs(
 ) -> LightSelectionPdfs<'static> {
     let lamp_count = lights
         .iter()
-        .filter(|light| {
-            !(light.kind == LightType::Area && light.is_portal)
-                && light.energy > 0.0
-                && light.color.max_element() > 0.0
-                && (light.kind != LightType::Area
-                    || light.area.is_some_and(|area| {
-                        area.area > 0.0 && area.axis_u != DVec3::ZERO && area.axis_v != DVec3::ZERO
-                    }))
-        })
+        .filter(|light| cycles_light_selection_eligible(light))
         .count();
     let light_count = lamp_count as f64 + f64::from(u32::from(world_active));
     let pdf = if light_count == 0.0 {
@@ -7845,6 +7964,127 @@ fn volume_principled_needs_volume_attributes(
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(1.0);
     !density_attribute.is_empty() || (density > 0.0 && !color_attribute.is_empty())
+}
+fn shader_graph_has_spatial_volume_shader(doc: &SceneDoc, group_id: &Id) -> bool {
+    shader_graph_is_spatially_varying(
+        doc,
+        group_id,
+        "ShaderNodeOutputMaterial",
+        "Volume",
+        None,
+        &mut WorldShaderVariabilityState::default(),
+        None,
+    )
+}
+
+fn volume_principled_reads_nonprimary_attributes(
+    node_id: &Id,
+    group: &crate::graph::NodeGroup,
+    node: &crate::graph::GraphNode,
+) -> bool {
+    if !matches!(
+        node.node_type.as_str(),
+        "ShaderNodeVolumePrincipled" | "VolumePrincipled" | "PrincipledVolume"
+    ) || !volume_socket_is_active(group, node_id, node, "Density", 1.0)
+    {
+        return false;
+    }
+    let density = node
+        .inputs
+        .get("Density")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(1.0);
+    if density <= 0.0 {
+        return false;
+    }
+    let density_attribute = node
+        .inputs
+        .get("Density Attribute")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("density");
+    let color_attribute = node
+        .inputs
+        .get("Color Attribute")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    (!density_attribute.is_empty() && density_attribute != "density") || !color_attribute.is_empty()
+}
+
+fn shader_graph_reads_nonprimary_volume_attributes(doc: &SceneDoc, group_id: &Id) -> bool {
+    shader_graph_output_matches_node(
+        doc,
+        group_id,
+        "ShaderNodeOutputMaterial",
+        "Volume",
+        &volume_principled_reads_nonprimary_attributes,
+        &mut WorldShaderVariabilityState::default(),
+        None,
+    )
+}
+fn volume_node_may_scatter(
+    node_id: &Id,
+    group: &crate::graph::NodeGroup,
+    node: &crate::graph::GraphNode,
+) -> bool {
+    if !matches!(
+        node.node_type.as_str(),
+        "ShaderNodeVolumeScatter"
+            | "VolumeScatter"
+            | "ShaderNodeVolumePrincipled"
+            | "VolumePrincipled"
+            | "PrincipledVolume"
+    ) || !volume_socket_is_active(group, node_id, node, "Density", 1.0)
+    {
+        return false;
+    }
+    let density = node
+        .inputs
+        .get("Density")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(1.0);
+    if density <= 0.0 {
+        return false;
+    }
+    if node.node_type != "ShaderNodeVolumeScatter"
+        && node.node_type != "VolumeScatter"
+        && node
+            .inputs
+            .get("Color Attribute")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|attribute| !attribute.is_empty())
+    {
+        return true;
+    }
+    if group
+        .links
+        .iter()
+        .any(|link| link.to_node == *node_id && link.to_socket == "Color")
+    {
+        return true;
+    }
+    let Some(color) = node
+        .inputs
+        .get("Color")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return true;
+    };
+    color
+        .iter()
+        .take(3)
+        .any(|channel| channel.as_f64().is_none_or(|value| value != 0.0))
+}
+
+fn shader_graph_may_scatter(doc: &SceneDoc, group_id: &Id) -> bool {
+    shader_graph_output_matches_node(
+        doc,
+        group_id,
+        "ShaderNodeOutputMaterial",
+        "Volume",
+        &volume_node_may_scatter,
+        &mut WorldShaderVariabilityState::default(),
+        None,
+    )
 }
 
 fn shader_graph_has_spatial_volume_effect(
@@ -9412,8 +9652,12 @@ fn trace_path_with_guiding(
         let voxel_channel_pdf = grid.as_ref().map_or(DVec3::splat(1.0 / 3.0), |grid| {
             grid_channel_pdf(grid, throughput)
         });
-        let heterogeneous_path =
-            heterogeneous_world.is_some() || grid.as_ref().is_some_and(|grid| grid.heterogeneous);
+        // Only generated, constant pure absorption stays on native voxel marching.
+        // Source files, temperature inputs, scattering, and spatial volume effects use Source tracking.
+        let heterogeneous_path = heterogeneous_world.is_some()
+            || grid
+                .as_ref()
+                .is_some_and(|grid| grid.heterogeneous && grid.requires_source_transport);
         update_active_volume_indices(volumes, origin, direction, ray, &mut active_volume_indices);
         let mut roulette_terminated = false;
         // Roulette compensation follows continuation semantics; terminal lamps/background stay undivided
@@ -9517,6 +9761,9 @@ fn trace_path_with_guiding(
         } else {
             None
         };
+        let source_light_sample = method.and_then(|_| {
+            source_index.map(|source_index| sample_source_light(source_index, rng_offset))
+        });
         let needs_source_r5 = method.is_some()
             || (!terminal && grid.is_none() && heterogeneous_world.is_none() && stack.is_some());
         let source_r5 = if needs_source_r5 {
@@ -9533,15 +9780,8 @@ fn trace_path_with_guiding(
         } else {
             None
         };
-        let (mut choices, source_strategy) = equiangular_choices(
-            lights,
-            origin,
-            method,
-            source_index,
-            rng_offset,
-            source_r5,
-            rng,
-        )?;
+        let (mut choices, source_strategy) =
+            equiangular_choices(lights, origin, method, source_light_sample, source_r5, rng)?;
         let path_sample_u = source_strategy
             .map(|strategy| strategy.sample)
             .or_else(|| source_r5.map(f64::from));
@@ -9606,6 +9846,11 @@ fn trace_path_with_guiding(
             heterogeneous_volume_tree_query(origin, direction, span_start, span_length)
         } else {
             volume_tree_query(origin, direction, span_start, span_length)
+        };
+        let nee_guide_selection = if guide.is_some() {
+            volume_guide_nee_selection(source_light_sample, light_selection, tree_query, lights)
+        } else {
+            VolumeGuideNeeSelection::None
         };
         if method.is_some() {
             light_selection.lamp_pdfs(tree_query, &mut light_tree_pdfs);
@@ -10042,7 +10287,12 @@ fn trace_path_with_guiding(
                     &mut guide,
                     (bounce == 0).then_some(VolumeGuideClass::Scatter),
                 );
-                add_volume_guide_contribution(&mut target, contribution);
+                add_volume_guide_nee_contribution(
+                    &mut target,
+                    nee_guide_selection,
+                    light_tree::SampledEmitter::Lamp(index),
+                    contribution,
+                );
             }
         }
         if heterogeneous_path
@@ -10109,6 +10359,7 @@ fn trace_path_with_guiding(
                     bounce,
                     transparent_depth: transparent_bounce,
                     source_rng_offset: rng_offset,
+                    source_light_sample,
                     light_selection,
                     light_sampling_threshold,
                     world: world_settings,
@@ -10223,6 +10474,7 @@ fn trace_path_with_guiding(
                             bounce,
                             transparent_depth: transparent_bounce,
                             source_rng_offset: rng_offset,
+                            source_light_sample,
                             light_selection,
                             light_sampling_threshold,
                             world: world_settings,
@@ -10338,6 +10590,7 @@ fn trace_path_with_guiding(
                         bounce,
                         transparent_depth: transparent_bounce,
                         source_rng_offset: rng_offset,
+                        source_light_sample,
                         light_selection,
                         light_sampling_threshold,
                         world: world_settings,
@@ -10442,6 +10695,7 @@ fn trace_path_with_guiding(
                         bounce,
                         transparent_depth: transparent_bounce,
                         source_rng_offset: rng_offset,
+                        source_light_sample,
                         light_selection,
                         light_sampling_threshold,
                         world: world_settings,
@@ -10555,6 +10809,7 @@ fn trace_path_with_guiding(
                         bounce,
                         transparent_depth: transparent_bounce,
                         source_rng_offset: rng_offset,
+                        source_light_sample,
                         light_selection,
                         light_sampling_threshold,
                         world: world_settings,
@@ -10653,6 +10908,7 @@ fn trace_path_with_guiding(
                             bounce,
                             transparent_depth: transparent_bounce,
                             source_rng_offset: rng_offset,
+                            source_light_sample,
                             light_selection,
                             light_sampling_threshold,
                             world: world_settings,
@@ -10933,6 +11189,7 @@ fn trace_path_with_guiding(
                     bounce,
                     transparent_depth: transparent_bounce,
                     source_rng_offset: rng_offset,
+                    source_light_sample,
                     light_selection,
                     light_sampling_threshold,
                     world: world_settings,
@@ -13046,6 +13303,7 @@ fn direct_lighting(
         bounce,
         transparent_depth,
         source_rng_offset,
+        source_light_sample: next_source_light_sample,
         light_selection,
         light_sampling_threshold,
         world: world_settings,
@@ -13060,8 +13318,16 @@ fn direct_lighting(
     let closures = &mut surface.closures;
     let tree_query = surface_tree_query(point, normal, closures);
     light_selection.lamp_pdfs(tree_query, lamp_pdfs);
-    let light_sample_uv =
-        source_index.map(|source_index| source_light_uv(source_index, source_rng_offset));
+    let source_light_sample = source_index.map(|source_index| {
+        next_source_light_sample
+            .unwrap_or_else(|| sample_source_light(source_index, source_rng_offset))
+    });
+    let light_sample_uv = source_light_sample.map(|source_light_sample| source_light_sample.uv);
+    let guide_selection = if guide.is_some() {
+        volume_guide_nee_selection(source_light_sample, light_selection, tree_query, lights)
+    } else {
+        VolumeGuideNeeSelection::None
+    };
     let mut contribution = DVec3::ZERO;
     for (index, light) in lights.iter().enumerate() {
         let selection_pdf = lamp_pdfs
@@ -13117,10 +13383,12 @@ fn direct_lighting(
                         distance: sample.distance,
                         transparent_depth,
                         source_rng_offset: Some(source_rng_offset),
-                        target: sample
-                            .distance
-                            .is_finite()
-                            .then_some(shadow_point + sample.direction * sample.distance),
+                        target: sample.sampled_point.or_else(|| {
+                            sample
+                                .distance
+                                .is_finite()
+                                .then_some(shadow_point + sample.direction * sample.distance)
+                        }),
                         footprint,
                         self_primitive: Some(primitive_id),
                         light_path_context: shadow_light_path_context(
@@ -13145,7 +13413,12 @@ fn direct_lighting(
             bounce,
             selection_pdf * roulette.clamp_pdf_multiplier,
         );
-        add_volume_guide_contribution(&mut guide, light_contribution);
+        add_volume_guide_nee_contribution(
+            &mut guide,
+            guide_selection,
+            light_tree::SampledEmitter::Lamp(index),
+            light_contribution,
+        );
         contribution += light_contribution;
     }
     // The background is a sampled lamp here; forward background hits have no bounce cap.
@@ -13229,7 +13502,12 @@ fn direct_lighting(
                         bounce,
                         world_selection_pdf * roulette.clamp_pdf_multiplier,
                     );
-                    add_volume_guide_contribution(&mut guide, world_contribution);
+                    add_volume_guide_nee_contribution(
+                        &mut guide,
+                        guide_selection,
+                        light_tree::SampledEmitter::World,
+                        world_contribution,
+                    );
                     contribution += world_contribution;
                 }
             }
@@ -13257,6 +13535,7 @@ fn direct_volume_lighting(
         bounce,
         transparent_depth,
         source_rng_offset,
+        source_light_sample: next_source_light_sample,
         light_selection,
         light_sampling_threshold,
         world: world_settings,
@@ -13264,9 +13543,21 @@ fn direct_volume_lighting(
         ..
     } = next_event;
     let source_index = rng.source_index()?;
-    let light_sample_uv = source_light_uv(source_index, source_rng_offset);
+    let source_light_sample = next_source_light_sample
+        .unwrap_or_else(|| sample_source_light(source_index, source_rng_offset));
+    let light_sample_uv = source_light_sample.uv;
     let mut contribution = DVec3::ZERO;
     let tree_query = site.tree_query;
+    let guide_selection = if guide.is_some() {
+        volume_guide_nee_selection(
+            Some(source_light_sample),
+            light_selection,
+            tree_query,
+            scene.lights,
+        )
+    } else {
+        VolumeGuideNeeSelection::None
+    };
     if !site.skip_lamps {
         light_selection.lamp_pdfs(tree_query, lamp_pdfs);
     }
@@ -13333,7 +13624,12 @@ fn direct_volume_lighting(
             bounce,
             selection_pdf * roulette.clamp_pdf_multiplier,
         );
-        add_volume_guide_contribution(&mut guide, light_contribution);
+        add_volume_guide_nee_contribution(
+            &mut guide,
+            guide_selection,
+            light_tree::SampledEmitter::Lamp(index),
+            light_contribution,
+        );
         contribution += light_contribution;
     }
     let world_selection_pdf = light_selection.world_pdf(tree_query);
@@ -13400,7 +13696,12 @@ fn direct_volume_lighting(
                     bounce,
                     world_selection_pdf * roulette.clamp_pdf_multiplier,
                 );
-                add_volume_guide_contribution(&mut guide, world_contribution);
+                add_volume_guide_nee_contribution(
+                    &mut guide,
+                    guide_selection,
+                    light_tree::SampledEmitter::World,
+                    world_contribution,
+                );
                 contribution += world_contribution;
             }
         }
@@ -13531,12 +13832,13 @@ fn source_volume_strategy_sample(
     }
 }
 
-/// Source's emitter UV is dimension O+1; the all-emitter evaluator does not implement its z-based
-/// emitter selection, so every native light receives the same xy sample.
-fn source_light_uv(source_index: u32, source_rng_offset: u32) -> [f32; 2] {
-    let [u, v, _] =
+fn sample_source_light(source_index: u32, source_rng_offset: u32) -> SourceLightSample {
+    let [u, v, selection] =
         super::world_volume::volume_uniform_3d(source_index, source_rng_offset.wrapping_add(1));
-    [u, v]
+    SourceLightSample {
+        uv: [u, v],
+        selection: f64::from(selection),
+    }
 }
 
 fn equiangular_point(
@@ -13555,21 +13857,21 @@ fn equiangular_choices(
     lights: &[PointLight],
     origin: DVec3,
     method: Option<crate::model::VolumeSampling>,
-    source_index: Option<u32>,
-    source_rng_offset: u32,
+    source_light_sample: Option<SourceLightSample>,
     source_r5: Option<f32>,
     rng: &mut Pcg32,
 ) -> Result<(Vec<VolumeLightChoice>, Option<VolumeStrategySample>)> {
     let Some(method) = method else {
         return Ok((Vec::new(), None));
     };
-    let source_index = source_index.ok_or_else(|| {
-        PotError::new(
-            ErrorCode::InternalError,
-            "Cycles volume sampling requires a Source pixel index",
-        )
-    })?;
-    let source_uv = source_light_uv(source_index, source_rng_offset);
+    let source_uv = source_light_sample
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "Cycles volume sampling requires a Source pixel index",
+            )
+        })?
+        .uv;
     let mut choices: Vec<_> = lights
         .iter()
         .map(|light| VolumeLightChoice {
@@ -13984,10 +14286,12 @@ fn volume_light_nee(
                     distance: sample.distance,
                     transparent_depth,
                     source_rng_offset: Some(source_rng_offset),
-                    target: sample
-                        .distance
-                        .is_finite()
-                        .then_some(point + sample.direction * sample.distance),
+                    target: sample.sampled_point.or_else(|| {
+                        sample
+                            .distance
+                            .is_finite()
+                            .then_some(point + sample.direction * sample.distance)
+                    }),
                     footprint,
                     self_primitive: None,
                     light_path_context: shadow_light_path_context(
@@ -14429,6 +14733,7 @@ fn sample_light_with_source_uv(
             distance: f64::INFINITY,
             radiance: light.color * light.energy,
             pdf: 0.0,
+            sampled_point: None,
         });
     }
     if light.kind == LightType::Area {
@@ -14468,6 +14773,7 @@ fn sample_light_with_source_uv(
             radiance: light.color
                 * (intensity / distance_squared * light_attenuation(light, -direction)),
             pdf: 0.0,
+            sampled_point: None,
         });
     }
     let emitter = emitter_radiance(light.energy, radius);
@@ -14501,11 +14807,79 @@ fn sample_light_with_source_uv(
             distance,
             radiance: light.color * (weight * light_attenuation(light, -direction)),
             pdf: distance * distance / (std::f64::consts::PI * radius * radius * cos_light),
+            sampled_point: None,
         });
     }
     // Sphere (`is_sphere = true`).
     if distance_squared > radius * radius {
         // Uniform cone over the visible cap, pdf `1 / (2π (1 − cos θ_max))`.
+        if let Some(source_uv) = source_uv {
+            // Cycles maps light UVs through a concentric disk before sampling the sphere cap.
+            let light_position = light.position.to_array().map(|value| value as f32);
+            let receiver_position = point.to_array().map(|value| value as f32);
+            let source_offset = [
+                light_position[0] - receiver_position[0],
+                light_position[1] - receiver_position[1],
+                light_position[2] - receiver_position[2],
+            ];
+            let source_distance_squared = source_offset[0] * source_offset[0]
+                + source_offset[1] * source_offset[1]
+                + source_offset[2] * source_offset[2];
+            let source_distance = source_distance_squared.sqrt();
+            let source_radius = radius as f32;
+            let source_radius_squared = source_radius * source_radius;
+            let sin_squared = source_radius_squared / source_distance_squared;
+            let one_minus_cos = if sin_squared > 0.0004 {
+                1.0 - (1.0 - sin_squared).max(0.0).sqrt()
+            } else {
+                0.5 * sin_squared
+            };
+            let [disk_x, disk_y] = concentric_disk_sample(source_uv);
+            let disk_radius_squared = disk_x * disk_x + disk_y * disk_y;
+            let cosine = 1.0 - disk_radius_squared * one_minus_cos;
+            let disk_scale = (one_minus_cos * (2.0 - one_minus_cos * disk_radius_squared))
+                .max(0.0)
+                .sqrt();
+            let sample_x = disk_x * disk_scale;
+            let sample_y = disk_y * disk_scale;
+            let toward_centre = DVec3::new(
+                f64::from(source_offset[0] / source_distance),
+                f64::from(source_offset[1] / source_distance),
+                f64::from(source_offset[2] / source_distance),
+            );
+            let (tangent, bitangent) = make_orthonormals(toward_centre);
+            let tangent = tangent.to_array().map(|value| value as f32);
+            let bitangent = bitangent.to_array().map(|value| value as f32);
+            let toward_centre = toward_centre.to_array().map(|value| value as f32);
+            let source_direction: [f32; 3] = std::array::from_fn(|axis| {
+                sample_x * tangent[axis] + sample_y * bitangent[axis] + cosine * toward_centre[axis]
+            });
+            let direction = DVec3::from_array(source_direction.map(f64::from));
+            let distance = source_distance * cosine
+                - (source_radius_squared - source_distance_squared
+                    + source_distance_squared * cosine * cosine)
+                    .max(0.0)
+                    .sqrt();
+            let unprojected_point: [f32; 3] = std::array::from_fn(|axis| {
+                receiver_position[axis] + source_direction[axis] * distance
+            });
+            let normal: [f32; 3] =
+                std::array::from_fn(|axis| unprojected_point[axis] - light_position[axis]);
+            let normal_length =
+                (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+            let sampled_point = DVec3::from_array(std::array::from_fn(|axis| {
+                f64::from(light_position[axis] + normal[axis] / normal_length * source_radius)
+            }));
+            let solid_angle = f64::from(one_minus_cos) * std::f64::consts::TAU;
+            return Some(LightSample {
+                direction,
+                distance: f64::from(distance),
+                radiance: light.color
+                    * (emitter * solid_angle * light_attenuation(light, -direction)),
+                sampled_point: Some(sampled_point),
+                pdf: 1.0 / solid_angle,
+            });
+        }
         let one_minus_cos = sphere_one_minus_cos(radius * radius, distance_squared);
         let sample_u = source_uv.map_or_else(|| rng.next_f64(), |uv| f64::from(uv[0]));
         let sample_v = source_uv.map_or_else(|| rng.next_f64(), |uv| f64::from(uv[1]));
@@ -14526,6 +14900,7 @@ fn sample_light_with_source_uv(
             distance,
             radiance: light.color * (emitter * solid_angle * light_attenuation(light, -direction)),
             pdf: 1.0 / solid_angle,
+            sampled_point: None,
         });
     }
     // Receiver inside the sphere: uniform directions (pdf `1 / 4π`), and the spot cone does not
@@ -14544,6 +14919,7 @@ fn sample_light_with_source_uv(
         direction,
         distance,
         radiance: light.color * (emitter * 4.0 * std::f64::consts::PI),
+        sampled_point: None,
         pdf,
     })
 }
@@ -14557,10 +14933,12 @@ fn sample_volume_segment_light_position(
 ) -> Option<DVec3> {
     if light.kind != LightType::Area {
         let sample = sample_light_with_source_uv(light, point, rng, Some(source_uv))?;
-        return sample
-            .distance
-            .is_finite()
-            .then(|| point + sample.direction * sample.distance);
+        return sample.sampled_point.or_else(|| {
+            sample
+                .distance
+                .is_finite()
+                .then(|| point + sample.direction * sample.distance)
+        });
     }
     if light.is_portal || !light.energy.is_finite() || light.energy <= 0.0 {
         return None;
@@ -14676,8 +15054,7 @@ mod volume_segment_light_sampling_tests {
             std::slice::from_ref(&disk),
             origin,
             Some(VolumeSampling::Equiangular),
-            Some(source_index),
-            0,
+            Some(super::sample_source_light(source_index, 0)),
             Some(super::super::world_volume::volume_uniform_1d(
                 source_index,
                 5,
@@ -14705,8 +15082,7 @@ mod volume_segment_light_sampling_tests {
             std::slice::from_ref(&spread_disk),
             origin,
             Some(VolumeSampling::Equiangular),
-            Some(source_index),
-            0,
+            Some(super::sample_source_light(source_index, 0)),
             Some(super::super::world_volume::volume_uniform_1d(
                 source_index,
                 5,
@@ -14843,6 +15219,7 @@ fn sample_area_light(
         distance,
         radiance: emitted * (region.area * cos_light / distance_squared),
         pdf: distance_squared / (region.area * cos_light),
+        sampled_point: None,
     })
 }
 
@@ -14865,6 +15242,7 @@ fn sample_spread_line(light: &PointLight, shape: &AreaShape, point: DVec3) -> Op
         distance,
         radiance: light.color * (area_radiance(light.energy, shape.area) * std::f64::consts::PI),
         pdf: 0.0,
+        sampled_point: None,
     })
 }
 
@@ -16796,6 +17174,21 @@ fn collect_volumes<'a>(
                 last + DVec3::splat(pad_voxels),
             )
         };
+        let volume_shader = material.and_then(|material| material.node_tree.as_ref());
+        let source_shader_spatial = volume_shader
+            .is_some_and(|group_id| shader_graph_has_spatial_volume_shader(doc, group_id));
+        let source_shader_attributes = volume_shader
+            .is_some_and(|group_id| shader_graph_reads_nonprimary_volume_attributes(doc, group_id));
+        let source_shader_may_scatter =
+            volume_shader.is_some_and(|group_id| shader_graph_may_scatter(doc, group_id));
+        let requires_source_transport =
+            matches!(&volume.source, crate::geom::volume::VolumeSource::File(_))
+                || volume.decoded_vdb.is_some()
+                || volume_temperature.is_some()
+                || scattering
+                || source_shader_may_scatter
+                || source_shader_spatial
+                || source_shader_attributes;
         let source_heterogeneous = volume_temperature.is_some()
             || volume_primary_density_grid_is_read(volume)
             || material.is_some_and(|material| {
@@ -16827,6 +17220,7 @@ fn collect_volumes<'a>(
                 params.volume_sampling
             }),
             source_heterogeneous,
+            requires_source_transport,
             source_octree: None,
             interpolation,
             index_from_local: if volume.decoded_vdb.is_some() {
@@ -17525,6 +17919,7 @@ mod volume_shader_context_tests {
         assert!(native_heterogeneous);
         Ok(())
     }
+
     #[test]
     fn principled_missing_named_attribute_still_uses_core_when_object_has_another_grid() {
         let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
@@ -18260,6 +18655,7 @@ mod heterogeneous_volume_context_tests {
             meters_per_unit: 1.0,
             density_range: Some((0.0, 1.0)),
             source_heterogeneous: false,
+            requires_source_transport: false,
             source_octree: None,
             albedo: DVec3::ZERO,
             lobes: Vec::new(),
@@ -18409,6 +18805,7 @@ mod heterogeneous_volume_context_tests {
             meters_per_unit: 1.0,
             density_range: Some((1.0, 1.0)),
             source_heterogeneous: true,
+            requires_source_transport: false,
             source_octree: None,
             albedo: DVec3::ZERO,
             lobes: Vec::new(),
@@ -18495,6 +18892,7 @@ mod heterogeneous_volume_context_tests {
             meters_per_unit: 1.0,
             density_range: Some((1.0, 1.0)),
             source_heterogeneous: true,
+            requires_source_transport: false,
             source_octree: None,
             albedo: DVec3::ZERO,
             lobes: Vec::new(),
@@ -18607,6 +19005,7 @@ mod heterogeneous_volume_context_tests {
             meters_per_unit,
             density_range: None,
             source_heterogeneous: true,
+            requires_source_transport: false,
             source_octree: None,
             albedo: DVec3::ZERO,
             lobes: Vec::new(),
@@ -18669,6 +19068,7 @@ mod heterogeneous_volume_context_tests {
             meters_per_unit: 2.0,
             density_range: Some((0.0, 1.0)),
             source_heterogeneous: true,
+            requires_source_transport: true,
             source_octree: None,
             albedo: DVec3::ONE,
             lobes: vec![ScatterLobe {
@@ -18789,6 +19189,7 @@ mod heterogeneous_volume_context_tests {
             meters_per_unit: 1.0,
             density_range: None,
             source_heterogeneous: true,
+            requires_source_transport: true,
             source_octree: None,
             albedo: DVec3::ZERO,
             lobes: Vec::new(),
@@ -19552,6 +19953,7 @@ struct VoxelGrid {
     groups: Vec<ScatterGroup>,
     stochastic: bool,
     heterogeneous: bool,
+    requires_source_transport: bool,
     /// Blender's `cycles.volume_sampling` of each volume that the segment crosses.
     samplings: Vec<crate::model::VolumeSampling>,
 }
@@ -19576,6 +19978,7 @@ fn voxel_grid(
     let mut minimum_step = f64::INFINITY;
     let mut stochastic = false;
     let mut heterogeneous = false;
+    let mut requires_source_transport = false;
     let mut samplings = Vec::new();
     for instance in volumes {
         if instance.ray_mask & ray.bit() == 0 {
@@ -19607,6 +20010,7 @@ fn voxel_grid(
                 && instance.albedo.max_element() > 0.0
                 && instance.extinction_rgb_scale.max_element() > 0.0;
             heterogeneous |= instance.source_heterogeneous;
+            requires_source_transport |= instance.requires_source_transport;
             samplings.push(instance.sampling);
         }
     }
@@ -19713,6 +20117,7 @@ fn voxel_grid(
         achromatic,
         groups,
         stochastic,
+        requires_source_transport,
         heterogeneous,
         samplings,
     }))
@@ -20746,6 +21151,7 @@ mod volume_extinction_tests {
             meters_per_unit: 0.5,
             density_range: Some((1.0, 1.0)),
             source_heterogeneous: false,
+            requires_source_transport: false,
             source_octree: None,
             albedo: DVec3::ZERO,
             lobes: scatter_lobes(&[]),
@@ -20799,6 +21205,7 @@ mod volume_extinction_tests {
             meters_per_unit: 1.0,
             density_range: Some((1.0, 1.0)),
             source_heterogeneous: false,
+            requires_source_transport: false,
             source_octree: None,
             albedo: DVec3::ZERO,
             lobes: vec![ScatterLobe {
@@ -24995,7 +25402,7 @@ mod cycles_world_light_tests {
         let mut squared_sum = DVec3::ZERO;
         for source_index in 0..samples {
             let mut rng = Pcg32::for_sample(0x51a7, source_index, 0, 0);
-            let source_uv = super::source_light_uv(source_index, 0);
+            let source_uv = super::sample_source_light(source_index, 0).uv;
             let anchor = super::equiangular_point(light, origin, source_uv, &mut rng);
             let raw = crate::render::world_volume::volume_uniform_1d(source_index, 5);
             let strategy = super::source_volume_strategy_sample(method, raw, anchor.is_some());
@@ -25203,7 +25610,7 @@ mod cycles_world_light_tests {
             }
             for seed in 0..256 {
                 let mut rng = Pcg32::for_sample(0x91, seed, 0, 0);
-                let source_uv = super::source_light_uv(seed, 0);
+                let source_uv = super::sample_source_light(seed, 0).uv;
                 let Some(anchor) = super::equiangular_point(&light, origin, source_uv, &mut rng)
                 else {
                     panic!("front-side area sample should exist");
@@ -25418,6 +25825,7 @@ mod cycles_world_light_tests {
                 bounce,
                 transparent_depth: 0,
                 source_rng_offset: 0,
+                source_light_sample: None,
                 light_selection: LightSelectionPdfs {
                     lamps: 0.0,
                     world: 1.0,
@@ -25462,6 +25870,7 @@ mod cycles_world_light_tests {
                 bounce: 0,
                 transparent_depth: 0,
                 source_rng_offset: 0,
+                source_light_sample: None,
                 light_selection: LightSelectionPdfs {
                     lamps: 0.0,
                     world: 1.0,
@@ -25508,6 +25917,7 @@ mod cycles_world_light_tests {
                 bounce: 0,
                 transparent_depth: 0,
                 source_rng_offset: 0,
+                source_light_sample: None,
                 light_selection: LightSelectionPdfs {
                     lamps: 0.0,
                     world: 1.0,
@@ -25576,6 +25986,7 @@ mod cycles_world_light_tests {
                 bounce,
                 transparent_depth: 0,
                 source_rng_offset: 0,
+                source_light_sample: None,
                 light_selection,
                 light_sampling_threshold: 0.0,
                 world: WorldPathSettings {
@@ -25940,6 +26351,7 @@ mod cycles_world_light_tests {
                 bounce: 0,
                 transparent_depth: 0,
                 source_rng_offset: 0,
+                source_light_sample: None,
                 light_selection: LightSelectionPdfs {
                     lamps: 1.0,
                     world: 0.0,
@@ -26001,6 +26413,7 @@ mod cycles_world_light_tests {
             meters_per_unit: 1.0,
             density_range: Some((0.01, 0.01)),
             source_heterogeneous: false,
+            requires_source_transport: false,
             source_octree: None,
             albedo: DVec3::ZERO,
             lobes: Vec::new(),
@@ -26290,6 +26703,7 @@ mod cycles_world_light_tests {
                     bounce: 0,
                     transparent_depth: 0,
                     source_rng_offset: 0,
+                    source_light_sample: None,
                     light_selection,
                     light_sampling_threshold: 1.0,
                     world: WorldPathSettings {
@@ -26340,7 +26754,7 @@ mod cycles_world_light_tests {
         assert!(!no_mis_light.hittable());
         let area = light.area.ok_or("area light fixture has no shape")?;
         let source_index = 0;
-        let [u, v] = super::source_light_uv(source_index, 0);
+        let [u, v] = super::sample_source_light(source_index, 0).uv;
         let target = light.position
             + area.axis_u * (area.half_u * f64::from(2.0 * u - 1.0))
             + area.axis_v * (area.half_v * f64::from(2.0 * v - 1.0));
@@ -26384,6 +26798,7 @@ mod cycles_world_light_tests {
                     bounce: 0,
                     transparent_depth: 0,
                     source_rng_offset: 0,
+                    source_light_sample: None,
                     light_selection,
                     light_sampling_threshold: 0.0,
                     world: WorldPathSettings {

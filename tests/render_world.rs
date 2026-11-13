@@ -370,7 +370,7 @@ fn homogeneous_absorbing_volume_cube_transmittance_matches_beer_lambert()
 fn accepted_grid_volume_scatter_clears_transparent_background() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
-    let density = 0.7_f64;
+    let density = 70.0_f64;
     let mut operations = vec![json!({
         "op":"volume.create","id":"fog","grids":[{
             "dims":[2,2,2],"voxel_size":1.0,"origin":[-0.5,-0.5,-0.5],

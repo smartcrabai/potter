@@ -15,8 +15,16 @@ DEFAULT_SECONDS = 4
 # Seconds per target from the slower of the two latest CI runs. Library unit and doc tests run as separate
 # Cargo commands on shard 0, so their entries include that command's compile time.
 TARGET_SECONDS = {
-    # Volume budgets include Source octree baking until CI records their duration.
-    "world_volume_path_oracle": 2500,
+    # World volume costs include Source octree baking; heterogeneous estimates are conservative.
+    "world_volume_path_oracle": 420,
+    "world_volume_gradient_distance": 600,
+    "world_volume_gradient_equiangular": 600,
+    "world_volume_gradient_multiple_importance": 600,
+    "world_volume_noise_distance": 600,
+    "world_volume_noise_equiangular": 600,
+    "world_volume_noise_multiple_importance": 600,
+    "world_volume_spatial_emission": 600,
+    "world_volume_override_spatial": 600,
     ("potter_core", "lib-unit"): 413,
     "native_shader_bsdf_wave12": 408,
     "volume_nee": 386,

@@ -232,6 +232,11 @@ impl Default for LightTreeSettings {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SampledEmitter {
+    Lamp(usize),
+    World,
+}
 
 pub(super) struct LightTree {
     emitters: Vec<Emitter>,
@@ -405,62 +410,113 @@ impl LightTree {
         }
     }
 
-    fn pdf(&self, target: usize, query: Query) -> f64 {
-        let Some(root) = &self.root else {
-            return 0.0;
+    /// Traverses the same max/min midpoint CDF as `pdf`, remapping each selected interval.
+    pub(super) fn sample(
+        &self,
+        sample: f64,
+        point: DVec3,
+        normal_or_direction: DVec3,
+        distance: f64,
+        volume: bool,
+        has_transmission: bool,
+    ) -> Option<(SampledEmitter, f64)> {
+        if !(0.0..1.0).contains(&sample) {
+            return None;
+        }
+        let query = Query {
+            point,
+            normal_or_direction,
+            distance,
+            volume,
+            has_transmission,
         };
-        let Some(&(path_bits, path_length)) = self.paths.get(target) else {
-            return 0.0;
-        };
-        let mut node = root;
-        let mut pdf = 1.0;
-        for depth in 0..path_length {
-            let NodeKind::Inner(left, right) = &node.kind else {
-                break;
-            };
-            let left_importance = child_importance(
-                left,
-                &self.emitters,
-                &self.lights,
-                &self.mesh_subtrees,
-                query,
-            );
-            let right_importance = child_importance(
-                right,
-                &self.emitters,
-                &self.lights,
-                &self.mesh_subtrees,
-                query,
-            );
-            let total_max = left_importance.max + right_importance.max;
-            if total_max <= 0.0 {
-                return 0.0;
-            }
-            let total_min = left_importance.min + right_importance.min;
-            let probability_max = left_importance.max / total_max;
-            let probability_min = if total_min > 0.0 {
-                left_importance.min / total_min
-            } else {
-                (if left_importance.max > 0.0 { 0.5 } else { 0.0 })
-                    + (if right_importance.max == 0.0 {
-                        0.5
+        let mut remaining = sample;
+        let mut probability = 1.0;
+        let mut node = self.root.as_ref()?;
+        loop {
+            match &node.kind {
+                NodeKind::Inner(left, right) => {
+                    let left_probability = self.left_probability(left, right, query)?;
+                    if remaining < left_probability {
+                        remaining /= left_probability;
+                        probability *= left_probability;
+                        node = left;
                     } else {
-                        0.0
-                    })
-            };
-            let left_probability = f64::midpoint(probability_max, probability_min);
-            let go_right = path_bits & (1_u64 << depth) != 0;
-            if go_right {
-                pdf *= 1.0 - left_probability;
-                node = right;
-            } else {
-                pdf *= left_probability;
-                node = left;
+                        let right_probability = 1.0 - left_probability;
+                        if right_probability <= 0.0 {
+                            return None;
+                        }
+                        remaining = (remaining - left_probability) / right_probability;
+                        probability *= right_probability;
+                        node = right;
+                    }
+                }
+                NodeKind::Leaf { emitters, .. } => {
+                    for emitter in emitters {
+                        let emitter_probability = self.leaf_probability(emitters, *emitter, query);
+                        if emitter_probability <= 0.0 {
+                            continue;
+                        }
+                        if remaining < emitter_probability {
+                            match self.emitters[*emitter].kind {
+                                EmitterKind::Lamp(index) => {
+                                    return Some((
+                                        SampledEmitter::Lamp(index),
+                                        probability * emitter_probability,
+                                    ));
+                                }
+                                EmitterKind::World => {
+                                    return Some((
+                                        SampledEmitter::World,
+                                        probability * emitter_probability,
+                                    ));
+                                }
+                                EmitterKind::Mesh(_) | EmitterKind::MeshTriangle => return None,
+                            }
+                        }
+                        remaining -= emitter_probability;
+                    }
+                    return None;
+                }
             }
         }
-        let NodeKind::Leaf { emitters, .. } = &node.kind else {
-            return 0.0;
+    }
+
+    fn left_probability(&self, left: &Node, right: &Node, query: Query) -> Option<f64> {
+        let left_importance = child_importance(
+            left,
+            &self.emitters,
+            &self.lights,
+            &self.mesh_subtrees,
+            query,
+        );
+        let right_importance = child_importance(
+            right,
+            &self.emitters,
+            &self.lights,
+            &self.mesh_subtrees,
+            query,
+        );
+        let total_max = left_importance.max + right_importance.max;
+        if total_max <= 0.0 {
+            return None;
+        }
+        let total_min = left_importance.min + right_importance.min;
+        let probability_max = left_importance.max / total_max;
+        let probability_min = if total_min > 0.0 {
+            left_importance.min / total_min
+        } else {
+            (if left_importance.max > 0.0 { 0.5 } else { 0.0 })
+                + (if right_importance.max == 0.0 {
+                    0.5
+                } else {
+                    0.0
+                })
         };
+        Some(f64::midpoint(probability_max, probability_min))
+    }
+
+    fn leaf_probability(&self, emitters: &[usize], target: usize, query: Query) -> f64 {
         let mut total_max = 0.0;
         let mut total_min = 0.0;
         let mut positive_max = 0_usize;
@@ -489,7 +545,38 @@ impl LightTree {
         } else {
             0.0
         };
-        pdf * 0.5 * (target_importance.max / total_max + minimum_probability)
+        f64::midpoint(target_importance.max / total_max, minimum_probability)
+    }
+
+    fn pdf(&self, target: usize, query: Query) -> f64 {
+        let Some(root) = &self.root else {
+            return 0.0;
+        };
+        let Some(&(path_bits, path_length)) = self.paths.get(target) else {
+            return 0.0;
+        };
+        let mut node = root;
+        let mut pdf = 1.0;
+        for depth in 0..path_length {
+            let NodeKind::Inner(left, right) = &node.kind else {
+                break;
+            };
+            let Some(left_probability) = self.left_probability(left, right, query) else {
+                return 0.0;
+            };
+            let go_right = path_bits & (1_u64 << depth) != 0;
+            if go_right {
+                pdf *= 1.0 - left_probability;
+                node = right;
+            } else {
+                pdf *= left_probability;
+                node = left;
+            }
+        }
+        let NodeKind::Leaf { emitters, .. } = &node.kind else {
+            return 0.0;
+        };
+        pdf * self.leaf_probability(emitters, target, query)
     }
 }
 
