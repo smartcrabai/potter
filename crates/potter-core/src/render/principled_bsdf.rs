@@ -136,7 +136,16 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
         dielectric_f0(params.ior, params.specular_ior_level)
     };
     let specular_weight = if layers.caustics_reflective {
-        (metallic + dielectric_weight * (1.0 - metallic) * (1.0 - transmission)).max(1.0e-4)
+        let weight = metallic + dielectric_weight * (1.0 - metallic) * (1.0 - transmission);
+        let has_specular_eval = metallic > 0.0
+            || ((1.0 - metallic) * (1.0 - transmission) > 0.0
+                && specular_layer(params, true).is_some());
+        // Source sampling omits a specular proposal that has no evaluation energy; legacy keeps its floor.
+        if layers.source_bsdf_sampling && !has_specular_eval {
+            0.0
+        } else {
+            weight.max(1.0e-4)
+        }
     } else {
         0.0
     };
@@ -876,6 +885,8 @@ pub(crate) struct Layers {
     /// Cycles' glossy blur alpha (`bsdf_blur`) for standalone microfacets and principled hair; zero when unblurred.
     pub(crate) glossy_blur_alpha: f64,
     pub(crate) caustics_reflective: bool,
+    /// Source-volume BSDF sampling omits dielectric proposals that have no evaluation energy.
+    source_bsdf_sampling: bool,
     /// Cycles' converted `shadow_terminator_shading_offset` frequency multiplier.
     pub(crate) shadow_terminator_frequency_multiplier: f64,
 }
@@ -936,6 +947,7 @@ pub(crate) fn layers_at(
         glass,
         glossy_blur_alpha: 0.0,
         caustics_reflective: true,
+        source_bsdf_sampling: false,
         shadow_terminator_frequency_multiplier: 1.0,
     }
 }
@@ -1027,6 +1039,11 @@ impl Layers {
         }
         layers.lower =
             coat_lower_factor_of(params, layers.coat.as_ref()) * layers.sheen.layer_weight();
+        layers
+    }
+    pub(crate) fn with_source_bsdf_sampling(&self) -> Self {
+        let mut layers = *self;
+        layers.source_bsdf_sampling = true;
         layers
     }
     /// Applies Cycles' object shading-terminator frequency to this closure.

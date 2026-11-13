@@ -10021,10 +10021,10 @@ mod tests {
         BsdfModel, BsdfParams, EeveeGBufferCandidate, EeveeGBufferLobe, EeveeGBufferMode,
         Evaluator, EvaluatorWorkspace, GeometryAttribute, GeometryAttributeValues, HairComponent,
         HairParametrization, HairScatteringModel, HitContext, HitDifferentials, HitUvLayers,
-        LightPathContext,
-        MetallicFresnel, MicrofacetDistribution, PreparedMaterial, PrincipledHairParameters,
-        SheenDistribution, SubsurfaceMethod, SurfaceShading, ToonComponent, Value as ShaderValue,
-        color_lerp, evaluate_displacement, evaluate_surface, layer_index, layer_uv,
+        LightPathContext, MetallicFresnel, MicrofacetDistribution, PreparedMaterial,
+        PrincipledHairParameters, SheenDistribution, SubsurfaceMethod, SurfaceShading,
+        ToonComponent, Value as ShaderValue, color_lerp, evaluate_displacement, evaluate_surface,
+        layer_index, layer_uv,
     };
 
     #[test]
@@ -10310,13 +10310,7 @@ mod tests {
             ),
         ];
         for (ray_kind, expected) in cases {
-            let path_state = light_path_context(
-                ray_kind,
-                false,
-                false,
-                false,
-                [4, 2, 3, 4, 5, 6],
-            );
+            let path_state = light_path_context(ray_kind, false, false, false, [4, 2, 3, 4, 5, 6]);
             let context = HitContext::new(&groups).with_light_path_context(path_state);
             for (output, expected) in outputs.into_iter().zip(expected) {
                 assert_eq!(
@@ -10327,7 +10321,11 @@ mod tests {
             }
             assert_eq!(
                 light_path_scalar(&groups, &graph_id, &node_id, "Ray Depth", &context),
-                if ray_kind == RayKind::Shadow { 5.0 } else { 4.0 },
+                if ray_kind == RayKind::Shadow {
+                    5.0
+                } else {
+                    4.0
+                },
             );
             for (output, expected) in [
                 ("Transparent Depth", 2.0),
@@ -10343,21 +10341,21 @@ mod tests {
             }
         }
 
-        let path_state =
-            light_path_context(RayKind::Shadow, false, false, false, [u32::MAX, 0, 0, 0, 0, 0]);
+        let path_state = light_path_context(
+            RayKind::Shadow,
+            false,
+            false,
+            false,
+            [u32::MAX, 0, 0, 0, 0, 0],
+        );
         let context = HitContext::new(&groups).with_light_path_context(path_state);
         assert_eq!(
             light_path_scalar(&groups, &graph_id, &node_id, "Ray Depth", &context),
             f64::from(u32::MAX) + 1.0,
         );
 
-        let path_state = light_path_context(
-            RayKind::Shadow,
-            false,
-            false,
-            true,
-            [4, 0, 0, 0, 0, 0],
-        );
+        let path_state =
+            light_path_context(RayKind::Shadow, false, false, true, [4, 0, 0, 0, 0, 0]);
         let context = HitContext::new(&groups).with_light_path_context(path_state);
         assert_eq!(
             light_path_scalar(&groups, &graph_id, &node_id, "Ray Depth", &context),
@@ -10365,26 +10363,16 @@ mod tests {
             "Shadow and emission add one only once",
         );
 
-        let path_state = light_path_context(
-            RayKind::Camera,
-            false,
-            false,
-            true,
-            [4, 0, 0, 0, 0, 0],
-        );
+        let path_state =
+            light_path_context(RayKind::Camera, false, false, true, [4, 0, 0, 0, 0, 0]);
         let context = HitContext::new(&groups).with_light_path_context(path_state);
         assert_eq!(
             light_path_scalar(&groups, &graph_id, &node_id, "Ray Depth", &context),
             5.0,
         );
 
-        let path_state = light_path_context(
-            RayKind::Diffuse,
-            true,
-            true,
-            false,
-            [7, 3, 0, 0, 0, 0],
-        );
+        let path_state =
+            light_path_context(RayKind::Diffuse, true, true, false, [7, 3, 0, 0, 0, 0]);
         let context = HitContext::new(&groups).with_light_path_context(path_state);
         assert_eq!(
             light_path_scalar(&groups, &graph_id, &node_id, "Is Reflection Ray", &context),
@@ -10434,9 +10422,8 @@ mod tests {
             "Transmission Depth",
             "Ray Portal Depth",
         ] {
-            let error =
-                evaluate_input_node_output(&groups, &graph_id, &node_id, output, &context)
-                    .unwrap_err();
+            let error = evaluate_input_node_output(&groups, &graph_id, &node_id, output, &context)
+                .unwrap_err();
             assert_eq!(error.code, ErrorCode::UnsupportedFeature, "{output}");
             assert_eq!(
                 error.details["feature_id"],
@@ -12821,7 +12808,7 @@ mod tests {
         let output_id = Id::new("output").unwrap();
         assert_eq!(super::select_world_output(&graph, true), None);
         assert_eq!(super::select_world_output(&graph, false), Some(&output_id));
-        assert!(evaluate_world_volume_graph(graph).volume.is_empty());
+        assert_eq!(evaluate_world_volume_graph(graph).volume.len(), 0);
     }
 
     fn emission_and_absorption_world_volume(combiner: &str, inputs: Value) -> SurfaceShading {

@@ -7,7 +7,7 @@ from mathutils import Vector
 
 
 argv = sys.argv[sys.argv.index("--") + 1 :]
-blend_path, oracle_path, case = argv
+blend_path, oracle_path, case, samples = argv
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
@@ -22,7 +22,7 @@ scene.render.image_settings.file_format = "OPEN_EXR"
 scene.render.image_settings.color_depth = "32"
 scene.render.image_settings.color_mode = "RGBA"
 scene.cycles.device = "CPU"
-scene.cycles.samples = 512
+scene.cycles.samples = int(samples)
 scene.cycles.seed = 0
 scene.cycles.max_bounces = 4
 scene.cycles.diffuse_bounces = 4

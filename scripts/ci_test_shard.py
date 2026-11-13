@@ -15,8 +15,12 @@ DEFAULT_SECONDS = 4
 # Seconds per target from the slower of the two latest CI runs. Library unit and doc tests run as separate
 # Cargo commands on shard 0, so their entries include that command's compile time.
 TARGET_SECONDS = {
+    # Volume budgets include Source octree baking until CI records their duration.
+    "world_volume_path_oracle": 2500,
     ("potter_core", "lib-unit"): 413,
     "native_shader_bsdf_wave12": 408,
+    "volume_nee": 386,
+    "volume_spectral_extinction": 381,
     ("potter_workflow", "lib-doc"): 287,
     ("potter_workflow", "lib-unit"): 281,
     ("potter_core", "lib-doc"): 268,
@@ -26,7 +30,6 @@ TARGET_SECONDS = {
     "path_transmission_bounce_budget": 136,
     "blend_modifiers_constraints": 119,
     "blend_realistic_scene": 103,
-    "volume_spectral_extinction": 81,
     "native_principled_thin_wall_indirect": 76,
     "cov_nodes_math_extended": 69,
     "shader_p1_oracle": 59,
@@ -37,6 +40,7 @@ TARGET_SECONDS = {
     "closure_list_oracle": 35,
     "realtime_light_shapes_extra": 33,
     "native_metal_sphere_lights": 33,
+    "volume_interpolation": 29,
     "cov_nodes_math": 28,
     "realtime_glass_direct": 27,
     "realtime_direct_light_cases": 27,

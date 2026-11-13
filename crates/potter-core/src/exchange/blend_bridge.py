@@ -1882,6 +1882,7 @@ def volume_dump(volume):
             "library": library_reference(volume),
             "materials": _material_names(volume),
             "filepath": volume_filepath(volume),
+            "space": volume.render.space,
             "grids": [grid.name for grid in volume.grids],
             "custom_properties": custom_props(volume),
             "fake_user": bool(getattr(volume, "use_fake_user", False)),
@@ -11035,6 +11036,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             source = compatibility_block(doc, "volumes", "Volume", data_id)
             name = compatibility_name(doc, "Volume", data_id, source.get("name", data_id))
             volume = bpy.data.volumes.new(name)
+            volume.render.space = "WORLD"
             volume_data = item.get("volume") or {}
             volume_source = volume_data.get("source") or {}
             if volume_source.get("kind") == "file":

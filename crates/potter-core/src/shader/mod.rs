@@ -3,6 +3,7 @@ pub(crate) mod converters;
 pub(crate) mod inline_fold;
 pub(crate) mod texture;
 mod texture_kernels;
+pub(crate) use texture_kernels::hash_uint;
 pub(crate) mod texture_procedural_kernels;
 mod world;
 
@@ -15,9 +16,9 @@ pub(crate) use evaluator::{
     EEVEE_CLOSURE_REFLECTION, EEVEE_CLOSURE_REFRACTION, EEVEE_CLOSURE_SHADER_TO_RGBA,
     EEVEE_CLOSURE_SUBSURFACE, EEVEE_CLOSURE_TRANSLUCENT, EEVEE_CLOSURE_TRANSPARENCY,
     GeometryAttribute, GeometryAttributeValues, GlassDistribution, HairComponent, HairParameters,
-    HairParametrization, HairScatteringModel, LightPathContext, MetallicFresnel, MetallicParameters,
-    MicrofacetDistribution, PrincipledHairParameters, SheenDistribution, ToonComponent,
-    ToonParameters, dielectric_f0, evaluate_surface_with_workspace_into_semantics,
+    HairParametrization, HairScatteringModel, LightPathContext, MetallicFresnel,
+    MetallicParameters, MicrofacetDistribution, PrincipledHairParameters, SheenDistribution,
+    ToonComponent, ToonParameters, dielectric_f0, evaluate_surface_with_workspace_into_semantics,
     evaluate_surface_with_workspace_semantics, evaluate_volume_output_with_workspace, heaviest,
     make_orthonormals, shader_node_type_supported,
 };

@@ -9,8 +9,9 @@ use tempfile::tempdir;
 const SIZE: usize = 4;
 const GRID_SIZE: usize = 17;
 const ORACLE_SEEDS: [u32; 4] = [0, 1, 2, 3];
-const ABSORPTION_SAMPLES: u32 = 32;
-// Preserve the existing deterministic absorption reference band; new scattering cases use measured standard errors.
+const ABSORPTION_SAMPLES: u32 = 512;
+// Source-compatible native voxel transport uses stochastic null collisions; this stronger fixed sample budget
+// improves the absorption estimate without changing the scene, seed, oracle, or tolerance.
 const ABSORPTION_TOLERANCE: f64 = 0.09;
 
 fn pot() -> Command {
@@ -348,6 +349,14 @@ fn assert_matches_seed_oracle(
             / (count - 1.0);
         let potter_stderr = (sample_variance / count).sqrt();
         let combined_stderr = (blender_stderr[channel].powi(2) + potter_stderr.powi(2)).sqrt();
+        eprintln!(
+            "{description} channel {channel}: Native {:.9} ± {:.9}; Source {:.9} ± {:.9}; combined SE {:.9}",
+            potter_mean[channel],
+            potter_stderr,
+            blender_mean[channel],
+            blender_stderr[channel],
+            combined_stderr,
+        );
         assert!(
             (potter_mean[channel] - blender_mean[channel]).abs() <= 3.0 * combined_stderr,
             "{description} channel {channel}: Potter {:.6} ± {:.6} vs Blender {:.6} ± {:.6}, outside three combined standard errors",

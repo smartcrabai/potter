@@ -3,17 +3,17 @@ use glam::{DVec3, Vec3};
 use crate::error::{ErrorCode, PotError, Result};
 
 const GAUSSIAN: [f32; 11] = [
-    0.0012273699895602,
-    0.0084674212370284,
-    0.0379843612914121,
-    0.1108921888487800,
-    0.2108379677336155,
-    0.2611813817992076,
-    0.2108379677336155,
-    0.1108921888487800,
-    0.0379843612914121,
-    0.0084674212370284,
-    0.0012273699895602,
+    0.001_227_37,
+    0.008_467_421,
+    0.037_984_36,
+    0.110_892_19,
+    0.210_837_98,
+    0.261_181_38,
+    0.210_837_98,
+    0.110_892_19,
+    0.037_984_36,
+    0.008_467_421,
+    0.001_227_37,
 ];
 const FILTER_RADIUS: usize = 5;
 
@@ -69,7 +69,7 @@ pub(super) struct VolumeGuidingRead {
 
 impl VolumeGuidingRead {
     pub(super) fn homogeneous_scatter_probability(
-        &self,
+        self,
         extinction: DVec3,
         distance: f64,
         optical_depth: f32,
@@ -93,7 +93,7 @@ impl VolumeGuidingRead {
         (attenuation + 0.75 * (guided - attenuation)).as_dvec3()
     }
 
-    pub(super) fn heterogeneous_parameters(&self, optical_depth: f32) -> (f64, f64) {
+    pub(super) fn heterogeneous_parameters(self, optical_depth: f32) -> (f64, f64) {
         let scattered = reduce_add(decode_rgbe(self.scatter_rgbe));
         let transmitted = reduce_add(decode_rgbe(self.transmit_rgbe));
         let volume = transmitted + scattered;
@@ -231,7 +231,7 @@ fn filter_x_rows(
 ) {
     for (local_y, row) in reads.chunks_exact_mut(width).enumerate() {
         let y = start_y + local_y;
-        for x in 0..width {
+        for (x, read) in row.iter_mut().enumerate() {
             let mut scatter = Vec3::ZERO;
             let mut transmit = Vec3::ZERO;
             for (tap, gaussian) in GAUSSIAN.iter().copied().enumerate() {
@@ -245,7 +245,7 @@ fn filter_x_rows(
                 scatter += accumulator.scatter_sum * weight;
                 transmit += accumulator.transmit_sum * weight;
             }
-            row[x] = VolumeGuidingRead {
+            *read = VolumeGuidingRead {
                 scatter_rgbe: encode_rgbe(scatter),
                 transmit_rgbe: encode_rgbe(transmit),
             };
@@ -253,12 +253,12 @@ fn filter_x_rows(
     }
 }
 
-fn split_column_bands<'read>(
-    reads: &'read mut [VolumeGuidingRead],
+fn split_column_bands(
+    reads: &mut [VolumeGuidingRead],
     width: usize,
     height: usize,
     band_count: usize,
-) -> Result<Vec<Vec<&'read mut [VolumeGuidingRead]>>> {
+) -> Result<Vec<Vec<&mut [VolumeGuidingRead]>>> {
     let mut bands = Vec::new();
     bands
         .try_reserve_exact(band_count)
@@ -285,10 +285,10 @@ fn split_column_bands<'read>(
 fn band_width(total: usize, band_count: usize, index: usize) -> usize {
     let base = total / band_count;
     let remainder = total % band_count;
-    base + if index < remainder { 1 } else { 0 }
+    base + usize::from(index < remainder)
 }
 
-fn filter_y_parallel<'read>(bands: Vec<Vec<&'read mut [VolumeGuidingRead]>>) -> Result<()> {
+fn filter_y_parallel(bands: Vec<Vec<&mut [VolumeGuidingRead]>>) -> Result<()> {
     let band_count = bands.len();
     if band_count == 1 {
         if let Some(rows) = bands.into_iter().next() {
@@ -310,13 +310,14 @@ fn filter_y_parallel<'read>(bands: Vec<Vec<&'read mut [VolumeGuidingRead]>>) -> 
     })
 }
 
-fn filter_y_columns<'read>(mut rows: Vec<&'read mut [VolumeGuidingRead]>) {
+fn filter_y_columns(mut rows: Vec<&mut [VolumeGuidingRead]>) {
     if rows.is_empty() {
         return;
     }
     let height = rows.len();
     let width = rows[0].len();
-    for x in 0..width {
+    let mut x = 0;
+    while x < width {
         let mut scatter_neighbors = [Vec3::ZERO; 11];
         let mut transmit_neighbors = [Vec3::ZERO; 11];
         for i in 0..FILTER_RADIUS {
@@ -351,11 +352,12 @@ fn filter_y_columns<'read>(mut rows: Vec<&'read mut [VolumeGuidingRead]>) {
                 transmit_rgbe: encode_rgbe(transmit.abs()),
             };
         }
+        x += 1;
     }
 }
 
-fn join_filter_workers<'scope>(
-    handles: Vec<std::io::Result<std::thread::ScopedJoinHandle<'scope, ()>>>,
+fn join_filter_workers(
+    handles: Vec<std::io::Result<std::thread::ScopedJoinHandle<'_, ()>>>,
 ) -> Result<()> {
     let mut first_error = None;
     for handle in handles {
@@ -423,29 +425,29 @@ fn source_clamp_vec3(value: Vec3, minimum: f32, maximum: f32) -> Vec3 {
 
 fn source_safe_divide(numerator: Vec3, denominator: Vec3) -> Vec3 {
     Vec3::new(
-        if denominator.x != 0.0 {
+        if denominator.x == 0.0 {
+            0.0
+        } else {
             numerator.x / denominator.x
-        } else {
-            0.0
         },
-        if denominator.y != 0.0 {
+        if denominator.y == 0.0 {
+            0.0
+        } else {
             numerator.y / denominator.y
-        } else {
-            0.0
         },
-        if denominator.z != 0.0 {
-            numerator.z / denominator.z
-        } else {
+        if denominator.z == 0.0 {
             0.0
+        } else {
+            numerator.z / denominator.z
         },
     )
 }
 
 fn source_safe_divide_scalar(numerator: f32, denominator: f32) -> f32 {
-    if denominator != 0.0 {
-        numerator / denominator
-    } else {
+    if denominator == 0.0 {
         0.0
+    } else {
+        numerator / denominator
     }
 }
 
@@ -484,7 +486,7 @@ fn encode_rgbe(value: Vec3) -> u32 {
 }
 
 fn decode_rgbe(value: u32) -> Vec3 {
-    if value & 0x7fff_ffff == 0 {
+    if value.trailing_zeros() >= 31 {
         return Vec3::ZERO;
     }
     let [r, g, b, exponent] = value.to_ne_bytes();
@@ -505,33 +507,33 @@ fn power_of_two(exponent: i32) -> f32 {
 }
 
 fn fast_log(value: f32) -> f32 {
-    const LN_2: f32 = 0.6931471805599453;
+    const LN_2: f32 = std::f32::consts::LN_2;
     let value = value.clamp(f32::MIN_POSITIVE, f32::MAX);
     let bits = value.to_bits();
     let exponent = (bits >> 23) as i32 - 127;
     let fraction = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000) - 1.0;
     let fraction2 = fraction * fraction;
     let fraction4 = fraction2 * fraction2;
-    let mut high = fraction * -0.00931049621349 + 0.05206469089414;
-    let mut low = fraction * 0.47868480909345 - 0.72116591947498;
-    high = fraction * high - 0.13753123777116;
-    high = fraction * high + 0.24187369696082;
-    high = fraction * high - 0.34730547155299;
-    low = fraction * low + 1.442689881667200;
+    let mut high = fraction * -0.009_310_496 + 0.052_064_69;
+    let mut low = fraction * 0.478_684_8 - 0.721_165_9;
+    high = fraction * high - 0.137_531_24;
+    high = fraction * high + 0.241_873_7;
+    high = fraction * high - 0.347_305_48;
+    low = fraction * low + 1.442_689_9;
     ((fraction4 * high) + (fraction * low) + exponent as f32) * LN_2
 }
 
 fn fast_exp(value: f32) -> f32 {
-    const LN_2: f32 = 0.6931471805599453;
+    const LN_2: f32 = std::f32::consts::LN_2;
     let mut value = (value / LN_2).clamp(-126.0, 126.0);
     let exponent = value as i32;
     value -= exponent as f32;
     value = 1.0 - (1.0 - value);
-    let mut result = 1.33336498402e-3_f32;
-    result = value * result + 9.810352697968e-3;
-    result = value * result + 5.551834031939e-2;
-    result = value * result + 0.2401793301105;
-    result = value * result + 0.693144857883;
+    let mut result = 1.333_365e-3_f32;
+    result = value * result + 9.810_353e-3;
+    result = value * result + 5.551_834e-2;
+    result = value * result + 0.240_179_33;
+    result = value * result + 0.693_144_86;
     result = value * result + 1.0;
     f32::from_bits(
         result
@@ -584,8 +586,8 @@ mod tests {
     }
 
     #[test]
-    fn filter_preserves_source_border_and_rgbe_intermediate_rounding() {
-        let mut film = VolumeGuidingFilm::new(1, 1).expect("one-pixel film allocation");
+    fn filter_preserves_source_border_and_rgbe_intermediate_rounding() -> super::Result<()> {
+        let mut film = VolumeGuidingFilm::new(1, 1)?;
         let scatter = Vec3::new(0.7, 0.4, 0.2);
         let transmit = Vec3::new(0.15, 0.3, 0.55);
         let sample = VolumeGuidingSample {
@@ -596,7 +598,7 @@ mod tests {
         accumulators[0].add_scatter(scatter);
         accumulators[0].add_transmit(transmit);
         accumulators[0].record(sample);
-        film.filter().expect("one-pixel filter");
+        film.filter()?;
         let (reads, _) = film.buffers();
         let after_x = rgbe_round_trip(scatter * GAUSSIAN[5]);
         let after_y = rgbe_round_trip(after_x * GAUSSIAN[5]);
@@ -604,6 +606,7 @@ mod tests {
         let after_x = rgbe_round_trip(transmit * GAUSSIAN[5]);
         let after_y = rgbe_round_trip(after_x * GAUSSIAN[5]);
         assert_eq!(decode_rgbe(reads[0].transmit_rgbe), after_y);
+        Ok(())
     }
 
     #[test]

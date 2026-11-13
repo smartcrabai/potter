@@ -26,7 +26,7 @@ impl AdaptiveSampling {
         }
     }
 
-    pub(super) fn align_batch_end(&self, completed: u32, proposed_end: u32) -> u32 {
+    pub(super) fn align_batch_end(self, completed: u32, proposed_end: u32) -> u32 {
         if proposed_end <= completed {
             return completed;
         }
@@ -40,14 +40,14 @@ impl AdaptiveSampling {
         next_filter_sample.saturating_add(1).min(proposed_end)
     }
 
-    pub(super) fn needs_filter(&self, completed: u32) -> bool {
+    pub(super) fn needs_filter(self, completed: u32) -> bool {
         completed.checked_sub(1).is_some_and(|sample| {
             sample > self.min_samples && sample & (ADAPTIVE_STEP - 1) == ADAPTIVE_STEP - 1
         })
     }
 
     pub(super) fn filter_pixels(
-        &self,
+        self,
         pixels: &mut [AdaptivePixel],
         width: u32,
         height: u32,
@@ -201,28 +201,30 @@ where
 }
 
 fn filter_x_row(row: &mut [AdaptivePixel]) {
+    let mut previous: Option<&mut AdaptivePixel> = None;
     let mut prev = false;
-    for x in 0..row.len() {
-        if !row[x].converged {
-            if x > 0 && !prev {
-                row[x - 1].converged = false;
-            }
-            prev = true;
-        } else {
+    for pixel in row.iter_mut() {
+        if pixel.converged {
             if prev {
-                row[x].converged = false;
+                pixel.converged = false;
             }
             prev = false;
+        } else {
+            if !prev && let Some(previous_pixel) = previous.as_deref_mut() {
+                previous_pixel.converged = false;
+            }
+            prev = true;
         }
+        previous = Some(pixel);
     }
 }
 
-fn split_column_bands<'pixels>(
-    pixels: &'pixels mut [AdaptivePixel],
+fn split_column_bands(
+    pixels: &mut [AdaptivePixel],
     width: usize,
     height: usize,
     band_count: usize,
-) -> Result<Vec<Vec<&'pixels mut [AdaptivePixel]>>> {
+) -> Result<Vec<Vec<&mut [AdaptivePixel]>>> {
     let mut bands = Vec::new();
     bands
         .try_reserve_exact(band_count)
@@ -249,10 +251,10 @@ fn split_column_bands<'pixels>(
 fn band_width(total: usize, band_count: usize, index: usize) -> usize {
     let base = total / band_count;
     let remainder = total % band_count;
-    base + if index < remainder { 1 } else { 0 }
+    base + usize::from(index < remainder)
 }
 
-fn filter_y_parallel<'pixels>(bands: Vec<Vec<&'pixels mut [AdaptivePixel]>>) -> Result<()> {
+fn filter_y_parallel(bands: Vec<Vec<&mut [AdaptivePixel]>>) -> Result<()> {
     let band_count = bands.len();
     if band_count == 1 {
         if let Some(rows) = bands.into_iter().next() {
@@ -276,32 +278,33 @@ fn filter_y_parallel<'pixels>(bands: Vec<Vec<&'pixels mut [AdaptivePixel]>>) -> 
     })
 }
 
-fn filter_y_columns<'pixels>(mut rows: Vec<&'pixels mut [AdaptivePixel]>) {
-    if rows.is_empty() {
+fn filter_y_columns(mut rows: Vec<&mut [AdaptivePixel]>) {
+    let Some((first_row, remaining_rows)) = rows.split_first_mut() else {
         return;
-    }
-    let height = rows.len();
-    let width = rows[0].len();
-    for x in 0..width {
-        let mut prev = false;
-        for y in 0..height {
-            if !rows[y][x].converged {
-                if y > 0 && !prev {
-                    rows[y - 1][x].converged = false;
-                }
-                prev = true;
-            } else {
+    };
+    for (x, first_pixel) in first_row.iter_mut().enumerate() {
+        let mut prev = !first_pixel.converged;
+        let mut previous_pixel = Some(first_pixel);
+        for row in remaining_rows.iter_mut() {
+            let pixel = &mut row[x];
+            if pixel.converged {
                 if prev {
-                    rows[y][x].converged = false;
+                    pixel.converged = false;
                 }
                 prev = false;
+            } else {
+                if !prev && let Some(previous_pixel) = previous_pixel.as_deref_mut() {
+                    previous_pixel.converged = false;
+                }
+                prev = true;
             }
+            previous_pixel = Some(pixel);
         }
     }
 }
 
-fn join_filter_workers<'scope>(
-    handles: Vec<std::io::Result<std::thread::ScopedJoinHandle<'scope, usize>>>,
+fn join_filter_workers(
+    handles: Vec<std::io::Result<std::thread::ScopedJoinHandle<'_, usize>>>,
 ) -> Result<usize> {
     let mut raw_active = 0;
     let mut first_error = None;
@@ -446,10 +449,10 @@ mod tests {
             };
             5 * 4
         ];
-        pixels[1 * 5 + 2].converged = false;
+        pixels[5 + 2].converged = false;
         assert_eq!(
             adaptive.filter_pixels(&mut pixels, 5, 4, 1.0, |index| {
-                assert_eq!(index, 1 * 5 + 2);
+                assert_eq!(index, 5 + 2);
                 1
             }),
             Ok(1)

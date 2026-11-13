@@ -107,7 +107,7 @@ fn compute_render_tile_size(suggested_tile_size: u32) -> u64 {
     let aligned = if suggested <= IMAGE_TILE_SIZE {
         suggested
     } else {
-        ((suggested + IMAGE_TILE_SIZE - 1) / IMAGE_TILE_SIZE) * IMAGE_TILE_SIZE
+        suggested.div_ceil(IMAGE_TILE_SIZE) * IMAGE_TILE_SIZE
     };
     aligned.min(MAX_TILE_SIZE)
 }
@@ -116,12 +116,7 @@ fn ceil_div(value: u64, divisor: u64) -> u64 {
     if divisor == 0 {
         0
     } else {
-        let quotient = value / divisor;
-        if value % divisor == 0 {
-            quotient
-        } else {
-            quotient + 1
-        }
+        value.div_ceil(divisor)
     }
 }
 
@@ -232,17 +227,17 @@ mod tests {
         }
         assert_crops_partition_image(9001, 3, &tiles);
 
-        assert!(collect_tiles(0, 100, 128, true).is_empty());
-        assert!(collect_tiles(100, 0, 128, true).is_empty());
-        assert!(collect_tiles(0, 0, 128, true).is_empty());
+        assert_eq!(collect_tiles(0, 100, 128, true), Vec::<VolumeTile>::new());
+        assert_eq!(collect_tiles(100, 0, 128, true), Vec::<VolumeTile>::new());
+        assert_eq!(collect_tiles(0, 0, 128, true), Vec::<VolumeTile>::new());
     }
 
     #[test]
-    fn u32_sized_images_yield_a_finite_prefix_with_wide_coordinates() {
+    fn u32_sized_images_yield_a_finite_prefix_with_wide_coordinates() -> Result<(), &'static str> {
         let mut tiles = VolumeTiles::new(u32::MAX, u32::MAX, 8192, false);
-        let first = tiles.next().unwrap();
-        let second = tiles.next().unwrap();
-        let third = tiles.next().unwrap();
+        let first = tiles.next().ok_or("missing first tile")?;
+        let second = tiles.next().ok_or("missing second tile")?;
+        let third = tiles.next().ok_or("missing third tile")?;
 
         assert_eq!(first.buffer_x, 0);
         assert_eq!(first.buffer_y, 0);
@@ -250,11 +245,12 @@ mod tests {
         assert_eq!(second.buffer_x, 8192);
         assert_eq!(third.buffer_x, 16384);
         for tile in [first, second, third] {
-            assert!(u64::from(tile.buffer_x) + u64::from(tile.buffer_width) <= u64::from(u32::MAX));
+            assert!(u32::try_from(u64::from(tile.buffer_x) + u64::from(tile.buffer_width)).is_ok());
             assert!(
-                u64::from(tile.buffer_y) + u64::from(tile.buffer_height) <= u64::from(u32::MAX)
+                u32::try_from(u64::from(tile.buffer_y) + u64::from(tile.buffer_height)).is_ok()
             );
         }
+        Ok(())
     }
 
     fn assert_crops_partition_image(width: u32, height: u32, tiles: &[VolumeTile]) {

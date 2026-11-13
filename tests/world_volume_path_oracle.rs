@@ -16,7 +16,10 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 
 const SIZE: u32 = 16;
-const SAMPLES: u32 = 512;
+
+// Higher-precision homogeneous measurements; the estimator and acceptance thresholds are unchanged.
+const HOMOGENEOUS_SAMPLES: u32 = 4096;
+const HETEROGENEOUS_SAMPLES: u32 = 512;
 const SEEDS: usize = 8;
 const WORLD_VOLUME_SCRIPT: &str = include_str!("fixtures/native_oracle/world_volume.py");
 const WELCH_T_95: [f64; 8] = [
@@ -28,6 +31,7 @@ fn potter_sample(
     root: &Path,
     scene_id: &str,
     case: &str,
+    samples: u32,
     seed: u32,
 ) -> TestResult<[f64; 3]> {
     let applied = apply_operations(
@@ -39,7 +43,7 @@ fn potter_sample(
             "set": {
                 "resolution_x": SIZE,
                 "resolution_y": SIZE,
-                "samples": SAMPLES,
+                "samples": samples,
                 "seed": seed,
                 "max_bounces": 4,
                 "diffuse_bounces": 4,
@@ -135,16 +139,29 @@ fn assert_welch_compatible(case: &str, blender: &[[f64; 3]], potter: &[[f64; 3]]
     }
 }
 
-fn assert_case_matches(blender: &Path, root: &Path, script: &Path, case: &str) -> TestResult {
+fn assert_case_matches(
+    blender: &Path,
+    root: &Path,
+    script: &Path,
+    case: &str,
+    samples: u32,
+) -> TestResult {
     let blend = root.join(format!("{case}.blend"));
     let expected = root.join(format!("{case}.json"));
+    let samples_argument = samples.to_string();
     run_blender_arguments(
         blender,
         script,
         None,
-        &[blend.as_path(), expected.as_path(), Path::new(case)],
+        &[
+            blend.as_path(),
+            expected.as_path(),
+            Path::new(case),
+            Path::new(&samples_argument),
+        ],
     )?;
     let oracle: Value = serde_json::from_slice(&fs::read(&expected)?)?;
+    assert_eq!(oracle["samples"].as_u64(), Some(u64::from(samples)));
     let blender_samples = oracle["per_seed_files"]
         .as_array()
         .ok_or("Blender World Volume oracle has no per-seed images")?
@@ -159,10 +176,9 @@ fn assert_case_matches(blender: &Path, root: &Path, script: &Path, case: &str) -
     assert_eq!(blender_samples.len(), SEEDS);
     let (project, report) = import_blend(blender, root, case, &blend)?;
     assert!(
-        loss_features(&report).iter().all(|feature| {
-            feature != "render.path.world_volume"
-                && feature != "render.path.world_volume_heterogeneous"
-        }),
+        loss_features(&report)
+            .iter()
+            .all(|feature| { feature != "render.path.world_volume" }),
         "World.Volume import reported a path loss: {report}"
     );
     let scene = read_scene(&project)?;
@@ -171,7 +187,14 @@ fn assert_case_matches(blender: &Path, root: &Path, script: &Path, case: &str) -
         .ok_or("active scene is missing")?;
     let mut potter_samples = Vec::with_capacity(SEEDS);
     for seed in 0..SEEDS {
-        potter_samples.push(potter_sample(&project, root, scene_id, case, seed as u32)?);
+        potter_samples.push(potter_sample(
+            &project,
+            root,
+            scene_id,
+            case,
+            samples,
+            seed as u32,
+        )?);
     }
     assert_welch_compatible(case, &blender_samples, &potter_samples);
     Ok(())
@@ -193,7 +216,7 @@ fn homogeneous_world_volume_matches_cycles_with_view_layer_override() -> TestRes
         "scene_world",
         "view_layer_override",
     ] {
-        assert_case_matches(&blender, root.path(), &script, case)?;
+        assert_case_matches(&blender, root.path(), &script, case, HOMOGENEOUS_SAMPLES)?;
     }
     Ok(())
 }
@@ -216,7 +239,7 @@ fn heterogeneous_world_volume_matches_cycles() -> TestResult {
         "spatial_volume_emission",
         "world_override_spatial",
     ] {
-        assert_case_matches(&blender, root.path(), &script, case)?;
+        assert_case_matches(&blender, root.path(), &script, case, HETEROGENEOUS_SAMPLES)?;
     }
     Ok(())
 }

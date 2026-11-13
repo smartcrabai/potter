@@ -2392,16 +2392,16 @@ fn default_adaptive_min_samples() -> u32 {
     0
 }
 
-fn is_default_adaptive_min_samples(value: &u32) -> bool {
-    *value == 0
+fn is_default_adaptive_min_samples<T: Into<u32> + Copy>(value: &T) -> bool {
+    (*value).into() == default_adaptive_min_samples()
 }
 
 fn default_tile_size() -> u32 {
     2048
 }
 
-fn is_default_tile_size(value: &u32) -> bool {
-    *value == 2048
+fn is_default_tile_size<T: Into<u32> + Copy>(value: &T) -> bool {
+    (*value).into() == default_tile_size()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

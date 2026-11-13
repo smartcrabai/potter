@@ -472,7 +472,9 @@ fn absorbing_volume_adaptive_tiles_crop_and_normalize_at_the_first_filter()
     assert_eq!(adaptive, reference);
     assert!(
         adaptive
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|pixel| pixel[..3].iter().any(|component| *component > 0))
     );
     Ok(())

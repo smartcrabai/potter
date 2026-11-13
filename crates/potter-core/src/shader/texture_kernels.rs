@@ -429,7 +429,7 @@ pub(super) fn uint_to_float(value: u32) -> f32 {
     value as f32 / u32::MAX as f32
 }
 
-pub(super) fn hash_uint(value: u32) -> u32 {
+pub(crate) fn hash_uint(value: u32) -> u32 {
     let mut a = 0xdead_beef_u32.wrapping_add(17);
     let mut b = a;
     let mut c = a;

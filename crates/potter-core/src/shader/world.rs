@@ -1424,14 +1424,12 @@ mod tests {
         let light_path_id = Id::new("light_path")?;
         let background_id = Id::new("background")?;
         let mut group = NodeGroup::new("World", GraphKind::Shader);
-        group.nodes.insert(
-            output_id.clone(),
-            GraphNode::new("ShaderNodeOutputWorld"),
-        );
-        group.nodes.insert(
-            light_path_id.clone(),
-            GraphNode::new("ShaderNodeLightPath"),
-        );
+        group
+            .nodes
+            .insert(output_id.clone(), GraphNode::new("ShaderNodeOutputWorld"));
+        group
+            .nodes
+            .insert(light_path_id.clone(), GraphNode::new("ShaderNodeLightPath"));
         group.nodes.insert(
             background_id.clone(),
             GraphNode::new("ShaderNodeBackground"),
@@ -1462,7 +1460,13 @@ mod tests {
                 DVec3::Z,
                 path_traced,
             )
-            .unwrap_err();
+            .err()
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InvalidOperation,
+                    "world Light Path shader was accepted",
+                )
+            })?;
             assert_eq!(error.code, ErrorCode::UnsupportedFeature);
         }
         Ok(())
