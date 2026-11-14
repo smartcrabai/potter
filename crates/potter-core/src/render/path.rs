@@ -14,9 +14,8 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
     geom::volume::{
-        VolumeData, local_to_index_matrix, sample_density_checked_with,
-        sample_density_realtime_checked_with, sample_index_density_checked_with,
-        sample_index_density_realtime_checked_with, volume_attribute_is_present,
+        VolumeData, sample_density_checked_with, sample_density_realtime_checked_with,
+        volume_attribute_is_present,
     },
     image::{ImageData, ImageInterpolation},
     model::{
@@ -244,9 +243,11 @@ struct VolumeInstance<'a> {
     sampling: crate::model::VolumeSampling,
     /// Blender's `cycles.volume_interpolation` of the volume's material.
     interpolation: crate::model::VolumeInterpolation,
-    /// The inverse of an inline grid's index-to-local matrix, built once per volume (`local_to_index_matrix`). `None` for a
+    /// The inverse of an inline grid's index-to-local matrix, prepared once with its validated sampler. `None` for a
     /// decoded VDB, which samples at its local position.
     index_from_local: Option<DMat4>,
+    /// Inline samples validated once while collecting the frame's immutable volume instances.
+    prepared_density_grid: Option<crate::geom::volume::PreparedVolumeGrid<'a>>,
     /// The owning object's ray mask: a ray kind it excludes passes the volume by, as Cycles' volume bounds are not
     /// intersected by such rays.
     ray_mask: u8,
@@ -9636,10 +9637,10 @@ fn trace_path_with_guiding(
         } else {
             stack_medium(&active_media)
         };
-        let grid = if exit_entry.is_some() {
+        let mut grid_metadata = if exit_entry.is_some() {
             None
         } else {
-            voxel_grid(
+            voxel_grid_metadata(
                 volumes,
                 volume_temperatures,
                 origin,
@@ -9649,15 +9650,35 @@ fn trace_path_with_guiding(
                 heterogeneous_world.is_some(),
             )?
         };
-        let voxel_channel_pdf = grid.as_ref().map_or(DVec3::splat(1.0 / 3.0), |grid| {
-            grid_channel_pdf(grid, throughput)
-        });
         // Only generated, constant pure absorption stays on native voxel marching.
         // Source files, temperature inputs, scattering, and spatial volume effects use Source tracking.
         let heterogeneous_path = heterogeneous_world.is_some()
-            || grid
+            || grid_metadata
                 .as_ref()
                 .is_some_and(|grid| grid.heterogeneous && grid.requires_source_transport);
+        let grid = if heterogeneous_path {
+            None
+        } else {
+            grid_metadata
+                .take()
+                .map(|metadata| {
+                    voxel_grid_tables(
+                        volumes,
+                        volume_temperatures,
+                        origin,
+                        direction,
+                        ray,
+                        metadata,
+                    )
+                })
+                .transpose()?
+        };
+        let has_voxel_grid = grid.is_some() || grid_metadata.is_some();
+        let voxel_channel_pdf = if heterogeneous_path {
+            None
+        } else {
+            grid.as_ref().map(|grid| grid_channel_pdf(grid, throughput))
+        };
         update_active_volume_indices(volumes, origin, direction, ray, &mut active_volume_indices);
         let mut roulette_terminated = false;
         // Roulette compensation follows continuation semantics; terminal lamps/background stay undivided
@@ -9665,7 +9686,7 @@ fn trace_path_with_guiding(
         let mut roulette_weight = 1.0;
         if roulette_applies(RouletteEvents {
             exit_probe: exit_entry.is_some(),
-            has_volume: grid.is_some() || stack.is_some() || heterogeneous_world.is_some(),
+            has_volume: has_voxel_grid || stack.is_some() || heterogeneous_world.is_some(),
             has_surface: hit.is_some(),
             has_light: light.is_some(),
         }) {
@@ -9699,7 +9720,7 @@ fn trace_path_with_guiding(
                 }
             }
         }
-        if grid.is_some() || stack.is_some() || heterogeneous_world.is_some() {
+        if has_voxel_grid || stack.is_some() || heterogeneous_world.is_some() {
             if bounce == 0
                 && let Some(guide) = guide.as_mut()
             {
@@ -9742,8 +9763,10 @@ fn trace_path_with_guiding(
             None
         } else {
             segment_sampling(
-                grid.iter()
+                grid_metadata
+                    .iter()
                     .flat_map(|grid| grid.samplings.iter().copied())
+                    .chain(grid.iter().flat_map(|grid| grid.samplings.iter().copied()))
                     .chain(
                         active_media
                             .iter()
@@ -9754,7 +9777,7 @@ fn trace_path_with_guiding(
         };
         let budget = transparent_max_bounces.saturating_sub(transparent_bounce);
         let needs_source_volume_sample = method.is_some()
-            || (!terminal && grid.is_none() && heterogeneous_world.is_none() && stack.is_some())
+            || (!terminal && !has_voxel_grid && heterogeneous_world.is_none() && stack.is_some())
             || heterogeneous_path;
         let source_index = if needs_source_volume_sample {
             Some(rng.source_index()?)
@@ -9765,7 +9788,7 @@ fn trace_path_with_guiding(
             source_index.map(|source_index| sample_source_light(source_index, rng_offset))
         });
         let needs_source_r5 = method.is_some()
-            || (!terminal && grid.is_none() && heterogeneous_world.is_none() && stack.is_some());
+            || (!terminal && !has_voxel_grid && heterogeneous_world.is_none() && stack.is_some());
         let source_r5 = if needs_source_r5 {
             let source_index = source_index.ok_or_else(|| {
                 PotError::new(
@@ -9786,7 +9809,7 @@ fn trace_path_with_guiding(
             .map(|strategy| strategy.sample)
             .or_else(|| source_r5.map(f64::from));
         let homogeneous_path_sample =
-            if !terminal && grid.is_none() && heterogeneous_world.is_none() {
+            if !terminal && !has_voxel_grid && heterogeneous_world.is_none() {
                 if let Some(medium) = stack.as_ref() {
                     let source_index = source_index.ok_or_else(|| {
                         PotError::new(
@@ -9825,7 +9848,7 @@ fn trace_path_with_guiding(
             };
         // Homogeneous media take Cycles' dedicated direct-scatter sample instead of reusing the
         // indirect path event. The latter can be absorption/null/escape and has a different density.
-        let homogeneous_direct = if heterogeneous_world.is_none() && grid.is_none() {
+        let homogeneous_direct = if heterogeneous_world.is_none() && !has_voxel_grid {
             stack.as_ref().zip(homogeneous_path_sample.as_ref())
         } else {
             None
@@ -10134,7 +10157,12 @@ fn trace_path_with_guiding(
                                 grid.as_ref(),
                                 stack.as_ref(),
                                 distance,
-                                voxel_channel_pdf,
+                                voxel_channel_pdf.ok_or_else(|| {
+                                    PotError::new(
+                                        ErrorCode::InternalError,
+                                        "native voxel MIS requires its channel PDF",
+                                    )
+                                })?,
                             ),
                         )
                     } else {
@@ -17095,6 +17123,7 @@ fn collect_volumes<'a>(
             params.volume_interpolation
         });
         let mut volume_temperature = None;
+        let mut prepared_density_grid = None;
         if let Some(shading) = &evaluated_material {
             let mut active_capture = None;
             for capture in &temperature_captures {
@@ -17110,6 +17139,18 @@ fn collect_volumes<'a>(
             if let Some(capture) = active_capture {
                 if shading.volume.len() != 1 || temperature_captures.len() != 1 {
                     return Err(volume_temperature_graph_error(node_id));
+                }
+                if capture.attribute == "density"
+                    && matches!(
+                        &volume.source,
+                        crate::geom::volume::VolumeSource::Generated(_)
+                    )
+                {
+                    prepared_density_grid =
+                        Some(crate::geom::volume::prepare_density_grid_at_local(
+                            volume,
+                            (bounds_min + bounds_max) * 0.5,
+                        )?);
                 }
                 let mut temperature = VolumeTemperature {
                     attribute: capture.attribute.clone(),
@@ -17128,6 +17169,7 @@ fn collect_volumes<'a>(
                     volume,
                     (bounds_min + bounds_max) * 0.5,
                     path_traced,
+                    prepared_density_grid,
                 )?;
                 volume_temperature = Some(temperature);
             }
@@ -17203,6 +17245,16 @@ fn collect_volumes<'a>(
                     )
                 })
             });
+        let (prepared_density_grid, index_from_local) = if let Some((prepared, index_from_local)) =
+            prepared_density_grid
+        {
+            (Some(prepared), Some(index_from_local))
+        } else if volume.decoded_vdb.is_some() {
+            (None, None)
+        } else {
+            let (prepared, index_from_local) = crate::geom::volume::prepare_density_grid(volume)?;
+            (Some(prepared), Some(index_from_local))
+        };
         volumes.push(VolumeInstance {
             volume,
             world_to_local: matrix.inverse(),
@@ -17223,11 +17275,8 @@ fn collect_volumes<'a>(
             requires_source_transport,
             source_octree: None,
             interpolation,
-            index_from_local: if volume.decoded_vdb.is_some() {
-                None
-            } else {
-                Some(local_to_index_matrix(volume)?)
-            },
+            prepared_density_grid,
+            index_from_local,
             path_traced,
             ray_mask: node.resolved_ray_visibility().mask(),
         });
@@ -17318,6 +17367,7 @@ fn volume_temperature_emission_at(
     volume: &VolumeData,
     local_position: DVec3,
     map_vdb_taps: bool,
+    prepared_density_grid: Option<(crate::geom::volume::PreparedVolumeGrid<'_>, DMat4)>,
 ) -> Result<DVec3> {
     let mut map = |attribute: f64| {
         blackbody_emission(
@@ -17329,6 +17379,24 @@ fn volume_temperature_emission_at(
     };
     let sampled = if temperature.attribute.is_empty() {
         None
+    } else if temperature.attribute == "density"
+        && matches!(
+            &volume.source,
+            crate::geom::volume::VolumeSource::Generated(_)
+        )
+    {
+        let (prepared, index_from_local) = prepared_density_grid.ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "generated density has no validated sampler",
+            )
+        })?;
+        Some(map(prepared.sample_density_at_local(
+            local_position,
+            index_from_local,
+            temperature.interpolation,
+            !temperature.path_traced,
+        )?))
     } else if map_vdb_taps {
         crate::geom::volume::sample_scalar_attribute_mapped_checked(
             &temperature.attribute,
@@ -17410,6 +17478,9 @@ fn volume_emission_at(
         instance.volume,
         local_position,
         temperature.path_traced,
+        instance
+            .prepared_density_grid
+            .zip(instance.index_from_local),
     )?;
     Ok(instance.emission + sampled - temperature.center_emission)
 }
@@ -17611,7 +17682,7 @@ mod volume_shader_context_tests {
         model::{DataBlock, Id, Material, Node, SceneDoc},
     };
 
-    use super::{RayKind, collect_volumes, voxel_grid};
+    use super::collect_volumes;
 
     #[test]
     fn realtime_volume_uses_eevee_falloff_and_volume_object_info() -> crate::error::Result<()> {
@@ -17782,141 +17853,6 @@ mod volume_shader_context_tests {
             }
             assert_eq!(volume.albedo, DVec3::ONE);
         }
-        Ok(())
-    }
-    fn collected_voxel_grid_classification(
-        volume_node_type: &str,
-        density_attribute: Option<&str>,
-        values: Vec<f32>,
-    ) -> crate::error::Result<(bool, bool)> {
-        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
-        let graph_id = Id::from_static("volume_shader");
-        let material_id = Id::from_static("volume_material");
-        let data_id = Id::from_static("volume_data");
-        let object_id = Id::from_static("volume_object");
-        let mut group = NodeGroup::new("Volume shader", GraphKind::Shader);
-        let mut volume_node = GraphNode::new(volume_node_type);
-        volume_node.inputs.insert("Density".to_owned(), json!(1.0));
-        if let Some(attribute) = density_attribute {
-            volume_node
-                .inputs
-                .insert("Density Attribute".to_owned(), json!(attribute));
-        }
-        let _ = group.nodes.insert(Id::from_static("volume"), volume_node);
-        let mut output = GraphNode::new("ShaderNodeOutputMaterial");
-        let _ = output
-            .properties
-            .insert("is_active_output".to_owned(), json!(true));
-        let _ = group.nodes.insert(Id::from_static("output"), output);
-        group.links.push(GraphLink {
-            from_node: Id::from_static("volume"),
-            from_socket: "Volume".to_owned(),
-            to_node: Id::from_static("output"),
-            to_socket: "Volume".to_owned(),
-        });
-        let _ = doc.node_groups.insert(graph_id.clone(), group);
-        let _ = doc.materials.insert(
-            material_id.clone(),
-            Material {
-                name: "Volume material".to_owned(),
-                node_tree: Some(graph_id.clone()),
-                ..Material::default()
-            },
-        );
-        let mut volume = VolumeData::default();
-        volume.grids.push(VolumeGrid {
-            dims: [2, 2, 2],
-            voxel_size: 1.0,
-            values: Some(values),
-            ..VolumeGrid::default()
-        });
-        let source_needs_attributes =
-            super::shader_graph_has_spatial_volume_effect(&doc, &graph_id, &volume, false);
-        let _ = doc.data_blocks.insert(
-            data_id.clone(),
-            DataBlock {
-                data_type: "volume".to_owned(),
-                volume: Some(volume),
-                ..DataBlock::default()
-            },
-        );
-        let _ = doc.nodes.insert(
-            object_id.clone(),
-            Node {
-                name: "Volume".to_owned(),
-                kind: "volume".to_owned(),
-                data: Some(data_id),
-                materials: vec![Some(material_id)],
-                ..Node::default()
-            },
-        );
-        if let Some(root) = doc.collections.get_mut(&Id::from_static("collection_root")) {
-            root.objects.push(object_id);
-        }
-        let snapshot = Snapshot::evaluate(
-            &doc,
-            &EvaluationContext {
-                scene_id: Some(doc.active_scene.clone()),
-                purpose: EvaluationPurpose::Render,
-                ..EvaluationContext::default()
-            },
-        )?;
-        let warnings = RefCell::new(Vec::new());
-        let (volumes, temperatures) = collect_volumes(
-            &doc,
-            &snapshot,
-            true,
-            1.0,
-            &BTreeMap::new(),
-            &warnings,
-            crate::node_kernels::MathSemantics::Cycles,
-        )?;
-        let Some(grid) = voxel_grid(
-            &volumes,
-            &temperatures,
-            DVec3::new(-2.0, 0.5, 0.5),
-            DVec3::X,
-            4.0,
-            RayKind::Camera,
-            false,
-        )?
-        else {
-            return Err(crate::error::PotError::new(
-                crate::error::ErrorCode::InternalError,
-                "test ray did not intersect the volume grid",
-            ));
-        };
-        Ok((grid.heterogeneous, source_needs_attributes))
-    }
-
-    #[test]
-    fn principled_density_attribute_uses_heterogeneous_core_for_uniform_grid()
-    -> crate::error::Result<()> {
-        let (native_heterogeneous, source_needs_attributes) = collected_voxel_grid_classification(
-            "ShaderNodeVolumePrincipled",
-            Some("density"),
-            vec![1.0; 8],
-        )?;
-        assert!(native_heterogeneous);
-        assert!(source_needs_attributes);
-        Ok(())
-    }
-    #[test]
-    fn implicit_density_grid_routes_constant_scatter_through_core() -> crate::error::Result<()> {
-        let (native_heterogeneous, source_needs_attributes) =
-            collected_voxel_grid_classification("ShaderNodeVolumeScatter", None, vec![1.0; 8])?;
-        assert!(native_heterogeneous);
-        assert!(!source_needs_attributes);
-        Ok(())
-    }
-
-    #[test]
-    fn constant_source_absorption_is_homogeneous_but_native_density_grid_is_heterogeneous()
-    -> crate::error::Result<()> {
-        let (native_heterogeneous, source_needs_attributes) =
-            collected_voxel_grid_classification("ShaderNodeVolumeAbsorption", None, vec![1.0; 8])?;
-        assert!(!source_needs_attributes);
-        assert!(native_heterogeneous);
         Ok(())
     }
 
@@ -18644,6 +18580,7 @@ mod heterogeneous_volume_context_tests {
             }],
             ..crate::geom::volume::VolumeData::default()
         };
+        let prepared_density_grid = Some(crate::geom::volume::prepare_density_grid(&volume)?.0);
         let make_instance = |object_scale, translation| VolumeInstance {
             volume: &volume,
             world_to_local: (glam::DMat4::from_translation(translation)
@@ -18665,6 +18602,7 @@ mod heterogeneous_volume_context_tests {
             sampling: crate::model::VolumeSampling::Distance,
             interpolation: crate::model::VolumeInterpolation::Linear,
             index_from_local: Some(glam::DMat4::IDENTITY),
+            prepared_density_grid,
             ray_mask: RayKind::Camera.bit(),
             path_traced: true,
         };
@@ -18796,6 +18734,7 @@ mod heterogeneous_volume_context_tests {
             }],
             ..crate::geom::volume::VolumeData::default()
         };
+        let prepared_density_grid = Some(crate::geom::volume::prepare_density_grid(&volume)?.0);
         let volumes = [VolumeInstance {
             volume: &volume,
             world_to_local: glam::DMat4::IDENTITY,
@@ -18815,6 +18754,7 @@ mod heterogeneous_volume_context_tests {
             sampling: crate::model::VolumeSampling::Distance,
             interpolation: crate::model::VolumeInterpolation::Linear,
             index_from_local: Some(glam::DMat4::IDENTITY),
+            prepared_density_grid,
             ray_mask: RayKind::Camera.bit(),
             path_traced: true,
         }];
@@ -18883,6 +18823,7 @@ mod heterogeneous_volume_context_tests {
             }],
             ..crate::geom::volume::VolumeData::default()
         };
+        let prepared_density_grid = Some(crate::geom::volume::prepare_density_grid(&volume)?.0);
         let make_instance = |bounds_min, bounds_max| VolumeInstance {
             volume: &volume,
             world_to_local: glam::DMat4::IDENTITY,
@@ -18902,6 +18843,7 @@ mod heterogeneous_volume_context_tests {
             sampling: crate::model::VolumeSampling::Distance,
             interpolation: crate::model::VolumeInterpolation::Linear,
             index_from_local: Some(glam::DMat4::IDENTITY),
+            prepared_density_grid,
             ray_mask: RayKind::Camera.bit(),
             path_traced: true,
         };
@@ -18996,6 +18938,7 @@ mod heterogeneous_volume_context_tests {
             }],
             ..crate::geom::volume::VolumeData::default()
         };
+        let prepared_density_grid = Some(crate::geom::volume::prepare_density_grid(&volume)?.0);
         let make_instance = |extinction_rgb_scale, meters_per_unit, sampling| VolumeInstance {
             volume: &volume,
             world_to_local: glam::DMat4::IDENTITY,
@@ -19015,6 +18958,7 @@ mod heterogeneous_volume_context_tests {
             sampling,
             interpolation: crate::model::VolumeInterpolation::Linear,
             index_from_local: Some(glam::DMat4::IDENTITY),
+            prepared_density_grid,
             ray_mask: RayKind::Camera.bit(),
             path_traced: true,
         };
@@ -19059,6 +19003,7 @@ mod heterogeneous_volume_context_tests {
             }],
             ..crate::geom::volume::VolumeData::default()
         };
+        let prepared_density_grid = Some(crate::geom::volume::prepare_density_grid(&volume)?.0);
         let instance = VolumeInstance {
             volume: &volume,
             world_to_local: glam::DMat4::IDENTITY,
@@ -19081,6 +19026,7 @@ mod heterogeneous_volume_context_tests {
             sampling: crate::model::VolumeSampling::Distance,
             interpolation: crate::model::VolumeInterpolation::Linear,
             index_from_local: Some(glam::DMat4::IDENTITY),
+            prepared_density_grid,
             ray_mask: RayKind::Camera.bit(),
             path_traced: true,
         };
@@ -19180,6 +19126,7 @@ mod heterogeneous_volume_context_tests {
             }],
             ..crate::geom::volume::VolumeData::default()
         };
+        let prepared_density_grid = Some(crate::geom::volume::prepare_density_grid(&volume)?.0);
         let instance = VolumeInstance {
             volume: &volume,
             world_to_local: glam::DMat4::IDENTITY,
@@ -19199,6 +19146,7 @@ mod heterogeneous_volume_context_tests {
             sampling: crate::model::VolumeSampling::Distance,
             interpolation: crate::model::VolumeInterpolation::Linear,
             index_from_local: Some(glam::DMat4::IDENTITY),
+            prepared_density_grid,
             ray_mask: RayKind::Camera.bit(),
             path_traced: true,
         };
@@ -19952,8 +19900,6 @@ struct VoxelGrid {
     /// The scatter of the volumes with each anisotropy, so every phase is evaluated with its own volumes.
     groups: Vec<ScatterGroup>,
     stochastic: bool,
-    heterogeneous: bool,
-    requires_source_transport: bool,
     /// Blender's `cycles.volume_sampling` of each volume that the segment crosses.
     samplings: Vec<crate::model::VolumeSampling>,
 }
@@ -19964,6 +19910,7 @@ struct ScatterGroup {
     scatter: Vec<DVec3>,
 }
 
+#[cfg(test)]
 fn voxel_grid(
     volumes: &[VolumeInstance<'_>],
     volume_temperatures: &[Option<VolumeTemperature>],
@@ -19973,6 +19920,49 @@ fn voxel_grid(
     ray: RayKind,
     include_temperature_emission: bool,
 ) -> Result<Option<VoxelGrid>> {
+    let Some(metadata) = voxel_grid_metadata(
+        volumes,
+        volume_temperatures,
+        origin,
+        direction,
+        max_distance,
+        ray,
+        include_temperature_emission,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(voxel_grid_tables(
+        volumes,
+        volume_temperatures,
+        origin,
+        direction,
+        ray,
+        metadata,
+    )?))
+}
+
+/// Bounds and transport flags needed before choosing dense native marching or Source tracking.
+struct VoxelGridMetadata {
+    entry: f64,
+    exit: f64,
+    minimum_step: f64,
+    stochastic: bool,
+    heterogeneous: bool,
+    requires_source_transport: bool,
+    samplings: Vec<crate::model::VolumeSampling>,
+    include_temperature_emission: bool,
+}
+
+fn voxel_grid_metadata(
+    volumes: &[VolumeInstance<'_>],
+    volume_temperatures: &[Option<VolumeTemperature>],
+    origin: DVec3,
+    direction: DVec3,
+    max_distance: f64,
+    ray: RayKind,
+    include_temperature_emission: bool,
+) -> Result<Option<VoxelGridMetadata>> {
     let mut entry = f64::INFINITY;
     let mut exit = 0.0_f64;
     let mut minimum_step = f64::INFINITY;
@@ -20019,6 +20009,35 @@ fn voxel_grid(
     if !entry.is_finite() || exit <= entry {
         return Ok(None);
     }
+    Ok(Some(VoxelGridMetadata {
+        entry,
+        exit,
+        minimum_step,
+        stochastic,
+        heterogeneous,
+        requires_source_transport,
+        samplings,
+        include_temperature_emission,
+    }))
+}
+
+fn voxel_grid_tables(
+    volumes: &[VolumeInstance<'_>],
+    volume_temperatures: &[Option<VolumeTemperature>],
+    origin: DVec3,
+    direction: DVec3,
+    ray: RayKind,
+    metadata: VoxelGridMetadata,
+) -> Result<VoxelGrid> {
+    let VoxelGridMetadata {
+        entry,
+        exit,
+        minimum_step,
+        stochastic,
+        samplings,
+        include_temperature_emission,
+        ..
+    } = metadata;
     let segment_length = exit - entry;
     let steps = (segment_length / minimum_step)
         .ceil()
@@ -20104,7 +20123,7 @@ fn voxel_grid(
         }
     }))
     .clamp(DVec3::ZERO, DVec3::ONE);
-    Ok(Some(VoxelGrid {
+    Ok(VoxelGrid {
         entry,
         exit,
         step,
@@ -20117,10 +20136,8 @@ fn voxel_grid(
         achromatic,
         groups,
         stochastic,
-        requires_source_transport,
-        heterogeneous,
         samplings,
-    }))
+    })
 }
 
 struct TemperatureEmissionMarch<'a, 'volume> {
@@ -20594,20 +20611,17 @@ fn instance_density(instance: &VolumeInstance<'_>, local_position: DVec3) -> f64
 fn instance_density_checked(instance: &VolumeInstance<'_>, local_position: DVec3) -> Result<f64> {
     match instance.index_from_local {
         Some(index_from_local) => {
-            let coordinate = index_from_local.transform_point3(local_position);
-            if instance.path_traced {
-                sample_index_density_checked_with(
-                    coordinate,
-                    instance.volume,
-                    instance.interpolation,
+            let prepared = instance.prepared_density_grid.ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "inline volume grid has no validated sampler",
                 )
-            } else {
-                sample_index_density_realtime_checked_with(
-                    coordinate,
-                    instance.volume,
-                    instance.interpolation,
-                )
-            }
+            })?;
+            prepared.sample_density(
+                index_from_local.transform_point3(local_position),
+                instance.interpolation,
+                !instance.path_traced,
+            )
         }
         None if instance.path_traced => {
             sample_density_checked_with(local_position, instance.volume, instance.interpolation)
@@ -21161,6 +21175,7 @@ mod volume_extinction_tests {
             sampling: crate::model::VolumeSampling::MultipleImportance,
             interpolation: crate::model::VolumeInterpolation::Linear,
             index_from_local: None,
+            prepared_density_grid: None,
             path_traced: true,
             ray_mask: crate::model::RayVisibility::default().mask(),
         };
@@ -21218,6 +21233,7 @@ mod volume_extinction_tests {
             sampling: crate::model::VolumeSampling::default(),
             interpolation: crate::model::VolumeInterpolation::Linear,
             index_from_local: None,
+            prepared_density_grid: None,
             path_traced: true,
             ray_mask,
         };
@@ -26423,6 +26439,7 @@ mod cycles_world_light_tests {
             sampling: crate::model::VolumeSampling::Distance,
             interpolation: crate::model::VolumeInterpolation::Linear,
             index_from_local: None,
+            prepared_density_grid: None,
             ray_mask: crate::model::RayVisibility::default().mask(),
             path_traced: true,
         }];

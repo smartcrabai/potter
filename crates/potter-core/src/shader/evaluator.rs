@@ -1637,18 +1637,32 @@ fn evaluate_volume_output_inner(
             format!("shader graph `{graph_id}` is not a shader graph"),
         ));
     }
-    let output = if has_world_output(group) {
-        let Some(output) = select_world_output(group, true) else {
-            return Ok(());
-        };
-        output
-    } else {
-        PreparedMaterial::active_output(group).ok_or_else(|| {
+    let prepared_index = prepared.link_index(graph_id, group);
+    let output = match prepared_index {
+        Some(index) if index.world_output_graph => {
+            let Some(output) = index.output.as_ref() else {
+                return Ok(());
+            };
+            output
+        }
+        Some(index) => index.output.as_ref().ok_or_else(|| {
             PotError::new(
                 ErrorCode::EvaluationFailed,
                 "shader graph has no active shader output node",
             )
-        })?
+        })?,
+        None if has_world_output(group) => {
+            let Some(output) = select_world_output(group, true) else {
+                return Ok(());
+            };
+            output
+        }
+        None => PreparedMaterial::active_output(group).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "shader graph has no active shader output node",
+            )
+        })?,
     };
     let (_, has_volume, _) = prepared.output_feeds(graph_id, group, output);
     if !has_volume {
@@ -1660,7 +1674,8 @@ fn evaluate_volume_output_inner(
         hit_ctx: *hit_ctx,
         workspace,
         alpha_linked_images: &prepared.alpha_linked_images,
-        links: prepared.fold_index(graph_id, group),
+        links: prepared_index.map(|index| &index.folds),
+        node_bindings: prepared_index.map(|index| &index.bindings),
         group_input_binding: None,
         group_depth: 0,
         math_semantics,
@@ -1760,6 +1775,7 @@ fn evaluate_surface_inner_into(
         workspace,
         alpha_linked_images: &prepared.alpha_linked_images,
         links: prepared.fold_index(graph_id, group),
+        node_bindings: prepared.binding_index(graph_id, group),
         group_input_binding: None,
         group_depth: 0,
         math_semantics,
@@ -1937,6 +1953,7 @@ fn evaluate_displacement_inner(
         math_semantics,
         alpha_linked_images: &prepared.alpha_linked_images,
         links: prepared.fold_index(graph_id, group),
+        node_bindings: prepared.binding_index(graph_id, group),
         group_input_binding: None,
         group_depth: 0,
         texture_mapping_unsupported: &prepared.texture_mapping_unsupported,
@@ -2171,14 +2188,14 @@ enum Value {
     Shader(ClosureSpan),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ValueKind {
     Scalar,
     Vector,
     Color,
     Shader,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NodeKind {
     OutputMaterial,
     Reroute,
@@ -2588,16 +2605,196 @@ struct LinkIndex {
     /// target node and socket of each candidate link.
     links_address: usize,
     link_count: usize,
+    /// The selected output and the sockets linked to it.
+    output: Option<Id>,
+    has_surface: bool,
+    has_volume: bool,
+    has_displacement: bool,
     /// Prebuilt incoming-link index and primitive folds for every nested group invocation.
     folds: super::inline_fold::FoldIndex,
-    /// The output node that the socket flags below describe.
-    output: Option<Id>,
-    /// Whether a link reaches the output's `Surface` socket.
-    has_surface: bool,
-    /// Whether a link reaches the output's `Volume` socket.
-    has_volume: bool,
-    /// Whether a link reaches the output's `Displacement` socket.
-    has_displacement: bool,
+    /// Whether this is a World graph, whose selected output may be absent without an evaluation error.
+    world_output_graph: bool,
+    /// Per-node socket bindings and static dispatch prepared with the graph.
+    bindings: PreparedGraphBindings,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PreparedGraphBindings {
+    nodes: BTreeMap<Id, PreparedNodeBindings>,
+    children: BTreeMap<Id, PreparedGraphBindings>,
+    interface_inputs: BTreeMap<String, PreparedInterfaceSocket>,
+    interface_outputs: BTreeMap<String, PreparedInterfaceSocket>,
+    active_group_output: Option<Id>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreparedInterfaceSocket {
+    index: usize,
+    kind: Option<ValueKind>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PreparedNodeBindings {
+    kind: Option<NodeKind>,
+    inputs: BTreeMap<String, PreparedInputBinding>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PreparedInputBinding {
+    link: Option<usize>,
+    input_key: Option<String>,
+    linked: bool,
+}
+
+impl PreparedGraphBindings {
+    fn new(
+        group: &NodeGroup,
+        folds: &super::inline_fold::FoldIndex,
+        node_groups: &Registry<NodeGroup>,
+    ) -> Self {
+        let nodes = group
+            .nodes
+            .iter()
+            .map(|(node_id, node)| {
+                let mut queries = BTreeSet::new();
+                if let Some(incoming) = folds.incoming.get(node_id) {
+                    for &link_index in incoming {
+                        if let Some(link) = group.links.get(link_index) {
+                            add_socket_queries(&mut queries, &link.to_socket);
+                        }
+                    }
+                }
+                for input in node.inputs.keys() {
+                    add_socket_queries(&mut queries, input);
+                }
+                if node.node_type == "ShaderNodeGroup"
+                    && let Some(child_group) = node
+                        .properties
+                        .get("node_tree")
+                        .and_then(JsonValue::as_str)
+                        .and_then(|group_id| node_groups.get(group_id))
+                {
+                    for socket in &child_group.interface.inputs {
+                        add_socket_queries(&mut queries, &socket.id);
+                        add_socket_queries(&mut queries, &socket.name);
+                    }
+                }
+                if node.node_type == "NodeGroupOutput" {
+                    for socket in &group.interface.outputs {
+                        add_socket_queries(&mut queries, &socket.id);
+                        add_socket_queries(&mut queries, &socket.name);
+                    }
+                }
+                let incoming = folds.incoming.get(node_id);
+                let inputs = queries
+                    .into_iter()
+                    .map(|requested| {
+                        let link = incoming.and_then(|indices| {
+                            indices.iter().copied().find(|&link_index| {
+                                group.links.get(link_index).is_some_and(|link| {
+                                    link.to_node == *node_id
+                                        && input_socket_matches(
+                                            node_groups,
+                                            node,
+                                            &link.to_socket,
+                                            &requested,
+                                        )
+                                })
+                            })
+                        });
+                        let input_key = node
+                            .inputs
+                            .iter()
+                            .find(|(candidate, _)| {
+                                input_socket_matches(node_groups, node, candidate, &requested)
+                            })
+                            .map(|(candidate, _)| candidate.clone());
+                        let linked = incoming.is_some_and(|indices| {
+                            indices.iter().any(|&link_index| {
+                                group.links.get(link_index).is_some_and(|link| {
+                                    link.to_node == *node_id
+                                        && socket_matches(&link.to_socket, &requested)
+                                })
+                            })
+                        });
+                        (
+                            requested,
+                            PreparedInputBinding {
+                                link,
+                                input_key,
+                                linked,
+                            },
+                        )
+                    })
+                    .collect();
+                (
+                    node_id.clone(),
+                    PreparedNodeBindings {
+                        kind: prepared_node_kind(node),
+                        inputs,
+                    },
+                )
+            })
+            .collect();
+        let children = folds
+            .children
+            .iter()
+            .filter_map(|(node_id, child_folds)| {
+                let child_group_id = group
+                    .nodes
+                    .get(node_id)?
+                    .properties
+                    .get("node_tree")?
+                    .as_str()?;
+                let child_group = node_groups.get(child_group_id)?;
+                Some((
+                    node_id.clone(),
+                    Self::new(child_group, child_folds, node_groups),
+                ))
+            })
+            .collect();
+        let interface_inputs = prepared_interface_sockets(&group.interface.inputs);
+        let interface_outputs = prepared_interface_sockets(&group.interface.outputs);
+        let active_group_output = active_group_output(group).cloned();
+        Self {
+            nodes,
+            children,
+            interface_inputs,
+            interface_outputs,
+            active_group_output,
+        }
+    }
+}
+fn prepared_interface_sockets(
+    sockets: &[crate::graph::GraphSocket],
+) -> BTreeMap<String, PreparedInterfaceSocket> {
+    let mut prepared = BTreeMap::new();
+    for (index, socket) in sockets.iter().enumerate() {
+        let binding = PreparedInterfaceSocket {
+            index,
+            kind: group_socket_value_kind(&socket.socket_type),
+        };
+        prepared.entry(socket.id.clone()).or_insert(binding);
+        prepared.entry(socket.name.clone()).or_insert(binding);
+    }
+    prepared
+}
+
+fn add_socket_queries(queries: &mut BTreeSet<String>, socket: &str) {
+    queries.insert(socket.to_owned());
+    if let Some(alias) = socket_alias(socket) {
+        queries.insert(alias.to_owned());
+    }
+}
+
+fn prepared_node_kind(node: &GraphNode) -> Option<NodeKind> {
+    if node.node_type == "NodeReroute" {
+        Some(NodeKind::Reroute)
+    } else if node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true) {
+        Some(NodeKind::Muted)
+    } else {
+        NodeKind::from_node_type(&node.node_type)
+    }
 }
 
 impl LinkIndex {
@@ -2605,9 +2802,11 @@ impl LinkIndex {
         graph_id: &Id,
         group: &NodeGroup,
         output: Option<&Id>,
+        world_output_graph: bool,
         node_groups: &Registry<NodeGroup>,
     ) -> Self {
         let folds = super::inline_fold::FoldIndex::new(graph_id, group, node_groups);
+        let bindings = PreparedGraphBindings::new(group, &folds, node_groups);
         let (has_surface, has_volume, has_displacement) = output
             .map_or((false, false, false), |output| {
                 scan_output_feeds(group, output)
@@ -2621,6 +2820,8 @@ impl LinkIndex {
             has_volume,
             has_surface,
             has_displacement,
+            world_output_graph,
+            bindings,
         }
     }
 }
@@ -2661,12 +2862,13 @@ impl PreparedMaterial {
                 ..Self::default()
             };
         };
-        let output = if has_world_output(group) {
+        let world_output_graph = has_world_output(group);
+        let output = if world_output_graph {
             select_world_output(group, true)
         } else {
             Self::active_output(group)
         };
-        let links = LinkIndex::new(graph_id, group, output, node_groups);
+        let links = LinkIndex::new(graph_id, group, output, world_output_graph, node_groups);
         let source_fold_failure = RefCell::new(None);
         let eevee_closure_flags = graph_eevee_closure_flags(
             graph_id,
@@ -2747,6 +2949,10 @@ impl PreparedMaterial {
         group: &NodeGroup,
     ) -> Option<&super::inline_fold::FoldIndex> {
         self.link_index(graph_id, group).map(|index| &index.folds)
+    }
+    fn binding_index(&self, graph_id: &Id, group: &NodeGroup) -> Option<&PreparedGraphBindings> {
+        self.link_index(graph_id, group)
+            .map(|index| &index.bindings)
     }
     /// Whether a link reaches the `Surface`, `Volume`, and `Displacement` sockets of `output` in `group`.
     fn output_feeds(&self, graph_id: &Id, group: &NodeGroup, output: &Id) -> (bool, bool, bool) {
@@ -2877,6 +3083,7 @@ struct GroupInputBinding<'a> {
     node_id: &'a Id,
     binding: Option<&'a GroupInputBinding<'a>>,
     links: Option<&'a super::inline_fold::FoldIndex>,
+    node_bindings: Option<&'a PreparedGraphBindings>,
     depth: usize,
 }
 
@@ -2890,6 +3097,8 @@ struct Evaluator<'graph, 'material, 'registry, 'workspace, 'prepared, 'scope> {
     alpha_linked_images: &'prepared BTreeSet<Id>,
     /// The graph's prebuilt incoming-link and fold index; `None` scans the links and skips prepared folding.
     links: Option<&'scope super::inline_fold::FoldIndex>,
+    /// The graph's prepared input bindings, socket interfaces and static node dispatch.
+    node_bindings: Option<&'scope PreparedGraphBindings>,
     /// The call site whose socket values feed this group's Group Input nodes.
     group_input_binding: Option<&'scope GroupInputBinding<'scope>>,
     group_depth: usize,
@@ -2900,41 +3109,55 @@ struct Evaluator<'graph, 'material, 'registry, 'workspace, 'prepared, 'scope> {
 impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     fn group_interface_input_default<'a>(
         &'a self,
+        node_id: &Id,
         node: &GraphNode,
         socket: &str,
     ) -> Option<&'a JsonValue> {
         let group_id = node.properties.get("node_tree")?.as_str()?;
-        self.hit_ctx
-            .node_groups
-            .get(group_id)?
-            .interface
-            .inputs
-            .iter()
-            .find(|candidate| candidate.id == socket || candidate.name == socket)
-            .map(|candidate| &candidate.default)
-            .filter(|default| !default.is_null())
+        let group = self.hit_ctx.node_groups.get(group_id)?;
+        let candidate = match self.node_bindings.and_then(|bindings| {
+            bindings
+                .children
+                .get(node_id)
+                .and_then(|child| child.interface_inputs.get(socket))
+        }) {
+            Some(binding) => group.interface.inputs.get(binding.index),
+            None => group
+                .interface
+                .inputs
+                .iter()
+                .find(|candidate| candidate.id == socket || candidate.name == socket),
+        }?;
+        Some(&candidate.default).filter(|default| !default.is_null())
     }
+
     fn group_interface_output_default<'a>(&'a self, socket: &str) -> Option<&'a JsonValue> {
-        self.group
-            .interface
-            .outputs
-            .iter()
-            .find(|candidate| candidate.id == socket || candidate.name == socket)
-            .map(|candidate| &candidate.default)
-            .filter(|default| !default.is_null())
+        let candidate = match self.node_bindings {
+            Some(bindings) => bindings
+                .interface_outputs
+                .get(socket)
+                .and_then(|binding| self.group.interface.outputs.get(binding.index)),
+            None => self
+                .group
+                .interface
+                .outputs
+                .iter()
+                .find(|candidate| candidate.id == socket || candidate.name == socket),
+        }?;
+        Some(&candidate.default).filter(|default| !default.is_null())
     }
 
     fn input(&mut self, node_id: &Id, socket: &str, kind: ValueKind) -> Result<Value> {
         let node = self.node(node_id)?;
         let group = self.group;
+        let prepared_input = self
+            .node_bindings
+            .and_then(|bindings| bindings.nodes.get(node_id))
+            .and_then(|node| node.inputs.get(socket));
         let incoming = match self.links {
             Some(index) => {
-                index
-                    .incoming
-                    .get(node_id)
-                    .into_iter()
-                    .flatten()
-                    .find_map(|&socket_index| {
+                match prepared_input {
+                    Some(binding) => binding.link.and_then(|socket_index| {
                         let link = group.links.get(socket_index)?;
                         (link.to_node == *node_id
                             && input_socket_matches(
@@ -2944,7 +3167,22 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                                 socket,
                             ))
                         .then_some((socket_index, link))
-                    })
+                    }),
+                    None if self.node_bindings.is_some() => None,
+                    None => index.incoming.get(node_id).into_iter().flatten().find_map(
+                        |&socket_index| {
+                            let link = group.links.get(socket_index)?;
+                            (link.to_node == *node_id
+                                && input_socket_matches(
+                                    self.hit_ctx.node_groups,
+                                    node,
+                                    &link.to_socket,
+                                    socket,
+                                ))
+                            .then_some((socket_index, link))
+                        },
+                    ),
+                }
             }
             None => group.links.iter().enumerate().find(|(_, link)| {
                 link.to_node == *node_id
@@ -2962,15 +3200,25 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                 return self.output(&link.from_node, &link.from_socket, socket_index);
             }
         }
-        let raw = node
-            .inputs
-            .iter()
-            .find(|(name, _)| input_socket_matches(self.hit_ctx.node_groups, node, name, socket))
-            .map(|(_, value)| value)
-            .filter(|value| !value.is_null());
+        let raw = match prepared_input {
+            Some(binding) => binding
+                .input_key
+                .as_ref()
+                .and_then(|key| node.inputs.get(key))
+                .filter(|value| !value.is_null()),
+            None if self.node_bindings.is_some() => None,
+            None => node
+                .inputs
+                .iter()
+                .find(|(name, _)| {
+                    input_socket_matches(self.hit_ctx.node_groups, node, name, socket)
+                })
+                .map(|(_, value)| value)
+                .filter(|value| !value.is_null()),
+        };
         let default = raw.or_else(|| socket_default(node, socket)).or_else(|| {
             match node.node_type.as_str() {
-                "ShaderNodeGroup" => self.group_interface_input_default(node, socket),
+                "ShaderNodeGroup" => self.group_interface_input_default(node_id, node, socket),
                 "NodeGroupOutput" => self.group_interface_output_default(socket),
                 _ => None,
             }
@@ -3004,22 +3252,39 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         let Some(binding) = self.group_input_binding else {
             return Err(unsupported_node(node_id, "NodeGroupInput.call_site"));
         };
-        let Some(input_socket) = self
-            .group
-            .interface
-            .inputs
-            .iter()
-            .find(|candidate| candidate.id == socket || candidate.name == socket)
-        else {
-            return Err(invalid(format!("unknown Group Input output `{socket}`")));
-        };
-        let kind = group_socket_value_kind(&input_socket.socket_type)
-            .ok_or_else(|| unsupported_node_id("NodeGroupInput", socket))?;
-        let (parent_group, parent_node_id, parent_binding, parent_links, parent_depth) = (
+        let prepared_socket = self
+            .node_bindings
+            .and_then(|bindings| bindings.interface_inputs.get(socket));
+        let input_socket = match (self.node_bindings, prepared_socket) {
+            (Some(_), Some(binding)) => self.group.interface.inputs.get(binding.index),
+            (Some(_), None) => None,
+            (None, _) => self
+                .group
+                .interface
+                .inputs
+                .iter()
+                .find(|candidate| candidate.id == socket || candidate.name == socket),
+        }
+        .ok_or_else(|| invalid(format!("unknown Group Input output `{socket}`")))?;
+        let kind = match (self.node_bindings, prepared_socket) {
+            (Some(_), Some(binding)) => binding.kind,
+            (Some(_), None) => None,
+            (None, _) => group_socket_value_kind(&input_socket.socket_type),
+        }
+        .ok_or_else(|| unsupported_node_id("NodeGroupInput", socket))?;
+        let (
+            parent_group,
+            parent_node_id,
+            parent_binding,
+            parent_links,
+            parent_node_bindings,
+            parent_depth,
+        ) = (
             binding.group,
             binding.node_id,
             binding.binding,
             binding.links,
+            binding.node_bindings,
             binding.depth,
         );
         let mut parent = Evaluator {
@@ -3030,6 +3295,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             math_semantics: self.math_semantics,
             alpha_linked_images: self.alpha_linked_images,
             links: parent_links,
+            node_bindings: parent_node_bindings,
             group_input_binding: parent_binding,
             group_depth: parent_depth,
             texture_mapping_unsupported: self.texture_mapping_unsupported,
@@ -3052,19 +3318,35 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         if child_group.kind != GraphKind::Shader {
             return Err(unsupported_node(id, "ShaderNodeGroup.graph_kind"));
         }
-        let Some(output_socket) = child_group
-            .interface
-            .outputs
-            .iter()
-            .find(|candidate| candidate.id == socket || candidate.name == socket)
-        else {
-            return Err(invalid(format!("unknown Shader Group output `{socket}`")));
-        };
-        let output_kind = group_socket_value_kind(&output_socket.socket_type)
-            .ok_or_else(|| unsupported_node(id, "ShaderNodeGroup.output_socket_type"))?;
-        let Some(output_node) = active_group_output(child_group) else {
-            return Err(unsupported_node(id, "ShaderNodeGroup.output"));
-        };
+        let child_bindings = self
+            .node_bindings
+            .and_then(|bindings| bindings.children.get(id));
+        let output_socket = match child_bindings {
+            Some(bindings) => bindings
+                .interface_outputs
+                .get(socket)
+                .and_then(|binding| child_group.interface.outputs.get(binding.index)),
+            None => child_group
+                .interface
+                .outputs
+                .iter()
+                .find(|candidate| candidate.id == socket || candidate.name == socket),
+        }
+        .ok_or_else(|| invalid(format!("unknown Shader Group output `{socket}`")))?;
+        let output_kind = match (
+            child_bindings,
+            child_bindings.and_then(|bindings| bindings.interface_outputs.get(socket)),
+        ) {
+            (Some(_), Some(binding)) => binding.kind,
+            (Some(_), None) => None,
+            (None, _) => group_socket_value_kind(&output_socket.socket_type),
+        }
+        .ok_or_else(|| unsupported_node(id, "ShaderNodeGroup.output_socket_type"))?;
+        let output_node = match child_bindings {
+            Some(bindings) => bindings.active_group_output.as_ref(),
+            None => active_group_output(child_group),
+        }
+        .ok_or_else(|| unsupported_node(id, "ShaderNodeGroup.output"))?;
 
         let child_key = std::ptr::from_ref(child_group).addr();
         if self.workspace.active_groups.contains(&child_key) {
@@ -3081,6 +3363,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             node_id: id,
             binding: self.group_input_binding,
             links: self.links,
+            node_bindings: self.node_bindings,
             depth: self.group_depth,
         };
         self.workspace.active_groups.push(child_key);
@@ -3092,6 +3375,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             math_semantics: self.math_semantics,
             alpha_linked_images,
             links: self.links.and_then(|index| index.children.get(id)),
+            node_bindings: child_bindings,
             group_input_binding: Some(&binding),
             group_depth,
             texture_mapping_unsupported,
@@ -3104,19 +3388,26 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     /// Whether `socket` of `node_id` takes a link, so its value comes from another node rather than the socket's
     /// stored default.
     fn is_linked(&self, node_id: &Id, socket: &str) -> bool {
-        match self.links {
-            Some(index) => index
-                .incoming
+        match self.node_bindings {
+            Some(bindings) => bindings
+                .nodes
                 .get(node_id)
-                .into_iter()
-                .flatten()
-                .filter_map(|&link_index| self.group.links.get(link_index))
-                .any(|link| link.to_node == *node_id && socket_matches(&link.to_socket, socket)),
-            None => self
-                .group
-                .links
-                .iter()
-                .any(|link| link.to_node == *node_id && socket_matches(&link.to_socket, socket)),
+                .and_then(|node| node.inputs.get(socket))
+                .is_some_and(|binding| binding.linked),
+            None => match self.links {
+                Some(index) => index
+                    .incoming
+                    .get(node_id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|&link_index| self.group.links.get(link_index))
+                    .any(|link| {
+                        link.to_node == *node_id && socket_matches(&link.to_socket, socket)
+                    }),
+                None => self.group.links.iter().any(|link| {
+                    link.to_node == *node_id && socket_matches(&link.to_socket, socket)
+                }),
+            },
         }
     }
     fn inputs_fold_to_primitives(&self, node_id: &Id) -> bool {
@@ -3183,26 +3474,22 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             node: node_key,
             socket: socket_index,
         });
-        // Map the borrowed node type to a value before dispatch mutably through the evaluator.
-        let kind = if node.node_type == "NodeReroute" {
-            Ok(NodeKind::Reroute)
-        } else if node.properties.get("mute").and_then(JsonValue::as_bool) == Some(true) {
-            Ok(NodeKind::Muted)
-        } else {
-            match NodeKind::from_node_type(node.node_type.as_str()) {
-                Some(kind) => Ok(kind),
-                None => Err(PotError::with_details(
-                    ErrorCode::UnsupportedFeature,
-                    format!(
-                        "shader node `{}` is not supported by the native evaluator",
-                        node.node_type
-                    ),
-                    json!({
-                        "feature_id": format!("shader.node.{}", node.node_type),
-                        "node_id": node_id
-                    }),
-                )),
-            }
+        let prepared_node = self
+            .node_bindings
+            .and_then(|bindings| bindings.nodes.get(node_id));
+        let kind = match prepared_node.map_or_else(|| prepared_node_kind(node), |node| node.kind) {
+            Some(kind) => Ok(kind),
+            None => Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!(
+                    "shader node `{}` is not supported by the native evaluator",
+                    node.node_type
+                ),
+                json!({
+                    "feature_id": format!("shader.node.{}", node.node_type),
+                    "node_id": node_id
+                }),
+            )),
         };
         let result = kind.and_then(|kind| self.evaluate_node(node_id, kind, socket));
         self.workspace.active.pop();
@@ -7983,27 +8270,30 @@ fn socket_default<'node>(node: &'node GraphNode, socket: &str) -> Option<&'node 
     node.inputs.get(alias)
 }
 
-fn socket_matches(candidate: &str, requested: &str) -> bool {
-    if candidate == requested {
-        return true;
+fn socket_alias(socket: &str) -> Option<&'static str> {
+    match socket {
+        "Shader" => Some("Shader 1"),
+        "Shader 1" => Some("Shader"),
+        "Shader_001" => Some("Shader 2"),
+        "Shader 2" => Some("Shader_001"),
+        "Transmission" => Some("Transmission Weight"),
+        "Transmission Weight" => Some("Transmission"),
+        "Subsurface" => Some("Subsurface Weight"),
+        "Subsurface Weight" => Some("Subsurface"),
+        "Clearcoat" => Some("Coat Weight"),
+        "Coat Weight" => Some("Clearcoat"),
+        "Sheen" => Some("Sheen Weight"),
+        "Sheen Weight" => Some("Sheen"),
+        "Emission" => Some("Emission Color"),
+        "Emission Color" => Some("Emission"),
+        _ => None,
     }
-    matches!(
-        (candidate, requested),
-        ("Shader", "Shader 1")
-            | ("Shader 1", "Shader")
-            | ("Shader_001", "Shader 2")
-            | ("Shader 2", "Shader_001")
-            | ("Transmission", "Transmission Weight")
-            | ("Transmission Weight", "Transmission")
-            | ("Subsurface", "Subsurface Weight")
-            | ("Subsurface Weight", "Subsurface")
-            | ("Clearcoat", "Coat Weight")
-            | ("Coat Weight", "Clearcoat")
-            | ("Sheen", "Sheen Weight")
-            | ("Sheen Weight", "Sheen")
-            | ("Emission", "Emission Color")
-            | ("Emission Color", "Emission")
-    )
+}
+
+fn socket_matches(candidate: &str, requested: &str) -> bool {
+    candidate == requested
+        || socket_alias(candidate) == Some(requested)
+        || socket_alias(requested) == Some(candidate)
 }
 fn input_socket_matches(
     groups: &Registry<NodeGroup>,
@@ -8230,6 +8520,7 @@ impl<'a> SourceFoldResolver<'a> {
                 math_semantics: crate::node_kernels::MathSemantics::Eevee,
                 alpha_linked_images: &empty,
                 links: Some(self.fold_index),
+                node_bindings: None,
                 group_input_binding: self.input_binding,
                 group_depth: self
                     .input_binding
@@ -8620,6 +8911,7 @@ fn graph_eevee_closure_flags_output(
                 node_id,
                 binding: input_binding,
                 links: Some(fold_index),
+                node_bindings: None,
                 depth: input_binding.map_or(0, |binding| binding.depth.saturating_add(1)),
             };
             flags |= graph_eevee_closure_flags_output(
@@ -9111,6 +9403,7 @@ fn graph_eevee_surface_flags_output(
                 node_id,
                 binding: input_binding,
                 links: Some(fold_index),
+                node_bindings: None,
                 depth: input_binding.map_or(0, |binding| binding.depth.saturating_add(1)),
             };
             flags.merge(graph_eevee_surface_flags_output(
@@ -10079,6 +10372,7 @@ mod tests {
             math_semantics: crate::node_kernels::MathSemantics::Cycles,
             alpha_linked_images: &alpha_linked_images,
             links: None,
+            node_bindings: None,
             group_input_binding: None,
             group_depth: 0,
             texture_mapping_unsupported: &alpha_linked_images,
@@ -10111,6 +10405,7 @@ mod tests {
             alpha_linked_images: &alpha_linked_images,
             math_semantics: crate::node_kernels::MathSemantics::Cycles,
             links: None,
+            node_bindings: None,
             group_input_binding: None,
             group_depth: 0,
             texture_mapping_unsupported: &alpha_linked_images,
@@ -13197,6 +13492,7 @@ mod tests {
             workspace: &mut workspace,
             alpha_linked_images: &empty,
             links: None,
+            node_bindings: None,
             group_input_binding: None,
             group_depth: 0,
             math_semantics: crate::node_kernels::MathSemantics::Cycles,
@@ -14081,6 +14377,7 @@ mod tests {
             math_semantics: crate::node_kernels::MathSemantics::Cycles,
             alpha_linked_images: &alpha_linked_images,
             links: None,
+            node_bindings: None,
             group_input_binding: None,
             group_depth: 0,
             texture_mapping_unsupported: &alpha_linked_images,

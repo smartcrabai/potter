@@ -12,34 +12,35 @@ ROOT = Path(__file__).resolve().parents[1]
 SHARD_COUNT = 4
 # Unlisted targets averaged 3.3 s in the latest CI runs.
 DEFAULT_SECONDS = 4
-# Seconds per target from the slower of the two latest CI runs. Library unit and doc tests run as separate
-# Cargo commands on shard 0, so their entries include that command's compile time.
+# Estimated seconds per target, using CI timings or conservative runtime projections.
+# Library unit and doc entries include the compile time of their separate Cargo commands.
 TARGET_SECONDS = {
-    # World volume costs include Source octree baking; heterogeneous estimates are conservative.
+    # World costs include Source octree baking; unfinished cases use sampling-family estimates.
     "world_volume_path_oracle": 420,
-    "world_volume_gradient_distance": 600,
-    "world_volume_gradient_equiangular": 600,
-    "world_volume_gradient_multiple_importance": 600,
-    "world_volume_noise_distance": 600,
-    "world_volume_noise_equiangular": 600,
-    "world_volume_noise_multiple_importance": 600,
-    "world_volume_spatial_emission": 600,
-    "world_volume_override_spatial": 600,
+    "world_volume_gradient_distance": 1332,
+    "world_volume_gradient_equiangular": 618,
+    "world_volume_gradient_multiple_importance": 1000,
+    "world_volume_noise_distance": 800,
+    "world_volume_noise_equiangular": 380,
+    "world_volume_noise_multiple_importance": 650,
+    "world_volume_spatial_emission": 713,
+    "world_volume_override_spatial": 1000,
     ("potter_core", "lib-unit"): 413,
-    "native_shader_bsdf_wave12": 408,
-    "volume_nee": 386,
-    "volume_spectral_extinction": 381,
+    "native_shader_bsdf_wave12": 530,
+    "volume_nee": 100,
+    "volume_spectral_extinction": 100,
     ("potter_workflow", "lib-doc"): 287,
     ("potter_workflow", "lib-unit"): 281,
     ("potter_core", "lib-doc"): 268,
-    "native_principled_anisotropic": 250,
+    "native_principled_anisotropic": 268,
+    "vdb_frustum_render": 205,
     "native_principled_thin_film": 190,
     "blend_roundtrip_constraints": 167,
-    "path_transmission_bounce_budget": 136,
+    "path_transmission_bounce_budget": 161,
     "blend_modifiers_constraints": 119,
     "blend_realistic_scene": 103,
     "native_principled_thin_wall_indirect": 76,
-    "cov_nodes_math_extended": 69,
+    "cov_nodes_math_extended": 109,
     "shader_p1_oracle": 59,
     "realtime_volume_factor": 51,
     "blend_roundtrip_bbone": 50,
