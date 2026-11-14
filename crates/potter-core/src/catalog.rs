@@ -475,6 +475,50 @@ pub fn feature_catalog() -> Value {
             );
             row
         },
+        {
+            let mut row = supported(
+                "shader.volume.object_grid_implicit_density",
+                "Cycles Volume Objects with constant shader coefficients over a primary volume grid",
+                "Volume Object / ShaderNodeOutputMaterial.Volume",
+                &[
+                    "volume.create",
+                    "volume.update",
+                    "material.create",
+                    "material.update",
+                    "graph.create",
+                    "graph.node_add",
+                    "graph.link",
+                ],
+                [true, true, true, true, true, true, true],
+            );
+            row["status"] = json!("partial");
+            row["reason"] = json!(
+                "A Cycles .blend import with a Volume Object's primary grid and an effective Volume shader that produces nonzero constant scattering or absorption coefficients is a source-specific loss: Blender's shader-only coefficients are not density-multiplied, while Potter's Volume Object path implicitly multiplies them by its primary grid. Import reports `shader.volume.object_grid_implicit_density` for known constant Scatter and Absorption graphs with no grid attribute read. Grid-attribute-reading shaders and Principled Volume attribute cases keep their existing import-loss behavior. Mesh materials, World Output.Volume, and native `volume.create` keep their existing semantics."
+            );
+            row
+        },
+        {
+            let mut row = supported(
+                "shader.volume.object_density_space",
+                "Cycles Volume Objects using Blender Volume.render.space OBJECT",
+                "Volume / ShaderNodeOutputMaterial.Volume",
+                &[
+                    "volume.create",
+                    "volume.update",
+                    "material.create",
+                    "material.update",
+                    "graph.create",
+                    "graph.node_add",
+                    "graph.link",
+                ],
+                [true, true, true, true, true, true, true],
+            );
+            row["status"] = json!("partial");
+            row["reason"] = json!(
+                "Blender Volume.render.space OBJECT multiplies effective Cycles Volume coefficients and Volume emission by object_volume_density = 1 / length(transform_direction(matrix_world, normalize(1,1,1))). Potter VolumeData has World-density semantics. Import reports `shader.volume.object_density_space` only for active Cycles Volume Objects with captured primary grids, a non-unit Source density factor, and a known nonzero effective Volume output; WORLD space, unit-density transforms, zero outputs, and inactive or hidden objects do not report. Native .blend export writes Volume.render.space WORLD."
+            );
+            row
+        },
         supported(
             "shader.output_material.volume",
             "Output Material volume surface with analytic extinction and scattering",
@@ -544,22 +588,6 @@ pub fn feature_catalog() -> Value {
                 "render.update",
             ],
             "A reachable OutputWorld.Volume is preserved but Potter does not evaluate World Volume closures. EEVEE derives `World.has_volume_absorption` from this input to decide whether the extracted WorldSun is enabled; the exact absorption state is not represented, so realtime rendering refuses the connected World.Volume.",
-        ),
-        unsupported(
-            "render.path.world_volume",
-            "Cycles path World Volume closure",
-            "OutputWorld.Volume",
-            &[
-                "world.create",
-                "world.update",
-                "scene.update",
-                "view_layer.update",
-                "render.update",
-                "graph.create",
-                "graph.node_add",
-                "graph.link",
-            ],
-            "When a Cycles path view layer selects a World whose OutputWorld.Volume is reachable, the import reports this loss and path rendering refuses the graph because Potter does not implement the World Volume closure.",
         ),
         unsupported(
             "render.eevee.world_probe.local_volume_grids",
@@ -3565,7 +3593,7 @@ pub fn formats_catalog() -> Value {
             true,
             &["Blender 5.2-compatible headless executable"],
             &[
-                "Primitive mesh descriptors, node groups, resources, libraries, world node graphs, constraints, drivers, unsupported object/data-block types, unsupported modifiers, and custom mesh attributes are reported as losses.",
+                "Primitive mesh descriptors, node groups, resources, libraries, world node graphs, constraints, drivers, unsupported object/data-block types, unsupported modifiers, and custom mesh attributes are reported as losses. Cycles Volume Objects with a primary volume grid and constant shader-only Volume coefficients are reported as `shader.volume.object_grid_implicit_density` losses on import.",
             ],
         ),
         format_row(

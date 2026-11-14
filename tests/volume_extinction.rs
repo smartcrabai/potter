@@ -132,6 +132,53 @@ fn render_center_block(scene: &Path, output_directory: &Path) -> Result<[f64; 3]
     Ok(sum.map(|total| total / count))
 }
 
+/// Renders the centre block from linear floating-point EXR, without the PNG display clamp.
+fn render_center_block_exr(
+    scene: &Path,
+    output_directory: &Path,
+) -> Result<[f64; 3], Box<dyn Error>> {
+    struct RgbImage {
+        width: usize,
+        height: usize,
+        pixels: Vec<[f32; 3]>,
+    }
+    let output = pot()
+        .arg("render")
+        .arg(scene)
+        .args(["--engine", "path", "--format", "exr", "--out"])
+        .arg(output_directory)
+        .arg("--json")
+        .output()?;
+    assert_cli_success(&output)?;
+    let image = exr::prelude::read_first_rgba_layer_from_file(
+        output_directory.join("frame_0001.exr"),
+        |resolution, _| RgbImage {
+            width: resolution.width(),
+            height: resolution.height(),
+            pixels: vec![[0.0_f32; 3]; resolution.width() * resolution.height()],
+        },
+        |pixels: &mut RgbImage, position, (red, green, blue, _alpha): (f32, f32, f32, f32)| {
+            pixels.pixels[position.y() * pixels.width + position.x()] = [red, green, blue];
+        },
+    )?;
+    let pixels = image.layer_data.channel_data.pixels;
+    if pixels.width != SIZE as usize || pixels.height != SIZE as usize {
+        return Err(format!("renderer EXR is not a {SIZE}x{SIZE} image").into());
+    }
+    let mut sum = [0.0; 3];
+    let first = (SIZE / 2 - BLOCK / 2) as usize;
+    for y in first..first + BLOCK as usize {
+        for x in first..first + BLOCK as usize {
+            let pixel = pixels.pixels[y * pixels.width + x];
+            for (channel, total) in sum.iter_mut().enumerate() {
+                *total += f64::from(pixel[channel]);
+            }
+        }
+    }
+    let count = f64::from(BLOCK * BLOCK);
+    Ok(sum.map(|total| total / count))
+}
+
 /// Renders one unit slab with a volume-only material in front of a white world of strength 1, at `samples` per
 /// pixel and `max_bounces`. The graph is `nodes` and `links`; the caller links the final closure to the output's
 /// Volume socket.
@@ -152,6 +199,27 @@ fn render_slab_seeded(
     max_bounces: u32,
     seed: u32,
 ) -> Result<[f64; 3], Box<dyn Error>> {
+    render_slab_seeded_with_format(nodes, links, samples, max_bounces, seed, false)
+}
+
+fn render_slab_seeded_exr(
+    nodes: Vec<Value>,
+    links: Vec<Value>,
+    samples: u32,
+    max_bounces: u32,
+    seed: u32,
+) -> Result<[f64; 3], Box<dyn Error>> {
+    render_slab_seeded_with_format(nodes, links, samples, max_bounces, seed, true)
+}
+
+fn render_slab_seeded_with_format(
+    nodes: Vec<Value>,
+    links: Vec<Value>,
+    samples: u32,
+    max_bounces: u32,
+    seed: u32,
+    exr: bool,
+) -> Result<[f64; 3], Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
     let mut operations = graph_operations(nodes, links);
@@ -164,7 +232,12 @@ fn render_slab_seeded(
         json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":samples,"seed":seed,"max_bounces":max_bounces,"volume_bounces":max_bounces}}),
     ]);
     make_scene(&scene, &operations)?;
-    render_center_block(&scene, &directory.path().join("render"))
+    let render_directory = &directory.path().join("render");
+    if exr {
+        render_center_block_exr(&scene, render_directory)
+    } else {
+        render_center_block(&scene, render_directory)
+    }
 }
 
 /// Renders the slab for an absorption-only graph. Cycles attenuates such a slab deterministically
@@ -317,21 +390,28 @@ fn principled_absorption_colour_transmits_exp_of_one_minus_sqrt_per_channel()
 
 #[test]
 fn volume_scatter_conserves_a_white_environment() -> Result<(), Box<dyn Error>> {
-    // Albedo 1 in a uniform white world: every path ends in the environment, so the radiance is 1. Blender's oracle
-    // runs with 64 bounces (`generate_volume_extinction_oracle.py`): a path that scatters more than twice is cut off
-    // at the 2-bounce budget of the absorption slabs, so this case uses the oracle's budget. A scattering path is
-    // stochastic, so the block is rendered at 512 samples per pixel.
-    let measured = render_slab_at(
-        vec![node(
-            "volume",
-            "ShaderNodeVolumeScatter",
-            json!({"Color": [0.2, 0.5, 0.8, 1.0], "Density": 1.0}),
-        )],
-        vec![link("volume", "Volume", "output", "Volume")],
-        512,
-        64,
-    )?;
-    assert_matches("volume_scatter_white", measured, [1.0; 3])
+    // A white environment through an albedo-1 slab has radiance 1 in every channel. A 32-seed EXR sweep measured
+    // branch means [1.0006, 1.0005, 0.9972] and per-seed SDs [0.0088, 0.0019, 0.0085]; at 32 seeds, three standard
+    // errors are [0.0047, 0.0010, 0.0045], within the 0.01 analytic bound. The origin/main estimator measured
+    // [1.7088, 1.2451, 0.9980], so unclamped EXR makes this a strength check as well as an energy check.
+    let nodes = vec![node(
+        "volume",
+        "ShaderNodeVolumeScatter",
+        json!({"Color": [0.2, 0.5, 0.8, 1.0], "Density": 1.0}),
+    )];
+    let links = vec![link("volume", "Volume", "output", "Volume")];
+    let mut mean = [0.0; 3];
+    for seed in 0..32 {
+        let measured = render_slab_seeded_exr(nodes.clone(), links.clone(), 512, 64, seed)?;
+        if seed == 0 {
+            eprintln!("volume_scatter_white seed-0 linear EXR mean: {measured:?}");
+        }
+        for (channel, total) in mean.iter_mut().enumerate() {
+            *total += measured[channel] / 32.0;
+        }
+    }
+    eprintln!("volume_scatter_white 32-seed linear EXR mean: {mean:?}");
+    assert_matches("volume_scatter_white", mean, [1.0; 3])
 }
 
 #[test]

@@ -1882,6 +1882,7 @@ def volume_dump(volume):
             "library": library_reference(volume),
             "materials": _material_names(volume),
             "filepath": volume_filepath(volume),
+            "space": volume.render.space,
             "grids": [grid.name for grid in volume.grids],
             "custom_properties": custom_props(volume),
             "fake_user": bool(getattr(volume, "use_fake_user", False)),
@@ -4546,6 +4547,10 @@ def dump_scene(scene):
                 "resolution_y": int(scene.render.resolution_y),
                 "resolution_percentage": int(scene.render.resolution_percentage),
                 "samples": samples,
+                "use_adaptive_sampling": bool(getattr(cycles, "use_adaptive_sampling", True)),
+                "adaptive_threshold": float(getattr(cycles, "adaptive_threshold", 0.01)),
+                "adaptive_min_samples": int(getattr(cycles, "adaptive_min_samples", 0)),
+                "tile_size": int(getattr(cycles, "tile_size", 2048)),
                 "seed": seed,
                 "max_bounces": int(getattr(getattr(scene, "cycles", None), "max_bounces", 4)),
                 "diffuse_bounces": int(getattr(getattr(scene, "cycles", None), "diffuse_bounces", 4)),
@@ -10701,6 +10706,16 @@ def export_doc(doc, target, pack, scene_hash, context):
                 cycles_curves.subdivisions = curve_subdivisions
         if hasattr(scene, "cycles"):
             scene.cycles.blur_glossy = float(render.get("filter_glossy", 1.0))
+            scene.cycles.use_adaptive_sampling = bool(
+                render.get("use_adaptive_sampling", True)
+            )
+            scene.cycles.adaptive_threshold = float(
+                render.get("adaptive_threshold", 0.01)
+            )
+            scene.cycles.adaptive_min_samples = int(
+                render.get("adaptive_min_samples", 0)
+            )
+            scene.cycles.tile_size = int(render.get("tile_size", 2048))
             scene.cycles.dicing_rate = float(render.get("dicing_rate", 1.0))
             scene.cycles.preview_dicing_rate = float(render.get("preview_dicing_rate", 8.0))
             scene.cycles.max_subdivisions = int(render.get("max_subdivisions", 12))
@@ -11021,6 +11036,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             source = compatibility_block(doc, "volumes", "Volume", data_id)
             name = compatibility_name(doc, "Volume", data_id, source.get("name", data_id))
             volume = bpy.data.volumes.new(name)
+            volume.render.space = "WORLD"
             volume_data = item.get("volume") or {}
             volume_source = volume_data.get("source") or {}
             if volume_source.get("kind") == "file":

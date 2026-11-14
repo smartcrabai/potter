@@ -24,6 +24,10 @@ if bpy.app.version != (5, 2, 2):
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
 scene.render.engine = "CYCLES"
+scene.cycles.use_adaptive_sampling = False
+scene.cycles.adaptive_threshold = 0.23
+scene.cycles.adaptive_min_samples = 19
+scene.cycles.tile_size = 3072
 scene.cycles.caustics_reflective = False
 scene.cycles.caustics_refractive = False
 scene.cycles.film_exposure = 1.75
@@ -129,6 +133,10 @@ assert world.cycles.volume_interpolation == "CUBIC"
 assert world.cycles.volume_step_size == 0.125
 scene = bpy.data.scenes.get("Scene")
 assert scene is not None and scene.render.engine == "CYCLES"
+assert scene.cycles.use_adaptive_sampling is False
+assert scene.cycles.adaptive_threshold == 1.0
+assert scene.cycles.adaptive_min_samples == 4096
+assert scene.cycles.tile_size == 8192
 assert scene.cycles.caustics_reflective is False
 assert scene.cycles.caustics_refractive is False
 assert scene.cycles.film_exposure == 1.75
@@ -318,6 +326,17 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
     assert_eq!(render["caustics_refractive"], false);
     assert_eq!(render["film_exposure"], 1.75);
     assert_eq!(render["film_transparent_glass"], true);
+    assert_eq!(render["use_adaptive_sampling"], false);
+    assert!(
+        (render["adaptive_threshold"]
+            .as_f64()
+            .ok_or("adaptive threshold missing")?
+            - 0.23)
+            .abs()
+            < 1e-6
+    );
+    assert_eq!(render["adaptive_min_samples"], 19);
+    assert_eq!(render["tile_size"], 3072);
     assert!(
         (render["film_transparent_roughness"]
             .as_f64()
@@ -473,6 +492,10 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
         "film_exposure",
         "film_transparent_glass",
         "film_transparent_roughness",
+        "use_adaptive_sampling",
+        "adaptive_threshold",
+        "adaptive_min_samples",
+        "tile_size",
     ] {
         assert_eq!(
             inspected_scene["render"][field], render[field],
@@ -539,6 +562,26 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
             json!({"op":"light.update","target":{"id":light_node_id},"set":{"max_bounces":1025}}),
         ),
         (
+            "adaptive_threshold",
+            json!({"op":"render.update","target":{"id":scene_id},"set":{"adaptive_threshold":-0.001}}),
+        ),
+        (
+            "adaptive_threshold",
+            json!({"op":"render.update","target":{"id":scene_id},"set":{"adaptive_threshold":1.001}}),
+        ),
+        (
+            "adaptive_min_samples",
+            json!({"op":"render.update","target":{"id":scene_id},"set":{"adaptive_min_samples":4097}}),
+        ),
+        (
+            "tile_size",
+            json!({"op":"render.update","target":{"id":scene_id},"set":{"tile_size":7}}),
+        ),
+        (
+            "tile_size",
+            json!({"op":"render.update","target":{"id":scene_id},"set":{"tile_size":8193}}),
+        ),
+        (
             "film_exposure",
             json!({"op":"render.update","target":{"id":scene_id},"set":{"film_exposure":4_294_967_297.0}}),
         ),
@@ -555,6 +598,60 @@ fn cycles_world_material_and_light_settings_round_trip_through_blend() -> TestRe
         assert_update_rejected(&project, root, index, &operation, field)?;
     }
     assert_eq!(read_scene(&project)?["revision"], scene["revision"]);
+    let update_revision = read_scene(&project)?["revision"]
+        .as_u64()
+        .ok_or("scene revision is missing")?;
+    let valid_update = root.join("update-cycles-render-settings.json");
+    fs::write(
+        &valid_update,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "base_revision": update_revision,
+            "operations": [{
+                "op": "render.update",
+                "target": {"id": scene_id},
+                "set": {
+                    "use_adaptive_sampling": false,
+                    "adaptive_threshold": 1.0,
+                    "adaptive_min_samples": 4096,
+                    "tile_size": 8192
+                }
+            }]
+        }))?,
+    )?;
+    let update_output = pot()
+        .args(["apply"])
+        .arg(&project)
+        .args(["--file"])
+        .arg(&valid_update)
+        .arg("--json")
+        .output()?;
+    assert!(
+        update_output.status.success(),
+        "render.update failed: {}",
+        String::from_utf8_lossy(&update_output.stdout)
+    );
+    let update_report: Value = serde_json::from_slice(&update_output.stdout)?;
+    assert_eq!(update_report["ok"], true, "{update_report}");
+    let updated_scene = read_scene(&project)?;
+    assert_ne!(updated_scene["revision"], scene["revision"]);
+    let updated_render = &updated_scene["scenes"][scene_id]["render"];
+    assert_eq!(updated_render["use_adaptive_sampling"], false);
+    assert_eq!(updated_render["adaptive_threshold"], 1.0);
+    assert_eq!(updated_render["adaptive_min_samples"], 4096);
+    assert_eq!(updated_render["tile_size"], 8192);
+    let updated_inspection = inspect_id(&project, scene_id)?;
+    for field in [
+        "use_adaptive_sampling",
+        "adaptive_threshold",
+        "adaptive_min_samples",
+        "tile_size",
+    ] {
+        assert_eq!(
+            updated_inspection["render"][field], updated_render[field],
+            "render.update/read {field}"
+        );
+    }
 
     let exported = root.join("cycles-settings-roundtrip.blend");
     let export_output = export_raw(&blender, &project, "blend", &exported, true)?;

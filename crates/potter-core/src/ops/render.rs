@@ -14,6 +14,10 @@ const SET_FIELDS: &[&str] = &[
     "resolution_x",
     "resolution_y",
     "resolution_percentage",
+    "use_adaptive_sampling",
+    "adaptive_threshold",
+    "adaptive_min_samples",
+    "tile_size",
     "samples",
     "seed",
     "max_bounces",
@@ -169,6 +173,21 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
     let resolution_y = optional_u32(engine, set, "resolution_y", 1, 16_384)?;
     let resolution_percentage = optional_u32(engine, set, "resolution_percentage", 1, 100)?;
     let samples = optional_u32(engine, set, "samples", 1, 1_000_000)?;
+    let adaptive_threshold = optional_f64(engine, set, "adaptive_threshold", 0.0, 1.0)?;
+    let adaptive_min_samples = optional_u32(engine, set, "adaptive_min_samples", 0, 4096)?;
+    let tile_size = optional_u32(engine, set, "tile_size", 8, 8192)?;
+    let use_adaptive_sampling = set
+        .get("use_adaptive_sampling")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "use_adaptive_sampling must be a boolean",
+                    &operation_pointer(engine.operation_index, "set/use_adaptive_sampling"),
+                )
+            })
+        })
+        .transpose()?;
     let seed = optional_u32(engine, set, "seed", 0, u32::MAX)?;
     let max_bounces = optional_u32(engine, set, "max_bounces", 0, 1024)?;
     let volume_bounces = optional_u32(engine, set, "volume_bounces", 0, 1024)?;
@@ -653,6 +672,18 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         }
         if let Some(value) = samples {
             scene.render.samples = value;
+        }
+        if let Some(value) = use_adaptive_sampling {
+            scene.render.use_adaptive_sampling = value;
+        }
+        if let Some(value) = adaptive_threshold {
+            scene.render.adaptive_threshold = value;
+        }
+        if let Some(value) = adaptive_min_samples {
+            scene.render.adaptive_min_samples = value;
+        }
+        if let Some(value) = tile_size {
+            scene.render.tile_size = value;
         }
         if let Some(value) = seed {
             scene.render.seed = value;

@@ -91,6 +91,10 @@ pub fn run(args: RenderArgs) -> Result<(Option<SceneInfo>, Value)> {
         || !(0.0..=4_294_967_296.0).contains(&settings.film_exposure)
         || !settings.film_transparent_roughness.is_finite()
         || !(0.0..=1.0).contains(&settings.film_transparent_roughness)
+        || !settings.adaptive_threshold.is_finite()
+        || !(0.0..=1.0).contains(&settings.adaptive_threshold)
+        || settings.adaptive_min_samples > 4096
+        || !(8..=8192).contains(&settings.tile_size)
     {
         return Err(PotError::new(
             ErrorCode::SceneInvalid,

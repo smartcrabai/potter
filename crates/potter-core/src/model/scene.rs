@@ -2380,6 +2380,30 @@ fn is_default_eevee_volumetric_end<T: Copy + Into<f64>>(value: &T) -> bool {
     equal_f64(f64::from((*value).into() as f32), f64::from(100.0_f32))
 }
 
+fn default_adaptive_threshold() -> f64 {
+    0.01
+}
+
+fn is_default_adaptive_threshold<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64(f64::from((*value).into() as f32), f64::from(0.01_f32))
+}
+
+fn default_adaptive_min_samples() -> u32 {
+    0
+}
+
+fn is_default_adaptive_min_samples<T: Into<u32> + Copy>(value: &T) -> bool {
+    (*value).into() == default_adaptive_min_samples()
+}
+
+fn default_tile_size() -> u32 {
+    2048
+}
+
+fn is_default_tile_size<T: Into<u32> + Copy>(value: &T) -> bool {
+    (*value).into() == default_tile_size()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CyclesCurveShape {
@@ -2410,6 +2434,24 @@ pub struct RenderSettings {
     pub resolution_percentage: u32,
     pub samples: u32,
     pub seed: u32,
+    /// Cycles adaptive sampling controls, enabled by default and used by the volume path pipeline.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub use_adaptive_sampling: bool,
+    #[serde(
+        default = "default_adaptive_threshold",
+        skip_serializing_if = "is_default_adaptive_threshold"
+    )]
+    pub adaptive_threshold: f64,
+    #[serde(
+        default = "default_adaptive_min_samples",
+        skip_serializing_if = "is_default_adaptive_min_samples"
+    )]
+    pub adaptive_min_samples: u32,
+    #[serde(
+        default = "default_tile_size",
+        skip_serializing_if = "is_default_tile_size"
+    )]
+    pub tile_size: u32,
     pub max_bounces: u32,
     /// Blender Cycles `scene.cycles.diffuse_bounces`; omitted at its Blender default of 4.
     #[serde(
@@ -2665,6 +2707,16 @@ impl RenderSettings {
                 "Cycles sample clamp settings are outside Blender RNA range 0..=100000000",
             ));
         }
+        if !self.adaptive_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.adaptive_threshold)
+            || self.adaptive_min_samples > 4096
+            || !(8..=8192).contains(&self.tile_size)
+        {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "Cycles adaptive sampling and tile settings are outside Blender RNA ranges",
+            ));
+        }
         if !self.light_sampling_threshold.is_finite()
             || !(0.0..=1.0).contains(&self.light_sampling_threshold)
         {
@@ -2777,6 +2829,10 @@ impl Default for RenderSettings {
             resolution_y: 1080,
             resolution_percentage: 100,
             samples: 64,
+            use_adaptive_sampling: default_true(),
+            adaptive_threshold: default_adaptive_threshold(),
+            adaptive_min_samples: default_adaptive_min_samples(),
+            tile_size: default_tile_size(),
             seed: 0,
             max_bounces: 4,
             caustics_reflective: true,
@@ -5837,6 +5893,10 @@ mod tests {
         assert_eq!(render.sample_clamp_indirect, 10.0);
         assert_eq!(render.light_sampling_threshold, 0.01);
         assert!(render.use_light_tree);
+        assert!(render.use_adaptive_sampling);
+        assert_eq!(render.adaptive_threshold, 0.01);
+        assert_eq!(render.adaptive_min_samples, 0);
+        assert_eq!(render.tile_size, 2048);
         assert!(render.caustics_reflective);
         assert!(render.caustics_refractive);
         assert_eq!(render.film_exposure, 1.0);
@@ -5867,6 +5927,10 @@ mod tests {
             "sample_clamp_direct",
             "sample_clamp_indirect",
             "light_sampling_threshold",
+            "use_adaptive_sampling",
+            "adaptive_threshold",
+            "adaptive_min_samples",
+            "tile_size",
             "use_light_tree",
         ] {
             assert!(serialized.get(field).is_none(), "{field} should be omitted");
@@ -5881,6 +5945,10 @@ mod tests {
             sample_clamp_direct: 1.5,
             sample_clamp_indirect: 24.0,
             light_sampling_threshold: 0.25,
+            use_adaptive_sampling: false,
+            adaptive_threshold: 0.23,
+            adaptive_min_samples: 19,
+            tile_size: 3072,
             use_light_tree: false,
             ..super::RenderSettings::default()
         };
@@ -5940,6 +6008,26 @@ mod tests {
             },
             super::RenderSettings {
                 film_transparent_roughness: 1.01,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                adaptive_threshold: -f64::EPSILON,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                adaptive_threshold: 1.01,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                adaptive_min_samples: 4097,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                tile_size: 7,
+                ..super::RenderSettings::default()
+            },
+            super::RenderSettings {
+                tile_size: 8193,
                 ..super::RenderSettings::default()
             },
         ] {

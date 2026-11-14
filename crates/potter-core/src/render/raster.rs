@@ -766,8 +766,8 @@ pub(crate) struct CameraFrame {
 }
 #[derive(Clone, Copy)]
 pub(super) struct CameraLensSample {
-    aperture: glam::DVec2,
-    focus_distance: f64,
+    pub(super) aperture: glam::DVec2,
+    pub(super) focus_distance: f64,
 }
 impl CameraLensSample {
     pub(super) fn is_zero(self) -> bool {

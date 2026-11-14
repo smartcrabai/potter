@@ -22,10 +22,10 @@ const ENERGY: f64 = 100.0;
 const POSITION: [f64; 3] = [1.6, 0.6, 0.9];
 const DENSITY: f64 = 0.05;
 const SAMPLES: u32 = 2048;
-/// Mesh and diffuse cases use their fixed tolerances at 2048 spp; voxel cases average four 32-spp seeds and compare
-/// against Blender at three combined standard errors, capped at the existing tolerance.
+/// The native density-grid Source path uses stochastic null collisions, so voxel cases use four 512-spp seeds while
+/// retaining the original seed set and existing tolerance cap.
 const SINGLE_SCATTER_SEEDS: u32 = 4;
-const VOXEL_SINGLE_SCATTER_SAMPLES: u32 = 32;
+const VOXEL_SINGLE_SCATTER_SAMPLES: u32 = 512;
 const DIFFUSE_TOLERANCE: f64 = 0.005;
 const MESH_TOLERANCE: f64 = 0.015;
 const MESH_DISTANCE_TOLERANCE: f64 = 0.13;

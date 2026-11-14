@@ -12,42 +12,72 @@ ROOT = Path(__file__).resolve().parents[1]
 SHARD_COUNT = 4
 # Unlisted targets averaged 3.3 s in the latest CI runs.
 DEFAULT_SECONDS = 4
-# Seconds per target from the slower of the two latest CI runs. Library unit and doc tests run as separate
-# Cargo commands on shard 0, so their entries include that command's compile time.
+# Target weights use latest completed CI timings, except the doc compile headroom projection.
+# Library-kind batch compilation is charged once to potter_core; other package entries are runtime.
 TARGET_SECONDS = {
-    ("potter_core", "lib-unit"): 413,
-    "native_shader_bsdf_wave12": 408,
-    ("potter_workflow", "lib-doc"): 287,
-    ("potter_workflow", "lib-unit"): 281,
-    ("potter_core", "lib-doc"): 268,
-    "native_principled_anisotropic": 250,
-    "native_principled_thin_film": 190,
-    "blend_roundtrip_constraints": 167,
-    "path_transmission_bounce_budget": 136,
-    "blend_modifiers_constraints": 119,
-    "blend_realistic_scene": 103,
-    "volume_spectral_extinction": 81,
-    "native_principled_thin_wall_indirect": 76,
-    "cov_nodes_math_extended": 69,
-    "shader_p1_oracle": 59,
-    "realtime_volume_factor": 51,
-    "blend_roundtrip_bbone": 50,
-    "backface_culling": 39,
-    "realtime_light_factors": 37,
-    "closure_list_oracle": 35,
-    "realtime_light_shapes_extra": 33,
-    "native_metal_sphere_lights": 33,
-    "cov_nodes_math": 28,
-    "realtime_glass_direct": 27,
-    "realtime_direct_light_cases": 27,
-    "native_principled_thin_wall": 27,
-    "blend_udim_tiles": 27,
+    "world_volume_path_oracle": 330,
+    "world_volume_gradient_distance": 1137,
+    "world_volume_gradient_equiangular": 1000,
+    "world_volume_gradient_multiple_importance": 855,
+    "world_volume_noise_distance": 579,
+    "world_volume_noise_equiangular": 503,
+    "world_volume_noise_multiple_importance": 565,
+    "world_volume_spatial_emission": 1075,
+    "world_volume_override_spatial": 827,
+    ("potter_core", "lib-unit"): 586,
+    "native_shader_bsdf_wave12": 516,
+    "volume_nee": 55,
+    "volume_spectral_extinction": 17,
+    ("potter_workflow", "lib-doc"): 1,
+    ("potter_workflow", "lib-unit"): 1,
+    ("potter_core", "lib-doc"): 363,  # Interrupted compile headroom projection.
+    "native_principled_anisotropic": 167,
+    "native_graph_transparent": 15,
+    "vdb_frustum_render": 232,
+    "vdb_reader": 28,
+    "native_principled_thin_film": 209,
+    "blend_roundtrip_constraints": 143,
+    "path_transmission_bounce_budget": 129,
+    "blend_modifiers_constraints": 118,
+    "blend_realistic_scene": 59,
+    "native_principled_thin_wall_indirect": 63,
+    "cov_nodes_math_extended": 109,
+    "shader_p1_oracle": 79,
+    "realtime_volume_factor": 40,
+    "realtime_shadow_terminator": 64,
+    "blend_roundtrip_bbone": 54,
+    "backface_culling": 43,
+    "realtime_light_factors": 35,
+    "closure_list_oracle": 22,
+    "realtime_light_shapes_extra": 35,
+    "native_metal_sphere_lights": 27,
+    "native_light_tree": 32,
+    "volume_interpolation": 10,
+    "cov_nodes_math": 20,
+    "realtime_glass_direct": 25,
+    "realtime_direct_light_cases": 26,
+    "native_principled_thin_wall": 31,
+    "blend_udim_tiles": 31,
     "blend_collection_instances": 27,
-    "realtime_flat_emission": 26,
-    "constraints_more": 26,
-    "native_area_light_mis": 25,
-    "realtime_transparent_shadow": 23,
-    "realtime_film_filter": 20,
+    "realtime_flat_emission": 9,
+    "constraints_more": 29,
+    "native_area_light_mis": 24,
+    "realtime_transparent_shadow": 20,
+    "realtime_film_filter": 19,
+    "render_world": 13,
+    "shader_converters": 22,
+    "vrm_import": 12,
+    "realtime_principled_thin_wall": 13,
+    "shader_procedural_textures": 16,
+    "blend_boolean_regressions": 11,
+    "native_pixel_filter": 18,
+    "native_subsurface_sphere": 12,
+    "realtime_transparent_tint": 14,
+    "blend_external_assets": 20,
+    "blend_modifier_order": 16,
+    "native_clip_texture_round_trip": 11,
+    "native_normal_persistence": 17,
+    "rig": 13,
 }
 KNOWN_KINDS = {
     "lib",
@@ -150,38 +180,63 @@ def discover_targets(metadata):
 def assign_targets(targets):
     assignments = [[] for _ in range(SHARD_COUNT)]
     loads = [0] * SHARD_COUNT
-    integration_targets = []
+    batches = []
+    library_units = []
+    library_docs = []
 
     for target in targets:
-        if target[2] == "integration":
-            integration_targets.append(target)
+        if target[2] == "lib-unit":
+            library_units.append(target)
+        elif target[2] == "lib-doc":
+            library_docs.append(target)
         else:
-            assignments[0].append(target)
-            loads[0] += target[4]
+            batches.append([target])
+    for group in (library_units, library_docs):
+        if group:
+            batches.append(group)
 
-    integration_targets.sort(key=lambda target: (-target[4], target[0], target[1]))
-    for target in integration_targets:
+    batches.sort(
+        key=lambda batch: (
+            -sum(target[4] for target in batch),
+            tuple(sorted((target[0], target[1], target[2]) for target in batch)),
+        )
+    )
+    for batch in batches:
         shard = min(range(SHARD_COUNT), key=lambda index: (loads[index], index))
-        assignments[shard].append(target)
-        loads[shard] += target[4]
+        assignments[shard].extend(batch)
+        loads[shard] += sum(target[4] for target in batch)
 
     return assignments
 
 
 def cargo_commands(targets):
-    groups = {}
+    package_groups = {}
+    library_units = []
+    library_docs = []
+
     for target in targets:
-        groups.setdefault((target[0], target[2] == "lib-doc"), []).append(target)
+        if target[2] == "lib-unit":
+            library_units.append(target)
+        elif target[2] == "lib-doc":
+            library_docs.append(target)
+        else:
+            package_groups.setdefault(target[0], []).append(target)
 
     commands = []
-    for (package_name, doctests), group in sorted(groups.items()):
+    for package_name, group in sorted(package_groups.items()):
         command = ["cargo", "test", "--package", package_name, "--all-features", "--no-fail-fast"]
-        if doctests:
-            command.append("--doc")
-        else:
-            for target in group:
-                command.extend(target[3])
+        for target in group:
+            command.extend(target[3])
         commands.append(command)
+
+    for group, selector in ((library_units, "--lib"), (library_docs, "--doc")):
+        if group:
+            command = ["cargo", "test"]
+            for package_name in sorted({target[0] for target in group}):
+                command.extend(("--package", package_name))
+            command.extend(("--all-features", "--no-fail-fast", selector))
+            commands.append(command)
+
     return commands
 
 

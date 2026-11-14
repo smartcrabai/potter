@@ -499,6 +499,13 @@ fn complete_scene_schema(root: &mut Value) {
     ]);
     let render = &mut defs["render_settings"];
     render["properties"]["use_high_quality_normals"] = json!({"type":["boolean","null"]});
+    render["properties"]["use_adaptive_sampling"] = json!({"type":"boolean","default":true});
+    render["properties"]["adaptive_threshold"] =
+        json!({"type":"number","minimum":0,"maximum":1,"default":0.01});
+    render["properties"]["adaptive_min_samples"] =
+        json!({"type":"integer","minimum":0,"maximum":4096,"default":0});
+    render["properties"]["tile_size"] =
+        json!({"type":"integer","minimum":8,"maximum":8192,"default":2048});
     render["properties"]["eevee_light_threshold"] = json!({"type":"number","minimum":0.0});
     render["properties"]["eevee_gi_cubemap_resolution"] = json!({
         "oneOf":[{"type":"integer","enum":[128,256,512,1024,2048,4096]},{"type":"null"}],
@@ -3413,6 +3420,10 @@ fn set_schema(operation: &str) -> Value {
             "resolution_y":{"type":"integer","minimum":1,"maximum":16384},
             "resolution_percentage":{"type":"integer","minimum":1,"maximum":100},
             "samples":{"type":"integer","minimum":1,"maximum":1_000_000},
+            "use_adaptive_sampling":{"type":"boolean"},
+            "adaptive_threshold":{"type":"number","minimum":0,"maximum":1},
+            "adaptive_min_samples":{"type":"integer","minimum":0,"maximum":4096},
+            "tile_size":{"type":"integer","minimum":8,"maximum":8192},
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
             "max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "cycles_curves_shape":{"oneOf":[{"enum":["ribbons","thick","thick_linear"]},{"type":"null"}]},

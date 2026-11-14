@@ -205,6 +205,46 @@ enum GridSamples<'a> {
     F64(&'a [f64]),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedVolumeGrid<'a> {
+    grid: &'a VolumeGrid,
+    samples: GridSamples<'a>,
+}
+
+impl PreparedVolumeGrid<'_> {
+    pub(crate) fn sample_density(
+        self,
+        coordinate: DVec3,
+        interpolation: VolumeInterpolation,
+        round_to_f16: bool,
+    ) -> Result<f64> {
+        sample_index_checked(
+            coordinate,
+            self.grid,
+            &self.samples,
+            interpolation,
+            round_to_f16,
+        )
+    }
+
+    pub(crate) fn sample_density_at_local(
+        self,
+        position: DVec3,
+        local_to_index: DMat4,
+        interpolation: VolumeInterpolation,
+        round_to_f16: bool,
+    ) -> Result<f64> {
+        if !position.is_finite() {
+            return Err(invalid_volume("sample position must be finite"));
+        }
+        self.sample_density(
+            local_to_index.transform_point3(position),
+            interpolation,
+            round_to_f16,
+        )
+    }
+}
+
 impl GridSamples<'_> {
     fn get(self, index: usize) -> Option<f64> {
         match self {
@@ -771,14 +811,6 @@ pub fn sample_index_density_checked_with(
     interpolation: VolumeInterpolation,
 ) -> Result<f64> {
     sample_index_density_checked_with_precision(coordinate, volume, interpolation, false)
-}
-
-pub(crate) fn sample_index_density_realtime_checked_with(
-    coordinate: DVec3,
-    volume: &VolumeData,
-    interpolation: VolumeInterpolation,
-) -> Result<f64> {
-    sample_index_density_checked_with_precision(coordinate, volume, interpolation, true)
 }
 
 fn sample_index_density_checked_with_precision(
@@ -3431,6 +3463,24 @@ fn validate_grid(grid: &VolumeGrid) -> Result<GridSamples<'_>> {
     );
     grid.local_bounds(DVec3::ZERO, maximum_index)?;
     Ok(samples)
+}
+
+pub(crate) fn prepare_density_grid(volume: &VolumeData) -> Result<(PreparedVolumeGrid<'_>, DMat4)> {
+    let grid = first_grid(volume)?;
+    let samples = validate_grid(grid)?;
+    let local_to_index = grid.checked_index_to_local_matrix()?.inverse();
+    Ok((PreparedVolumeGrid { grid, samples }, local_to_index))
+}
+
+pub(crate) fn prepare_density_grid_at_local(
+    volume: &VolumeData,
+    position: DVec3,
+) -> Result<(PreparedVolumeGrid<'_>, DMat4)> {
+    ensure_evaluable_source(volume)?;
+    if !position.is_finite() {
+        return Err(invalid_volume("sample position must be finite"));
+    }
+    prepare_density_grid(volume)
 }
 
 fn validate_grid_samples(grid: &VolumeGrid) -> Result<GridSamples<'_>> {

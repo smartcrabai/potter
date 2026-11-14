@@ -3471,6 +3471,7 @@ fn validate_intermediate(raw: &Value) -> Result<()> {
         "meshes",
         "hair_curves",
         "materials",
+        "volumes",
         "cameras",
         "lights",
         "armatures",
@@ -3487,6 +3488,9 @@ fn validate_intermediate(raw: &Value) -> Result<()> {
                     return Err(invalid_intermediate(&format!(
                         "`{collection}` contains a non-object item"
                     )));
+                }
+                if collection == "volumes" {
+                    blender_volume_is_object_space(item)?;
                 }
                 if collection == "collections"
                     && item
@@ -3734,9 +3738,31 @@ fn validate_intermediate(raw: &Value) -> Result<()> {
                             )));
                         }
                     }
+                    if render
+                        .get("use_adaptive_sampling")
+                        .is_some_and(|value| !value.is_boolean())
+                    {
+                        return Err(invalid_intermediate(
+                            "render use_adaptive_sampling must be a boolean",
+                        ));
+                    }
+                    for (field, minimum, maximum) in
+                        [("adaptive_min_samples", 0, 4096), ("tile_size", 8, 8192)]
+                    {
+                        if render.get(field).is_some_and(|value| {
+                            value
+                                .as_u64()
+                                .is_none_or(|value| value < minimum || value > maximum)
+                        }) {
+                            return Err(invalid_intermediate(&format!(
+                                "render {field} is outside Blender's RNA range"
+                            )));
+                        }
+                    }
                     for (field, minimum, maximum) in [
                         ("film_exposure", 0.0, 4_294_967_296.0),
                         ("film_transparent_roughness", 0.0, 1.0),
+                        ("adaptive_threshold", 0.0, 1.0),
                     ] {
                         if render.get(field).is_some_and(|value| {
                             !value.as_f64().is_some_and(|value| {
@@ -4634,6 +4660,15 @@ fn build_imported_graph(
                 .get("use_light_tree")
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
+            use_adaptive_sampling: render
+                .get("use_adaptive_sampling")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            adaptive_threshold: number_field(&render, "adaptive_threshold", 0.01),
+            adaptive_min_samples: u32::try_from(integer_field(&render, "adaptive_min_samples", 0))
+                .map_err(|_| invalid_intermediate("render adaptive_min_samples is out of range"))?,
+            tile_size: u32::try_from(integer_field(&render, "tile_size", 2048))
+                .map_err(|_| invalid_intermediate("render tile_size is out of range"))?,
             volume_bounces: u32::try_from(integer_field(&render, "volume_bounces", 0))
                 .map_err(|_| invalid_intermediate("render volume_bounces is out of range"))?,
             transparent_max_bounces: u32::try_from(integer_field(
@@ -6799,6 +6834,8 @@ fn build_imported_graph(
             .to_owned(),
     };
     let mut losses = import_losses(raw);
+    losses.extend(cycles_volume_object_grid_import_losses(raw, &doc));
+    losses.extend(cycles_volume_object_density_space_import_losses(raw, &doc));
     losses.extend(shader_node_import_losses(&doc));
     losses.extend(uv_project_animated_camera_losses(&doc));
     losses.extend(missing_udim_tile_losses(images, &resource_ids, &doc)?);
@@ -9297,6 +9334,16 @@ fn safe_resource_stem(value: &str) -> String {
         "resource".to_owned()
     } else {
         stem
+    }
+}
+
+fn blender_volume_is_object_space(item: &Value) -> Result<bool> {
+    match string_field(item, "space")? {
+        "WORLD" => Ok(false),
+        "OBJECT" => Ok(true),
+        other => Err(invalid_intermediate(&format!(
+            "Volume.render.space has unknown value `{other}`"
+        ))),
     }
 }
 
@@ -13878,13 +13925,22 @@ fn material_shader_graph_import_losses(raw: &Value, material: &Value, losses: &m
         let Some(node_type) = node.get("type").and_then(Value::as_str) else {
             continue;
         };
-        if !crate::shader::shader_node_type_supported(node_type) {
+        if node_type == "ShaderNodeLightPath"
+            || !crate::shader::shader_node_type_supported(node_type)
+        {
+            let reason = if node_type == "ShaderNodeLightPath" {
+                format!(
+                    "Shader node `{name}` of type `{node_type}` requires ray state unavailable to Potter's material shader evaluator; the node is preserved"
+                )
+            } else {
+                format!(
+                    "Shader node `{name}` of type `{node_type}` is unsupported by Potter's shader evaluator; the node is preserved"
+                )
+            };
             losses.push(loss(
                 "blender.material.shader_node.unsupported",
                 material_name,
-                &format!(
-                    "Shader node `{name}` of type `{node_type}` is unsupported by Potter's shader evaluator; the node is preserved"
-                ),
+                &reason,
             ));
         }
         let properties = node.get("properties").unwrap_or(&Value::Null);
@@ -13988,6 +14044,596 @@ fn material_shader_graph_import_losses(raw: &Value, material: &Value, losses: &m
             }
         }
     }
+}
+
+fn select_cycles_material_output(group: &NodeGroup) -> Option<&Id> {
+    let mut all_output: Option<(&Id, bool)> = None;
+    let mut cycles_output: Option<(&Id, bool)> = None;
+    for (id, node) in &group.nodes {
+        if !matches!(
+            node.node_type.as_str(),
+            "OutputMaterial" | "ShaderNodeOutputMaterial"
+        ) {
+            continue;
+        }
+        let active = node
+            .properties
+            .get("is_active_output")
+            .and_then(Value::as_bool)
+            == Some(true);
+        let selected = match node
+            .properties
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("ALL")
+        {
+            "CYCLES" => &mut cycles_output,
+            "ALL" => &mut all_output,
+            _ => continue,
+        };
+        if selected.is_none_or(|(_, selected_active)| active && !selected_active) {
+            *selected = Some((id, active));
+        }
+    }
+    cycles_output.or(all_output).map(|(id, _)| id)
+}
+
+fn volume_graph_nodes_reaching_cycles_output(
+    graph_id: &Id,
+    group: &NodeGroup,
+    groups: &Registry<NodeGroup>,
+) -> Option<BTreeSet<Id>> {
+    let output = select_cycles_material_output(group)?;
+    let pruner = crate::shader::SourceMixInputPruner::new(graph_id, group, groups);
+    let mut reachable = BTreeSet::from([output.clone()]);
+    let mut pending = group
+        .links
+        .iter()
+        .filter(|link| link.to_node == *output && link.to_socket == "Volume")
+        .map(|link| link.from_node.clone())
+        .collect::<Vec<_>>();
+    while let Some(target) = pending.pop() {
+        if !reachable.insert(target.clone()) {
+            continue;
+        }
+        for link in group.links.iter().filter(|link| link.to_node == target) {
+            if !pruner.input_is_pruned(&link.to_node, &link.to_socket) {
+                pending.push(link.from_node.clone());
+            }
+        }
+    }
+    Some(reachable)
+}
+
+fn raw_graph_input_default<'a>(node: &'a Value, socket: &str) -> Option<&'a Value> {
+    node.get("inputs")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|input| input.get("name").and_then(Value::as_str) == Some(socket))
+        .and_then(|input| input.get("default"))
+}
+
+fn volume_graph_input_value<'a>(
+    tree: &'a Value,
+    node: &'a Value,
+    socket: &str,
+) -> Option<&'a Value> {
+    let node_name = node.get("name").and_then(Value::as_str)?;
+    let socket_id = node
+        .get("inputs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|input| input.get("name").and_then(Value::as_str) == Some(socket))
+        .and_then(|input| input.get("identifier"))
+        .and_then(Value::as_str);
+    let link = tree
+        .get("links")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|link| {
+            link.get("to_node").and_then(Value::as_str) == Some(node_name)
+                && link
+                    .get("to_socket")
+                    .and_then(Value::as_str)
+                    .is_some_and(|target| target == socket || Some(target) == socket_id)
+        });
+    let Some(link) = link else {
+        return raw_graph_input_default(node, socket);
+    };
+    let source_name = link.get("from_node").and_then(Value::as_str)?;
+    let source_socket = link.get("from_socket").and_then(Value::as_str)?;
+    let source = tree
+        .get("nodes")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|source| source.get("name").and_then(Value::as_str) == Some(source_name))?;
+    if !matches!(
+        source.get("type").and_then(Value::as_str),
+        Some("ShaderNodeValue" | "ShaderNodeRGB")
+    ) {
+        return None;
+    }
+    source
+        .get("properties")?
+        .get("potter_output_defaults")?
+        .as_array()?
+        .iter()
+        .find(|output| output.get("identifier").and_then(Value::as_str) == Some(source_socket))
+        .and_then(|output| output.get("default"))
+}
+
+fn volume_input_color(tree: &Value, node: &Value, socket: &str) -> Option<[f64; 3]> {
+    let values = volume_graph_input_value(tree, node, socket)?.as_array()?;
+    Some([
+        values.first()?.as_f64()?,
+        values.get(1)?.as_f64()?,
+        values.get(2)?.as_f64()?,
+    ])
+}
+
+fn constant_volume_closure_has_sigma(tree: &Value, node: &Value, node_type: &str) -> Option<bool> {
+    let density = volume_graph_input_value(tree, node, "Density")?.as_f64()?;
+    if density <= 0.0 {
+        return Some(false);
+    }
+    let color = volume_input_color(tree, node, "Color")?;
+    match node_type {
+        "ShaderNodeVolumeScatter" => Some(color.iter().any(|value| *value > 0.0)),
+        "ShaderNodeVolumeAbsorption" => Some(color.iter().any(|value| *value < 1.0)),
+        _ => None,
+    }
+}
+
+fn constant_principled_volume_has_effect(
+    tree: &Value,
+    node: &Value,
+    volume_source: &Value,
+) -> Option<bool> {
+    let density = volume_graph_input_value(tree, node, "Density")?.as_f64()?;
+    let color = volume_input_color(tree, node, "Color")?;
+    let absorption_color = volume_input_color(tree, node, "Absorption Color")?;
+    let has_extinction = density > 0.0
+        && (0..3).any(|channel| {
+            color[channel] > 0.0
+                || (1.0 - color[channel]).max(0.0)
+                    * (1.0 - absorption_color[channel].max(0.0).sqrt()).max(0.0)
+                    > 0.0
+        });
+    if has_extinction {
+        return Some(true);
+    }
+    let emission_strength = volume_graph_input_value(tree, node, "Emission Strength")?.as_f64()?;
+    let emission_color = volume_input_color(tree, node, "Emission Color")?;
+    if emission_strength > 0.0 && emission_color.iter().any(|value| *value != 0.0) {
+        return Some(true);
+    }
+    let blackbody = volume_graph_input_value(tree, node, "Blackbody Intensity")?.as_f64()? as f32;
+    if blackbody <= 0.0 {
+        return Some(false);
+    }
+    let temperature = volume_graph_input_value(tree, node, "Temperature")?.as_f64()? as f32;
+    let temperature = temperature.max(0.0);
+    let tint = volume_input_color(tree, node, "Blackbody Tint")?;
+    if tint.iter().all(|value| *value == 0.0) {
+        return Some(false);
+    }
+    let temperature_attribute =
+        volume_graph_input_value(tree, node, "Temperature Attribute")?.as_str()?;
+    let has_temperature_grid = !temperature_attribute.is_empty()
+        && volume_source
+            .get("grids")
+            .and_then(Value::as_array)
+            .is_some_and(|grids| {
+                grids
+                    .iter()
+                    .any(|grid| grid.as_str() == Some(temperature_attribute))
+            });
+    if has_temperature_grid {
+        return None;
+    }
+    let temperature_squared = temperature * temperature;
+    let temperature_fourth = temperature_squared * temperature_squared;
+    let intensity = 5.670_373e-8_f32 * 1.0e-6_f32 / std::f32::consts::PI
+        * blackbody.mul_add(temperature_fourth - 1.0, 1.0);
+    Some(intensity > 0.0)
+}
+
+fn constant_emission_has_effect(tree: &Value, node: &Value) -> Option<bool> {
+    let color = volume_input_color(tree, node, "Color")?;
+    let strength = volume_graph_input_value(tree, node, "Strength")?.as_f64()?;
+    Some(strength != 0.0 && color.iter().any(|value| *value != 0.0))
+}
+
+fn material_has_constant_volume_sigma(raw: &Value, doc: &SceneDoc, material_name: &str) -> bool {
+    material_has_volume_effect(raw, doc, material_name, false, None)
+}
+
+fn material_has_volume_density_effect(
+    raw: &Value,
+    doc: &SceneDoc,
+    material_name: &str,
+    volume_source: &Value,
+) -> bool {
+    material_has_volume_effect(raw, doc, material_name, true, Some(volume_source))
+}
+
+fn material_has_volume_effect(
+    raw: &Value,
+    doc: &SceneDoc,
+    material_name: &str,
+    include_emission: bool,
+    volume_source: Option<&Value>,
+) -> bool {
+    let Some(raw_material) = raw
+        .get("materials")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|item| item.get("name").and_then(Value::as_str) == Some(material_name))
+    else {
+        return false;
+    };
+    let Some(tree) = raw_material.get("nodes") else {
+        return false;
+    };
+    let Some(material) = doc
+        .materials
+        .values()
+        .find(|material| material.name == material_name)
+    else {
+        return false;
+    };
+    let Some(graph_id) = material.node_tree.as_ref() else {
+        return false;
+    };
+    let Some(group) = doc.node_groups.get(graph_id) else {
+        return false;
+    };
+    let Some(reachable) =
+        volume_graph_nodes_reaching_cycles_output(graph_id, group, &doc.node_groups)
+    else {
+        return false;
+    };
+    let raw_nodes = tree
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            node.get("name")
+                .and_then(Value::as_str)
+                .map(|name| (name, node))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut has_volume_closure = false;
+    let mut has_nonzero_effect = false;
+    for node_id in reachable {
+        let Some(node) = group.nodes.get(&node_id) else {
+            return false;
+        };
+        if node.properties.get("mute").and_then(Value::as_bool) == Some(true) {
+            return false;
+        }
+        match node.node_type.as_str() {
+            "OutputMaterial"
+            | "ShaderNodeOutputMaterial"
+            | "ShaderNodeAddShader"
+            | "ShaderNodeMixShader"
+            | "ShaderNodeValue"
+            | "ShaderNodeRGB"
+            | "ShaderNodeMath"
+            | "ShaderNodeMix"
+            | "ShaderNodeMixRGB" => {}
+            "ShaderNodeVolumeScatter" | "ShaderNodeVolumeAbsorption" => {
+                has_volume_closure = true;
+                let Some(raw_node) = raw_nodes.get(node.name.as_str()) else {
+                    return false;
+                };
+                let Some(has_effect) =
+                    constant_volume_closure_has_sigma(tree, raw_node, &node.node_type)
+                else {
+                    return false;
+                };
+                has_nonzero_effect |= has_effect;
+            }
+            "ShaderNodeVolumePrincipled" if include_emission => {
+                has_volume_closure = true;
+                let Some(raw_node) = raw_nodes.get(node.name.as_str()) else {
+                    return false;
+                };
+                let Some(volume_source) = volume_source else {
+                    return false;
+                };
+                let Some(has_effect) =
+                    constant_principled_volume_has_effect(tree, raw_node, volume_source)
+                else {
+                    return false;
+                };
+                has_nonzero_effect |= has_effect;
+            }
+            "ShaderNodeEmission" if include_emission => {
+                has_volume_closure = true;
+                let Some(raw_node) = raw_nodes.get(node.name.as_str()) else {
+                    return false;
+                };
+                let Some(has_effect) = constant_emission_has_effect(tree, raw_node) else {
+                    return false;
+                };
+                has_nonzero_effect |= has_effect;
+            }
+            _ => return false,
+        }
+    }
+    has_volume_closure && has_nonzero_effect
+}
+
+fn effective_volume_object_material<'a>(object: &'a Value, volume: &'a Value) -> Option<&'a str> {
+    let link = object
+        .get("material_links")
+        .and_then(Value::as_array)?
+        .first()?
+        .as_str()?;
+    match link {
+        "data" | "DATA" => volume
+            .get("materials")
+            .and_then(Value::as_array)?
+            .first()?
+            .as_str(),
+        "object" | "OBJECT" => object
+            .get("materials")
+            .and_then(Value::as_array)?
+            .first()?
+            .as_str(),
+        _ => None,
+    }
+}
+
+fn object_volume_density_is_scaled(object: &Value) -> bool {
+    let Some(rows) = object.get("matrix_world").and_then(Value::as_array) else {
+        return true;
+    };
+    if rows.len() != 4 {
+        return true;
+    }
+    let mut linear = [[0.0_f32; 3]; 3];
+    for (row, linear_row) in linear.iter_mut().enumerate() {
+        let Some(values) = rows.get(row).and_then(Value::as_array) else {
+            return true;
+        };
+        for (column, linear_value) in linear_row.iter_mut().enumerate() {
+            let Some(value) = values
+                .get(column)
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite())
+            else {
+                return true;
+            };
+            *linear_value = value as f32;
+            if !linear_value.is_finite() {
+                return true;
+            }
+        }
+    }
+    let direction = glam::Vec3::ONE.normalize();
+    let transformed = glam::Vec3::new(
+        linear[0][0] * direction.x + linear[0][1] * direction.y + linear[0][2] * direction.z,
+        linear[1][0] * direction.x + linear[1][1] * direction.y + linear[1][2] * direction.z,
+        linear[2][0] * direction.x + linear[2][1] * direction.y + linear[2][2] * direction.z,
+    );
+    let density = 1.0 / transformed.length();
+    // Rigid transforms can differ from unit density by a few f32 ulps.
+    !density.is_finite() || (density - 1.0).abs() > 4.0 * f32::EPSILON
+}
+
+fn cycles_volume_object_grid_import_losses(raw: &Value, doc: &SceneDoc) -> Vec<Loss> {
+    let active_scene = raw.get("active_scene").and_then(Value::as_str);
+    let scene = raw
+        .get("scenes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|scene| scene.get("name").and_then(Value::as_str) == active_scene);
+    let Some(scene) = scene else {
+        return Vec::new();
+    };
+    let render = scene.get("render");
+    let native_engine = render
+        .and_then(|render| render.get("engine_native"))
+        .and_then(Value::as_str);
+    let cycles = match native_engine {
+        Some("CYCLES") => true,
+        Some(_) => false,
+        None => {
+            render
+                .and_then(|render| render.get("engine"))
+                .and_then(Value::as_str)
+                == Some("path")
+        }
+    };
+    if !cycles {
+        return Vec::new();
+    }
+    let Some(scene_objects) = scene
+        .get("object_names")
+        .and_then(Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<BTreeSet<_>>()
+        })
+    else {
+        return Vec::new();
+    };
+    let Some(view_layers) = scene.get("view_layers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let objects = raw.get("objects").and_then(Value::as_array);
+    let volumes = raw.get("volumes").and_then(Value::as_array);
+    let mut losses = Vec::new();
+    for object in objects.into_iter().flatten().filter(|object| {
+        object.get("type").and_then(Value::as_str) == Some("VOLUME")
+            && object.get("hide_render").and_then(Value::as_bool) != Some(true)
+    }) {
+        let Some(object_name) = object.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !scene_objects.contains(object_name) {
+            continue;
+        }
+        let Some(data_name) = object.get("data_name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(volume) = volumes
+            .into_iter()
+            .flatten()
+            .find(|volume| volume.get("name").and_then(Value::as_str) == Some(data_name))
+        else {
+            continue;
+        };
+        if volume
+            .get("grids")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            continue;
+        }
+        let object_material = effective_volume_object_material(object, volume);
+        let effective_volume_material = view_layers.iter().any(|view_layer| {
+            let in_layer = view_layer
+                .get("object_names")
+                .and_then(Value::as_array)
+                .is_some_and(|names| names.iter().any(|name| name.as_str() == Some(object_name)));
+            if !in_layer || view_layer.get("use_volumes").and_then(Value::as_bool) == Some(false) {
+                return false;
+            }
+            let material_name = match view_layer.get("material_override") {
+                Some(Value::String(name)) => Some(name.as_str()),
+                Some(Value::Null) => object_material,
+                _ => None,
+            };
+            material_name.is_some_and(|name| material_has_constant_volume_sigma(raw, doc, name))
+        });
+        if effective_volume_material {
+            losses.push(loss(
+                "shader.volume.object_grid_implicit_density",
+                object
+                    .get("potter_id")
+                    .and_then(Value::as_str)
+                    .or(Some(object_name)),
+                "the effective Cycles Material Output Volume shader has constant coefficients, but Potter implicitly multiplies a Volume Object's coefficients by its primary volume grid",
+            ));
+        }
+    }
+    losses
+}
+
+fn cycles_volume_object_density_space_import_losses(raw: &Value, doc: &SceneDoc) -> Vec<Loss> {
+    let active_scene = raw.get("active_scene").and_then(Value::as_str);
+    let scene = raw
+        .get("scenes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|scene| scene.get("name").and_then(Value::as_str) == active_scene);
+    let Some(scene) = scene else {
+        return Vec::new();
+    };
+    let render = scene.get("render");
+    let native_engine = render
+        .and_then(|render| render.get("engine_native"))
+        .and_then(Value::as_str);
+    let cycles = match native_engine {
+        Some("CYCLES") => true,
+        Some(_) => false,
+        None => {
+            render
+                .and_then(|render| render.get("engine"))
+                .and_then(Value::as_str)
+                == Some("path")
+        }
+    };
+    if !cycles {
+        return Vec::new();
+    }
+    let Some(scene_objects) = scene
+        .get("object_names")
+        .and_then(Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<BTreeSet<_>>()
+        })
+    else {
+        return Vec::new();
+    };
+    let Some(view_layers) = scene.get("view_layers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let objects = raw.get("objects").and_then(Value::as_array);
+    let volumes = raw.get("volumes").and_then(Value::as_array);
+    let mut losses = Vec::new();
+    for object in objects.into_iter().flatten().filter(|object| {
+        object.get("type").and_then(Value::as_str) == Some("VOLUME")
+            && object.get("hide_render").and_then(Value::as_bool) != Some(true)
+    }) {
+        let Some(object_name) = object.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !scene_objects.contains(object_name) {
+            continue;
+        }
+        let Some(data_name) = object.get("data_name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(volume) = volumes
+            .into_iter()
+            .flatten()
+            .find(|volume| volume.get("name").and_then(Value::as_str) == Some(data_name))
+        else {
+            continue;
+        };
+        if volume.get("space").and_then(Value::as_str) != Some("OBJECT")
+            || volume
+                .get("grids")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            || !object_volume_density_is_scaled(object)
+        {
+            continue;
+        }
+        let object_material = effective_volume_object_material(object, volume);
+        let effective_volume_material = view_layers.iter().any(|view_layer| {
+            let in_layer = view_layer
+                .get("object_names")
+                .and_then(Value::as_array)
+                .is_some_and(|names| names.iter().any(|name| name.as_str() == Some(object_name)));
+            if !in_layer || view_layer.get("use_volumes").and_then(Value::as_bool) == Some(false) {
+                return false;
+            }
+            let material_name = match view_layer.get("material_override") {
+                Some(Value::String(name)) => Some(name.as_str()),
+                Some(Value::Null) => object_material,
+                _ => None,
+            };
+            material_name
+                .is_some_and(|name| material_has_volume_density_effect(raw, doc, name, volume))
+        });
+        if effective_volume_material {
+            losses.push(loss(
+                "shader.volume.object_density_space",
+                object
+                    .get("potter_id")
+                    .and_then(Value::as_str)
+                    .or(Some(object_name)),
+                "Blender Volume.render.space OBJECT scales the effective Cycles Volume coefficients by the object transform, while Potter uses World-density semantics",
+            ));
+        }
+    }
+    losses
 }
 
 fn import_losses(raw: &Value) -> Vec<Loss> {
@@ -14217,66 +14863,6 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                     scene_name,
                     "World Output.Volume is reachable but Potter does not evaluate that World Volume closure; EEVEE uses its absorption state to decide whether WorldSun extraction is enabled, and that state is not represented.",
                 ));
-            }
-        }
-        if engine == Some("path") {
-            let scene_world = scene.get("world").filter(|world| !world.is_null());
-            let scene_world_name = scene_world
-                .and_then(|world| world.get("name"))
-                .and_then(Value::as_str);
-            let mut selected_world_names = BTreeSet::new();
-            if let Some(layers) = scene
-                .get("view_layers")
-                .and_then(Value::as_array)
-                .filter(|layers| !layers.is_empty())
-            {
-                for layer in layers {
-                    let world_name = layer
-                        .get("world_override")
-                        .and_then(Value::as_str)
-                        .filter(|name| !name.is_empty())
-                        .or(scene_world_name);
-                    if let Some(world_name) = world_name {
-                        selected_world_names.insert(world_name.to_owned());
-                    }
-                }
-            } else if let Some(world_name) = scene_world_name {
-                selected_world_names.insert(world_name.to_owned());
-            }
-            let worlds = raw.get("worlds").and_then(Value::as_array);
-            let mut volume_world_names = Vec::new();
-            for world_name in selected_world_names {
-                let world = worlds
-                    .into_iter()
-                    .flatten()
-                    .find(|world| {
-                        world.get("name").and_then(Value::as_str) == Some(world_name.as_str())
-                    })
-                    .or_else(|| {
-                        scene_world.filter(|world| {
-                            world.get("name").and_then(Value::as_str) == Some(world_name.as_str())
-                        })
-                    });
-                let volume_reachable = world
-                    .and_then(|world| world.get("nodes"))
-                    .map(|tree| {
-                        shader_graph_nodes_reaching_output_socket(
-                            tree,
-                            "ShaderNodeOutputWorld",
-                            Some("Volume"),
-                        )
-                    })
-                    .unwrap_or_default();
-                if !volume_reachable.is_empty() {
-                    volume_world_names.push(world_name);
-                }
-            }
-            if !volume_world_names.is_empty() {
-                let reason = format!(
-                    "Cycles path rendering refuses reachable OutputWorld.Volume on effective World(s) `{}` because Potter does not implement Cycles World Volume closures",
-                    volume_world_names.join("`, `"),
-                );
-                losses.push(loss("render.path.world_volume", scene_name, &reason));
             }
         }
         if scene
@@ -24816,6 +25402,20 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             context: &context,
         };
         export_blend(&doc, &project, &output, &options)?;
+        let volume_space = Command::new(&blender)
+            .arg("--background")
+            .arg(&output)
+            .arg("--python-expr")
+            .arg("import bpy; assert next(iter(bpy.data.volumes)).render.space == 'WORLD'")
+            .output()
+            .map_err(|error| PotError::io(&error))?;
+        if !volume_space.status.success() {
+            return Err(PotError::with_details(
+                ErrorCode::ImportFailed,
+                "native Blender Volume export did not preserve World-density semantics",
+                child_details(&volume_space),
+            ));
+        }
         let imported = import_blend(&output, Some(&blender))?;
         let imported_data = imported
             .doc
@@ -24838,6 +25438,92 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             Some(&smoke_id)
         );
         assert_eq!(imported_node.material_slot(Some(imported_data), 1), None);
+        Ok(())
+    }
+
+    #[test]
+    fn blender_volume_render_space_capture_reports_scaled_object_density_loss() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let script_path = directory.path().join("make_volume_space_fixture.py");
+        let blend_path = directory.path().join("volume-space.blend");
+        let vdb_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/openvdb_transform_types/density.vdb");
+        fs::write(
+            &script_path,
+            r#"
+import bpy, sys
+vdb_path, blend_path = sys.argv[sys.argv.index("--") + 1:]
+bpy.ops.wm.read_factory_settings(use_empty=True)
+bpy.context.scene.render.engine = "CYCLES"
+
+def add_volume(name, space):
+    bpy.ops.object.volume_import(filepath=vdb_path)
+    obj = bpy.context.object
+    obj.name = name
+    obj.data.name = name + " Data"
+    obj.data.render.space = space
+    obj.scale = (2.0, 2.0, 2.0)
+    return obj
+
+object_volume = add_volume("Object Space", "OBJECT")
+world_volume = add_volume("World Space", "WORLD")
+material = bpy.data.materials.new("Volume Scatter")
+material.use_nodes = True
+nodes = material.node_tree.nodes
+output = next(node for node in nodes if node.type == "OUTPUT_MATERIAL")
+for node in list(nodes):
+    if node != output:
+        nodes.remove(node)
+scatter = nodes.new("ShaderNodeVolumeScatter")
+scatter.inputs["Color"].default_value = (0.5, 0.5, 0.5, 1.0)
+scatter.inputs["Density"].default_value = 1.0
+material.node_tree.links.new(scatter.outputs["Volume"], output.inputs["Volume"])
+object_volume.data.materials.append(material)
+world_volume.data.materials.append(material)
+bpy.context.view_layer.update()
+bpy.ops.wm.save_as_mainfile(filepath=blend_path, check_existing=False)
+"#,
+        )
+        .map_err(|error| PotError::io(&error))?;
+        let generated = Command::new(&blender)
+            .arg("--background")
+            .arg("--factory-startup")
+            .arg("--disable-autoexec")
+            .arg("--python-exit-code")
+            .arg("3")
+            .arg("--python")
+            .arg(&script_path)
+            .arg("--")
+            .arg(&vdb_path)
+            .arg(&blend_path)
+            .output()
+            .map_err(|error| PotError::io(&error))?;
+        if !generated.status.success() {
+            return Err(PotError::with_details(
+                ErrorCode::ImportFailed,
+                "Blender Volume.render.space fixture creation failed",
+                child_details(&generated),
+            ));
+        }
+
+        let imported = import_blend(&blend_path, Some(&blender))?;
+        let density_space_losses: Vec<_> = imported
+            .losses
+            .iter()
+            .filter(|loss| loss.feature_id == "shader.volume.object_density_space")
+            .collect();
+        assert_eq!(
+            density_space_losses.len(),
+            1,
+            "expected an Object-space density loss only, got {density_space_losses:?}",
+        );
+        let object_loss = density_space_losses
+            .first()
+            .ok_or_else(|| invalid_intermediate("Object-space volume loss is missing"))?;
+        assert_eq!(object_loss.data_id.as_deref(), Some("Object Space"));
         Ok(())
     }
 
@@ -28867,72 +29553,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
         assert!(import_losses(&raw).iter().all(|loss| {
             loss.feature_id != "render.world.volume_absorption"
                 && loss.feature_id != "render.eevee.world_probe.local_volume_grids"
-        }));
-    }
-    #[test]
-    fn cycles_world_volume_loss_uses_effective_view_layer_world() {
-        let volume_world = json!({
-            "nodes": [
-                {
-                    "name": "World Output",
-                    "type": "ShaderNodeOutputWorld",
-                    "properties": {"is_active_output": true}
-                },
-                {"name": "Absorption", "type": "ShaderNodeVolumeAbsorption"}
-            ],
-            "links": [{
-                "from_node": "Absorption",
-                "from_socket": "Volume",
-                "to_node": "World Output",
-                "to_socket": "Volume"
-            }]
-        });
-        let surface_world = json!({
-            "nodes": [{
-                "name": "World Output",
-                "type": "ShaderNodeOutputWorld",
-                "properties": {"is_active_output": true}
-            }],
-            "links": []
-        });
-        let raw = json!({
-            "worlds": [
-                {"name": "Surface", "nodes": surface_world.clone()},
-                {"name": "Volume", "nodes": volume_world.clone()},
-                {"name": "Volume Base", "nodes": volume_world.clone()},
-                {"name": "Surface Override", "nodes": surface_world.clone()}
-            ],
-            "scenes": [
-                {
-                    "name": "OverrideVolume",
-                    "render": {"engine": "path"},
-                    "world": {"name": "Surface", "nodes": surface_world.clone()},
-                    "view_layers": [{"name": "Layer", "world_override": "Volume", "use_volumes": false}]
-                },
-                {
-                    "name": "SceneWorldFallback",
-                    "render": {"engine": "path"},
-                    "world": {"name": "Volume Base", "nodes": volume_world.clone()},
-                    "view_layers": [{"name": "Layer", "world_override": null, "use_volumes": false}]
-                },
-                {
-                    "name": "OverrideSurface",
-                    "render": {"engine": "path"},
-                    "world": {"name": "Volume Base", "nodes": volume_world},
-                    "view_layers": [{"name": "Layer", "world_override": "Surface Override", "use_volumes": false}]
-                }
-            ]
-        });
-        let losses = import_losses(&raw);
-        for scene_name in ["OverrideVolume", "SceneWorldFallback"] {
-            assert!(losses.iter().any(|loss| {
-                loss.feature_id == "render.path.world_volume"
-                    && loss.data_id.as_deref() == Some(scene_name)
-            }));
-        }
-        assert!(losses.iter().all(|loss| {
-            loss.feature_id != "render.path.world_volume"
-                || loss.data_id.as_deref() != Some("OverrideSurface")
+                && loss.feature_id != "render.path.world_volume"
         }));
     }
     #[test]
@@ -30727,6 +31348,65 @@ fn shader_import_losses_only_report_unavailable_outputs() -> Result<()> {
     }));
     Ok(())
 }
+#[test]
+fn material_shader_import_reports_light_path_context_loss() {
+    let material = json!({
+        "name": "Material",
+        "nodes": {
+            "nodes": [
+                {"name": "Output", "type": "ShaderNodeOutputMaterial", "properties": {"is_active_output": true}},
+                {"name": "Mix", "type": "ShaderNodeMixShader"},
+                {"name": "Light Path", "type": "ShaderNodeLightPath"},
+                {"name": "Emission A", "type": "ShaderNodeEmission"},
+                {"name": "Emission B", "type": "ShaderNodeEmission"}
+            ],
+            "links": [
+                {"from_node": "Light Path", "from_socket": "Is Camera Ray", "to_node": "Mix", "to_socket": "Fac"},
+                {"from_node": "Emission A", "from_socket": "Emission", "to_node": "Mix", "to_socket": "Shader1"},
+                {"from_node": "Emission B", "from_socket": "Emission", "to_node": "Mix", "to_socket": "Shader2"},
+                {"from_node": "Mix", "from_socket": "Shader", "to_node": "Output", "to_socket": "Surface"}
+            ]
+        }
+    });
+    let mut losses = Vec::new();
+    material_shader_graph_import_losses(&Value::Null, &material, &mut losses);
+    assert!(crate::shader::shader_node_type_supported(
+        "ShaderNodeLightPath"
+    ));
+    assert!(losses.iter().any(|loss| {
+        loss.feature_id == "blender.material.shader_node.unsupported"
+            && loss.data_id.as_deref() == Some("Material")
+            && loss.reason.contains("requires ray state")
+    }));
+}
+
+#[test]
+fn world_volume_light_path_is_not_a_material_node_import_loss() {
+    let raw = json!({
+        "scenes": [{
+            "name": "Scene",
+            "render": {"engine": "path"},
+            "world": {
+                "nodes": {
+                    "nodes": [
+                        {"name": "Output", "type": "ShaderNodeOutputWorld", "properties": {"is_active_output": true}},
+                        {"name": "Light Path", "type": "ShaderNodeLightPath"},
+                        {"name": "Volume", "type": "ShaderNodeVolumePrincipled"}
+                    ],
+                    "links": [
+                        {"from_node": "Light Path", "from_socket": "Is Camera Ray", "to_node": "Volume", "to_socket": "Density"},
+                        {"from_node": "Volume", "from_socket": "Volume", "to_node": "Output", "to_socket": "Volume"}
+                    ]
+                }
+            }
+        }]
+    });
+    assert!(
+        !import_losses(&raw)
+            .iter()
+            .any(|loss| { loss.feature_id == "blender.material.shader_node.unsupported" })
+    );
+}
 
 #[test]
 fn realtime_world_probe_import_loss_requires_a_world_and_anisotropic_volume() -> Result<()> {
@@ -31408,6 +32088,655 @@ mod volume_and_physics_loss_tests {
             .into_iter()
             .map(|loss| loss.feature_id)
             .collect()
+    }
+
+    fn imported_features(raw: &Value) -> Result<Vec<String>> {
+        validate_intermediate(raw)?;
+        let imported = build_imported_graph(
+            raw,
+            Path::new("volume-import.blend"),
+            b"ORIGINAL".to_vec(),
+            &BTreeMap::new(),
+        )?;
+        Ok(imported
+            .losses
+            .into_iter()
+            .map(|loss| loss.feature_id)
+            .collect())
+    }
+
+    fn material(name: &str, nodes: &[Value], links: &[Value]) -> Value {
+        json!({
+            "name": name,
+            "potter_id": format!("material_{name}"),
+            "pass_index": 0,
+            "nodes": {
+                "name": format!("{name} Shader"),
+                "potter_id": format!("graph_{name}"),
+                "type": "ShaderNodeTree",
+                "nodes": nodes,
+                "links": links
+            }
+        })
+    }
+
+    fn output_material() -> Value {
+        json!({
+            "name": "Output",
+            "type": "ShaderNodeOutputMaterial",
+            "properties": {"target": "CYCLES", "is_active_output": true},
+            "inputs": [{"name": "Volume", "identifier": "Volume", "default": null}]
+        })
+    }
+
+    fn scatter(name: &str) -> Value {
+        json!({
+            "name": name,
+            "type": "ShaderNodeVolumeScatter",
+            "inputs": [
+                {"name": "Color", "identifier": "Color", "default": [0.5, 0.5, 0.5, 1.0]},
+                {"name": "Density", "identifier": "Density", "default": 1.0},
+                {"name": "Anisotropy", "identifier": "Anisotropy", "default": 0.0}
+            ]
+        })
+    }
+
+    fn volume_output_link(from: &str, to: &str) -> Value {
+        json!({"from_node": from, "from_socket": "Volume",
+               "to_node": to, "to_socket": "Volume"})
+    }
+
+    fn source_volume_raw(
+        materials: &[Value],
+        object_type: &str,
+        active: bool,
+        material_override: &Value,
+        world: &Value,
+    ) -> Value {
+        let scene_objects = if active { json!(["Fog"]) } else { json!([]) };
+        let collection_objects = if active { json!(["Fog"]) } else { json!([]) };
+        let data_name = match object_type {
+            "VOLUME" => json!("FogData"),
+            "MESH" => json!("MeshData"),
+            _ => Value::Null,
+        };
+        let meshes = if object_type == "MESH" {
+            json!([{
+                "name": "MeshData",
+                "potter_id": "mesh_data",
+                "vertices": [{"co": [0.0, 0.0, 0.0]}, {"co": [1.0, 0.0, 0.0]},
+                             {"co": [0.0, 1.0, 0.0]}],
+                "edges": [{"v": [0, 1]}, {"v": [1, 2]}, {"v": [2, 0]}],
+                "polygons": [{"v": [0, 1, 2], "material_index": 0, "smooth": false}],
+                "materials": ["Material"],
+                "uv_layers": [],
+                "attributes": [],
+                "custom_properties": {}
+            }])
+        } else {
+            json!([])
+        };
+        json!({
+            "bridge_version": 2,
+            "blender_version": "5.2.2",
+            "file_version": [5, 2, 2],
+            "active_scene": "Scene",
+            "scenes": [{
+                "name": "Scene",
+                "potter_id": "scene_main",
+                "root_collection": "collection:Collection",
+                "render": {"engine": "path", "engine_native": "CYCLES"},
+                "object_names": scene_objects.clone(),
+                "view_layers": [{
+                    "name": "View Layer",
+                    "potter_id": "view_main",
+                    "object_names": scene_objects,
+                    "excluded_collections": [],
+                    "material_override": material_override,
+                    "world_override": null,
+                    "use_volumes": true
+                }],
+                "world": world
+            }],
+            "collections": [{
+                "name": "Collection",
+                "potter_id": "collection_main",
+                "bridge_id": "collection:Collection",
+                "children": [],
+                "objects": collection_objects
+            }],
+            "objects": [{
+                "name": "Fog",
+                "potter_id": "object_fog",
+                "type": object_type,
+                "data_name": data_name,
+                "materials": [null],
+                "material_links": ["data"],
+                "location": [0.0, 0.0, 0.0],
+                "rotation_mode": "XYZ",
+                "rotation_euler": [0.0, 0.0, 0.0],
+                "rotation_quaternion": [1.0, 0.0, 0.0, 0.0],
+                "scale": [1.0, 1.0, 1.0],
+                "matrix_world": [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0]
+                ],
+                "hide_render": false,
+                "modifiers": []
+            }],
+            "volumes": [{
+                "name": "FogData",
+                "potter_id": "volume_fog",
+                "filepath": "",
+                "space": "WORLD",
+                "grids": ["density"],
+                "materials": ["Material"],
+                "custom_properties": {},
+                "fake_user": false,
+                "users": 1
+            }],
+            "meshes": meshes,
+            "materials": materials,
+            "cameras": [],
+            "lights": [],
+            "actions": [],
+            "texts": [],
+            "node_groups": [],
+            "other_datablocks": [],
+            "unused_datablocks": []
+        })
+    }
+
+    fn volume_import_loss(raw: &Value) -> Result<bool> {
+        Ok(imported_features(raw)?
+            .iter()
+            .any(|feature| feature == "shader.volume.object_grid_implicit_density"))
+    }
+
+    #[test]
+    fn cycles_volume_object_import_loss_tracks_effective_constant_sigma() -> Result<()> {
+        let feature_material = |name: &str, closure: Value, input_links: &[Value]| {
+            let mut nodes = vec![output_material(), closure];
+            if input_links
+                .iter()
+                .any(|link| link["from_node"].as_str() == Some("Volume Info"))
+            {
+                nodes.push(json!({
+                    "name": "Volume Info",
+                    "type": "ShaderNodeVolumeInfo",
+                    "inputs": []
+                }));
+            }
+            material(name, &nodes, input_links)
+        };
+        let scatter_material = material(
+            "Material",
+            &[output_material(), scatter("Scatter")],
+            &[volume_output_link("Scatter", "Output")],
+        );
+        assert!(volume_import_loss(&source_volume_raw(
+            std::slice::from_ref(&scatter_material),
+            "VOLUME",
+            true,
+            &Value::Null,
+            &Value::Null,
+        ))?);
+
+        let mut alternate_primary_grid = source_volume_raw(
+            std::slice::from_ref(&scatter_material),
+            "VOLUME",
+            true,
+            &Value::Null,
+            &Value::Null,
+        );
+        alternate_primary_grid["volumes"][0]["filepath"] = json!("missing.vdb");
+        alternate_primary_grid["volumes"][0]["grids"] = json!(["smoke"]);
+        assert!(volume_import_loss(&alternate_primary_grid)?);
+
+        let mut vdb_without_grid = source_volume_raw(
+            std::slice::from_ref(&scatter_material),
+            "VOLUME",
+            true,
+            &Value::Null,
+            &Value::Null,
+        );
+        vdb_without_grid["volumes"][0]["filepath"] = json!("missing.vdb");
+        vdb_without_grid["volumes"][0]["grids"] = json!([]);
+        assert!(!volume_import_loss(&vdb_without_grid)?);
+
+        let mut black_scatter = source_volume_raw(
+            std::slice::from_ref(&scatter_material),
+            "VOLUME",
+            true,
+            &Value::Null,
+            &Value::Null,
+        );
+        black_scatter["materials"][0]["nodes"]["nodes"][1]["inputs"][0]["default"] =
+            json!([0.0, 0.0, 0.0, 1.0]);
+        assert!(!volume_import_loss(&black_scatter)?);
+
+        let mut zero_density = source_volume_raw(
+            std::slice::from_ref(&scatter_material),
+            "VOLUME",
+            true,
+            &Value::Null,
+            &Value::Null,
+        );
+        zero_density["materials"][0]["nodes"]["nodes"][1]["inputs"][1]["default"] = json!(0.0);
+        assert!(!volume_import_loss(&zero_density)?);
+
+        let linked_density = material(
+            "Material",
+            &[
+                output_material(),
+                json!({
+                    "name": "Density Value",
+                    "type": "ShaderNodeValue",
+                    "properties": {
+                        "potter_output_defaults": [{"identifier": "Value", "default": 2.0}]
+                    },
+                    "inputs": []
+                }),
+                scatter("Scatter"),
+            ],
+            &[
+                json!({"from_node": "Density Value", "from_socket": "Value",
+                       "to_node": "Scatter", "to_socket": "Density"}),
+                volume_output_link("Scatter", "Output"),
+            ],
+        );
+        assert!(volume_import_loss(&source_volume_raw(
+            &[linked_density],
+            "VOLUME",
+            true,
+            &Value::Null,
+            &Value::Null,
+        ))?);
+
+        let absorption = json!({
+            "name": "Absorption",
+            "type": "ShaderNodeVolumeAbsorption",
+            "inputs": [
+                {"name": "Color", "identifier": "Color", "default": [0.5, 0.5, 0.5, 1.0]},
+                {"name": "Density", "identifier": "Density", "default": 1.0}
+            ]
+        });
+        let absorption_material = feature_material(
+            "Material",
+            absorption,
+            &[volume_output_link("Absorption", "Output")],
+        );
+        assert!(volume_import_loss(&source_volume_raw(
+            &[absorption_material],
+            "VOLUME",
+            true,
+            &Value::Null,
+            &Value::Null,
+        ))?);
+
+        let white_absorption = json!({
+            "name": "Absorption",
+            "type": "ShaderNodeVolumeAbsorption",
+            "inputs": [
+                {"name": "Color", "identifier": "Color", "default": [1.0, 1.0, 1.0, 1.0]},
+                {"name": "Density", "identifier": "Density", "default": 1.0}
+            ]
+        });
+        let white_absorption = feature_material(
+            "Material",
+            white_absorption,
+            &[volume_output_link("Absorption", "Output")],
+        );
+        assert!(!volume_import_loss(&source_volume_raw(
+            &[white_absorption],
+            "VOLUME",
+            true,
+            &Value::Null,
+            &Value::Null,
+        ))?);
+
+        let principled = json!({
+            "name": "Principled Volume",
+            "type": "ShaderNodeVolumePrincipled",
+            "inputs": [
+                {"name": "Color", "identifier": "Color", "default": [0.5, 0.5, 0.5, 1.0]},
+                {"name": "Density", "identifier": "Density", "default": 1.0},
+                {"name": "Density Attribute", "identifier": "Density Attribute", "default": ""},
+                {"name": "Color Attribute", "identifier": "Color Attribute", "default": ""},
+                {"name": "Absorption Color", "identifier": "Absorption Color",
+                 "default": [0.0, 0.0, 0.0, 1.0]},
+                {"name": "Blackbody Intensity", "identifier": "Blackbody Intensity",
+                 "default": 0.0},
+                {"name": "Temperature Attribute", "identifier": "Temperature Attribute",
+                 "default": "temperature"}
+            ]
+        });
+        let principled_material = feature_material(
+            "Material",
+            principled,
+            &[volume_output_link("Principled Volume", "Output")],
+        );
+        let principled_features = imported_features(&source_volume_raw(
+            &[principled_material],
+            "VOLUME",
+            true,
+            &Value::Null,
+            &Value::Null,
+        ))?;
+        assert!(
+            !principled_features
+                .iter()
+                .any(|feature| feature == "shader.volume.object_grid_implicit_density")
+        );
+        assert!(
+            principled_features
+                .iter()
+                .any(|feature| feature == "shader.volume.spatially_varying_graph")
+        );
+
+        let grid_read_material = material(
+            "Material",
+            &[
+                output_material(),
+                scatter("Scatter"),
+                json!({"name": "Volume Info", "type": "ShaderNodeVolumeInfo", "inputs": []}),
+            ],
+            &[
+                json!({"from_node": "Volume Info", "from_socket": "Density",
+                       "to_node": "Scatter", "to_socket": "Density"}),
+                volume_output_link("Scatter", "Output"),
+            ],
+        );
+        assert!(!volume_import_loss(&source_volume_raw(
+            &[grid_read_material],
+            "VOLUME",
+            true,
+            &Value::Null,
+            &Value::Null,
+        ))?);
+
+        let mut eevee_output = output_material();
+        eevee_output["name"] = json!("EEVEE Output");
+        eevee_output["properties"]["target"] = json!("EEVEE");
+        let cycles_output = json!({"name": "Cycles Output", "type": "ShaderNodeOutputMaterial",
+                  "properties": {"target": "CYCLES", "is_active_output": true},
+                  "inputs": [{"name": "Volume", "identifier": "Volume", "default": null}]});
+        let cycles_target_material = material(
+            "Material",
+            &[
+                eevee_output,
+                scatter("EEVEE Scatter"),
+                cycles_output,
+                scatter("Cycles Scatter"),
+                json!({"name": "Volume Info", "type": "ShaderNodeVolumeInfo", "inputs": []}),
+            ],
+            &[
+                volume_output_link("EEVEE Scatter", "EEVEE Output"),
+                json!({"from_node": "Volume Info", "from_socket": "Density",
+                       "to_node": "Cycles Scatter", "to_socket": "Density"}),
+                volume_output_link("Cycles Scatter", "Cycles Output"),
+            ],
+        );
+        assert!(!volume_import_loss(&source_volume_raw(
+            &[cycles_target_material],
+            "VOLUME",
+            true,
+            &Value::Null,
+            &Value::Null,
+        ))?);
+
+        let mut overridden_raw = source_volume_raw(
+            &[
+                material(
+                    "Material",
+                    &[output_material(), scatter("Scatter")],
+                    &[volume_output_link("Scatter", "Output")],
+                ),
+                material(
+                    "Grid",
+                    &[
+                        output_material(),
+                        scatter("Scatter"),
+                        json!({"name": "Volume Info", "type": "ShaderNodeVolumeInfo", "inputs": []}),
+                    ],
+                    &[
+                        json!({"from_node": "Volume Info", "from_socket": "Density",
+                               "to_node": "Scatter", "to_socket": "Density"}),
+                        volume_output_link("Scatter", "Output"),
+                    ],
+                ),
+            ],
+            "VOLUME",
+            true,
+            &json!("Grid"),
+            &Value::Null,
+        );
+        assert!(!volume_import_loss(&overridden_raw)?);
+        overridden_raw["scenes"][0]["view_layers"][0]["material_override"] = Value::Null;
+        assert!(volume_import_loss(&overridden_raw)?);
+
+        let dead_grid_branch = material(
+            "Material",
+            &[
+                output_material(),
+                json!({
+                    "name": "Mix",
+                    "type": "ShaderNodeMixShader",
+                    "inputs": [
+                        {"name": "Fac", "identifier": "Fac", "default": 0.0},
+                        {"name": "Shader", "identifier": "Shader", "default": null},
+                        {"name": "Shader", "identifier": "Shader_001", "default": null}
+                    ]
+                }),
+                scatter("Live Scatter"),
+                scatter("Dead Scatter"),
+                json!({"name": "Volume Info", "type": "ShaderNodeVolumeInfo", "inputs": []}),
+            ],
+            &[
+                json!({"from_node": "Volume Info", "from_socket": "Density",
+                       "to_node": "Dead Scatter", "to_socket": "Density"}),
+                json!({"from_node": "Live Scatter", "from_socket": "Volume",
+                       "to_node": "Mix", "to_socket": "Shader"}),
+                json!({"from_node": "Dead Scatter", "from_socket": "Volume",
+                       "to_node": "Mix", "to_socket": "Shader_001"}),
+                json!({"from_node": "Mix", "from_socket": "Shader",
+                       "to_node": "Output", "to_socket": "Volume"}),
+            ],
+        );
+        assert!(volume_import_loss(&source_volume_raw(
+            &[dead_grid_branch],
+            "VOLUME",
+            true,
+            &Value::Null,
+            &Value::Null,
+        ))?);
+
+        let world = json!({
+            "name": "World",
+            "potter_id": "world_main",
+            "color": [0.1, 0.1, 0.1],
+            "background_color": [0.1, 0.1, 0.1],
+            "strength": 1.0,
+            "nodes": {
+                "name": "World Shader",
+                "potter_id": "world_graph",
+                "type": "ShaderNodeTree",
+                "nodes": [
+                    {"name": "World Output", "type": "ShaderNodeOutputWorld",
+                     "properties": {"target": "CYCLES", "is_active_output": true}},
+                    scatter("World Scatter")
+                ],
+                "links": [volume_output_link("World Scatter", "World Output")]
+            }
+        });
+        let mesh_material = material(
+            "Material",
+            &[output_material(), scatter("Scatter")],
+            &[volume_output_link("Scatter", "Output")],
+        );
+        assert!(!volume_import_loss(&source_volume_raw(
+            std::slice::from_ref(&mesh_material),
+            "MESH",
+            true,
+            &Value::Null,
+            &world,
+        ))?);
+        assert!(!volume_import_loss(&source_volume_raw(
+            &[mesh_material],
+            "VOLUME",
+            false,
+            &Value::Null,
+            &Value::Null,
+        ))?);
+        Ok(())
+    }
+
+    #[test]
+    fn blender_volume_object_density_space_loss_tracks_effective_coefficients() -> Result<()> {
+        const FEATURE: &str = "shader.volume.object_density_space";
+        let has_loss = |raw: &Value| -> Result<bool> {
+            Ok(imported_features(raw)?
+                .iter()
+                .any(|feature| feature == FEATURE))
+        };
+        let scaled_volume = |materials: &[Value]| {
+            let mut raw = source_volume_raw(materials, "VOLUME", true, &Value::Null, &Value::Null);
+            raw["volumes"][0]["space"] = json!("OBJECT");
+            raw["objects"][0]["matrix_world"] = json!([
+                [2.0, 0.0, 0.0, 0.0],
+                [0.0, 2.0, 0.0, 0.0],
+                [0.0, 0.0, 2.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0]
+            ]);
+            raw
+        };
+        let scattering = material(
+            "Material",
+            &[output_material(), scatter("Scatter")],
+            &[volume_output_link("Scatter", "Output")],
+        );
+
+        let scaled = scaled_volume(std::slice::from_ref(&scattering));
+        assert!(has_loss(&scaled)?);
+        let mut missing_grid = scaled.clone();
+        missing_grid["volumes"][0]["filepath"] = json!("missing.vdb");
+        missing_grid["volumes"][0]["grids"] = json!([]);
+        let missing_grid_features = imported_features(&missing_grid)?;
+        assert!(missing_grid_features.iter().all(|feature| {
+            feature != "shader.volume.object_grid_implicit_density"
+                && feature != "shader.volume.object_density_space"
+        }));
+
+        let mut identity = scaled.clone();
+        identity["objects"][0]["matrix_world"] = json!([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ]);
+        assert!(!has_loss(&identity)?);
+
+        let mut world_space = scaled.clone();
+        world_space["volumes"][0]["space"] = json!("WORLD");
+        assert!(!has_loss(&world_space)?);
+
+        let mut zero_scattering = scaled.clone();
+        zero_scattering["materials"][0]["nodes"]["nodes"][1]["inputs"][1]["default"] = json!(0.0);
+        assert!(!has_loss(&zero_scattering)?);
+
+        let mut hidden = scaled.clone();
+        hidden["objects"][0]["hide_render"] = json!(true);
+        assert!(!has_loss(&hidden)?);
+
+        let mut overridden = scaled_volume(&[
+            scattering.clone(),
+            material("NoVolume", &[output_material()], &[]),
+        ]);
+        overridden["scenes"][0]["view_layers"][0]["material_override"] = json!("NoVolume");
+        assert!(!has_loss(&overridden)?);
+
+        let principled = material(
+            "Material",
+            &[
+                output_material(),
+                json!({
+                    "name": "Principled Volume",
+                    "type": "ShaderNodeVolumePrincipled",
+                    "inputs": [
+                        {"name": "Color", "identifier": "Color", "default": [0.5, 0.5, 0.5, 1.0]},
+                        {"name": "Density", "identifier": "Density", "default": 1.0},
+                        {"name": "Density Attribute", "identifier": "Density Attribute", "default": ""},
+                        {"name": "Color Attribute", "identifier": "Color Attribute", "default": ""},
+                        {"name": "Absorption Color", "identifier": "Absorption Color",
+                         "default": [0.0, 0.0, 0.0, 1.0]},
+                        {"name": "Emission Color", "identifier": "Emission Color",
+                         "default": [1.0, 1.0, 1.0, 1.0]},
+                        {"name": "Emission Strength", "identifier": "Emission Strength",
+                         "default": 0.0},
+                        {"name": "Blackbody Intensity", "identifier": "Blackbody Intensity",
+                         "default": 0.0},
+                        {"name": "Temperature", "identifier": "Temperature", "default": 1000.0},
+                        {"name": "Temperature Attribute", "identifier": "Temperature Attribute",
+                         "default": ""},
+                        {"name": "Blackbody Tint", "identifier": "Blackbody Tint",
+                         "default": [1.0, 1.0, 1.0, 1.0]}
+                    ]
+                }),
+            ],
+            &[volume_output_link("Principled Volume", "Output")],
+        );
+        assert!(has_loss(&scaled_volume(std::slice::from_ref(&principled)))?);
+        let mut blackbody_only = scaled_volume(&[principled]);
+        blackbody_only["materials"][0]["nodes"]["nodes"][1]["inputs"][0]["default"] =
+            json!([0.0, 0.0, 0.0, 1.0]);
+        blackbody_only["materials"][0]["nodes"]["nodes"][1]["inputs"][1]["default"] = json!(0.0);
+        blackbody_only["materials"][0]["nodes"]["nodes"][1]["inputs"][4]["default"] =
+            json!([1.0, 1.0, 1.0, 1.0]);
+        blackbody_only["materials"][0]["nodes"]["nodes"][1]["inputs"][7]["default"] = json!(1.0);
+        assert!(has_loss(&blackbody_only)?);
+
+        let mut blackbody_black_tint = blackbody_only.clone();
+        blackbody_black_tint["materials"][0]["nodes"]["nodes"][1]["inputs"][10]["default"] =
+            json!([0.0, 0.0, 0.0, 1.0]);
+        assert!(!has_loss(&blackbody_black_tint)?);
+
+        let mut zero_temperature = blackbody_only;
+        zero_temperature["materials"][0]["nodes"]["nodes"][1]["inputs"][8]["default"] = json!(0.0);
+        assert!(!has_loss(&zero_temperature)?);
+
+        let emission = material(
+            "Material",
+            &[
+                output_material(),
+                json!({
+                    "name": "Emission",
+                    "type": "ShaderNodeEmission",
+                    "inputs": [
+                        {"name": "Color", "identifier": "Color", "default": [1.0, 1.0, 1.0, 1.0]},
+                        {"name": "Strength", "identifier": "Strength", "default": 1.0}
+                    ]
+                }),
+            ],
+            &[json!({
+                "from_node": "Emission",
+                "from_socket": "Emission",
+                "to_node": "Output",
+                "to_socket": "Volume"
+            })],
+        );
+        assert!(has_loss(&scaled_volume(&[emission]))?);
+
+        let mut missing_space = scaled.clone();
+        if let Some(volume) = missing_space["volumes"][0].as_object_mut() {
+            volume.remove("space");
+        }
+        assert!(validate_intermediate(&missing_space).is_err());
+        let mut unknown_space = scaled;
+        unknown_space["volumes"][0]["space"] = json!("OBJECT_LOCAL");
+        assert!(validate_intermediate(&unknown_space).is_err());
+        Ok(())
     }
 
     #[test]
