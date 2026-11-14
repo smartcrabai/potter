@@ -13,20 +13,19 @@ SHARD_COUNT = 4
 # Unlisted targets averaged 3.3 s in the latest CI runs.
 DEFAULT_SECONDS = 4
 # Estimated seconds per target, using CI timings or conservative runtime projections.
-# Library unit and doc entries include the compile time of their separate Cargo commands.
+# Library unit and doc weights retain conservative compile-time costs after batching.
 TARGET_SECONDS = {
-    # World costs include Source octree baking; unfinished cases use sampling-family estimates.
-    "world_volume_path_oracle": 420,
-    "world_volume_gradient_distance": 1332,
-    "world_volume_gradient_equiangular": 618,
-    "world_volume_gradient_multiple_importance": 1000,
-    "world_volume_noise_distance": 800,
-    "world_volume_noise_equiangular": 380,
-    "world_volume_noise_multiple_importance": 650,
-    "world_volume_spatial_emission": 713,
-    "world_volume_override_spatial": 1000,
+    "world_volume_path_oracle": 600,  # Unfinished HOMO runtime projection.
+    "world_volume_gradient_distance": 882,
+    "world_volume_gradient_equiangular": 774,
+    "world_volume_gradient_multiple_importance": 1076,
+    "world_volume_noise_distance": 659,
+    "world_volume_noise_equiangular": 524,
+    "world_volume_noise_multiple_importance": 564,
+    "world_volume_spatial_emission": 1200,  # Unfinished spatial runtime projection.
+    "world_volume_override_spatial": 1081,
     ("potter_core", "lib-unit"): 413,
-    "native_shader_bsdf_wave12": 530,
+    "native_shader_bsdf_wave12": 525,
     "volume_nee": 100,
     "volume_spectral_extinction": 100,
     ("potter_workflow", "lib-doc"): 287,
@@ -163,38 +162,63 @@ def discover_targets(metadata):
 def assign_targets(targets):
     assignments = [[] for _ in range(SHARD_COUNT)]
     loads = [0] * SHARD_COUNT
-    integration_targets = []
+    batches = []
+    library_units = []
+    library_docs = []
 
     for target in targets:
-        if target[2] == "integration":
-            integration_targets.append(target)
+        if target[2] == "lib-unit":
+            library_units.append(target)
+        elif target[2] == "lib-doc":
+            library_docs.append(target)
         else:
-            assignments[0].append(target)
-            loads[0] += target[4]
+            batches.append([target])
+    for group in (library_units, library_docs):
+        if group:
+            batches.append(group)
 
-    integration_targets.sort(key=lambda target: (-target[4], target[0], target[1]))
-    for target in integration_targets:
+    batches.sort(
+        key=lambda batch: (
+            -sum(target[4] for target in batch),
+            tuple(sorted((target[0], target[1], target[2]) for target in batch)),
+        )
+    )
+    for batch in batches:
         shard = min(range(SHARD_COUNT), key=lambda index: (loads[index], index))
-        assignments[shard].append(target)
-        loads[shard] += target[4]
+        assignments[shard].extend(batch)
+        loads[shard] += sum(target[4] for target in batch)
 
     return assignments
 
 
 def cargo_commands(targets):
-    groups = {}
+    package_groups = {}
+    library_units = []
+    library_docs = []
+
     for target in targets:
-        groups.setdefault((target[0], target[2] == "lib-doc"), []).append(target)
+        if target[2] == "lib-unit":
+            library_units.append(target)
+        elif target[2] == "lib-doc":
+            library_docs.append(target)
+        else:
+            package_groups.setdefault(target[0], []).append(target)
 
     commands = []
-    for (package_name, doctests), group in sorted(groups.items()):
+    for package_name, group in sorted(package_groups.items()):
         command = ["cargo", "test", "--package", package_name, "--all-features", "--no-fail-fast"]
-        if doctests:
-            command.append("--doc")
-        else:
-            for target in group:
-                command.extend(target[3])
+        for target in group:
+            command.extend(target[3])
         commands.append(command)
+
+    for group, selector in ((library_units, "--lib"), (library_docs, "--doc")):
+        if group:
+            command = ["cargo", "test"]
+            for package_name in sorted({target[0] for target in group}):
+                command.extend(("--package", package_name))
+            command.extend(("--all-features", "--no-fail-fast", selector))
+            commands.append(command)
+
     return commands
 
 
