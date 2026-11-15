@@ -1544,8 +1544,7 @@ impl HairBvh {
 
             match node.kind {
                 HairNodeKind::Leaf { start, end } => {
-                    for slot in start..end {
-                        let curve_index = self.curve_indices[slot];
+                    for &curve_index in &self.curve_indices[start..end] {
                         let current_max =
                             closest.map_or(t_max, |(_, _, hit)| hit.distance.min(t_max));
                         let Some((span_index, hit)) = intersect(curve_index, current_max) else {

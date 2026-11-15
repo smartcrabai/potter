@@ -551,8 +551,7 @@ pub(super) fn screw(
                 .map(|&point| {
                     source_face
                         .and_then(|_| last_loop[point % vertex_count])
-                        .map(|corner| vec![(corner, 1.0)])
-                        .unwrap_or_default()
+                        .map_or_default(|corner| vec![(corner, 1.0)])
                 })
                 .collect();
             if has_uv_layers {
@@ -723,8 +722,7 @@ pub(super) fn screw(
             .map(|members| {
                 members
                     .first()
-                    .map(|member| vec![(member % vertex_count, 1.0)])
-                    .unwrap_or_default()
+                    .map_or_default(|member| vec![(member % vertex_count, 1.0)])
             })
             .collect(),
         source_vertices: None,

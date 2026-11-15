@@ -1256,8 +1256,8 @@ pub(crate) fn solve_legacy(
     for segment in segments {
         let mut active_axes = [0; 3];
         let mut active_count = 0;
-        for axis in 0..3 {
-            if !segment.locked[axis] {
+        for (axis, &locked) in segment.locked.iter().enumerate() {
+            if !locked {
                 active_axes[active_count] = axis;
                 active_count += 1;
             }

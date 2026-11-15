@@ -3579,8 +3579,7 @@ fn physics_settings_properties(operation: &str) -> Value {
     let system = operation
         .strip_prefix("physics.")
         .and_then(|name| name.split_once('.'))
-        .map(|(system, _)| system)
-        .unwrap_or_default();
+        .map_or_default(|(system, _)| system);
     let mut properties = blender_schema_properties(system);
     if let Value::Object(native) = physics_native_properties(system) {
         properties.extend(native);

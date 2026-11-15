@@ -1608,8 +1608,7 @@ fn build_mesh_with_edge_sources(
                         .get(&edge_key(first, second))
                         .and_then(|&index| output_edge_sources.get(index))
                 })
-                .map(|&source_edge| vec![(source_edge, 1.0)])
-                .unwrap_or_default()
+                .map_or_default(|&source_edge| vec![(source_edge, 1.0)])
         })
         .collect();
     remap_attributes_with_edges(source, &mut result, origin, edge_origins)?;
@@ -2922,11 +2921,7 @@ fn array_corner_origin(
                         .position(|candidate| members.contains(candidate))
                 }
             };
-            corners.push(
-                pre_corner
-                    .map(|pre_corner| vec![(first + pre_corner, 1.0)])
-                    .unwrap_or_default(),
-            );
+            corners.push(pre_corner.map_or_default(|pre_corner| vec![(first + pre_corner, 1.0)]));
         }
     }
     corners

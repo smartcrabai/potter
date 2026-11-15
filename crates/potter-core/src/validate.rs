@@ -541,9 +541,7 @@ pub fn validate_with_context(
         },
         None => checks.push(check("avatar_settings", "supported", Value::Null)),
     }
-    let purpose = format
-        .map(crate::commands::export::export_purpose)
-        .unwrap_or_default();
+    let purpose = format.map_or_default(crate::commands::export::export_purpose);
     let context = crate::eval::EvaluationContext {
         purpose,
         ..crate::eval::EvaluationContext::default()

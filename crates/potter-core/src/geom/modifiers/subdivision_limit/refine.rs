@@ -646,16 +646,8 @@ fn assemble<T: Point>(
         }
     }
     let mut spoke_index = vec![Vec::new(); parent.faces.len()];
-    #[expect(
-        clippy::needless_range_loop,
-        reason = "f indexes the spoke table, the key table and the parent face list at once"
-    )]
     for f in 0..parent.faces.len() {
         spoke_index[f] = vec![None; parent.faces[f].len()];
-        #[expect(
-            clippy::needless_range_loop,
-            reason = "k indexes the spoke table, the key table and the parent corner list of face f"
-        )]
         for k in 0..parent.faces[f].len() {
             if let Some(index) = keys.spoke[f][k] {
                 debug_assert_eq!(index, child_edges.len());

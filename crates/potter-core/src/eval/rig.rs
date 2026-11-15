@@ -8812,9 +8812,9 @@ fn apply_object_constraint_in_space(
             } else {
                 (volume / total_scale).sqrt()
             };
-            for axis in 0..3 {
+            for (axis, scale) in desired.scale.iter_mut().enumerate() {
                 if axis != free_axis {
-                    desired.scale[axis] *= correction;
+                    *scale *= correction;
                 }
             }
         }

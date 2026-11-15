@@ -3006,8 +3006,7 @@ fn declared_type(tokens: &[Token], equals: usize) -> String {
     }
     tokens
         .get(position)
-        .map(|token| token.value.clone())
-        .unwrap_or_default()
+        .map_or_default(|token| token.value.clone())
 }
 
 fn import_deformation(prim: &Prim, mesh: &Mesh) -> Result<UsdDeformation> {

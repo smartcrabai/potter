@@ -290,8 +290,9 @@ pub fn explode(
                 tess_face
                     .source_corners
                     .get(piece.corner_slots[corner])
-                    .map(|source_corner| vec![(source_face_offset + *source_corner, 1.0)])
-                    .unwrap_or_default(),
+                    .map_or_default(|source_corner| {
+                        vec![(source_face_offset + *source_corner, 1.0)]
+                    }),
             );
         }
         rotate_valid_face(

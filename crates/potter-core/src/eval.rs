@@ -6289,11 +6289,7 @@ pub(crate) fn apply_particle_instance_modifier(
             json!({"modifier_id":modifier.id,"object":object_id}),
         )
     })?;
-    let track_flag = doc
-        .nodes
-        .get(node_id)
-        .map(object_track_flag)
-        .unwrap_or_default();
+    let track_flag = doc.nodes.get(node_id).map_or_default(object_track_flag);
     *mesh = crate::geom::modifiers::particle_instance::particle_instance(
         mesh,
         &particle_states,

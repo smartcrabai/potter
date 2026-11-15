@@ -802,8 +802,7 @@ fn decode_exr_default_with_validation(
                 .attributes
                 .layer_name
                 .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default();
+                .map_or_default(ToString::to_string);
             match name
                 .rsplit('.')
                 .next()
@@ -1008,14 +1007,12 @@ fn exr_render_layers<'a>(image: &'a ExrImageData, views: &[String]) -> Vec<ExrSe
             .attributes
             .layer_name
             .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
+            .map_or_default(ToString::to_string);
         let part_view = layer
             .attributes
             .view_name
             .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
+            .map_or_default(ToString::to_string);
         if layer_views.is_none()
             && !part_view.is_empty()
             && let Some(prefix) = part_name

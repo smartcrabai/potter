@@ -3718,11 +3718,9 @@ fn import_animations(
                 let id = object_id(object)?;
                 curve_nodes.insert(
                     id,
-                    object
-                        .args
-                        .get(1)
-                        .map(|name| strip_object_prefix(name, "AnimCurveNode").to_owned())
-                        .unwrap_or_default(),
+                    object.args.get(1).map_or_default(|name| {
+                        strip_object_prefix(name, "AnimCurveNode").to_owned()
+                    }),
                 );
             }
             "AnimationCurve" => {

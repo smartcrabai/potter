@@ -2031,7 +2031,7 @@ fn upgrade_v17(value: &mut Value) -> Result<Vec<Value>> {
         value
             .get("scenes")
             .and_then(Value::as_object)
-            .map(|scenes| {
+            .map_or_default(|scenes| {
                 scenes
                     .keys()
                     .filter_map(|scene_id| {
@@ -2040,7 +2040,6 @@ fn upgrade_v17(value: &mut Value) -> Result<Vec<Value>> {
                     })
                     .collect()
             })
-            .unwrap_or_default()
     } else {
         BTreeMap::new()
     };
@@ -2052,7 +2051,7 @@ fn upgrade_v17(value: &mut Value) -> Result<Vec<Value>> {
         value
             .get("scenes")
             .and_then(Value::as_object)
-            .map(|scenes| {
+            .map_or_default(|scenes| {
                 scenes
                     .keys()
                     .filter_map(|scene_id| {
@@ -2061,7 +2060,6 @@ fn upgrade_v17(value: &mut Value) -> Result<Vec<Value>> {
                     })
                     .collect()
             })
-            .unwrap_or_default()
     } else {
         BTreeMap::new()
     };

@@ -1164,12 +1164,9 @@ fn apply_modifier(
         // The evaluated `vertex_groups` attribute is a view of DataBlock weights keyed by this mesh's
         // IDs. Persist it as the weights and keep the transient attribute out of stored mesh data.
         let mut evaluated = evaluated;
-        let persisted_weights = engine
-            .doc
-            .data_blocks
-            .get(&data_id)
-            .map(|data| crate::eval::mesh_vertex_weights(&evaluated, &data.vertex_groups))
-            .unwrap_or_default();
+        let persisted_weights = engine.doc.data_blocks.get(&data_id).map_or_default(|data| {
+            crate::eval::mesh_vertex_weights(&evaluated, &data.vertex_groups)
+        });
         evaluated.attributes.remove("vertex_groups");
         let mesh_changed = engine
             .doc
@@ -1240,8 +1237,7 @@ fn modifier_to_apply(
         .doc
         .nodes
         .get(target)
-        .map(|node| node.modifiers.as_slice())
-        .unwrap_or_default();
+        .map_or_default(|node| node.modifiers.as_slice());
     let index = stack
         .iter()
         .position(|modifier| &modifier.id == modifier_id)

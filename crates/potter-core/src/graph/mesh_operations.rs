@@ -1056,16 +1056,12 @@ fn copy_direct_matrix_attributes(source: &Mesh, output: &mut Mesh, origin: &Orig
                 .map(|origins| single_origin(origins))
                 .collect::<Vec<_>>(),
             Some("FACE") => origin.faces.clone(),
-            Some("CORNER") => origin
-                .corners
-                .as_ref()
-                .map(|corners| {
-                    corners
-                        .iter()
-                        .map(|origins| single_origin(origins))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            Some("CORNER") => origin.corners.as_ref().map_or_default(|corners| {
+                corners
+                    .iter()
+                    .map(|origins| single_origin(origins))
+                    .collect()
+            }),
             Some("EDGE") => output
                 .edges
                 .iter()

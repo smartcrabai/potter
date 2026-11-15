@@ -2670,7 +2670,7 @@ fn compare_vertex_groups(
         ));
     }
     for (name, expected_entries) in expected {
-        let actual_entries = actual.get(name).map(Vec::as_slice).unwrap_or_default();
+        let actual_entries = actual.get(name).map_or_default(Vec::as_slice);
         if actual_entries.len() != expected_entries.len() {
             differences.push(format!(
                 "vertex group `{name}` has {} Potter entries, Blender has {}",

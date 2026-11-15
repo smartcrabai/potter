@@ -4189,7 +4189,7 @@ fn transfer_color_layers(
         } else {
             let mut destination_loop = 0;
             for (face_index, face) in destination.faces.iter().enumerate() {
-                for corner in 0..face.vertices.len() {
+                for (corner, &corner_vertex) in face.vertices.iter().enumerate() {
                     let mapped = mapped_loop_sources(
                         mapping_context,
                         destination,
@@ -4201,8 +4201,7 @@ fn transfer_color_layers(
                         && let Some(target) = weighted_color(&source_layer.values, &mapped)
                         && let Some(old) = destination_layer.values.get(destination_loop).copied()
                     {
-                        let mask =
-                            transfer_mask_weight(mask_weights, face.vertices[corner], invert_mask);
+                        let mask = transfer_mask_weight(mask_weights, corner_vertex, invert_mask);
                         destination_layer.values[destination_loop] =
                             mix_color(old, target, factor * mask, mix_mode, byte_color);
                     }

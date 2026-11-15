@@ -376,9 +376,8 @@ fn ocean_blender_corpus_matches_geometry_uvs_and_corner_colors() -> Result<(), B
             .get("blender_metadata")
             .and_then(|metadata| metadata.get("color_data_types"))
             .and_then(Value::as_object);
-        let mut actual_type_names: Vec<&str> = color_data_types
-            .map(|types| types.keys().map(String::as_str).collect())
-            .unwrap_or_default();
+        let mut actual_type_names: Vec<&str> =
+            color_data_types.map_or_default(|types| types.keys().map(String::as_str).collect());
         actual_type_names.sort_unstable();
         assert_eq!(
             actual_type_names, expected_names,

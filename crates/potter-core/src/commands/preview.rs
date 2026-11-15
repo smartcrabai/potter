@@ -21,8 +21,7 @@ pub fn run(args: PreviewArgs) -> Result<(Option<SceneInfo>, Value)> {
     let views = args
         .views
         .as_deref()
-        .map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>())
-        .unwrap_or_default();
+        .map_or_default(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>());
     let mode = match args.mode {
         PreviewMode::Solid => "solid",
         PreviewMode::Beauty => "beauty",

@@ -1992,8 +1992,7 @@ impl Evaluator<'_> {
 
     fn input_instance_paths_for_graph(&self) -> Vec<Vec<Id>> {
         self.input_instance_paths
-            .map(<[Vec<Id>]>::to_vec)
-            .unwrap_or_default()
+            .map_or_default(<[Vec<Id>]>::to_vec)
     }
 
     fn group_input_value(&self, socket: &str) -> Result<EvalValue> {
@@ -2371,11 +2370,7 @@ impl Evaluator<'_> {
                 callsite_node_id
             );
         }
-        let group_id = self
-            .group_stack
-            .last()
-            .map(ToString::to_string)
-            .unwrap_or_default();
+        let group_id = self.group_stack.last().map_or_default(ToString::to_string);
         let group_name = &self.group.name;
         let node_id = node_id.to_string();
         let _ = write!(

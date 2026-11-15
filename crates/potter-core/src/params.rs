@@ -52,7 +52,7 @@ pub(crate) fn rna_aliases(family: ParameterFamily, kind: &str) -> Vec<Vec<&'stat
     type_spec(family, kind)
         .and_then(|spec| spec.get("aliases"))
         .and_then(Value::as_array)
-        .map(|groups| {
+        .map_or_default(|groups| {
             groups
                 .iter()
                 .filter_map(|group| {
@@ -64,7 +64,6 @@ pub(crate) fn rna_aliases(family: ParameterFamily, kind: &str) -> Vec<Vec<&'stat
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 pub(crate) fn params_schema(family: ParameterFamily, kind: &str) -> Option<Value> {
@@ -175,14 +174,11 @@ fn validate_value(value: &Value, schema: &Value) -> Result<(), String> {
         }
         return Err("a value matching one of the allowed schemas".to_owned());
     }
-    let accepted_types = schema
-        .get("type")
-        .map(|value| match value {
-            Value::Array(values) => values.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
-            Value::String(name) => vec![name.as_str()],
-            _ => Vec::new(),
-        })
-        .unwrap_or_default();
+    let accepted_types = schema.get("type").map_or_default(|value| match value {
+        Value::Array(values) => values.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+        Value::String(name) => vec![name.as_str()],
+        _ => Vec::new(),
+    });
     if !accepted_types.is_empty()
         && !accepted_types
             .iter()

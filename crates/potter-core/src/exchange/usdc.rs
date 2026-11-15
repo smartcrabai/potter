@@ -1288,8 +1288,7 @@ fn encode_integer_data(values: &[i32]) -> Vec<u8> {
     let common = counts
         .into_iter()
         .max_by_key(|(value, count)| (*count, *value))
-        .map(|(value, _)| value)
-        .unwrap_or_default();
+        .map_or_default(|(value, _)| value);
     let mut codes = vec![0_u8; (values.len() * 2).div_ceil(8)];
     let mut variable = Vec::new();
     for (index, delta) in deltas.iter().enumerate() {

@@ -685,8 +685,7 @@ mod tests {
                 }
                 let positions: Vec<[f32; 3]> = record["positions"]
                     .as_array()
-                    .map(|rows| rows.iter().map(bits3).collect())
-                    .unwrap_or_default();
+                    .map_or_default(|rows| rows.iter().map(bits3).collect());
                 let actual = connect_islands(
                     index(&record["ring"][0]),
                     bits3(&record["normal"]),
