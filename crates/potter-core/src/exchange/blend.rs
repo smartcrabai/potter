@@ -843,7 +843,7 @@ fn add_linked_image_resources(document: &mut Value) {
     let linked = document
         .get("images")
         .and_then(Value::as_object)
-        .map(|images| {
+        .map_or_default(|images| {
             images
                 .iter()
                 .filter(|(_, image)| image.get("source").and_then(Value::as_str) == Some("file"))
@@ -860,8 +860,7 @@ fn add_linked_image_resources(document: &mut Value) {
                     ))
                 })
                 .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        });
     let Some(resources) = document
         .as_object_mut()
         .map(|root| root.entry("resources").or_insert_with(|| json!({})))
@@ -1150,8 +1149,7 @@ fn prepare_blend_export_resources(
     let resource_ids = document
         .get("resources")
         .and_then(Value::as_object)
-        .map(|resources| resources.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
+        .map_or_default(|resources| resources.keys().cloned().collect::<Vec<_>>());
     let parent = out
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -7671,8 +7669,7 @@ fn graph_node_inputs(
                 let socket_type = input
                     .get("type")
                     .and_then(Value::as_str)
-                    .map(blender_graph_socket_type)
-                    .unwrap_or_default();
+                    .map_or_default(blender_graph_socket_type);
                 converted.insert(
                     name.to_owned(),
                     resolve_graph_resource_value(&value, socket_type, mappings)?,
@@ -14849,14 +14846,13 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             let volume_reachable = scene
                 .get("world")
                 .and_then(|world| world.get("nodes"))
-                .map(|tree| {
+                .map_or_default(|tree| {
                     shader_graph_nodes_reaching_output_socket(
                         tree,
                         "ShaderNodeOutputWorld",
                         Some("Volume"),
                     )
-                })
-                .unwrap_or_default();
+                });
             if !volume_reachable.is_empty() {
                 losses.push(loss(
                     "render.world.volume_absorption",
@@ -15812,15 +15808,13 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
     {
         if let Some(world) = scene.get("world").filter(|world| !world.is_null()) {
             let tree = world.get("nodes");
-            let reachable = tree
-                .map(|tree| {
-                    shader_graph_nodes_reaching_output_socket(
-                        tree,
-                        "ShaderNodeOutputWorld",
-                        Some("Surface"),
-                    )
-                })
-                .unwrap_or_default();
+            let reachable = tree.map_or_default(|tree| {
+                shader_graph_nodes_reaching_output_socket(
+                    tree,
+                    "ShaderNodeOutputWorld",
+                    Some("Surface"),
+                )
+            });
             let is_reachable = |node: &Value| {
                 node.get("name")
                     .and_then(Value::as_str)
@@ -15982,13 +15976,12 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
         let scene_object_names = scene
             .get("object_names")
             .and_then(Value::as_array)
-            .map(|names| {
+            .map_or_default(|names| {
                 names
                     .iter()
                     .filter_map(Value::as_str)
                     .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
+            });
         let view_layers = scene
             .get("view_layers")
             .and_then(Value::as_array)
@@ -18764,8 +18757,7 @@ fn collect_shader_node_import_losses(
 ) {
     let reachable = shader_nodes_reaching(group, sink, sink_socket);
     let volume_reachable = volume_output_socket
-        .map(|socket| shader_nodes_reaching(group, sink, Some(socket)))
-        .unwrap_or_default();
+        .map_or_default(|socket| shader_nodes_reaching(group, sink, Some(socket)));
     for node_id in &reachable {
         let Some(node) = group.nodes.get(node_id) else {
             continue;
@@ -26746,11 +26738,7 @@ bpy.ops.wm.save_as_mainfile(filepath=sys.argv[-1])
             assert_eq!(descriptor.primitive, kind);
             assert_eq!(
                 Value::from(descriptor.params.clone()),
-                params
-                    .as_object()
-                    .cloned()
-                    .map(Value::Object)
-                    .unwrap_or_default()
+                params.as_object().cloned().map_or_default(Value::Object)
             );
             let source_mesh = doc
                 .data_blocks

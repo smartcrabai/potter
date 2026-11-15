@@ -796,16 +796,13 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
     let mut indices = Vec::with_capacity(samples.len());
     let mut bounds = Vec::with_capacity(samples.len());
     let mut normals = Vec::with_capacity(samples.len());
-    let layer_names = samples
-        .first()
-        .map(|sample| {
-            sample
-                .uv_layers
-                .iter()
-                .map(|layer| layer.name.as_str())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let layer_names = samples.first().map_or_default(|sample| {
+        sample
+            .uv_layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect::<Vec<_>>()
+    });
     if samples.iter().any(|sample| {
         sample
             .uv_layers
@@ -820,16 +817,13 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
     }
     let mut layer_uvs = vec![Vec::with_capacity(samples.len()); layer_names.len()];
     let mut layer_uv_indices = vec![Vec::with_capacity(samples.len()); layer_names.len()];
-    let color_specs = samples
-        .first()
-        .map(|sample| {
-            sample
-                .colors
-                .iter()
-                .map(|layer| (layer.name.as_str(), layer.domain))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let color_specs = samples.first().map_or_default(|sample| {
+        sample
+            .colors
+            .iter()
+            .map(|layer| (layer.name.as_str(), layer.domain))
+            .collect::<Vec<_>>()
+    });
     if samples.iter().any(|sample| {
         sample
             .colors
@@ -3522,14 +3516,13 @@ fn is_color_geomparam(parameter: &ParsedProperty) -> bool {
 fn color_geom_parameters(geom: &ParsedProperty) -> Vec<&ParsedProperty> {
     property(&geom.children, ".arbGeomParams")
         .filter(|parameter| parameter.property_type == 0)
-        .map(|arbitrary| {
+        .map_or_default(|arbitrary| {
             arbitrary
                 .children
                 .iter()
                 .filter(|parameter| is_color_geomparam(parameter))
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// Imports color `GeomParam`s as color layers named by `sourceName`, from each parameter's first

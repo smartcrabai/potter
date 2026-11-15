@@ -630,9 +630,9 @@ impl<'a> Builder<'a> {
         for (i, id) in ring.iter().enumerate() {
             let bound = &self.front.bounds[*id];
             if bound.ebev.is_some() {
-                for k in 1..seg {
+                for (k, &co) in bound.profile.prof_co.iter().enumerate().take(seg).skip(1) {
                     let index = vm.index(i, 0, k);
-                    vm.co[index] = bound.profile.prof_co[k];
+                    vm.co[index] = co;
                     defined[index] = true;
                 }
             } else if count == 2 {

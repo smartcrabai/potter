@@ -2387,8 +2387,7 @@ fn morph_index(
     }
     let target_count = root["meshes"][mesh_index]["primitives"][0]["targets"]
         .as_array()
-        .map(Vec::len)
-        .unwrap_or_default();
+        .map_or_default(Vec::len);
     if index >= target_count {
         return Err(unsupported_export(
             "vrm.expression_morph_target",

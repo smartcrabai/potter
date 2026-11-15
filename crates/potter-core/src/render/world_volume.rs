@@ -291,8 +291,8 @@ impl VolumeTrace {
         while octree.nodes[node_index].first_child != LEAF {
             scale -= 1;
             let mut child = 0;
-            for axis in 0..3 {
-                child |= (((self.current_p[axis] >> scale) & 1) as usize) << axis;
+            for (axis, &p) in self.current_p.iter().enumerate() {
+                child |= (((p >> scale) & 1) as usize) << axis;
             }
             node_index = octree.nodes[node_index].first_child + (child ^ self.octant_mask as usize);
         }

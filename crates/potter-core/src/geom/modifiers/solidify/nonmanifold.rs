@@ -931,11 +931,10 @@ fn build_topology(
                 let Some(id) = edge_adj[k] else {
                     continue;
                 };
-                for j in 0..adj[id].faces.len() {
+                for &face in &adj[id].faces {
                     if !can_merge {
                         break;
                     }
-                    let face = adj[id].faces[j];
                     let start = corners.face_start[face];
                     let size = corners.face_size[face];
                     let mut changes = 0_usize;
@@ -2444,7 +2443,7 @@ pub(super) fn solidify_nonmanifold(
         corners: Some(
             corner_sources
                 .iter()
-                .map(|source| source.map(|corner| vec![(corner, 1.0)]).unwrap_or_default())
+                .map(|source| source.map_or_default(|corner| vec![(corner, 1.0)]))
                 .collect(),
         ),
         ..Default::default()

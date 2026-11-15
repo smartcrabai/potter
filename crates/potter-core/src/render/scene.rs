@@ -1346,9 +1346,8 @@ pub(super) fn extract_geometry_with_semantics(
     let view_layer_use_volumes = view_layer.is_none_or(|layer| layer.use_volumes);
     let view_layer_use_strand = view_layer.is_none_or(|layer| layer.use_strand);
     let material_override = view_layer.and_then(|layer| layer.material_override.as_ref());
-    let excluded: HashSet<Id> = view_layer
-        .map(|layer| layer.excluded_collections.iter().cloned().collect())
-        .unwrap_or_default();
+    let excluded: HashSet<Id> =
+        view_layer.map_or_default(|layer| layer.excluded_collections.iter().cloned().collect());
     let mut visible_nodes = HashSet::new();
     let mut visited = HashSet::new();
     collect_collection_nodes(
@@ -1714,9 +1713,8 @@ pub(super) fn extract_geometry_with_semantics(
         for slot in 0..color_slot_count {
             let binding = snapshot.slot_binding(node_id, node, slot);
             let material_id = snapshot.slot_material(node_id, node, data_block, slot);
-            let references = material_id
-                .map(|material| color_layer_references(doc, material))
-                .unwrap_or_default();
+            let references =
+                material_id.map_or_default(|material| color_layer_references(doc, material));
             let available_mask = binding.map(|binding| Arc::clone(&binding.color_available_mask));
             let render_layer = if references.uses_render_layer {
                 let layer = binding.map_or_else(

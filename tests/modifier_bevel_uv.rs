@@ -753,9 +753,7 @@ fn vertex_group_names(mesh: &Mesh) -> Vec<String> {
         .attributes
         .get("vertex_groups")
         .and_then(Value::as_object);
-    groups
-        .map(|groups| groups.keys().cloned().collect())
-        .unwrap_or_default()
+    groups.map_or_default(|groups| groups.keys().cloned().collect())
 }
 
 fn group_weight(mesh: &Mesh, group: &str, vertex_id: u32) -> TestResult<f64> {

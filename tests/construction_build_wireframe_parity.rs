@@ -85,8 +85,7 @@ fn mesh_for(variant: &Value) -> Mesh {
     );
     let sharp_pairs: HashSet<[usize; 2]> = spec
         .get("sharp_edges")
-        .map(index_rows)
-        .unwrap_or_default()
+        .map_or_default(index_rows)
         .into_iter()
         .map(|edge| [edge[0].min(edge[1]), edge[0].max(edge[1])])
         .collect();

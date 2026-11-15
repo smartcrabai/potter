@@ -402,10 +402,6 @@ fn values(
     let mut mismatched_vertex = vec![false; vertex_count];
     let mut linear_edges = vec![false; geometry.edge_count()];
     let mut vertices: Vec<Option<Vertex>> = (0..vertex_count).map(|_| None).collect();
-    #[expect(
-        clippy::needless_range_loop,
-        reason = "each position indexes several per-vertex arrays and the geometry at once"
-    )]
     for position in 0..vertex_count {
         if geometry.vertex_faces[position].is_empty() {
             continue;
@@ -464,10 +460,6 @@ fn values(
             siblings,
         });
     }
-    #[expect(
-        clippy::needless_range_loop,
-        reason = "each position indexes several per-vertex arrays and the geometry at once"
-    )]
     for position in 0..vertex_count {
         if mismatched_vertex[position] || !geometry.vtags[position].boundary {
             continue;

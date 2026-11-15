@@ -277,8 +277,7 @@ fn material_bindings(doc: &SceneDoc, meshes: &[ExchangeMesh]) -> Result<BTreeMap
         let candidate = doc
             .materials
             .get(id)
-            .map(|material| material.name.replace(' ', "_"))
-            .unwrap_or_default();
+            .map_or_default(|material| material.name.replace(' ', "_"));
         if !candidate.is_empty()
             && !candidate.contains(char::is_whitespace)
             && !candidate.contains('#')
@@ -1957,10 +1956,7 @@ fn potter_material(
 fn resolve_map(map: Option<&MtlMap>, id: &Id, losses: &mut Vec<Loss>) -> Option<PathBuf> {
     let map = map?;
     let written = map.path.as_str();
-    let basename = Path::new(written)
-        .file_name()
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let basename = Path::new(written).file_name().map_or_default(PathBuf::from);
     let candidates = [
         map.dir.join(written),
         PathBuf::from(written),
@@ -2027,8 +2023,7 @@ fn texture_ref(
     };
     let name = path
         .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|stem| stem.to_string_lossy().into_owned());
     let image_id = unique_image_id(doc, &name)?;
     doc.images.insert(
         image_id.clone(),

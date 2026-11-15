@@ -131,15 +131,12 @@ fn output_json(output: &Output) -> TestResult<Value> {
 
 /// Feature ids of the `losses` array in a CLI result or error details object.
 fn loss_features(value: &Value) -> Vec<&str> {
-    value["losses"]
-        .as_array()
-        .map(|losses| {
-            losses
-                .iter()
-                .filter_map(|loss| loss["feature_id"].as_str())
-                .collect()
-        })
-        .unwrap_or_default()
+    value["losses"].as_array().map_or_default(|losses| {
+        losses
+            .iter()
+            .filter_map(|loss| loss["feature_id"].as_str())
+            .collect()
+    })
 }
 
 fn write_obj(directory: &Path, name: &str, text: &str) -> TestResult<PathBuf> {

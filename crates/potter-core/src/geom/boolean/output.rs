@@ -1382,16 +1382,13 @@ fn entry_values(entry: &Value) -> Option<&[Value]> {
 
 /// `entry` with its `values` replaced; the other fields are kept.
 fn with_values(entry: &Value, values: Value) -> Value {
-    let mut object: Map<String, Value> = entry
-        .as_object()
-        .map(|object| {
-            object
-                .iter()
-                .filter(|(key, _)| key.as_str() != "values")
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut object: Map<String, Value> = entry.as_object().map_or_default(|object| {
+        object
+            .iter()
+            .filter(|(key, _)| key.as_str() != "values")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    });
     object.insert("values".to_owned(), values);
     Value::Object(object)
 }

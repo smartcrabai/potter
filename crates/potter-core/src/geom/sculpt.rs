@@ -419,8 +419,8 @@ fn collapse_link_is_valid(
     adjacency: &std::collections::BTreeMap<u32, Vec<u32>>,
 ) -> bool {
     let [a, b] = endpoints;
-    let a_neighbors = adjacency.get(&a).map(Vec::as_slice).unwrap_or_default();
-    let b_neighbors = adjacency.get(&b).map(Vec::as_slice).unwrap_or_default();
+    let a_neighbors = adjacency.get(&a).map_or_default(Vec::as_slice);
+    let b_neighbors = adjacency.get(&b).map_or_default(Vec::as_slice);
     let common = a_neighbors
         .iter()
         .filter(|neighbor| **neighbor != b && b_neighbors.contains(neighbor))

@@ -737,13 +737,12 @@ fn assert_ordered_mesh_matches_blender(
     let actual_layer_names: Vec<String> = color_registry
         .and_then(|registry| registry.get("layers"))
         .and_then(Value::as_array)
-        .map(|layers| {
+        .map_or_default(|layers| {
             layers
                 .iter()
                 .map(|layer| layer.as_str().unwrap().to_owned())
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     assert_eq!(
         actual_layer_names, expected_layer_names,
         "{context} color layer order"
@@ -859,7 +858,7 @@ fn particle_mesh_snapshot(mesh: &potter_core::geom::Mesh) -> Value {
         .get("uv_layers")
         .and_then(|store| store.get("layers"))
         .and_then(Value::as_array)
-        .map(|layers| {
+        .map_or_default(|layers| {
             layers
                 .iter()
                 .map(|layer| {
@@ -886,8 +885,7 @@ fn particle_mesh_snapshot(mesh: &potter_core::geom::Mesh) -> Value {
                     (name.to_owned(), Value::Array(values))
                 })
                 .collect::<Map<_, _>>()
-        })
-        .unwrap_or_default();
+        });
     let custom_normal_codes =
         mesh.attributes
             .get("custom_normal")
@@ -930,13 +928,12 @@ fn particle_mesh_snapshot(mesh: &potter_core::geom::Mesh) -> Value {
         .get("color_layers")
         .and_then(|registry| registry.get("layers"))
         .and_then(Value::as_array)
-        .map(|layers| {
+        .map_or_default(|layers| {
             layers
                 .iter()
                 .map(|name| name.as_str().expect("color layer name").to_owned())
                 .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        });
     let mut color_attributes = Map::new();
     for name in &color_layer_names {
         let attribute = mesh.attributes.get(name).expect("color layer attribute");

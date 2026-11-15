@@ -1098,8 +1098,7 @@ fn overlay_authored(
     let inputs = graph
         .nodes
         .get(&principled)
-        .map(|node| node.inputs.clone())
-        .unwrap_or_default();
+        .map_or_default(|node| node.inputs.clone());
     if let Some(slot) = &textures.base_color {
         let base = format!("{prefix}_base");
         let texel = texture_node(&mut graph, &base, slot)?;

@@ -358,17 +358,13 @@ fn node_item(
             json!({ "id": id }),
         )
     })?;
-    let users = node
-        .data
-        .as_ref()
-        .map(|data_id| {
-            doc.nodes
-                .iter()
-                .filter(|(_, candidate)| candidate.data.as_ref() == Some(data_id))
-                .map(|(user_id, _)| user_id.to_string())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let users = node.data.as_ref().map_or_default(|data_id| {
+        doc.nodes
+            .iter()
+            .filter(|(_, candidate)| candidate.data.as_ref() == Some(data_id))
+            .map(|(user_id, _)| user_id.to_string())
+            .collect::<Vec<_>>()
+    });
     let params = node
         .data
         .as_ref()

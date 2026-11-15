@@ -91,7 +91,7 @@ impl Origin {
     ) -> Self {
         let vertices = vertices
             .into_iter()
-            .map(|source| source.map(|index| vec![(index, 1.0)]).unwrap_or_default())
+            .map(|source| source.map_or_default(|index| vec![(index, 1.0)]))
             .collect();
         Self {
             vertices,
@@ -1329,8 +1329,7 @@ impl Sources<'_> {
         let by_id: HashMap<u32, &Value> = attribute
             .get("values")
             .and_then(Value::as_object)
-            .map(|values| keyed_values(values, "e"))
-            .unwrap_or_default();
+            .map_or_default(|values| keyed_values(values, "e"));
         let mut output = Map::new();
         for (edge, sources) in self.output.edges.iter().zip(self.edge_origin) {
             let blended = blend(

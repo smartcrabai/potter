@@ -1030,14 +1030,13 @@ pub(crate) fn render_visible_nodes(
         .view_layer
         .as_ref()
         .and_then(|id| scene.view_layers.get(id))
-        .map(|layer| {
+        .map_or_default(|layer| {
             layer
                 .excluded_collections
                 .iter()
                 .cloned()
                 .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
+        });
     let mut visible = BTreeSet::new();
     let mut visited = BTreeSet::new();
     let mut pending = vec![scene.root_collection.clone()];
