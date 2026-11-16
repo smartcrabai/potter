@@ -13,7 +13,7 @@ members = ["crates/potter-core", "crates/potter-workflow"]
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/smartcrabai/potter"
-version = "0.2.0"
+version = "0.3.0"
 
 [workspace.dependencies]
 ab_glyph_rasterizer = "0.1.10"

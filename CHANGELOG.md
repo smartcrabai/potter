@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-11-16
 - Cycles `.blend` import reports `blender.object.is_shadow_catcher` for effective catcher flags, including source meshes reached through nested collection instances and opaque-film scenes; flag-only light/camera collections are ignored.
 - Cycles 5.2.2 path NEE honors World background sampling, shadow, visibility, bounce, and volume settings; Light portals and bounce limits; Material emission-sampling and volume settings; and `scene.cycles.light_sampling_threshold`. A constant World without portals disables BackgroundLight NEE; sampling method `NONE` disables its map strategy, while portals may still guide World samples. World and Light `max_bounces` limit NEE only, not forward emitter or background hits.
 - Cycles path selection round-trips `scene.cycles.use_light_tree` (default true). Potter evaluates supported lights deterministically with Cycles' per-emitter tree PMF for surface/volume NEE, clamp scaling, threshold survival, and forward-hit MIS; `false` retains flat selection. Emissive triangles are retained as per-triangle subtrees, although Potter does not sample them for NEE. Tree energy applies Cycles' normalization/area factors, temperature/exposure and statically estimable Light shader emission; an unestimable Light shader graph reports `blender.light.shader_nodes` only when the active scene uses the tree. Light/shadow linking remains an import loss.
