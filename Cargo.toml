@@ -6,41 +6,6 @@ name = "potter"
 repository.workspace = true
 version.workspace = true
 
-[[bin]]
-name = "pot"
-path = "src/main.rs"
-
-[dependencies]
-clap.workspace = true
-potter-core.workspace = true
-potter-workflow.workspace = true
-serde_json.workspace = true
-
-[dev-dependencies]
-assert_cmd.workspace = true
-exr.workspace = true
-glam.workspace = true
-hex.workspace = true
-image.workspace = true
-jsonschema.workspace = true
-num-traits.workspace = true
-png.workspace = true
-proptest.workspace = true
-serde.workspace = true
-sha2.workspace = true
-tempfile.workspace = true
-
-[profile.release]
-codegen-units = 1
-lto = true
-strip = true
-
-[profile.test]
-opt-level = 2
-
-[lints]
-workspace = true
-
 [workspace]
 members = ["crates/potter-core", "crates/potter-workflow"]
 
@@ -140,5 +105,40 @@ targets = [
   "aarch64-pc-windows-msvc",
 ]
 
+[[bin]]
+name = "pot"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+potter-core.workspace = true
+potter-workflow.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+exr.workspace = true
+glam.workspace = true
+hex.workspace = true
+image.workspace = true
+jsonschema.workspace = true
+num-traits.workspace = true
+png.workspace = true
+proptest.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+
+[profile.test]
+opt-level = 2
+
 [profile.dist]
 inherits = "release"
+
+[lints]
+workspace = true
