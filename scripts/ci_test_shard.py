@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan and run the workspace's Cargo test targets across six CI shards."""
+"""Plan and run the workspace's Cargo test targets across eight CI shards."""
 
 import argparse
 import json
@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SHARD_COUNT = 6
+SHARD_COUNT = 8
 # Unlisted targets averaged 3.3 s in the latest CI runs.
 DEFAULT_SECONDS = 4
 # Target weights use latest completed CI timings, except the doc compile headroom projection.

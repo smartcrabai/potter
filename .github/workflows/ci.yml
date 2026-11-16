@@ -53,12 +53,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
       # Test artifacts stay optimized; DWARF is unnecessary for ~200 test executables.
       CARGO_PROFILE_TEST_DEBUG: "0"
       POTTER_REQUIRE_BLENDER: "1"
-    # Each shard compiles the test profile (~8-9 minutes) before running about 32 minutes of balanced targets.
+    # Each shard compiles the test profile (~7-11 minutes) before running about 24 minutes of balanced targets.
     timeout-minutes: 60
     steps:
       - name: Checkout repository
