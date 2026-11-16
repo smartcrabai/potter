@@ -62,7 +62,7 @@ pot inspect ./from-blender --scene-id scene_main --frame 24 --json
 pot preview ./from-blender \
   --scene-id scene_main --frame 24 --mode beauty --views iso --json
 
-# Render animation. Return paths to generated image sequences / video
+# Render animation frames
 pot render ./scene --frames 1:120 --format exr --out ./frames --json
 
 # Bake simulation, texture, geometry, and animation
@@ -91,14 +91,15 @@ pot preview <scene> [--views <views> | --camera <id>] [--mode <mode>]
 pot pick <scene> --render <manifest> --pixel <x,y>
   [--domain object|vertex|edge|face|bone|stroke|point] [--json]
 pot validate <scene> [--strict] [--format <format>] [context] [--json]
-pot export <scene> --format <format> --out <path>
+pot export <scene> --format <format> --out <path> [--view <view>]
   [--allow-lossy] [--pack] [--overwrite] [context] [--json]
 pot render <scene> [--camera <id>] [--engine path|realtime] [--device cpu|gpu]
   [--frames <start:end[:step]>] --format <format> --out <dir>
   [--overwrite] [context] [--json]
-pot bake <scene> --kind simulation|texture|geometry|animation
-  [--target <id>] [--frames <start:end[:step]>] --out <dir>
-  [--overwrite] [context] [--json]
+pot bake <scene> --kind simulation|texture|geometry|animation|ocean|node-bake
+  [--target <id>] [--modifier <id>] [--node <id>] [--mode still|animation]
+  [--frames <start:end[:step]>] [--out <dir>] [--pack] [--unpack]
+  [--unpack-method <method>] [--delete] [--overwrite] [context] [--json]
 pot assets <scene> [--check] [--json]
 pot schema [--kind scene|operations|preview|response|capabilities|formats]
   [--op <op>] [--json]
@@ -303,7 +304,7 @@ Implement all families below in the first release. Each variant MUST cover every
 
 | Family | Operations |
 | --- | --- |
-| Scene / Collection / Object / Data | `scene.*`, `collection.*`, `node.*`, `data.*`: create, update, duplicate, delete, link / unlink, parent, origin, convert, make_single_user |
+| Scene / Collection / Object / Data | `scene.*`: create, update, marker_add, marker_remove; `collection.*`, `node.*`, `data.*`: create, update, duplicate, delete, link / unlink, parent, origin, convert, make_single_user |
 | mesh | `mesh.*`: element selection, position / attribute editing, extrude, inset, bevel, loop_cut, bridge, weld, split, dissolve, fill, subdivide, triangulate, knife, bisect, remesh, mirror |
 | Modifier / graph | `modifier.*`: create / update / reorder / apply all types. `modifier.create` and `modifier.update` take `enabled` (global switch), `show_viewport`, and `show_render`. `modifier.update` `set.params` merges key by key into the current params when the type is unchanged (a JSON `null` removes that key, restoring its default); a type change replaces params, since the old params do not belong to the new type. `params.use_pin_to_last` moves the modifier as Blender's pin setter does: a new modifier is inserted before the trailing pinned block, and pinning or unpinning moves it at once. `modifier.reorder` fails with `INVALID_OPERATION` when Blender's pin or original-data rules would stop the move short of `index`. `graph.*`: all nodes, sockets, links, groups, interfaces, zones, attributes |
 | sculpt / paint | `sculpt.*`, `paint.*`: brush / stroke, mask, face set, symmetry, Dyntopo, Multires, texture / vertex / weight |
@@ -373,7 +374,7 @@ apply result: committed, changed, base_revision, candidate_revision, changes, op
 
 ## 7. Inspect and Assets
 
-- With no id, return all Objects in the target Scene; with a tag, return all matches. Zero matches yields TARGET_NOT_FOUND. An id identifies the type and registry and can also retrieve Data-Blocks, etc.
+- With neither id nor tag, return every node in the project plus worlds; a tag searches all nodes. Zero matches yields TARGET_NOT_FOUND. An id identifies the type and registry and can also retrieve Data-Blocks, etc.
 - Do not implicitly add descendants. Show structure through parent, children, Collection membership, data references, and instance paths.
 - Retrieve the full Project inventory outside the filter from the summary. Include hidden and unused items in counts.
 - result: summary, items, references, resources, features. items contain typed information for the specified registries. Also return convenience values such as node params.
@@ -471,11 +472,11 @@ previews/
 
 ### Render and Bake
 
-- render uses the saved camera, world, light, shader, pass, compositor, and Scene output settings. Without a camera, return TARGET_NOT_FOUND. The default is the CPU path engine; realtime / GPU require explicit selection.
-- render supports stills, image sequences, video, audio, and VSE output. Validate formats such as PNG, JPEG, TIFF, OpenEXR, MP4, WebM, WAV / FLAC, etc., and codec / bit depth / alpha in the schema.
+- render uses the saved camera, world, light, shader, pass, compositor, and Scene output settings. Without a camera, return TARGET_NOT_FOUND unless the selected Scene has sequencer rendering enabled and non-empty strips. The default device is CPU; an omitted `--engine` uses the saved Scene engine (new Scenes default to `path`). Pass `--engine realtime` to request realtime; `--device gpu` returns UNSUPPORTED_FEATURE in this CPU build.
+- Render image output is PNG or OpenEXR only; other `--format` values return UNSUPPORTED_FEATURE. Enabled sequencer strips render into frames without a camera; WAV/FLAC audio is written separately when the Scene audio codec is `wav` or `flac`. Video output is unsupported.
 - Render output returns per-frame hashes, frame / subframe, samples / seed, fps, OCIO, AOV / pass, and a common run manifest.
 - Image sequence filenames use the shortest round-trip decimal representation of the frame number. For fixed-point notation, zero-pad the signed integer part to at least 4 digits (e.g. `frame_0012.5.png`); retain exponent notation. Distinguish repeated frames with `__2`, `__3`, etc., and match the manifest paths.
-- bake targets simulation / texture / geometry / animation. Validate solver, UV, target, frame, cache / output conditions, and return outputs and dependency keys.
+- Bake kinds are simulation, texture, geometry, animation, ocean, and node-bake; `texture` currently returns `UNSUPPORTED_FEATURE`. `--out` is optional but required for Ocean, animation, geometry, and simulation bakes. Node-bake uses `--modifier` and `--node`, accepts `--mode still|animation`, and supports `--pack`, `--unpack` with `--unpack-method use-local|write-local|use-original|write-original`, or `--delete`. For implemented bake kinds, validate solver, UV, target, frame, cache / output conditions, and return outputs and dependency keys.
 - Neither command changes the source of truth or revision. Explicitly import / attach generated assets to the source of truth with apply.
 - Floating-point results may differ across devices / solvers / parallel execution even for the same Snapshot. Reproduce with a specified environment and seed; validate numeric errors against feature-specific fixtures.
 - Do not make missing custom feature implementations appear successful by forwarding to Blender render / bake. render / bake require evaluation of all targets; fail processing with `UNSUPPORTED_FEATURE` for an individual Object and return `error.details.feature_id` and `error.details.node_id`. Do not publish partial output as success.
@@ -567,13 +568,13 @@ See the [Blender Compatibility requirements](blender-compatibility.md#3-meaning-
 | vrm | REQUIRED | REQUIRED | Humanoid avatar, skin, morph, MToon, spring bones, metadata |
 | vrm0 | REQUIRED | REQUIRED | Humanoid avatar, skin, morph, MToon, spring bones, metadata |
 | usd / usda / usdc / usdz | REQUIRED | REQUIRED | Scene, instances, materials, geometry, animation, volume, assets |
-| abc | REQUIRED | REQUIRED | Alembic geometry / transform / attribute time-series cache |
+| alembic (.abc) | REQUIRED | REQUIRED | Alembic geometry / transform / attribute time-series cache |
 | fbx | REQUIRED | REQUIRED | Hierarchy, mesh, material, rig, animation. Report variants / losses |
 | obj / ply / stl | REQUIRED | REQUIRED | Geometry, normal / UV / color / material as supported by the format |
 | bvh | REQUIRED | REQUIRED | Skeleton, motion |
 | svg | REQUIRED | REQUIRED | Curve / Grease Pencil. Specify projection, frame, sampling |
 | pdf | — | REQUIRED | Grease Pencil projection, frame, page |
-| PNG / JPEG / TIFF / EXR / video / audio | Asset import | Render / bake | Color, bit depth, alpha, codec, frame / fps / audio sync |
+| PNG / JPEG / TIFF / EXR | Asset import | PNG / OpenEXR render frames | Color, bit depth, alpha |
 
 - VRM 1.0 uses `VRMC_vrm`, `VRMC_springBone`, and `VRMC_materials_mtoon` 1.0; VRM 0.x uses the `VRM` extension.
 - VRM 1.0 and 0.x import and export. `pot validate --format vrm|vrm0 [--strict]` runs the same export preflight without writing a file and reports `VRM_EXPORT_PREFLIGHT_FAILED` when output is unrepresentable.
@@ -698,7 +699,7 @@ Common format:
 ```
 
 - On success, ok=true and error=null; result contains the command-specific result. On failure, error is required and any available report remains in result.
-- scene contains id, absolute path, revision, and hash. Return it on failure too if already retrieved. It is null if not retrieved / for schema retrieval.
+- scene contains id, absolute path, revision, and hash when present; it is null on failure and for schema retrieval.
 - command is the subcommand name; it is null for CLI errors before command determination. warnings is always an array, with code, message, data_id, and details.
 - Results involving evaluation specify snapshot_hash, Scene, View Layer, frame, engine / profile, and execution policy.
 - error.code is machine-readable, message is brief English, and details contain JSON Pointer, zero-based operation_index, target ID, feature_id, dependencies, etc.
@@ -710,10 +711,9 @@ Common format:
 
 ### Limits and Reproducibility
 
-- Default control JSON limit is 64 MiB / 10,000 operations per batch. Use typed binary / chunk references for large arrays, strokes, images, volumes, and caches.
-- Default budget: 1,000,000 source-of-truth entities, 100,000,000 evaluated triangles, 8 GiB memory; configure CPU thread count. Config can change these values. Exceeding a limit yields LIMIT_EXCEEDED; no partial saves.
-- Distinguish creation feature limits from resource budgets. Do not treat large Blender Scenes as unsupported features due to a fixed 1,000,000-triangle limit. Implement chunk / tile / stream processing.
-- Process one Preview at a time; do not hold all views' buffers simultaneously. Process video and caches by frame / chunk as well.
+- `LIMIT_EXCEEDED` is returned for command-specific caps and checked size / count / index overflow or exhaustion (for example, render frame ranges and revision increments). There are no shared control-JSON, batch-count, Scene-entity, evaluated-triangle, or memory budgets.
+- Distinguish feature limits from resource limits. Do not invent a global triangle cap; use chunk / tile / stream processing for large data.
+- The preview renderer processes each view sequentially rather than retaining all views' pixel buffers. Process caches by frame / chunk as well.
 - Source-of-truth JCS hashes, references, and persistent IDs are OS-independent. Reproduce ID mappings and center-selection buffers exactly with the same engine version, profile, input, evaluation context, and runtime environment.
 - Record engine / solver / device, seed, thread, OCIO, etc. for beauty / simulation / bake. Validate numeric errors per fixture. Do not require byte-for-byte identity for .blend due to compression, save-time conversion, or timestamps.
 - Do not confuse Blender byte differences with compatibility gaps; judge by editable semantics, references, and evaluation results.

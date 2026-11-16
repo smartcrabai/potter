@@ -21,7 +21,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/smartcrabai/potter/rele
 ```
 
 - Windows: download `potter-x86_64-pc-windows-msvc.zip` or `potter-aarch64-pc-windows-msvc.zip` from the [latest release](https://github.com/smartcrabai/potter/releases/latest) and put `pot.exe` on `PATH`.
-- From source: `cargo install --git https://github.com/smartcrabai/potter --locked` (CI builds with Rust 1.99, pinned in `rust-toolchain.toml`).
+- From source: `cargo install --git https://github.com/smartcrabai/potter --locked` (CI builds with the Rust toolchain pinned in `rust-toolchain.toml`).
 
 Optional dependencies:
 

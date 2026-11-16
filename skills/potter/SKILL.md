@@ -9,7 +9,7 @@ Headless, AI-oriented Blender alternative. All edits are versioned typed JSON ba
 
 ## Golden rules
 
-- Always pass `--json`. stdout is exactly one JSON envelope: `{schema_version, command, ok, scene:{id,path,revision,hash}, result, warnings, error:{code,message,details}}`. Branch on `ok` / `error.code`, never on text.
+- Always pass `--json`. stdout is exactly one JSON envelope: `{schema_version, command, ok, scene:{id,path,revision,hash}|null, result, warnings, error:{code,message,details}|null}`. Branch on `ok` / `error.code`, never on text.
 - Every mutating call needs the current revision: read `scene.revision` from the last envelope (or `pot inspect`) and send it as `base_revision`. Mismatch → `REVISION_CONFLICT` (exit 5); re-inspect, rebuild the batch, retry. Never re-send the same batch after an unknown outcome without inspecting first.
 - IDs are yours to choose: `^[a-z][a-z0-9_-]{0,63}$`. Names are display only. ID clash → `ID_EXISTS`; no auto-rename.
 - Unknown fields/flags/enums are errors. Ask the tool, don't guess: `pot schema --op <op> --json` returns the exact JSON Schema of one operation; `pot schema --kind capabilities --json` lists what is supported / `not_supported` (with reason).
@@ -104,9 +104,9 @@ Verify exact field names with `pot schema --op <op> --json` before first use.
 
 ## Output
 
-- `pot render <scene> --frames 1:24[:step] --format png|exr --out ./frames --json` uses the scene camera (`TARGET_NOT_FOUND` if none) and `render.*` settings (resolution, samples, seed, engine `path|realtime`).
-- `pot bake <scene> --kind animation|geometry|simulation|texture --frames 1:120 --out ./bake --json`.
-- `pot export <scene> --format glb|gltf|obj|stl|ply|usda|usdc|usdz|fbx|abc|bvh|svg|pdf|blend --out <path> --json`. Losses (feature the format can't hold) are refused with `UNREPRESENTABLE_FEATURE` and listed in `result.losses`; add `--allow-lossy` only if the loss is acceptable. `--overwrite` to replace. SVG/PDF accept `--view front|…`.
+- `pot render <scene> --frames 1:24[:step] --format png|exr --out ./frames --json` uses the Scene camera; without one, it returns `TARGET_NOT_FOUND` unless sequencer rendering is enabled and the Scene has strips. The default device is CPU; an omitted `--engine` uses the saved Scene engine (new Scenes default to `path`); `--engine realtime` requests realtime, and `--device gpu` returns `UNSUPPORTED_FEATURE` in this CPU build.
+- `pot bake <scene> --kind simulation|texture|geometry|animation|ocean|node-bake [--target <id>] [--frames 1:120] [--out ./bake] --json`. `--out` is optional and required for simulation, geometry, animation, or ocean; `texture` returns `UNSUPPORTED_FEATURE`. Node-bake accepts `--modifier`, `--node`, `--mode still|animation`, `--pack`, `--unpack`, `--unpack-method use-local|write-local|use-original|write-original`, and `--delete`.
+- `pot export <scene> --format glb|gltf|obj|stl|ply|usda|usdc|usdz|fbx|alembic|bvh|svg|pdf|blend --out <path> --json`. Losses (feature the format can't hold) are refused with `UNREPRESENTABLE_FEATURE` and listed in `result.losses`; add `--allow-lossy` only if the loss is acceptable. `--overwrite` to replace. SVG/PDF accept `--view front|…`.
 - `pot import <scene> --file in.glb --format glb --base-revision N [--mode append|replace] --json`. Append remaps colliding IDs (`result.id_mappings`).
 
 ## Blender (.blend)
