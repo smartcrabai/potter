@@ -105,6 +105,10 @@ targets = [
   "aarch64-pc-windows-msvc",
 ]
 
+# dist 0.33.0 defaults to the retired macos-14 runner
+[workspace.metadata.dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 [[bin]]
 name = "pot"
 path = "src/main.rs"
