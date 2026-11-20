@@ -44,6 +44,8 @@ Configure native VRM avatars with `avatar.update` / `avatar.clear`, then export 
 
 `pot workflow` runs multi-agent workflows on top of potter, driven by [jcode](https://github.com/1jehuang/jcode) agents through `jcode-sdk`. It needs `jcode` on PATH with a provider login.
 
+Potter pins the Rust SDK to an upstream jcode release tag in [`Cargo.toml`](Cargo.toml); the SDK is not published on crates.io.
+
 ```sh
 pot workflow -h                           # list available workflows
 pot workflow refine -p openai -m gpt-5.5 -i chair.jpg -i chair-side.jpg
